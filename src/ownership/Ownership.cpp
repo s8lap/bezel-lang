@@ -4671,6 +4671,18 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         }
         if (lc->value && !topLevelConsume)
             checkRead(*lc->value, /*selfTarget=*/false);
+        // fix #8852 (§9.7 / §28.3.8, v0.359): the `const` twin of the
+        // `var` local-declaration leg — a record component whose declared type
+        // is a function type admits only a capture-free function value.
+        // // per §9.7, §28.3.8
+        if (lc->value) {
+            if (const auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(lc->value.get()))
+                checkRecordFnComponentStore(*ne);
+            if (const auto* we =
+                    dynamic_cast<const ast::WithExpr*>(lc->value.get()))
+                checkRecordWithFnComponentStore(*we);
+        }
         // fix #2709 (v0.240): the SHARED gate. `constInitializerRejected` is
         // the single authority for "does §21.1 reject this initializer?", and
         // the lint guard in handleLocalDecl consults the SAME function — so
@@ -9332,6 +9344,19 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
         if (const auto* we =
                 dynamic_cast<const ast::WithExpr*>(ld.initializer.get()))
             checkRecordWithFromTemporary(*we);
+        // fix #8852 (§9.7 / §28.3.8, v0.359): a record component whose
+        // declared type is a function type admits only a capture-free function
+        // value — the function-typed-COMPONENT twin of the function-typed
+        // FIELD sink rule. `var r := new R(lambda() => t.v);` over
+        // `record R(f: () -> int)` dropped the closure's source set, so the
+        // closure outlived the owned local it captured (a use-after-dispose
+        // measured as a SEGV in `lam$0`). // per §9.7, §28.3.8
+        if (const auto* ne =
+                dynamic_cast<const ast::NewExpr*>(ld.initializer.get()))
+            checkRecordFnComponentStore(*ne);
+        if (const auto* we =
+                dynamic_cast<const ast::WithExpr*>(ld.initializer.get()))
+            checkRecordWithFnComponentStore(*we);
     }
     // Find the LocalSymbol that ExprTypecheck created for this decl.
     sema::LocalSymbol* lsym = findLocalSymbol(ld);
@@ -11400,6 +11425,14 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // and return arms exactly.
     if (const auto* we = dynamic_cast<const ast::WithExpr*>(as.value.get()))
         checkRecordWithFromTemporary(*we);
+    // fix #8852 (§9.7 / §28.3.8, v0.359): the assignment-site twin of the
+    // local-declaration leg above — a record component whose declared type is
+    // a function type admits only a capture-free function value. // per §9.7,
+    // §28.3.8
+    if (const auto* ne = dynamic_cast<const ast::NewExpr*>(as.value.get()))
+        checkRecordFnComponentStore(*ne);
+    if (const auto* we = dynamic_cast<const ast::WithExpr*>(as.value.get()))
+        checkRecordWithFnComponentStore(*we);
     // §28.3 (#386 cases 1+2): storing a borrow of an owned scope-bound local
     // into a field of an object, or writing it through an out/ref parameter,
     // lets the borrow outlive the local (use-after-dispose). Run AFTER
@@ -13171,11 +13204,31 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // closure or borrow-bearing record is examined even when it is the
     // whole returned expression. Neither check marks any local disposed;
     // they only diagnose. The discharge handling below is unchanged.
+    //
+    // fix #8852 (§9.7 / §28.3.8, v0.359): the diagnostic count is read
+    // before the escape check so the record-component store leg below can
+    // tell whether that check was silent — the same "did the previous check
+    // report?" idiom `ExprTypecheck.cpp` uses for its own tie-break legs.
+    const std::size_t diagsBeforeReturn =
+        ctx_.diagnostics().diagnostics().size();
     checkClosureEscapesOnReturn(e);       // D1: §28.9 closure capture escape
     // fix #6634 (§28.3 sink rule, §9.4, v0.340): a returned lambda that
     // captures the receiver. Inert for a lambda body's own `return` (a
     // lambda-body run never has a receiver type set).
     checkReceiverCaptureAtSink(e, "returned from the method");
+    // fix #8852 (§9.7 / §28.3.8, v0.359): a record component whose declared
+    // type is a function type admits only a capture-free function value — so
+    // `return new R(lambda() => t.v);` is a rejected store, not merely a
+    // rejected escape. The §28.3 escape check above ALREADY rejects a closure
+    // in the returned expression that captures an owned local / a plain
+    // parameter / a ref-out parameter / the caught exception / a
+    // borrow-bearing record, and it reports at the capture; this leg runs
+    // only when that check was SILENT, so a program keeps the one diagnostic
+    // it has always had, and the shapes the escape check does not reach (a
+    // receiver capture inside a construction's arguments — the §6652 gap) are
+    // diagnosed here. // per §9.7, §28.3.8
+    if (ctx_.diagnostics().diagnostics().size() == diagsBeforeReturn)
+        checkRecordFnComponentStoreRecursive(e);
     checkRecordBorrowEscapesOnReturn(e);  // D2: §9.7 borrow-bearing record
     // #1066 / §9.7 (v0.153): `return new Bag([…])` from a temporary is a
     // dangling borrow exactly as a local-decl initializer is.

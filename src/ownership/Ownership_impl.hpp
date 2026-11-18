@@ -986,6 +986,78 @@ public:
     // checks on each found node, matching the same recursion pattern that
     // checkClosureEscapesOnReturn uses for LambdaExpr/CallExpr. // per §9.7
     void checkRecordAndWithFromTemporaryRecursive(const ast::Expr& e);
+    // fix #8852 (§9.7 / §28.3.8, v0.359): a record component whose declared
+    // type is a FUNCTION TYPE is a §28.3.8 "function-typed holder" — "a store
+    // of a function value admits a capture-free value and rejects one whose
+    // source set is non-empty (a capture-bearing closure, a plain
+    // function-typed parameter, a local carrying either), judged at the site" —
+    // and §9.7 states the rule for the component directly: "A component whose
+    // declared type is a function type admits only a capture-free function
+    // value, at construction and in `with`."
+    //
+    // The construction DROPS the component closure's source set: a function
+    // value read back from a component carries the EMPTY set (§28.3.8
+    // *Provenance* clause 5), so a capture-bearing closure stored in a
+    // component loses the bound that kept its capture alive, and the closure
+    // then outlives the local it captured (use-after-dispose).
+    //
+    // These are the two store sites §9.7 names: the construction argument
+    // bound to the component (§9.1's generated primary constructor, §9.2's
+    // body-record constructor) and the `with(...)` override of the component
+    // (§9.5). The function-typed FIELD sink rule's missing twin: a store of a
+    // capture-bearing closure into a field is rejected (the §28.3
+    // borrowed-field store rule for an owned local, the §27.5/§28.3
+    // plain-parameter leg, the ref/out-parameter leg, the §9.4
+    // receiver-capture leg), and the record COMPONENT — the same kind of
+    // holder — was not reached. // per §9.7, §28.3.8, v0.359
+    void checkRecordFnComponentStore(const ast::NewExpr& ne);
+    void checkRecordWithFnComponentStore(const ast::WithExpr& we);
+    // The `with(...)` / construction sites reached through a RETURNED
+    // expression, including the nested forms `checkRecordAndWithFromTemporary-
+    // Recursive` recurs into (a collection literal's elements, a conditional's
+    // arms). // per §9.7, §28.3.8, v0.359
+    void checkRecordFnComponentStoreRecursive(const ast::Expr& e);
+    // The record's storage COMPONENTS, in the two views the store sites need:
+    //
+    //  - `positional`: the §9.1 positional components in DECLARATION order, so
+    //    that constructor argument i binds to positional component i — the same
+    //    index alignment `checkRecordFromTemporary` reads. It carries EVERY
+    //    positional component (not only the function-typed ones), because the
+    //    index of the argument is the index of the component and the function-
+    //    typed test is applied to the component the argument actually binds.
+    //  - `byName`: the §9.2 body components (auto-properties and fields),
+    //    name-keyed, for the `with(...)` override and the named-argument
+    //    spelling of a construction argument.
+    //
+    // The two views are read through the two sema primitives that provide
+    // them: `sema::recordPositionalFieldSymbols` (the index-aligned
+    // positional view) and `sema::recordStorageMembers` (the per-member
+    // facts — the name and the type). The `RecordStorageMember::isPositional`
+    // flag is deliberately NOT read: the sema walk fills `rsm` member by
+    // member and never assigns that flag, so it keeps its initialiser and
+    // reads `false` for a §9.1 positional component too — a reader of that
+    // flag loses the positional index alignment entirely (measured: every
+    // positional-record construction was classified as having no positional
+    // component, and no argument was ever bound to one). The positional set
+    // is identified by the member SYMBOL instead, which the walk yields for
+    // every member it visits. // per §9.1, §9.2, §9.7, v0.359
+    void recordStorageComponents(
+        const sema::TypeSymbol* ts,
+        std::vector<std::pair<std::string_view, const sema::TypeRef*>>& positional,
+        std::vector<std::pair<std::string_view, const sema::TypeRef*>>& byName)
+        const;
+    // The capture that makes a function value's source set NON-EMPTY, or null
+    // when the value is capture-free. `why` receives the clause naming the
+    // capture, for the diagnostic.
+    //
+    // §28.3.8's *Provenance* clause 1 reads a lambda literal's set off the
+    // borrows it captures; clause 6 reads a local's set off the forms the
+    // flow analysis traces it to; clause 3 gives a plain function-typed
+    // PARAMETER a set of its own ("its signature announces no set, so the
+    // value is bounded by the call"); §9.4's receiver leg adds the
+    // receiver's own contribution. // per §28.3.8, §9.4, v0.359
+    const ast::IdentifierExpr* fnValueSourceCapture(const ast::Expr& value,
+                                                    std::string& why);
     // True when `ft` is a borrow-carrying field type (a class/interface
     // reference — including the BUILTIN heap collections Array/Dictionary/… that
     // carry no user TypeDecl — an inline array of references, or a transitively

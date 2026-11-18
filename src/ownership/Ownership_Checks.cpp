@@ -23859,6 +23859,471 @@ void MethodOwnership::checkRecordAndWithFromTemporaryRecursive(const ast::Expr& 
     }
 }
 
+// fix #8852 (§9.7 / §28.3.8, v0.359): the capture that makes a function
+// value's source set NON-EMPTY — or null when the value is capture-free.
+//
+// §28.3.8's *Provenance* clause 1 reads a lambda literal's source set off the
+// borrows it captures ("a captured borrowed local or parameter that binding's
+// source; a captured owned local its enclosing scope; a captured `ref` or `out`
+// parameter, whatever its type, the declaring body's scope as well; a
+// captured local or parameter of a value type that holds borrows the sources of
+// the borrows it carries; … a captured function value its own set,
+// transitively"); clause 6 reads a LOCAL's set off "the union of the sets of
+// the forms the flow analysis traces it to"; clause 3 gives a plain
+// function-typed PARAMETER a set of its own ("its signature announces no set,
+// so the value is bounded by the call"); §9.4's receiver leg adds the
+// receiver's own contribution.
+//
+// The question this answers is the sink rule's: "a store of a function value
+// admits a capture-free value and rejects one whose source set is non-empty
+// (a capture-bearing closure, a plain function-typed parameter, a local
+// carrying either), judged at the site".
+//
+// The shapes this does NOT read a source for are the ones §28.3.8 itself
+// gives the EMPTY set: a captured value that carries no borrow ("a value type
+// that holds none, a null-source value, a `string` — contributes nothing, and
+// lives in its heap capture cell"), a lambda's OWN parameter (not a capture —
+// #4757), and a CALL result ("a method's function-typed return is capture-free
+// under the sink rule, so a method call's result carries the empty set",
+// provenance clause 4). // per §28.3.8, §9.4, v0.359
+const ast::IdentifierExpr* MethodOwnership::fnValueSourceCapture(
+    const ast::Expr& value, std::string& why) {
+    if (const auto* lam = dynamic_cast<const ast::LambdaExpr*>(&value)) {
+        std::vector<const ast::IdentifierExpr*> ids;
+        collectLambdaIdentifiers(*lam, ids);
+        appendDeepMoveOnlyChoiceCaptures(*lam, ids);  // fix #7891, §28.9
+        // §28.3's #4757 ruling: a lambda's OWN parameter is not a capture —
+        // it resolves inside the lambda's body and is re-bound per invocation.
+        // `collectLambdaIdentifiers` is a raw identifier walk, so the lambda's
+        // own parameter reads come back with the captures and must be filtered
+        // here.
+        const std::vector<sema::Symbol*>* ownParams = ctx_.lambdaParams(lam);
+        for (const ast::IdentifierExpr* id : ids) {
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            if (!sym) continue;
+            if (ownParams && std::find(ownParams->begin(), ownParams->end(),
+                                       sym) != ownParams->end())
+                continue;  // the lambda's own parameter — not a capture
+            // §31.1: a caught exception is a borrow whose lifetime is the
+            // catch arm's body — a closure that outlives the arm outlives it.
+            if (isCatchBorrow(sym)) {
+                why = std::string("it captures the caught exception `") +
+                      std::string(sym->name) + "`";
+                return id;
+            }
+            // §28.3: a captured OWNED local — the capture is a borrow of the
+            // local's enclosing scope, which the scope end disposes.
+            if (isEscapeBoundLocal(sym)) {
+                why = std::string("it captures `") + std::string(sym->name) +
+                      "`, an owned scope-bound local whose source is disposed "
+                      "at the end of its scope";
+                return id;
+            }
+            // §28.9 (#7891): a captured MOVE-ONLY local — the capture is a
+            // borrow of the local's enclosing scope.
+            if (isLiveMoveOnlyChoiceLocal(sym)) {
+                why = std::string("it captures `") + std::string(sym->name) +
+                      "`, a move-only local whose storage is the enclosing "
+                      "scope's";
+                return id;
+            }
+            // §27.5 / §28.6 (#1217): a `ref`/`out` parameter is a pointer
+            // into the CALLER's stack frame.
+            if (isRefOutParam(sym)) {
+                why = std::string("it captures `") + std::string(sym->name) +
+                      "`, a `ref`/`out` parameter — a pointer into the "
+                      "caller's stack frame";
+                return id;
+            }
+            // §27.5 / §28.3 (#4709): a plain (borrowing) parameter — its
+            // source is this call, which a stored closure outlives.
+            if (isPlainBorrowParam(sym)) {
+                why = std::string("it captures `") + std::string(sym->name) +
+                      "`, a plain (borrowing) parameter — its source is this "
+                      "call";
+                return id;
+            }
+            // §28.14 v0.177 (#1419) / §28.3.8: a closure CAPTURING a
+            // call-bounded function-typed parameter has a non-empty source
+            // set — the parameter's own set ("its signature announces no set,
+            // so the value is bounded by the call", provenance clause 3).
+            // The FIELD twin of this store already rejects it — §28.14's
+            // callee-obligation verification reports the PARAMETER's
+            // declaration ("parameter `cb` is call-bounded; declare it
+            // `scoped` to store it") when a closure capturing it is stored in
+            // a field; the record COMPONENT was not reached.
+            if (callBoundedParams_.count(sym)) {
+                why = std::string("it captures `") + std::string(sym->name) +
+                      "`, a call-bounded function-typed parameter — its "
+                      "source is this call";
+                return id;
+            }
+            // §28.3 *Provenance* clause 1: a captured FUNCTION value "carries
+            // its own set, transitively" — the fixpoint's answer for it.
+            if (sema::Symbol* carried = captureSourceOf(sym)) {
+                why = std::string("it carries a borrow of `") +
+                      std::string(carried->name) + "`";
+                return id;
+            }
+            // §9.7 (#2144) / §35.4: a captured borrow-bearing record / span /
+            // choice local re-borrows every source the record carries.
+            const sema::TypeRef* capTy = nullptr;
+            if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
+                capTy = ls->declType;
+            if (capTy && (isBorrowBearingRecordOrSpan(capTy) ||
+                          isBorrowBearingChoice(capTy))) {
+                if (sema::Symbol* src = carriedEscapeBoundSourceLiveAt(
+                        sym, id->span.begin.offset)) {
+                    why = std::string("it captures `") + std::string(sym->name) +
+                          "`, which carries a borrow of `" +
+                          std::string(src->name) + "`";
+                    return id;
+                }
+            }
+        }
+        // §9.4 (#6630): a closure that captures the RECEIVER — or a value
+        // receiver that holds borrows — contributes the receiver's own source,
+        // so its set is non-empty too.
+        if (const ast::IdentifierExpr* rc = receiverCaptureIn(value)) {
+            why = "it captures the receiver";
+            return rc;
+        }
+        return nullptr;
+    }
+    // §28.3 *Provenance* clause 6: a LOCAL contributes, at each read, the
+    // union of the sets of the forms the flow analysis traces it to.
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&value)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (!sym) return nullptr;
+        if (sema::Symbol* carried = captureSourceOf(sym)) {
+            why = std::string("it carries a borrow of `") +
+                  std::string(carried->name) + "`";
+            return id;
+        }
+        // §28.3 *Provenance* clause 3: a plain function-typed PARAMETER
+        // contributes itself — its signature announces no set, so no caller
+        // could bound the borrow it carries — and §28.3.8's holder rule names
+        // it in the reject list ("a capture-bearing closure, a plain
+        // function-typed parameter, a local carrying either"). §28.14 agrees:
+        // a call-bounded parameter "may not be stored in a field of any object
+        // (a property or indexer assignment is such a store, and so is a store
+        // into a function-typed record component …)".
+        //
+        // `callBoundedParams_` holds the plain function-typed formals — the
+        // enclosing method's own and (lazily, as the walk descends) a LAMBDA's
+        // own. `methodParamSet_` holds the ENCLOSING METHOD's parameters, so
+        // the conjunction names the method's own call-bounded formal and not a
+        // lambda's own parameter (§28.3's #4757 ruling: a lambda's own
+        // parameter resolves inside its body and is re-bound per invocation,
+        // so it is not a capture and carries no set).
+        if (callBoundedParams_.count(sym) && methodParamSet_.count(sym)) {
+            why = std::string("it is the plain function-typed parameter `") +
+                  std::string(sym->name) + "`";
+            return id;
+        }
+        return nullptr;
+    }
+    // Anything else — a CALL result, a conditional, a parenthesised value —
+    // carries the empty set (§28.3 *Provenance* clause 4: "a method's
+    // function-typed return is capture-free under the sink rule, so a method
+    // call's result carries the empty set").
+    return nullptr;
+}
+
+// fix #8852 (§9.7 / §28.3.8, v0.359): the store of a function value into a
+// record's FUNCTION-TYPED component.
+//
+// §28.3.8's *Function-typed holders* bullet: "A **function-typed holder** is a
+// field (a `scoped` field excepted), **a record component**, a choice case's
+// payload field, an inline-array slot, … At every function-typed holder the
+// closure bullet's sink rule holds: a store of a function value admits a
+// capture-free value and rejects one whose source set is non-empty (a
+// capture-bearing closure, a plain function-typed parameter, a local carrying
+// either), judged at the site, whatever form the member is declared in. The
+// stores are the assignment or initializer; … **an argument for a record
+// component at every call of the record's generated primary constructor**
+// (§9.1) and **a `with` assignment to it** (§9.5)."
+//
+// §9.7 states the same rule for the record component in its own words: "A
+// component whose declared type is a function type admits only a capture-free
+// function value, at construction and in `with`."
+//
+// MEASURED on r30-c1 @ cba27ac1f (issue #8852's own repro): over
+// `record R(f: () -> int)`, `var r := new R(lambda() => t.v); return r;`
+// compiled clean and the AOT+ASan run died with "SEGV on unknown address
+// 0x00000000000c … #0 in lam$0" — the captured owned local `t` was disposed at
+// the method's scope end and the escaped closure read it afterwards. The
+// DIRECT form (`return new R(lambda() => t.v);`) was already rejected, by the
+// §28.3 escape check that descends into the construction's arguments.
+//
+// The reason the record drops the source set is §28.3.8 *Provenance* clause 5:
+// "A function value read from … a component … carries the empty set". So a
+// capture-bearing closure stored in a component reads back as capture-free,
+// and the borrow that bounded it is gone.
+//
+// per §9.7, §28.3.8, v0.359
+// fix #8852 (§9.7 / §28.3.8, v0.359): the record's storage COMPONENTS, in the
+// two views the two store sites need.
+//
+//  - `positional`: the §9.1 positional components in DECLARATION order, so
+//    that constructor argument i binds to positional component i — the same
+//    index alignment `checkRecordFromTemporary` reads. It carries EVERY
+//    positional component, not only the function-typed ones: the index of the
+//    argument is the index of the component, and the function-typed test is
+//    applied to the component the argument actually binds.
+//  - `byName`: EVERY component by name — the §9.1 positional ones and the
+//    §9.2 body ones (auto-properties and fields) — for the `with(...)`
+//    override, which names its target (§9.5: "The named fields must be
+//    auto-generated positional-field properties …, auto-properties declared in
+//    the record body, or public fields"), and for the named-argument
+//    spelling of a construction argument (§22.5).
+//
+// The two views are read through the two sema primitives that provide them:
+// `sema::recordPositionalFieldSymbols` (the index-aligned positional view)
+// and `sema::recordStorageMembers` (the per-member facts — the name and the
+// type). The `RecordStorageMember::isPositional` flag is deliberately NOT
+// read: the sema walk fills `rsm` member by member and never assigns that
+// flag, so it keeps its initialiser and reads `false` for a §9.1 positional
+// component too — a reader of that flag classifies EVERY member as a body
+// member and loses the positional index alignment (MEASURED on r30-c1 @
+// cba27ac1f with this check in place: no positional record's argument was
+// ever bound to a component, so `new R(lambda() => t.v)` compiled clean while
+// `new R(lambda() => 0)` with a `with` override was rejected). The positional
+// set is identified by the member SYMBOL instead, which the walk yields for
+// every member it visits.
+//
+// per §9.1, §9.2, §9.5, §9.7, v0.359
+void MethodOwnership::recordStorageComponents(
+    const sema::TypeSymbol* ts,
+    std::vector<std::pair<std::string_view, const sema::TypeRef*>>& positional,
+    std::vector<std::pair<std::string_view, const sema::TypeRef*>>& byName) const {
+    positional.clear();
+    byName.clear();
+    if (!ts) return;
+    // The §9.1 positional components, in DECLARATION order — the view
+    // `checkRecordFromTemporary` pairs constructor argument i with.
+    const std::vector<const sema::Symbol*> posFields =
+        sema::recordPositionalFieldSymbols(ts);
+    // The per-member facts (the name and the type) of EVERY storage member,
+    // in the walk's order.
+    struct MemberFact {
+        const sema::Symbol* member = nullptr;
+        std::string_view name;
+        const sema::TypeRef* type = nullptr;
+    };
+    std::vector<MemberFact> facts;
+    sema::recordStorageMembers(
+        ts, ctx_, [&](const sema::RecordStorageMember& m) {
+            facts.push_back({m.member, m.name, m.type});
+            return true;
+        });
+    // The positional components, in the order `posFields` gives, taking their
+    // name and type from the walk (the walk's name is the positional
+    // parameter's name, which is the component's name).
+    for (const sema::Symbol* pf : posFields) {
+        for (const MemberFact& f : facts) {
+            if (f.member != pf) continue;
+            if (f.type) positional.emplace_back(f.name, f.type);
+            break;
+        }
+    }
+    // Every component by name: the positional ones first, then the body ones.
+    for (const MemberFact& f : facts) {
+        if (!f.type) continue;
+        byName.emplace_back(f.name, f.type);
+    }
+}
+
+// fix #8852 (§9.7 / §28.3.8, v0.359): the store of a function value into a
+// record's FUNCTION-TYPED component, at the CONSTRUCTION site.
+//
+// §28.3.8's *Function-typed holders* bullet: "A **function-typed holder** is a
+// field (a `scoped` field excepted), **a record component**, a choice case's
+// payload field, an inline-array slot, … At every function-typed holder the
+// closure bullet's sink rule holds: a store of a function value admits a
+// capture-free value and rejects one whose source set is non-empty (a
+// capture-bearing closure, a plain function-typed parameter, a local carrying
+// either), judged at the site, whatever form the member is declared in. The
+// stores are the assignment or initializer; … **an argument for a record
+// component at every call of the record's generated primary constructor**
+// (§9.1) and **a `with` assignment to it** (§9.5)."
+//
+// §9.7 states the same rule for the record component in its own words: "A
+// component whose declared type is a function type admits only a capture-free
+// function value, at construction and in `with`."
+//
+// THE CONSTRUCTION SITE is the §9.1 POSITIONAL component, reached through the
+// record's GENERATED primary constructor (whose parameters ARE the positional
+// components, §9.1: "A primary constructor whose parameters are the positional
+// fields, in declaration order"). §28.3.8 names exactly that call — "an
+// argument for a record component at every call of the record's generated
+// primary constructor" — and it exempts that constructor's function-typed
+// parameter from §28.14's call-bounded rule precisely because this rule
+// governs it instead ("a block-form setter's implicit `value` of function
+// type and a generated primary constructor's parameter for such a component
+// carry the empty set and are not call-bounded parameters (§28.14)"), so no
+// other check stands in its way.
+//
+// A §9.2 BODY component is NOT reached here: a body record's generated
+// primary constructor "binds only the record's positional fields, §9.1"
+// (MEASURED: `record R { public property f: () -> int; }` with no declared
+// constructor is rejected outright — "non-nullable field `f` needs an
+// initializer or a constructor that assigns it"), so a body component is
+// filled only by a USER-DECLARED constructor — whose parameter is §28.14's
+// business (MEASURED: a plain function-typed constructor parameter is already
+// rejected at the declaration — "parameter `g` is call-bounded; declare it
+// `scoped` to store it" — and a `scoped` one is admitted under §28.14's
+// storage-bounded admission). Judging that argument at the call site would
+// reject the §28.14 admission the `scoped` spelling exists for.
+//
+// MEASURED on r30-c1 @ cba27ac1f (issue #8852's own repro): over
+// `record R(f: () -> int)`, `var r := new R(lambda() => t.v); return r;`
+// compiled clean and the AOT+ASan run died with "SEGV on unknown address
+// 0x00000000000c … #0 in lam$0" — the captured owned local `t` was disposed at
+// the method's scope end and the escaped closure read it afterwards. The
+// DIRECT form (`return new R(lambda() => t.v);`) was already rejected, by the
+// §28.3 escape check that descends into the construction's arguments.
+//
+// The reason the record drops the source set is §28.3.8 *Provenance* clause 5:
+// "A function value read from … a component … carries the empty set". So a
+// capture-bearing closure stored in a component reads back as capture-free,
+// and the borrow that bounded it is gone.
+//
+// per §9.7, §28.3.8, v0.359
+void MethodOwnership::checkRecordFnComponentStore(const ast::NewExpr& ne) {
+    const sema::TypeRef* rt =
+        ne.type ? ctx_.resolvedType(*ne.type) : ctx_.exprType(ne);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    const sema::TypeSymbol* ts = rt->declaration;
+    if (ts->kind != ast::TypeDeclKind::Record) return;
+    // The record's components: the §9.1 positional ones (index-aligned with
+    // the constructor's parameters) and every component by name.
+    std::vector<std::pair<std::string_view, const sema::TypeRef*>> positional;
+    std::vector<std::pair<std::string_view, const sema::TypeRef*>> byName;
+    recordStorageComponents(ts, positional, byName);
+    if (positional.empty()) return;  // no §9.1 component: no generated-ctor site
+    // §22.5: the binding of each argument to its parameter — a positional
+    // argument fills the next parameter left to right, a named argument fills
+    // the parameter of that name.
+    std::size_t posSlot = 0;
+    for (const ast::CallArgument& a : ne.args) {
+        if (!a.value) continue;
+        std::string_view compName;
+        const sema::TypeRef* compTy = nullptr;
+        if (!a.name.empty()) {
+            // A named argument fills the parameter of that name (§22.5) — for
+            // the generated primary constructor the parameter IS the
+            // component, so the name is the component's.
+            for (const auto& c : positional)
+                if (c.first == a.name) { compName = c.first; compTy = c.second; break; }
+            if (!compTy)
+                for (const auto& c : byName)
+                    if (c.first == a.name) { compName = c.first; compTy = c.second; break; }
+        } else {
+            // §9.1: a positional argument fills the next positional component.
+            if (posSlot < positional.size()) {
+                compName = positional[posSlot].first;
+                compTy = positional[posSlot].second;
+            }
+            ++posSlot;
+        }
+        if (!compTy || compTy->kind != sema::TypeRef::Kind::Function) continue;
+        std::string why;
+        const ast::IdentifierExpr* cap = fnValueSourceCapture(*a.value, why);
+        if (!cap) continue;
+        report(
+            Severity::Error, cap->span.begin,
+            std::string("a capture-bearing function value may not be stored "
+                        "in the record component `") +
+            std::string(compName) + "` — " + why +
+            ", and a component whose declared type is a function type admits "
+            "only a capture-free function value, at construction and in "
+            "`with` (§9.7 / §28.3.8: a function value read back from a "
+            "component carries the empty source set, so the closure would "
+            "outlive the source it borrowed — use-after-dispose; copy the "
+            "data the closure needs into a value it can capture, or keep the "
+            "closure from escaping)");
+        return;  // one diagnostic per construction is enough
+    }
+}
+
+// fix #8852 (§9.7 / §28.3.8, v0.359): the `with(name := value, …)` sibling of
+// `checkRecordFnComponentStore` — §9.7's "and in `with`". The override list
+// is name-keyed (`WithExpr::InitAssign{name, value}`), so each override is
+// matched to its component by name. §9.5's `with` copies the storage DIRECTLY
+// — "it does not invoke the record's constructor" — so the override IS a
+// store into the component, and the holder rule applies to it.
+//
+// The target may be a §9.1 positional-field property or a §9.2 body
+// auto-property (§9.5: "The named fields must be auto-generated positional-
+// field properties …, auto-properties declared in the record body, or public
+// fields"), so the name lookup spans both.
+//
+// per §9.7, §28.3.8, v0.359
+void MethodOwnership::checkRecordWithFnComponentStore(const ast::WithExpr& we) {
+    if (!we.source) return;
+    const sema::TypeRef* rt = ctx_.exprType(*we.source);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    const sema::TypeSymbol* ts = rt->declaration;
+    if (ts->kind != ast::TypeDeclKind::Record) return;
+    std::vector<std::pair<std::string_view, const sema::TypeRef*>> positional;
+    std::vector<std::pair<std::string_view, const sema::TypeRef*>> byName;
+    recordStorageComponents(ts, positional, byName);
+    if (byName.empty()) return;
+    for (const ast::WithExpr::InitAssign& ia : we.assigns) {
+        if (!ia.value) continue;
+        std::string_view compName;
+        const sema::TypeRef* compTy = nullptr;
+        for (const auto& c : byName)
+            if (c.first == ia.name) { compName = c.first; compTy = c.second; break; }
+        if (!compTy || compTy->kind != sema::TypeRef::Kind::Function) continue;
+        std::string why;
+        const ast::IdentifierExpr* cap = fnValueSourceCapture(*ia.value, why);
+        if (!cap) continue;
+        report(
+            Severity::Error, cap->span.begin,
+            std::string("a capture-bearing function value may not be stored "
+                        "in the record component `") +
+            std::string(compName) + "` — " + why +
+            ", and a component whose declared type is a function type admits "
+            "only a capture-free function value, at construction and in "
+            "`with` (§9.7 / §28.3.8: a function value read back from a "
+            "component carries the empty source set, so the closure would "
+            "outlive the source it borrowed — use-after-dispose; copy the "
+            "data the closure needs into a value it can capture, or keep the "
+            "closure from escaping)");
+        return;  // one diagnostic per `with` is enough
+    }
+}
+
+// fix #8852 (§9.7 / §28.3.8, v0.359): the recursion into the expression forms
+// that can hold a record construction — a collection literal's elements and a
+// conditional's arms — mirroring `checkRecordAndWithFromTemporaryRecursive`
+// (the #5626 walker for the no-temporary-source rule). // per §9.7, §28.3.8
+void MethodOwnership::checkRecordFnComponentStoreRecursive(const ast::Expr& e) {
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        checkRecordFnComponentStore(*ne);
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        checkRecordWithFnComponentStore(*we);
+        return;
+    }
+    if (auto* cle = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& elem : cle->elements) {
+            if (elem) checkRecordFnComponentStoreRecursive(*elem);
+        }
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (ce->thenValue) checkRecordFnComponentStoreRecursive(*ce->thenValue);
+        if (ce->elseValue) checkRecordFnComponentStoreRecursive(*ce->elseValue);
+        return;
+    }
+}
+
 // §28.11 (issue #780): an owning inline-array slot `a[i]`. See the header for
 // the contract.
 bool MethodOwnership::targetIsOwningInlineArraySlot(
