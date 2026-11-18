@@ -1975,11 +1975,50 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // safe — registerUsingDisposal places the disposal at the local's OWN lexical
     // scope, firing at the inner-block scope end on the normal path (before the
     // throw) and via that block's unwind landing pad otherwise. Gated to
-    // synchronous, non-iterator, non-destructor bodies exactly like the function-
-    // exit auto-drop above (async suspend-locals / iterator-frame locals dispose
-    // via their own machinery; routing them here would double-dispose).
-    if (!isAsync_ && !sawYield_ && !isDestructor_) {
+    // non-iterator, non-destructor bodies exactly like the function-exit
+    // auto-drop above (iterator-frame locals dispose via their own machinery;
+    // routing them here would double-dispose).
+    //
+    // fix #8804 (§28.3 / §28.3.10 / §30.1 / §30.6, v0.359): the ASYNC body is
+    // no longer excluded from this sweep. The `!isAsync_` conjunct was there
+    // for the ASYNC BODY'S OWN locals — "In an `async` method an owned local
+    // that crosses an await is a suspend-local disposed by the state machine
+    // on the §30.5 completion edges ... Routing either through the scope-end
+    // using-disposal would double-dispose" — and those locals ARE in
+    // `endState`, where the #1772 async auto-drop arm (the `isAsync_` arm of
+    // the function-exit loop above) flags them. What the exclusion ALSO
+    // excluded, and what this fix restores, is the local of a NESTED body the
+    // async dataflow never saw: an `async lambda`'s own body local. A lambda
+    // body is analysed by the `applyUsingVarBorrowPinInLambdas` pre-pass
+    // (which records its owned locals in the shared `everOwnedPlainLocals_`
+    // but NOT in the enclosing body's `states_` / `endState`), so in an ASYNC
+    // body such a local was in NEITHER arm of the auto-drop: the async
+    // function-exit arm never saw it (not in `endState`) and this sweep was
+    // gated off — so `autoDropAtScopeEnd` was never set, codegen never
+    // registered its scope-end disposal, and the instance LEAKED (measured on
+    // the issue's own repro: 16 B per call, LeakSanitizer "Direct leak of 16
+    // byte(s) ... in bz$asynclam$0$Resume"). The SYNC body already handled the
+    // shape (this sweep runs there), so the same `async lambda` written in a
+    // SYNCHRONOUS method disposed its local correctly and drew the §28.3
+    // must-use warning — the asymmetry was the ENCLOSING body's kind, not the
+    // lambda's. §28.3.10: "An owned local is disposed exactly once on every
+    // control-flow path ... the compiler disposes the value at the end of its
+    // scope", and "The rule is uniform across body kinds". The ASYNC body's
+    // OWN locals stay with the async function-exit arm: the `isAsync_` skip
+    // below keeps every local the async dataflow SAW out of this sweep, so
+    // the maybe-consumed / reassigned locals that arm rejects keep their
+    // reject and the suspend-locals it flags are not flagged twice.
+    // // per §28.3, §28.3.10, §30.1, §30.6, v0.359
+    if (!sawYield_ && !isDestructor_) {
         for (sema::Symbol* sym : everOwnedPlainLocals_) {
+            // fix #8804 (§28.3, v0.359): the ASYNC body's own locals are the
+            // async function-exit arm's business — they are in `endState`, and
+            // that arm flags the undischarged ones and keeps the hard reject
+            // for the rest. Skip every symbol the async dataflow saw, so this
+            // sweep reaches only the locals the async body never saw (a nested
+            // scope's, a lambda body's) and the async body's own verdict is
+            // unchanged. // per §28.3, v0.359
+            if (isAsync_ && endState.count(sym) != 0) continue;
             // fix #8392 (§28.3.10 / K3.14, v0.357): the local is DISCHARGED
             // at the function exit on every path that reaches it, so no
             // implicit drop occurs there and the must-use lint's premise
