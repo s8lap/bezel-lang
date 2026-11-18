@@ -29457,9 +29457,35 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             const bool iifeCallee =
                 dynamic_cast<const ast::LambdaExpr*>(call->callee.get()) !=
                 nullptr;
+            // fix #8788 (§28.9 / §27.5, v0.359): the FORWARDING twin of the
+            // LOCAL / PARAMETER case — the callee is the RESULT OF ANOTHER
+            // CALL (`f2()()`, a lambda whose body is another lambda), so the
+            // callee expression names no slot and carries no symbol of its
+            // own: it is a COMPUTED function value. The closure it produces is
+            // a function value like any other, so its body mints +1 for its
+            // `string` return exactly as the local/param twin does
+            // (lowerLambda's expression-body path, or the block-body
+            // ReturnStmt path), and the call site must TRANSFER that single
+            // reference rather than retain on top of it.
+            //
+            // Before this arm the forwarding shape fell through to the BORROW
+            // path: the bound local retained the result on top of the callee's
+            // +1 and released only its own retain at scope end, so the
+            // callee's reference was never discharged — the #8788 leak (32 B
+            // + 4 B per call, measured under ASan/LSan).
+            //
+            // The gate is the callee's SYNTAX (a call expression), so no
+            // existing verdict moves: a local/param callee keeps the arm
+            // above, a method callee keeps isUserMethodStringReturnCall, and a
+            // function-typed FIELD callee — the same defect, tracked as
+            // #8248 — keeps its own (still open) verdict.
+            const bool forwardingCallee =
+                !sym &&
+                dynamic_cast<const ast::CallExpr*>(call->callee.get()) != nullptr;
             if (iifeCallee ||
                 dynamic_cast<sema::LocalSymbol*>(sym) ||
-                dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                dynamic_cast<sema::ParameterSymbol*>(sym) ||
+                forwardingCallee) {
                 // The result type of the call is the funcReturn of the callee.
                 // If that result is string (nullable OR non-nullable, fix #2196),
                 // this call is a +1 producer.
