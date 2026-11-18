@@ -42187,7 +42187,11 @@ void Emitter::collectClosureReleaseEligible(
                 const bool selfPass = selfAs && selfAs->op == ":=" &&
                                       bw.isTargetIdent(selfAs->target.get()) &&
                                       bw.isTargetIdent(selfAs->value.get());
-                if (sites.count(sk) && !ws && !selfPass) keepHere(st);
+                // A TryStmt's own kept sites are its catch guards (the
+                // walker walks a guard under the TryStmt), which run at a
+                // catch entry, after the protected body: kept there, below.
+                const bool isTry = dynamic_cast<const ast::TryStmt*>(s) != nullptr;
+                if (sites.count(sk) && !ws && !selfPass && !isTry) keepHere(st);
                 if (ws) {
                     loopFixpoint(ws->body, st, sites.count(sk) != 0,
                                  reads(ws->condition.get()));
@@ -42297,7 +42301,19 @@ void Emitter::collectClosureReleaseEligible(
                     FlowState bodySt = st;
                     flowList(ts->body, bodySt);
                     FlowState after = bodySt;
-                    const FlowState catchEntry = acc;
+                    FlowState catchEntry = acc;
+                    // fix-forward #8769: a guard keeps whatever the slot holds
+                    // at ANY point an exception can leave the body, including
+                    // a definition made inside it. Kept on the shared catch
+                    // entry (any guard may be the one storing), and joined into
+                    // the finally / outer handlers: a guard that evaluates to
+                    // false lets the exception propagate with `b` kept.
+                    if (sites.count(sk)) {
+                        keepHere(catchEntry);
+                        joinInto(acc, catchEntry);
+                        for (FlowState* outer : tryAccs)
+                            if (outer != &acc) joinInto(*outer, catchEntry);
+                    }
                     for (auto& c : ts->catches) {
                         FlowState cs2 = catchEntry;
                         if (reads(c.guard.get())) useHere(cs2);

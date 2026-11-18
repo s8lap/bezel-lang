@@ -209,3 +209,28 @@ BEZEL_TEST(closure_local_donor_edge_killed_8769,
         "    fs.Add(b);\n"),
         std::string("20800\nDONE\n"));
 }
+
+// FIX-FORWARD (review r42-rev-s48, probe h03): a catch `when` guard is
+// walked under its TryStmt, but it runs at the catch entry, after the
+// protected body. Kept at the try's ENTRY, the guard missed the definition
+// `b := g;` made inside the body, so the edge g -> b was dropped and `g` was
+// released at scope end while `d` (and then `fs`) still held it: a heap-use-
+// after-free under AddressSanitizer. Per call (g at k = i): 2 + 2i, summed
+// 40200.
+BEZEL_TEST(closure_local_donor_edge_killed_8769,
+           catch_guard_keeps_definition_made_in_try_body_spec_28_9) {
+    BEZEL_EXPECT_EQ(runNoMemoryErrorOut(
+        "    var d: Dictionary<int, Fn> := new Dictionary<int, Fn>();\n"
+        "    b := H;\n"
+        "    try\n"
+        "      b := g;\n"
+        "      if k >= 0 then\n"
+        "        throw new InvalidOperationException(\"x\");\n"
+        "      end;\n"
+        "    catch\n"
+        "      var e: InvalidOperationException when d.TryAdd(1, b) => do var z := 0; end\n"
+        "    end try;\n"
+        "    b := H;\n"
+        "    fs.Add(d[1]);\n"),
+        std::string("40200\nDONE\n"));
+}
