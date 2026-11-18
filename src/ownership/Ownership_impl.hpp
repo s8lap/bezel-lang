@@ -2021,6 +2021,11 @@ private:
     //   - `new R(args…)` of a positional borrow-bearing record with no
     //     declared constructor, each borrow-capable argument being such a
     //     plain local read (§9.7: a record's reference fields are borrows).
+    // Two more shapes (#7441): a lambda literal over tracked holders
+    // (`collectHeldBorrowsOfClosureCaptures`), and a builtin SPAN view a member
+    // call on such a plain local read returns (`xs.AsSpan()`, `s.Slice(…)`),
+    // whose every argument is a value that carries no borrow — §28.3 producers,
+    // the call result's sources are the receiver's and the plain arguments'.
     // Anything else leaves the holder untracked. // per §28.2, §9.7
     void bindHeldBorrows(sema::Symbol* holder, const ast::Expr* init);
     // #7441 (§28.2, §27.6, §28.3.8, v0.357): the third shape `bindHeldBorrows`
@@ -2032,6 +2037,24 @@ private:
     // and §27.6's formation rule own). // per §28.2, §27.6
     const ast::IdentifierExpr* boundMethodReferenceOverLocal(
         const ast::Expr* init);
+    // #7441 (§28.2, §28.3.8, v0.357): the fourth shape `bindHeldBorrows`
+    // names — a LAMBDA LITERAL whose captures are tracked holders: §28.2's
+    // "a closure that captures such a holder". Appends the entries of every
+    // captured holder to `out` and returns true when they are the closure's
+    // WHOLE source set (§28.3.8 provenance clause 1: "A lambda literal
+    // contributes the sources of the borrows it captures"). Returns false —
+    // the closure is then not tracked — when any capture contributes a source
+    // the pass does not hold as a holder's entry: a captured owner variable
+    // (the closure-over-the-variable sentence owns that case; the capture
+    // reads the variable, not a borrow taken from it), a captured parameter
+    // or untracked local whose type can carry a borrow, a captured function
+    // value the pass does not track, or `this`. A capture that carries no
+    // borrow (a number, a `string`) contributes nothing. `holder` is the
+    // local being declared (a self-reference is not tracked).
+    // // per §28.2, §28.3.8
+    bool collectHeldBorrowsOfClosureCaptures(
+        const ast::LambdaExpr& lam, const sema::Symbol* holder,
+        std::vector<LocalOwnership::HeldBorrow>& out);
     // Invoking a function-valued holder is a use of it. // per §28.2
     void checkInvokedBorrowHolder(const ast::CallExpr& call);
     // The entries a plain local read contributes; false when the read names
@@ -6947,6 +6970,13 @@ private:
     // (it would not be tracked), so the fact is the declaration's.
     // // per §28.2, §27.6
     std::unordered_set<const sema::Symbol*> heldBorrowMethodRefHolders_;
+    // The holders `bindHeldBorrows` tracked as a CLOSURE over tracked holders
+    // (#7441) — the diagnostic's wording only, as the set above.
+    // // per §28.2, §27.5
+    std::unordered_set<const sema::Symbol*> heldBorrowClosureHolders_;
+    // The holders `bindHeldBorrows` tracked as a SPAN over the source's value
+    // (#7441) — the diagnostic's wording only. // per §28.2, §28.3.9
+    std::unordered_set<const sema::Symbol*> heldBorrowSpanHolders_;
     int heldBorrowPreScanLambdaDepth_ = 0;
     // Set once any holder is bound in this method (`bindHeldBorrows`): the
     // `catch`-dispatch edge transform runs only for a method that binds one.

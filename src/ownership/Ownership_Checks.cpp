@@ -3688,6 +3688,16 @@ void MethodOwnership::checkUseThroughDisposedBorrowHolder(
             msg += "is a bound method reference that captured that value as "
                    "its receiver when it was formed (§27.6), before the "
                    "disposal, and the disposal reaches this use on every path";
+        else if (heldBorrowSpanHolders_.count(sym))
+            msg += "is a span over that value (§28.3), taken before the "
+                   "disposal, and the disposal reaches this use on every path";
+        else if (heldBorrowClosureHolders_.count(sym))
+            msg += named.size() == 1
+                ? "is a closure that captures a local borrow of that value "
+                  "(§27.5), and the disposal reaches this use on every path"
+                : "is a closure that captures local borrows of those values "
+                  "(§27.5), and every one of them is disposed on every path "
+                  "to this use";
         else
             msg += "is a local borrow of that value, taken before the "
                    "disposal, and the disposal reaches this use on every path";
@@ -3842,14 +3852,19 @@ void MethodOwnership::bindHeldBorrows(sema::Symbol* holder,
     std::vector<LocalOwnership::HeldBorrow> out;
     bool inRecord = false;
     bool inMethodRef = false;
+    bool inClosure = false;
+    bool inSpan = false;
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
             peelTopCastBang(init))) {
         // The alias: `var b := a;`, `const b := a;`, `a!`, `a as T`.
         if (ctx_.exprSymbol(*id) == holder) return;
         if (!collectHeldBorrowsOfLocalRead(*id, out)) return;
-        // A copy of a record holder is a record holder.
+        // A copy of a record holder is a record holder; a copy of a closure
+        // holder names the same closure.
         if (auto sit = states_.find(ctx_.exprSymbol(*id)); sit != states_.end())
             inRecord = sit->second.heldBorrowsInRecord;
+        inClosure = heldBorrowClosureHolders_.count(ctx_.exprSymbol(*id)) != 0;
+        inSpan = heldBorrowSpanHolders_.count(ctx_.exprSymbol(*id)) != 0;
     } else if (const auto* mref = boundMethodReferenceOverLocal(init)) {
         // The BOUND METHOD REFERENCE (§27.6): `var f := d.M;`. §27.6: "the
         // instance is captured at formation — by reference for class- or
@@ -3867,6 +3882,55 @@ void MethodOwnership::bindHeldBorrows(sema::Symbol* holder,
         if (ctx_.exprSymbol(*mref) == holder) return;
         if (!collectHeldBorrowsOfLocalRead(*mref, out)) return;
         inMethodRef = true;
+    } else if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(init)) {
+        // The CLOSURE over holders (§28.2: "a closure that captures such a
+        // holder"): `var g := lambda() => b.M();` with `b` a tracked holder.
+        // A tracked holder is never re-bound, so the borrow the closure reads
+        // at its invocation is the one the holder took — the closure borrows
+        // what its captured holders borrow, entry for entry (`disposed`
+        // included: a closure formed over an already-dead holder is dead).
+        if (!collectHeldBorrowsOfClosureCaptures(*lam, holder, out)) return;
+        inClosure = true;
+    } else if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        // The SPAN over the variable's value (§28.2: "a value that holds the
+        // borrow (a span over it, …)"; §28.3.9's own example, `var s :=
+        // xs.AsSpan(); xs.Dispose(); s[0]`): a member call on a plain local
+        // read whose result is a builtin span view. The result's sources are
+        // the receiver's and the plain arguments' (§28.3 producers, *Method
+        // call*), so with every argument a value that carries no borrow the
+        // span borrows exactly what the receiver read borrows — the owner
+        // variable's value, or what a tracked holder (another span) holds.
+        const auto* cma =
+            dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+        if (!cma || !cma->target) return;
+        // The name head, as `isBorrowBearingRecordOrSpan` reads it (builtin
+        // declaration name, else the annotation's, else the imported name).
+        std::string_view head;
+        if (const sema::TypeRef* crt = ctx_.exprType(*call);
+            crt && crt->kind == sema::TypeRef::Kind::Named) {
+            if (crt->declaration)
+                head = crt->declaration->name;
+            else if (crt->astNode && crt->astNode->name &&
+                     !crt->astNode->name->parts.empty())
+                head = crt->headName();
+            else
+                head = crt->importedName;
+        }
+        if (head != "Span" && head != "ReadOnlySpan" && head != "ArraySpan" &&
+            head != "ReadOnlyArraySpan")
+            return;
+        const auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+            peelTopCastBang(cma->target.get()));
+        if (!rid || ctx_.exprSymbol(*rid) == holder) return;
+        for (const auto& a : call->args) {
+            if (!a.value || a.isDiscard || !a.modifier.empty()) return;
+            const sema::TypeRef* at = ctx_.exprType(*a.value);
+            if (!at || at->kind == sema::TypeRef::Kind::Function ||
+                usingPinTypeHoldsBorrow(at))
+                return;  // a borrow the pass cannot name: untracked
+        }
+        if (!collectHeldBorrowsOfLocalRead(*rid, out)) return;
+        inSpan = true;
     } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                    peelTopCastBang(init))) {
         // A COMPONENT read of a tracked record holder (`var x := p.Item;`,
@@ -3949,7 +4013,92 @@ void MethodOwnership::bindHeldBorrows(sema::Symbol* holder,
     hit->second.heldBorrows = std::move(out);
     hit->second.heldBorrowsInRecord = inRecord;
     if (inMethodRef) heldBorrowMethodRefHolders_.insert(holder);
+    if (inClosure) heldBorrowClosureHolders_.insert(holder);
+    if (inSpan) heldBorrowSpanHolders_.insert(holder);
     anyHeldBorrows_ = true;
+}
+
+// §28.2 / §28.3.8 (v0.357), #7441: see the declaration.
+bool MethodOwnership::collectHeldBorrowsOfClosureCaptures(
+        const ast::LambdaExpr& lam, const sema::Symbol* holder,
+        std::vector<LocalOwnership::HeldBorrow>& out) {
+    std::vector<const ast::IdentifierExpr*> ids;
+    collectLambdaIdentifiers(lam, ids);
+    const std::uint32_t lamLo = lam.span.begin.offset;
+    const std::uint32_t lamHi = lam.span.end.offset;
+    std::unordered_set<const sema::Symbol*> ownParams;
+    if (const std::vector<sema::Symbol*>* ps = ctx_.lambdaParams(&lam))
+        for (const sema::Symbol* p : *ps) ownParams.insert(p);
+    auto add = [&out](const LocalOwnership::HeldBorrow& hb) {
+        for (const auto& e : out)
+            if (e.source == hb.source && e.disposed == hb.disposed) return;
+        out.push_back(hb);
+    };
+    for (const ast::IdentifierExpr* id : ids) {
+        if (!id) continue;
+        // The receiver is a source no holder entry stands for.
+        if (id->name == "this" || id->name == "base") return false;
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (!sym) {
+            // A callee identifier carries no expression symbol of its own
+            // (`checkInvokedBorrowHolder`): find a tracked local by name.
+            for (auto& [csym, clo] : states_)
+                if (refersTo(csym, *id)) { sym = csym; break; }
+        }
+        if (!sym) {
+            // Not a tracked local. In a body with no receiver it names a
+            // static member, a type or a module — no capture; in an instance
+            // body it may be a call on the implicit `this`.
+            if (!isStatic_) return false;
+            continue;
+        }
+        if (sym == holder) return false;
+        const bool isLocalOrParam =
+            dynamic_cast<sema::LocalSymbol*>(sym) ||
+            dynamic_cast<sema::ParameterSymbol*>(sym);
+        if (!isLocalOrParam) {
+            // A member read through the implicit `this` captures the
+            // receiver; a static member, a constant, a type or a module name
+            // captures nothing.
+            if (auto* ms = dynamic_cast<sema::MemberSymbol*>(sym)) {
+                if (dynamic_cast<sema::EnumConstantSymbol*>(ms) ||
+                    dynamic_cast<sema::ChoiceCaseSymbol*>(ms) ||
+                    dynamic_cast<sema::ConstMemberSymbol*>(ms) ||
+                    dynamic_cast<sema::NestedTypeSymbol*>(ms) ||
+                    dynamic_cast<sema::ConstructorSymbol*>(ms))
+                    continue;
+                bool isStaticMember = false;
+                for (std::string_view mod : ms->modifiers)
+                    if (mod == "static") { isStaticMember = true; break; }
+                if (!isStaticMember) return false;
+            }
+            continue;
+        }
+        // A tracked holder: the closure borrows what it borrows.
+        if (auto sit = states_.find(sym);
+            sit != states_.end() && !sit->second.heldBorrows.empty()) {
+            for (const auto& hb : sit->second.heldBorrows) add(hb);
+            continue;
+        }
+        // The lambda's own parameter or a local of its body (a nested
+        // lambda's included): not a capture.
+        if (ownParams.count(sym)) continue;
+        std::uint32_t declOff = sym->declLoc.offset;
+        bool declKnown = sym->declLoc.line != 0;
+        if (!declKnown && sym->decl) {
+            declOff = sym->decl->span.begin.offset;
+            declKnown = sym->decl->span.begin.line != 0;
+        }
+        if (declKnown && declOff >= lamLo && declOff < lamHi) continue;
+        // Any other captured local or parameter: it contributes nothing only
+        // where its type can carry no borrow (§28.3.8 provenance clause 1: "a
+        // captured value that carries no borrow … contributes nothing"). A
+        // function value carries its own set, which is not tracked here.
+        const sema::TypeRef* ty = ctx_.exprType(*id);
+        if (!ty || ty->kind == sema::TypeRef::Kind::Function) return false;
+        if (usingPinTypeHoldsBorrow(ty)) return false;
+    }
+    return !out.empty();
 }
 
 // §28.2 / §27.6 (v0.357), #7441: see the declaration.
