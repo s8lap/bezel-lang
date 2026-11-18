@@ -397,8 +397,19 @@ void Emitter::collectSuspendLocals(
                 // iterable's element), so it needs the guard of its own; a
                 // `void` field here traps identically.
                 ty = unitStorageTy(ty);  // fix #3527: the shared spelling
-                if (frameCapturedLocals_.count(static_cast<const void*>(fs)))
+                if (frameCapturedLocals_.count(static_cast<const void*>(fs))) {
+                    // fix #6211 (§27.5 / §21.4 / §30.1, v0.359): record the
+                    // PRE-BOXING type too, exactly as `suspendLocalSlotTy` does
+                    // for a captured LocalDecl (#3484 follow-up). The widened
+                    // field is MOVED onto the cell holder when the for-var is
+                    // boxed, and without a pre-box field of its own the
+                    // loop's induction / element slot — which `incBB` reads —
+                    // was not restored after a suspension in the body: the
+                    // loop read whatever the fresh activation's stack held
+                    // (a hang, an early exit, or a wrong value).
+                    frameLocalPreBoxTy_[fs] = ty;
                     ty = ptrTy();
+                }
                 out.push_back({fs, ty});
             }
             // §29.7 (#944): a for-in whose lowering creates an iterator-format

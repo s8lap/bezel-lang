@@ -8396,15 +8396,36 @@ bool Emitter::lowerWhile(const ast::WhileStmt& ws) {
 // fill the fresh cell — so reassigning the loop variable in the body writes
 // through the cell without disturbing iteration (capture-by-reference, §27.5).
 //
-// Iterator (state-machine) methods map the loop variable to a frame field and
-// have their own resume/spill handling, so we never rebox there.
+// State-machine bodies (iterator MoveNext, async Resume) pre-box too (fix
+// #6953): the cell holder takes over the loop variable's home across a
+// suspension, a frame field (smAllocaToField_) for a range loop or the handler
+// spill area (asyncHandlerSpillSlots_) for a collection loop in an async body,
+// and the pre-boxing slot keeps a pre-box field of its own (fix #6211).
 bool Emitter::lowerForBody(const ast::ForStmt& fs) {
     // #793 / §27.5: the fresh-per-iteration for-var capture cell (set below) when
     // the for-var is captured ONLY by non-escaping lambdas — eligible to free at
     // the end of each iteration's body.
     llvm::AllocaInst* forVarFreshCell = nullptr;
     bool forVarRefcountCell = false;
-    if (!smStateStruct_) {
+    // fix #6953 (§27.5 / §21.4 / §29.3, v0.359): this pre-boxing used to be
+    // gated on `!smStateStruct_`, so in an iterator (or async) state-machine
+    // body the for-var was boxed lazily by lowerLambda instead — a fresh cell
+    // per iteration that nothing ever freed (4 B/iteration for an `int`). The
+    // gate existed because a state-machine body's for-var slot is a
+    // suspend-local (smAllocaToField_), and a cell holder created here would
+    // not survive a `yield`/`await` unless it takes over the slot's frame
+    // field — the move lowerLambda performs for its own lazy boxing (§30 /
+    // #1377, #3484 follow-up). The same move is done below, so the holder is
+    // spilled and restored across the suspension exactly as the lazily boxed
+    // one was: a lambda formed before a `yield` and invoked after the resume
+    // still reads this iteration's live cell, which the body-end
+    // `boxedCellFree` reclaims only after the resume. lowerLambda then reaches
+    // boxLocalSlot's already-boxed path (`newSlot == slot`) and skips its own
+    // move. The pre-boxing slot keeps the loop going across the suspension
+    // through its own pre-box field, which collectSuspendLocals now reserves
+    // for a captured for-var (fix #6211); without it the loop's induction
+    // value is lost at the first `yield`/`await` in the body.
+    {
         auto it = locals_.find(&fs);
         if (it != locals_.end()) {
             llvm::AllocaInst* slot = it->second;
@@ -8412,6 +8433,40 @@ bool Emitter::lowerForBody(const ast::ForStmt& fs) {
                 llvm::AllocaInst* nb = nullptr;
                 boxLocalSlot(slot, nb, /*forLoopVar=*/true);
                 locals_[&fs] = nb;
+                // fix #6953 (§27.5 / §30.1 / §30.7, v0.359): in an async
+                // method or async iterator, a `for` over a COLLECTION keeps
+                // its element slot in the handler SPILL AREA
+                // (asyncHandlerSpillSlots_, promoted into the calloc'd
+                // `$Resume.spill` struct by promoteDemotedSlotsToFrame), not
+                // in a smAllocaToField_ frame field, so the field move below
+                // finds nothing to move. The cell holder must then get the
+                // SAME home, exactly as lowerLambda gives its own lazily
+                // created holder (fix #3503): a bare entry alloca of the
+                // resume function is not restored after a suspension, and the
+                // body-end `boxedCellFree` (#793) or #7611's `cellRelease`
+                // would free whatever the fresh activation's stack holds
+                // (ASan bad-free / double-free).
+                if (nb != slot && smStateStruct_ && smSelf_ &&
+                    std::find(asyncHandlerSpillSlots_.begin(),
+                              asyncHandlerSpillSlots_.end(),
+                              slot) != asyncHandlerSpillSlots_.end())
+                    asyncHandlerSpillSlots_.push_back(nb);
+                if (smStateStruct_ && nb != slot) {
+                    auto smit = smAllocaToField_.find(slot);
+                    if (smit != smAllocaToField_.end()) {
+                        unsigned fieldIdx = smit->second;
+                        smAllocaToField_.erase(smit);
+                        smAllocaToField_[nb] = fieldIdx;
+                        // The pre-boxing slot (the loop's own induction /
+                        // element storage, which incBB reads) keeps a field
+                        // of its own so it, too, survives the suspension.
+                        if (currentFn_ == smCellFrameFn_) {
+                            auto pit = smLocalPreBoxField_.find(&fs);
+                            if (pit != smLocalPreBoxField_.end())
+                                smAllocaToField_[slot] = pit->second;
+                        }
+                    }
+                }
                 // #793: boxLocalSlot(forLoopVar=true) allocates a FRESH cell each
                 // iteration, and those cells were never freed (a per-iteration
                 // leak, O(iterations)). When collectCellFreeEligible proves the
