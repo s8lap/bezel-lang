@@ -2368,6 +2368,36 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                               {gb.CreateLoad(ptrTy(), fptr, "iterge.strcap")});
             }
         }
+        // fix #7988 (§27.5 / §28.9 / §29.11, v0.359): the closure twin of the
+        // string retain above. The memcpy aliased each closure (function-typed)
+        // parameter's cell pointer into the clone, and the construction retain
+        // gave only the SOURCE frame a +1. A clone handed out by an explicit
+        // `return GenF(lambda ...).GetEnumerator();` outlives its source: the
+        // source temporary is disposed at the producing full expression's end,
+        // its Dispose drops the only frame reference, the cell and its env
+        // (with the captured string) are reclaimed, and the clone's next
+        // MoveNext invokes freed memory. So the clone takes its OWN +1 here and
+        // its Dispose (cloneDisposeFn, releaseClosures=true) drops it. A capture
+        // whose ownership the §29.8 claim above MOVED to the clone (the source
+        // slot was nulled) already carries the source's +1, so it is not
+        // retained again. bz_closure_retain is null-safe.
+        {
+            auto* clRetainFnGE = declareC("bz_closure_retain",
+                                          llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            for (std::size_t i = 0; i < frame.captures.size(); ++i) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    frame.captures[i].first);
+                if (!ps) continue;                   // 'this' capture — skip
+                sema::TypeRef* pt = paramTypeOf(ps);
+                if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
+                if (cloneDisposesOwnedCaptures && cloneOwnsParam(ps)) continue;
+                unsigned fieldIdx = frame.captureStart + (unsigned)i;
+                llvm::Value* fptr =
+                    gb.CreateStructGEP(stateStructTy, clone, fieldIdx);
+                gb.CreateCall(clRetainFnGE,
+                              {gb.CreateLoad(ptrTy(), fptr, "iterge.clcap")});
+            }
+        }
         // Install the clone vtable. In the narrow owned-capture shape its Dispose
         // also runs the state-keyed §29.8 parameter cleanup.
         gb.CreateStore(cloneVtGV,
@@ -2921,12 +2951,14 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // auto-dispose because the clone borrows the captures from the source). The
     // bodies are otherwise identical (same finally chains, same spill free, same
     // state guard). Parameterised by `targetFn` and `disposeOwned`.
-    // `releaseClosures` is deliberately SEPARATE from `disposeOwned`: the frame's
-    // +1 on a closure parameter belongs to the SOURCE frame alone and must be
-    // dropped exactly once, whereas `disposeOwned` also becomes true for the
-    // clone once the owned-capture claim is armed (#2154, and #973a below). They
-    // were the same flag before, so an armed claim had both the source and the
-    // clone release the same closure cell. // per §27.5 / §28.9 (#1864)
+    // `releaseClosures` is deliberately SEPARATE from `disposeOwned`: each
+    // frame's +1 on a closure parameter must be dropped exactly once by THAT
+    // frame, whereas `disposeOwned` also becomes true for the clone once the
+    // owned-capture claim is armed (#2154, and #973a below). They were the same
+    // flag before, so an armed claim had both the source and the clone release
+    // the same closure cell. Since fix #7988 the clone takes its own +1 in
+    // GetEnumerator, so both the source and the clone pass `true`; the flag
+    // stays so the pairing is stated at each call. // per §27.5 / §28.9 (#1864)
     auto emitDisposeBody = [&](llvm::Function* targetFn, bool disposeOwned,
                                bool stateKeyedOwned, bool releaseClosures) {
         currentFn_ = targetFn;
@@ -3256,12 +3288,13 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // #1864 / §27.5 / §28.9: release each closure (function-typed) parameter
         // the frame RETAINED at construction (emitIteratorMethod's capture-store
         // retain). The frame held its own +1 so it could invoke the closure
-        // across every MoveNext; that reference is dropped here. Like
-        // disposeOwnedParams, this runs on the SOURCE Dispose ONLY
-        // (disposeOwned=true): the per-loop clone (cloneDisposeFn,
-        // disposeOwned=false) BORROWS the captures from the source — the source
-        // is disposed last (reverse order) and drops the frame's reference
-        // exactly once. bz_closure_release is null-safe and reclaims the cell +
+        // across every MoveNext; that reference is dropped here. It runs on
+        // the SOURCE Dispose AND on a GetEnumerator clone's Dispose: fix #7988
+        // (§27.5 / §29.11, v0.359) gave the clone its own +1 (taken in
+        // GetEnumerator), because a clone handed out by an explicit
+        // `return GenF(lambda ...).GetEnumerator();` outlives its source, and a
+        // clone that borrowed the source's reference invoked a freed closure.
+        // bz_closure_release is null-safe and reclaims the cell +
         // env block at rc 0. Owned-class params (disposeOwnedParams) and closure
         // params are disjoint sets, so the two loops never touch the same field.
         auto releaseClosureCaptures = [&]() {
@@ -3674,10 +3707,13 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // driven frame, and the body's own null is what the guard reads.
     emitDisposeBody(disposeFn, /*disposeOwned=*/true,
                     /*stateKeyedOwned=*/false, /*releaseClosures=*/true);
+    // fix #7988 (§27.5 / §29.11, v0.359): the clone now holds its own +1 on
+    // each closure capture (taken in GetEnumerator), so its Dispose releases
+    // it too — each frame drops exactly the reference it holds.
     emitDisposeBody(cloneDisposeFn,
                     /*disposeOwned=*/cloneDisposesOwnedCaptures,
                     /*stateKeyedOwned=*/cloneDisposesOwnedCaptures,
-                    /*releaseClosures=*/false);
+                    /*releaseClosures=*/true);
 
     // Clear the per-iterator finally / disposal tracking.
     smIterCleanupAtState_.clear();     // fix #1567 §29.7/§28.10 (v0.182)
