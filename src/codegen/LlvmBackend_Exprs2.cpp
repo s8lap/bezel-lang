@@ -2872,12 +2872,22 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // (the return's silent transfer and the envdtor's content release
         // both claim the frame's one reference), with no write anywhere in
         // the program.
+        //
+        // fix #8723 / #8747 (§28.9 / §27.5, v0.359): OR when `decl` is a
+        // closure local whose one reference a site that keeps the value
+        // without taking a reference claims (`fs.Add(g)` outside the lambda:
+        // closureKeptCaptureLocals_). The same trade as #4198: the stored
+        // value leaks (#5866) instead of being freed under the collection.
+        const bool capturedLocalKeptWithoutReference =
+            ce.semaTy && ce.semaTy->kind == sema::TypeRef::Kind::Function &&
+            closureKeptCaptureLocals_.count(static_cast<const void*>(decl));
         ce.suppressContentRcInEnvdtor =
             mutatedSharedCaptureCell(
                 static_cast<const void*>(decl), ce.semaTy,
                 /*freshCellPerIteration=*/forceFresh) ||
             capturedLocalReturnedByName(static_cast<const void*>(decl),
-                                         ce.semaTy);
+                                         ce.semaTy) ||
+            capturedLocalKeptWithoutReference;
         // fix #3752 (§28.2 / §27.5 / §28.9, v0.286): THE FIRST capture's
         // envdtor is the captured local's DEFERRED SCOPE-END RELEASE — and a
         // deferred release is only sound when the env dies at or AFTER the
@@ -3002,7 +3012,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // `disposeStack_[ownerScopeIdx]` push) is needed; the cell
         // holder's lifetime (the local at depth `declScopeDepth`)
         // ends before its `+1` content would otherwise die.
+        // fix #8723 / #8747: a kept capture has no deferred release either.
         if ((contentIsString || contentIsClosure) &&
+            !capturedLocalKeptWithoutReference &&
             !alreadyBoxed && !isForVar && declScopeDepth > 0 &&
             currentFn_ == cellFreeEligibleFn_ &&
             cellFreeEligible_.count(static_cast<const void*>(decl)) &&

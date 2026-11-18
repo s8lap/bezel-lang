@@ -22208,6 +22208,14 @@ private:
     // `collectClosureReleaseEligible` walks the declaring body, and a nested
     // lambda's own re-scan leaves the enclosing body's entries alone.
     std::unordered_set<const void*> closureEscapingScopeEndRelease_;
+    // fix #8723 / #8747 (§28.9 / §27.5, v0.359): closure locals a lambda
+    // captures whose one reference DONATES to a site that keeps the value
+    // without taking a reference (`fs.Add(g)` beside `lambda(z) => g(z, 1)`;
+    // see the forwarding pass at the end of collectClosureReleaseEligible).
+    // Every capturing env suppresses its content retain and envdtor release
+    // for such a local, as for capturedLocalReturnedByName. Keyed and
+    // rewritten like closureEscapingScopeEndRelease_.
+    std::unordered_set<const void*> closureKeptCaptureLocals_;
     // fix #8743 (§28.9 / §30.5, v0.359): `Object` locals `b` of an async
     // `Task<Object>` body bound by `var b: Object := f as Object;`, where `f`
     // is a closure local this frame holds the one reference of (a lambda

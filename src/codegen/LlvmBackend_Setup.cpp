@@ -38765,7 +38765,7 @@ struct ClosureEscapeWalker {
     // True while the walk is inside one of the two reference-taking escape
     // sites named above.
     bool inReferenceTakingSite_ = false;
-    // fix #8723 (§28.9 / §27.5, v0.359): the KEPT walk
+    // fix #8723 / #8747 (§28.9 / §27.5, v0.359): the KEPT walk
     // collectClosureReleaseEligible runs over every closure-local candidate
     // to ask only "can a value of target be kept by a site that takes no
     // reference?" (keptWithoutReference_). Two more sites take a reference
@@ -39727,7 +39727,7 @@ struct ClosureEscapeWalker {
                     argIsTarget(c->args[ai].value.get()) &&
                     isBuiltinArrayComparerArg(c->callee.get(), ai, ctx))
                     safeArg = true;
-                // fix #8723: see closureLocalAssignTakesReference.
+                // fix #8723 / #8747: see closureLocalAssignTakesReference.
                 const bool savedSite = inReferenceTakingSite_;
                 if (!safeArg && callBoundedArg &&
                     argIsTarget(c->args[ai].value.get()) &&
@@ -40228,7 +40228,7 @@ struct ClosureEscapeWalker {
                     isTargetIdent(as->value.get()) &&
                     storeTargetTakesReference(*as->target))
                     inReferenceTakingSite_ = true;
-                // fix #8723: see closureLocalAssignTakesReference.
+                // fix #8723 / #8747: see closureLocalAssignTakesReference.
                 if (closureLocalAssignTakesReference && as->op == ":=" &&
                     as->target && as->value &&
                     isClosureTypedLocalAssign(*as->target) &&
@@ -41659,7 +41659,7 @@ void Emitter::collectClosureReleaseEligible(
         if (anyDemoted) demoteSourcesOfUnconfinedAliases();
     }
 
-    // fix #8723 (§28.9 / §27.5, v0.359): a value that passes from
+    // fix #8723 / #8747 (§28.9 / §27.5, v0.359): a value that passes from
     // one closure local into another keeps the verdict of where it ENDS UP.
     //
     // §28.9 puts a function value's lifetime with the runtime ("the type's
@@ -41668,7 +41668,7 @@ void Emitter::collectClosureReleaseEligible(
     // stored function value must stay callable while it is reachable. A
     // collection store keeps the pointer and takes no reference (#5866,
     // keptWithoutReference_), so the value it keeps lives on a reference
-    // some slot leaves unreleased.
+    // some slot leaves unreleased. Two shapes released every such reference:
     //
     //   - #8723: `b := g; fs.Add(b);`. The #4473 arm above releases `g` (its
     //     only escape is the assignment into a closure local), and `b`
@@ -41678,6 +41678,11 @@ void Emitter::collectClosureReleaseEligible(
     //     the store, `g` stayed in closureReleaseEligible_, whose lambda's
     //     capture cells collectCellFreeEligible frees at scope end; the
     //     caller's call read the freed cell.
+    //   - #8747: `var l := lambda(z) => g(z, 1); fs.Add(g);`. `g`'s
+    //     reference moved into the capture cell, whose envdtor releases it
+    //     when `l` dies at scope end, while `fs` keeps the pointer.
+    //     MEASURED: heap-use-after-free, freed by `bz_closure_release` from
+    //     the envdtor.
     //
     // The model: a slot whose every value carries a reference of its own (a
     // reassigned local: `lowerClosureLocalReassign` retains what it stores;
@@ -41685,8 +41690,11 @@ void Emitter::collectClosureReleaseEligible(
     // assigned or bound into it; a local that holds the reference it was
     // initialised with and is never reassigned is where the kept value's
     // reference comes from. That local DONATES its reference: it leaves both
-    // scope-end release sets. The stored value then leaks, as `fs.Add(g)`
-    // alone does: the accepted #5866 residual. A target that is not kept but still leaves
+    // scope-end release sets, and, if a lambda captures it, every capturing
+    // envdtor's content release is suppressed too (closureKeptCaptureLocals_,
+    // the #4198 trade for a capture whose reference another consumer
+    // claims). The stored value then leaks, as `fs.Add(g)` alone does: the
+    // accepted #5866 residual. A target that is not kept but still leaves
     // the frame (returned, stored with a reference, captured) moves each
     // source out of closureReleaseEligible_ into
     // closureEscapingScopeEndRelease_: its release stays armed, its capture
@@ -41762,9 +41770,10 @@ void Emitter::collectClosureReleaseEligible(
                    closureAliasOwned_.count(k) != 0;
         };
         // The KEPT walk (see closureLocalAssignTakesReference).
-        std::unordered_set<const void*> kept;
+        std::unordered_set<const void*> kept, captured;
         for (const ast::Node* c : candidates) {
             const void* key = static_cast<const void*>(c);
+            closureKeptCaptureLocals_.erase(key);
             ClosureEscapeWalker kw{ctx_, key};
             kw.coalesceReturnTransfers = coalesceReturnTransfers;
             kw.ownedAliasDecls = &closureAliasOwned_;
@@ -41779,6 +41788,7 @@ void Emitter::collectClosureReleaseEligible(
             };
             for (auto& s : body) kw.stmt(s.get());
             if (kw.keptWithoutReference_) kept.insert(key);
+            if (kw.isCapturedCellSlot_) captured.insert(key);
         }
         for (bool changed = true; changed;) {
             changed = false;
@@ -41794,6 +41804,7 @@ void Emitter::collectClosureReleaseEligible(
             if (!kept.count(key) || passesThrough(key)) continue;
             changedAny |= closureReleaseEligible_.erase(key) != 0;
             changedAny |= closureEscapingScopeEndRelease_.erase(key) != 0;
+            if (captured.count(key)) closureKeptCaptureLocals_.insert(key);
         }
         for (bool changed = true; changed;) {
             changed = false;
