@@ -2071,7 +2071,58 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // first lambda's compilation and its eligibility was already determined then).
     // For-var loop captures use a fresh cell EVERY iteration so freeing only at
     // scope exit would miss prior iterations; those are excluded (documented).
-    lastLambdaCapturedCells_.clear();
+    //
+    // fix #8827 (§27.5 / §28.3 / §28.9, v0.359): the pending-cell channel is
+    // NOT cleared here.  The channel is the transport by which a lambda
+    // hands its freshly-boxed capture cells to the site that owns them
+    // (`consumeLastLambdaCapturedCells`, called by the ctor site in
+    // `lowerNew`, by the method-call site in `releaseCallClosureArgs`, by
+    // `lowerLocalDecl`, …), which registers the scope-end `boxedCellFree`.
+    //
+    // WHY THE CLEAR WAS WRONG.  `clear()` ran at the START of EVERY lambda
+    // lowering, so the channel held only the LAST lambda's cells.  A site
+    // that lowers TWO lambda literals — two arguments of ONE constructor,
+    // `new K(lambda() => n, lambda() => n + 1)` — loses the FIRST lambda's
+    // entry to the second lambda's `clear()`, and the site's consume then
+    // sees an empty vector and registers NO free for that cell: the cell
+    // leaks (MEASURED on r30-c1 @ 082e6eb73: 4 B in 1 allocation per
+    // construction, 800 B over 200 constructions; `k2inloop`).  The same
+    // shape leaks on the METHOD-CALL path (`releaseCallClosureArgs`), and
+    // the general shape — two lambda arguments capturing DIFFERENT locals,
+    // so the first cell has no second capture to re-record it — leaks the
+    // first cell as well (`k2diff`: 4 B; `k2diffinloop`: 800 B).  §28.3:
+    // "Captures share one cell"; §27.5: "Captured variables are heap-
+    // allocated in a closure object"; §28.9: the function value's storage
+    // is runtime-managed — so every capture cell is reclaimed exactly once,
+    // and the record of THAT reclaim belongs to the cell, not to whichever
+    // lambda happened to be lowered last.
+    //
+    // WHY NO DUPLICATE ENTRY CAN ARISE.  The channel's producer is gated on
+    // `!alreadyBoxed` (the captured-param arm below and the captured-local
+    // arm below it): a cell is recorded by the capture that CREATES it, and
+    // a later capture of the same cell re-uses it (boxLocalSlot's
+    // already-boxed path) and records nothing.  `cellVars_` is keyed by the
+    // cell HOLDER slot, and the channel's entries carry that same holder as
+    // their `newSlot`, so "this cell already has an entry" and "this cell is
+    // already boxed" are the same question with the same answer — the
+    // channel can hold at most one entry per cell, before and after this
+    // change.
+    //
+    // WHY A LATE FREE IS SAFE.  An entry exists only for a capture the
+    // pre-scan classified as NON-escaping (`cellFreeEligible_`), so the
+    // capturing closure is released at its own site — before any later
+    // consume can run — and its envdtor (which reads the captured content
+    // through the cell) has already run by then.  The scope-end
+    // `boxedCellFree` registered by a later consume therefore frees a cell
+    // whose readers are gone: a bounded DELAY in the reclaim, never a
+    // use-after-free and never a double free (the consume erases every
+    // entry it processed, so no cell can be registered twice).
+    //
+    // The consumer's own per-cell soundness checks still decide the free's
+    // SCOPE: #966/#1017 (a disposal that reads through the cell defers the
+    // free into the owner's scope), #969 (a local declared shallower than
+    // the capture site is not freed at the capture scope) and
+    // `declScopeDisposeIndex` (a depth this body recorded) are unchanged.
 
     // Box and collect captured outer params. Boxing promotes the variable's
     // storage to a shared heap cell held in a fresh ptr-slot, which we rebind.
