@@ -4808,6 +4808,21 @@ private:
     // dispatch whose receiver is a concrete generic-interface instantiation
     // uses it to select that instantiation's itab (bz_itable_lookup_inst).
     const sema::TypeRef* pendingIfaceRecvTy_ = nullptr;
+    // fix #6631 (§11.1 / §11.2 / §14.1, v0.359): the INSTANTIATION arguments
+    // of the receiver's generic-interface type, resolved POSITIONALLY in the
+    // scope the receiver's type was WRITTEN in — the CALLER's scope for a
+    // receiver typed `IM<U,T>` inside a generic method `Use<U,T>`. Set by
+    // lowerCallDispatch's receiver-binding arm (the one place where the
+    // CALLER's substitution is still active) and consumed (cleared) at
+    // emitMethodCall's entry, exactly like pendingIfaceRecvTy_.
+    //
+    // The itable dispatch needs the receiver's instantiation to pick that
+    // instantiation's itab (§11.1: a generic interface may be listed at two or
+    // more instantiations, each with its own witness). Resolving it by NAME
+    // through the interface-keyed environment instead captures the caller's
+    // type-parameter names — the interface's `T` binds the caller's `T` — and
+    // the instantiation comes out SWAPPED (issue #6631).
+    std::vector<const sema::TypeRef*> pendingIfaceInstArgs_;
     // fix #6779 (§14.1 / §2.8.3 rule 4, v0.340): the call expression lowerCall
     // (or lowerNullCondCall) is about to hand to emitMethodCall, so the #1943
     // gate can read its explicit type-argument list. Same lifetime as

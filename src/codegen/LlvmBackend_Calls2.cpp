@@ -18288,6 +18288,13 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // set up the substitution for the method body specialization.
     auto savedSubst = genericSubst_;
     auto savedSemaTy = genericSubstSemaTy_;
+    // fix #6631 (§11.1 / §11.2 / §14.1, v0.359): the receiver's INSTANTIATION
+    // arguments, resolved POSITIONALLY in the scope the receiver's type was
+    // written in. Filled by the receiver-binding arm below (the one place
+    // where the CALLER's substitution is still active) and handed to
+    // emitMethodCall, which needs the instantiation to select that
+    // instantiation's itab. Empty when that arm does not apply.
+    std::vector<const sema::TypeRef*> recvInstArgs;
     if (!isStaticMethod(ms) && ms->parent && !args.empty()) {
         // Find the receiver expression to get its type.
         const ast::Expr* recvExpr = nullptr;
@@ -18353,6 +18360,19 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         std::string_view pname = gpNames[gi];
                         newSubst[pname] = lowerTypeRef(argSema);
                         newSema[pname] = argSema;
+                        // fix #6631 (§11.1 / §11.2 / §14.1, v0.359): the
+                        // receiver's ARGUMENTS, resolved in the CALLER's scope
+                        // and POSITIONALLY aligned with the parent's type
+                        // parameters — the receiver's INSTANTIATION. The
+                        // itable dispatch needs it (the receiver may be typed
+                        // at one of several instantiations of the same
+                        // interface, each with its own witness, §11.1), and it
+                        // cannot be recovered later: the caller's substitution
+                        // is gone by then and the active one is keyed by the
+                        // INTERFACE's parameter names, so re-substituting the
+                        // receiver's written arguments there captures them
+                        // (issue #6631).
+                        recvInstArgs.push_back(argSema);
                     }
                     // Check if any resolved arg is an UNRESOLVED placeholder and
                     // try the localGenericSubst_ for the receiver if so.
@@ -18897,10 +18917,18 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         prepareCallClosureArgRelease(ms, args, argExprs, call);
     // fix #5115: hand the receiver's static type to the itable dispatch.
     pendingIfaceRecvTy_ = nullptr;
+    // fix #6631 (§11.1 / §11.2 / §14.1, v0.359): and the receiver's
+    // INSTANTIATION arguments, resolved positionally in the scope the
+    // receiver's type was written in. The itable dispatch needs them to pick
+    // the right instantiation's itab; resolving them there by NAME would
+    // capture the caller's type-parameter names (issue #6631).
+    pendingIfaceInstArgs_.clear();
     if (auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(
             call.callee.get()))
-        if (rma->target)
+        if (rma->target) {
             pendingIfaceRecvTy_ = ctx_.exprType(*rma->target);
+            pendingIfaceInstArgs_ = std::move(recvInstArgs);
+        }
     // fix #6779: and the call itself, for the #1943 gate's type arguments.
     pendingMethodCallExpr_ = &call;
     // fix #5244 / #5262 (§4.6 / §28.9, v0.313): CALLER-SIDE PIN for a
@@ -21687,6 +21715,11 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
     // fix #5115: consume the receiver type lowerCall recorded (if any).
     const sema::TypeRef* ifaceRecvTy = pendingIfaceRecvTy_;
     pendingIfaceRecvTy_ = nullptr;
+    // fix #6631 (§11.1 / §11.2 / §14.1, v0.359): consume the receiver's
+    // INSTANTIATION arguments lowerCall resolved positionally (if any).
+    std::vector<const sema::TypeRef*> ifaceInstArgs =
+        std::move(pendingIfaceInstArgs_);
+    pendingIfaceInstArgs_.clear();
     // fix #6779: consume the call expression lowerCall recorded (if any).
     const ast::CallExpr* callExpr = pendingMethodCallExpr_;
     pendingMethodCallExpr_ = nullptr;
@@ -22427,6 +22460,25 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                     rt->declaration == iface && !rt->genericArgs.empty()) {
                     std::vector<const sema::TypeRef*> ra(
                         rt->genericArgs.begin(), rt->genericArgs.end());
+                    // fix #6631 (§11.1 / §11.2 / §14.1, v0.359): the
+                    // receiver's INSTANTIATION is the interface's type
+                    // parameters bound to the receiver's ARGUMENTS,
+                    // POSITIONALLY (§11.2 *Generic members*: "The interface's
+                    // substitution maps each of the interface's type parameters
+                    // to the implementing type's argument"). The receiver's
+                    // arguments are spelled in the CALLER's scope (`i: IM<U,T>`
+                    // inside `Use<U,T>`), so the NAME-substitution above binds
+                    // them by the INTERFACE's parameter names: the interface's
+                    // `T` captures the caller's `T` and the instantiation comes
+                    // out SWAPPED — the dispatch then selects the other
+                    // instantiation's itab and runs its witness with the
+                    // arguments at the wrong types (issue #6631). Prefer the
+                    // instantiation lowerCallDispatch resolved positionally in
+                    // the scope the receiver's type was written in.
+                    if (!ifaceInstArgs.empty() &&
+                        ifaceInstArgs.size() == ra.size() &&
+                        descArgsConcrete(ifaceInstArgs))
+                        ra = ifaceInstArgs;
                     // fix #6224 (§11.1 / §22.6, v0.339): inside a generic
                     // body the receiver `IL<X>` names the CALLER's parameter,
                     // which the callee environment lowerCall installed no
