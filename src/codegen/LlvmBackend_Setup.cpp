@@ -39094,6 +39094,27 @@ struct ClosureEscapeWalker {
     // assign-into arm, which must keep the reach it had when the walk
     // stopped at an escape of the initial value.
     bool assignedSomewhere = false;
+    // fix-forward #8863 (§8.1 / §28.9, v0.359): the locals the body being
+    // walked REASSIGNS (collectClosureReleaseEligible's ClosureLocalAssignScan
+    // set; the same set `assignedSomewhere` is pre-seeded from).
+    //
+    // A bare `var g: Object := f;` is a FORWARDED bind — the `Object` slot
+    // holds no reference of its own (a function value reaches `Object`
+    // through its own heap representation, §8.1), so what `g` does decides
+    // what `f` may do. That holds only while `f` KEEPS its value: a body
+    // that REASSIGNS `f` releases the old cell at the assignment, and `g`
+    // still names it (MEASURED on f0b4a3a19, `--sanitize=address`, 200
+    // iterations: heap-use-after-free — `var g: Object := f; f := <other
+    // lambda>;` then any use of `g`). A body that reassigns the source
+    // therefore reads the bind as an ESCAPE of the source again (the
+    // pre-#8863 behaviour: the cell leaks, which is safe) — the same
+    // demotion the record-holder arm (#8743) applies to a source the body
+    // reassigns ("A source the body reassigns is not admitted").
+    //
+    // NULL means "not known": the bind is read as a forward, the #8863
+    // behaviour. Only the walks that decide a RELEASE verdict (the walks
+    // inside collectClosureReleaseEligible, which owns the set) set it.
+    const std::unordered_set<const void*>* reassignedLocals = nullptr;
     // fix #8479 (§28.9, v0.357): the walk does not short-circuit for a target
     // that took its own reference at the bind either (an owned alias): its
     // verdict needs to know whether a lambda captures it anywhere in the
@@ -39347,9 +39368,15 @@ struct ClosureEscapeWalker {
     // through its own heap representation, §8.1, with no retain at the
     // bind), exactly like the `n ?? f` bind #8717 reasons about, so it is a
     // forwarded bind: what `g` does decides what `f` may do.
+    // fix-forward #8863: only while the source KEEPS its value. A body that
+    // reassigns the source releases the old cell at the assignment while the
+    // bound local still names it (heap-use-after-free), so the bind is NOT a
+    // forwarded bind there — it is an escape of the source again (the
+    // pre-#8863 behaviour). See `reassignedLocals`.
     bool bareObjectBind(const ast::Type* declType,
                         const ast::Expr* init) const {
         if (!declType || !init || !isTargetIdent(init)) return false;
+        if (reassignedLocals && reassignedLocals->count(target)) return false;
         const sema::TypeRef* t = ctx.resolvedType(*declType);
         return t && t->kind == sema::TypeRef::Kind::Primitive &&
                t->primitive == sema::PrimitiveType::Object;
@@ -40892,6 +40919,17 @@ void Emitter::collectCapturedCellClosureLocals(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     closureLocalCapturedCell_.clear();
     closureLocalCapturedCellReassigned_.clear();
+    // fix-forward #8863 (§8.1 / §28.9, v0.359): the locals this body
+    // REASSIGNS. A bare `Object` bind of one of them (`var g: Object := f;`)
+    // is not a forwarded bind: the reassignment releases the old cell while
+    // `g` still names it (heap-use-after-free). The same set
+    // collectClosureReleaseEligible uses, so both walks read the bind the
+    // same way.
+    std::unordered_set<const void*> reassignedLocals;
+    {
+        ClosureLocalAssignScan as{ctx_, reassignedLocals};
+        for (auto& s : body) as.stmt(s.get());
+    }
     // Walk every closure-typed LocalDecl in this body (mirroring
     // collectClosureReleaseEligible's candidate scan above) and run the
     // walker against the body's statements.
@@ -40909,6 +40947,10 @@ void Emitter::collectCapturedCellClosureLocals(
                 lt->kind == sema::TypeRef::Kind::Function) {
                 ClosureEscapeWalker w{ctx_, static_cast<const void*>(ld)};
                 w.scrutineeBorrowMode = true;
+                // fix-forward #8863: a bare `Object` bind of a source the body
+                // reassigns is not a forwarded bind (see the walker's
+                // `reassignedLocals`).
+                w.reassignedLocals = &reassignedLocals;
                 for (auto& ss : body) {
                     w.stmt(ss.get());
                     if (w.escaped && !w.escapedDueToReassign) break;
@@ -41489,6 +41531,9 @@ void Emitter::collectClosureReleaseEligible(
             aw.scrutineeBorrowMode = true;
             aw.assignBinds = &assignBinds;  // fix #8743
             aw.assignedSomewhere = assignedLocals.count(key) != 0;
+            // fix-forward #8863: a bare `Object` bind of a source the body
+            // reassigns is not a forwarded bind (see `reassignedLocals`).
+            aw.reassignedLocals = &assignedLocals;
             aw.walkWholeBody = true;
             for (auto& s : body) aw.stmt(s.get());
             if (aw.keptWithoutReference_) keptAliases.insert(key);
@@ -41546,6 +41591,9 @@ void Emitter::collectClosureReleaseEligible(
         // escape in source order.
         w.assignedSomewhere =
             assignedLocals.count(static_cast<const void*>(ld)) != 0;
+        // fix-forward #8863: a bare `Object` bind of a source the body
+        // reassigns is not a forwarded bind (see `reassignedLocals`).
+        w.reassignedLocals = &assignedLocals;
         const bool ownsFromBind =
             closureAliasOwned_.count(static_cast<const void*>(ld)) != 0;
         w.walkWholeBody = w.assignedSomewhere || ownsFromBind;
@@ -41800,6 +41848,9 @@ void Emitter::collectClosureReleaseEligible(
         // the scope).
         w.scrutineeBorrowMode = true;
         w.assignBinds = &assignBinds;  // fix #8743
+        // fix-forward #8863: a bare `Object` bind of a source the body
+        // reassigns is not a forwarded bind (see `reassignedLocals`).
+        w.reassignedLocals = &assignedLocals;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             closureBorrowRetainEligible_.insert(
@@ -41860,6 +41911,12 @@ void Emitter::collectClosureReleaseEligible(
                     if (x == static_cast<const void*>(s)) continue;
                     ClosureEscapeWalker xw{ctx_, x};
                     xw.identityCallForwards_ = true;  // fix #8743: a bind
+                    // fix-forward #8863: a source the body REASSIGNS is not
+                    // forwarded through a bare `Object` bind — the
+                    // reassignment releases the old cell while the bound
+                    // local still names it (heap-use-after-free). The
+                    // record-holder arm below declines the same source.
+                    xw.reassignedLocals = &assignedLocals;
                     if (xw.forwardsTarget(v.init, /*sawWrap=*/false) ||
                         xw.bareObjectBind(v.type, v.init))  // fix #8863
                         fb.sources.push_back(x);
@@ -41939,6 +41996,9 @@ void Emitter::collectClosureReleaseEligible(
             bw.scrutineeBorrowMode = true;
             bw.walkWholeBody = true;
             bw.assignBinds = &assignBinds;  // fix #8743
+            // fix-forward #8863: a bare `Object` bind of a source the body
+            // reassigns is not a forwarded bind (see `reassignedLocals`).
+            bw.reassignedLocals = &assignedLocals;
             bw.targetAssignIsPlainStore = fb.assignBound;  // fix #8743
             bw.recordHolderMode = fb.recordHolder;  // fix #8743
             for (auto& s : body) bw.stmt(s.get());
@@ -42037,6 +42097,9 @@ void Emitter::collectClosureReleaseEligible(
                 tw.scrutineeBorrowMode = true;
                 tw.walkWholeBody = true;
                 tw.assignBinds = &assignBinds;
+                // fix-forward #8863: a bare `Object` bind of a source the body
+                // reassigns is not a forwarded bind (see `reassignedLocals`).
+                tw.reassignedLocals = &assignedLocals;
                 tw.ignoreBareReturn_ = true;
                 for (auto& s : body) tw.stmt(s.get());
                 if (tw.sawIgnoredBareReturn_ && !tw.escaped &&
@@ -42198,6 +42261,9 @@ void Emitter::collectClosureReleaseEligible(
             kw.scrutineeBorrowMode = true;
             kw.assignBinds = &assignBinds;
             kw.assignedSomewhere = assignedLocals.count(key) != 0;
+            // fix-forward #8863: a bare `Object` bind of a source the body
+            // reassigns is not a forwarded bind (see `reassignedLocals`).
+            kw.reassignedLocals = &assignedLocals;
             kw.walkWholeBody = true;
             kw.closureLocalAssignTakesReference = true;
             kw.callBoundedArg = [this](const ast::CallExpr& call,
