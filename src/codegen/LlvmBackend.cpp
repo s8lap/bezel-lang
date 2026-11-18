@@ -40,6 +40,15 @@ static std::unique_ptr<llvm::TargetMachine> createHostTargetMachine() {
         llvm::TargetRegistry::lookupTarget(triple.str(), err);
     if (!target) return std::unique_ptr<llvm::TargetMachine>{};
     llvm::TargetOptions opts;
+    // fix #7737: a default-constructed TargetOptions leaves UseInitArray off,
+    // so the backend lowers `llvm.global_ctors` into the legacy `.ctors`
+    // section — which the AOT link (LLD + glibc crt) never runs. Every module
+    // constructor this compiler emits (`bz$trackStringDeaths`, per §28.9's
+    // runtime-managed lifetime; ASan's `asan.module_ctor`, which registers the
+    // generated globals) was therefore dead code, and `main` ran first. Use
+    // `.init_array`, which glibc runs before `main` (and which clang itself
+    // uses for every ELF target, so the runtime's own C++ TUs already do).
+    opts.UseInitArray = true;
     return std::unique_ptr<llvm::TargetMachine>(target->createTargetMachine(
         triple, "generic", "", opts, llvm::Reloc::PIC_));
 }

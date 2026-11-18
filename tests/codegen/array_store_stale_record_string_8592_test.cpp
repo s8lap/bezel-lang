@@ -379,9 +379,8 @@ BEZEL_TEST(array_store_stale_record_string_8592,
 // the constructor removed this row stays green, because the co-owner's take
 // also refuses a string whose count reads zero and a freed header that no
 // allocation has reused still reads zero. The constructor covers the case
-// where the address HAS been reused by something that is not a string, which
-// depends on the allocator and has no row. Each array holds N = 7 twice:
-// 200 x 14 = 2800.
+// where the address HAS been reused by something that is not a string: the
+// next row (#7737) pins it. Each array holds N = 7 twice: 200 x 14 = 2800.
 BEZEL_TEST(array_store_stale_record_string_8592,
            string_dead_before_the_first_co_owning_array_exists_spec_28_9) {
     expectCleanBothLegs(R"BZL(module P;
@@ -411,6 +410,57 @@ public class Program
 end Program;
 )BZL",
         "2800\n");
+}
+
+// #7737 — the same string, dead before the first co-owner exists, whose freed
+// header is then REUSED by a live class object: `k1`'s 32-byte block lands at
+// the dead string's address, so its count word is `k1.F2` (= 5, not zero) and
+// the `rc <= 0` refusal of the row above cannot see that it is dead. Only the
+// record of deaths can, and it must have been started before `main` by the
+// module constructor `bz$trackStringDeaths` — which never ran while the
+// backend lowered `llvm.global_ctors` to `.ctors` (the LLD + glibc link runs
+// only `.init_array`). The three stores then took a reference on `k1.F2`
+// (5 -> 8) and `rows.Clear()` gave it back. §28.9 (v0.359): "no runtime
+// lifetime mechanism exists for user-defined classes at all — no reference
+// counts", so no store may count on a `K`; nothing here writes `F2`, and every
+// field reads 5 both times. MEASURED on b279e8daf, plain build: `5,8,5,5,...` then
+// `5,5,...`, three runs of three; the sanitized leg's allocator does not
+// reuse the block, so only the plain leg is red on the base. The issue
+// reviewer's repro, verbatim (r42-rev-f21b-8592, c_ctor_k2five).
+BEZEL_TEST(array_store_stale_record_string_8592,
+           string_dead_before_the_first_co_owner_and_reused_by_a_live_object_7737_spec_28_9) {
+    expectCleanBothLegs(R"BZL(module P;
+record E(Name: string, N: int);
+public class K
+  public F1: long := 5;
+  public F2: long := 5;
+  public constructor() end;
+end K;
+public class Program
+  static method Stale(i: int): E
+    var e := new E("", 0);
+    if true then var g := $"dead{i},x".Split(','); e := new E(g[0], 7); end;
+    return e;
+  end Stale;
+  static method Show(k: K): string
+    return $"{k.F1},{k.F2},";
+  end Show;
+  public static method Main(): int
+    var e := Program.Stale(0);
+    var k1 := new K(); var k2 := new K(); var k3 := new K(); var k4 := new K(); var k5 := new K(); var k6 := new K();
+    var rows := new Array<E>();
+    rows.Add(e); rows.Add(e); rows.Add(e);
+    Console.WriteLine(Program.Show(k1) + Program.Show(k2) + Program.Show(k3) + Program.Show(k4) + Program.Show(k5) + Program.Show(k6));
+    rows.Clear();
+    Console.WriteLine(Program.Show(k1) + Program.Show(k2) + Program.Show(k3) + Program.Show(k4) + Program.Show(k5) + Program.Show(k6));
+    Console.WriteLine(rows.Count);
+    return 0;
+  end Main;
+end Program;
+)BZL",
+        "5,5,5,5,5,5,5,5,5,5,5,5,\n"
+        "5,5,5,5,5,5,5,5,5,5,5,5,\n"
+        "0\n");
 }
 
 // A slot that carries a dead string is copied out into a local (`var w :=
