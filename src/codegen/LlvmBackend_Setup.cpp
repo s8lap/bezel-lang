@@ -36778,15 +36778,24 @@ bool Emitter::lowerClosureLocalReassign(const ast::Expr& target,
     if (!isProducer)
         emitClosureRetain(newVal);
     builder_.CreateStore(newVal, slotAddr);
-    emitClosureRelease(oldVal);
+    // fix #8753 (§28.9, v0.359): the old value may be one a store kept
+    // without taking a reference (`fs.Add(b); b := g;`); the slot's
+    // reference is then the one keeping it alive. See
+    // closureReassignKeepsOld_.
+    if (!closureReassignKeepsOld_.count(static_cast<const void*>(&target)))
+        emitClosureRelease(oldVal);
     // fix #4422 (§27.5, v0.298): record the reassignment for
     // `emitClosureCall`'s call-site release. fix #8480 (§28.9, v0.357): the
     // slot owns its FINAL value's reference until scope end, and that is
     // where collectClosureReleaseEligible now releases it for every plain
     // reassigned local it classifies; the call-site release reads this set
-    // only for a local with no scope-end release armed.
+    // only for a local with no scope-end release armed. fix #8753: a local
+    // whose final value may be kept (closureReassignedKeptAtExit_) has no
+    // release at all, the call-site one included.
     if (auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(target)))
-        if (loc->decl)
+        if (loc->decl &&
+            !closureReassignedKeptAtExit_.count(
+                static_cast<const void*>(loc->decl)))
             closureLocalReassigned_.insert(static_cast<const void*>(loc->decl));
     return true;
 }
@@ -38914,6 +38923,17 @@ struct ClosureEscapeWalker {
     // walk, whose verdicts are unchanged.
     bool closureLocalAssignTakesReference = false;
     std::function<bool(const ast::CallExpr&, std::size_t)> callBoundedArg;
+    // fix #8753 (§28.9 / §27.5, v0.359): WHERE the KEPT walk met
+    // target. Set only on that walk: every statement at which it set
+    // keptWithoutReference_ (keptSiteStmts) and every statement that
+    // assigns target outside a lambda (targetAssignStmts), recorded as the
+    // statement stmt() was walking (curStmt_), so the header of an `if` /
+    // `while` / `for` / `case` stands for its condition. The donor pass's
+    // reaching-definition analysis checks that it visited every one of them
+    // before it trusts its own verdict.
+    std::vector<const ast::Stmt*>* keptSiteStmts = nullptr;
+    std::vector<const ast::Stmt*>* targetAssignStmts = nullptr;
+    const ast::Stmt* curStmt_ = nullptr;
     // fix-forward #8479 (§7.7 / §28.9, v0.357): set by the #6176 arm of
     // stmt(): a `return nn ?? e;` where NOTHING mints the caller's
     // reference, so the slot's own reference is the one the caller
@@ -39631,8 +39651,11 @@ struct ClosureEscapeWalker {
                 if (reassignSeen_) escapeAfterReassign_ = true;
                 else escapeBeforeReassign_ = true;
                 // fix-forward #8479: see keptWithoutReference_'s comment.
-                if (!inLambda && !inReferenceTakingSite_)
+                if (!inLambda && !inReferenceTakingSite_) {
                     keptWithoutReference_ = true;
+                    // fix #8753: see keptSiteStmts.
+                    if (keptSiteStmts) keptSiteStmts->push_back(curStmt_);
+                }
             }
             // fix #4434 (§27.5 / §28.9, v0.298): a target reference observed
             // while `inLambda` is true proves the slot is captured by a
@@ -40051,6 +40074,13 @@ struct ClosureEscapeWalker {
 
     void stmt(const ast::Stmt* s) {
         if (!s) return;
+        // fix #8753: see keptSiteStmts. Restored on every return.
+        struct CurStmtScope {
+            const ast::Stmt*& slot;
+            const ast::Stmt* saved;
+            ~CurStmtScope() { slot = saved; }
+        } curStmtScope{curStmt_, curStmt_};
+        curStmt_ = s;
         // fix #2107-follow-up / lane-35 narrow (#4422, §27.5 / §28.9, v0.298):
         // the stmt() short-circuit MUST NOT fire on a reassign-only escape.
         // The AssignmentStmt arm (line ~27648 below) sets `escaped = true` AND
@@ -40257,6 +40287,8 @@ struct ClosureEscapeWalker {
                 // (a lambda cannot reassign a local it does not capture). The
                 // envdtor owns the cell's release in this case.
                 if (inLambda) isCapturedCellSlot_ = true;
+                // fix #8753: see targetAssignStmts.
+                else if (targetAssignStmts) targetAssignStmts->push_back(s);
                 // Walk the RHS (which escapes) but not the target — the
                 // target is `target` itself, recursing into it would re-mark
                 // the reassign.
@@ -41836,17 +41868,26 @@ void Emitter::collectClosureReleaseEligible(
     // closureEscapingScopeEndRelease_: its release stays armed, its capture
     // cells are no longer freed with the scope.
     //
-    // Not handled (left as they were): a reassigned local's INITIAL value
-    // reaching a kept site (`fs.Add(b); b := g;` releases it at the
-    // reassignment), assignments inside a lambda body, and targets that are
-    // not candidates (parameters, borrow candidates).
+    // For a reassigned local the verdict is per DEFINITION (fix #8753, the
+    // reaching-definition analysis below). Not handled (left as they were):
+    // assignments inside a lambda body, and targets that are not candidates
+    // (parameters, borrow candidates).
     {
         std::unordered_set<const void*> candKeys;
         for (const ast::Node* c : candidates)
             candKeys.insert(static_cast<const void*>(c));
-        std::vector<std::pair<const void*, const void*>> edges;  // src -> dst
+        // src -> dst. fix #8753: `def` is the definition of dst that carries
+        // src's value (the AssignmentStmt, or for an owned alias's bind the
+        // alias's own declaration, i.e. dst) and also the statement where the
+        // value passes from src into dst.
+        struct DonorEdge {
+            const void* x;
+            const void* dst;
+            const void* def;
+        };
+        std::vector<DonorEdge> edges;
         auto addEdgesInto = [&](const void* dst, const ast::Expr* value,
-                                bool viaAssign) {
+                                bool viaAssign, const void* def) {
             for (const ast::Node* c : candidates) {
                 const void* x = static_cast<const void*>(c);
                 if (x == dst) continue;
@@ -41855,9 +41896,12 @@ void Emitter::collectClosureReleaseEligible(
                     viaAssign ? xw.forwardsTarget(value, /*sawWrap=*/true)
                               : xw.containsTargetAnywhere(value);
                 if (flows &&
-                    std::find(edges.begin(), edges.end(),
-                              std::make_pair(x, dst)) == edges.end())
-                    edges.push_back({x, dst});
+                    std::find_if(edges.begin(), edges.end(),
+                                 [&](const DonorEdge& e) {
+                                     return e.x == x && e.dst == dst &&
+                                            e.def == def;
+                                 }) == edges.end())
+                    edges.push_back({x, dst, def});
             }
         };
         std::function<void(const ast::Stmt*)> scanEdges =
@@ -41872,7 +41916,9 @@ void Emitter::collectClosureReleaseEligible(
                 if (as->op == ":=" && as->value && loc && loc->decl &&
                     candKeys.count(static_cast<const void*>(loc->decl)))
                     addEdgesInto(static_cast<const void*>(loc->decl),
-                                 as->value.get(), /*viaAssign=*/true);
+                                 as->value.get(), /*viaAssign=*/true,
+                                 static_cast<const void*>(
+                                     static_cast<const ast::Node*>(as)));
             }
             if (auto* is2 = dynamic_cast<const ast::IfStmt*>(s)) {
                 for (auto& b : is2->ifBranch.body) scanEdges(b.get());
@@ -41899,7 +41945,8 @@ void Emitter::collectClosureReleaseEligible(
             const void* key = static_cast<const void*>(c);
             if (!closureAliasOwned_.count(key)) continue;
             LocalDeclInitView av = localDeclInitView(c);
-            if (av.init) addEdgesInto(key, av.init, /*viaAssign=*/false);
+            if (av.init)
+                addEdgesInto(key, av.init, /*viaAssign=*/false, key);
         }
         auto passesThrough = [&](const void* k) {
             return assignedLocals.count(k) != 0 ||
@@ -41907,9 +41954,13 @@ void Emitter::collectClosureReleaseEligible(
         };
         // The KEPT walk (see closureLocalAssignTakesReference).
         std::unordered_set<const void*> kept, captured;
+        // fix #8753: where each walk met its target (keptSiteStmts).
+        std::unordered_map<const void*, std::vector<const ast::Stmt*>>
+            keptSitesOf, assignsOf;
         for (const ast::Node* c : candidates) {
             const void* key = static_cast<const void*>(c);
             closureKeptCaptureLocals_.erase(key);
+            closureReassignedKeptAtExit_.erase(key);
             ClosureEscapeWalker kw{ctx_, key};
             kw.coalesceReturnTransfers = coalesceReturnTransfers;
             kw.ownedAliasDecls = &closureAliasOwned_;
@@ -41922,16 +41973,334 @@ void Emitter::collectClosureReleaseEligible(
                                        std::size_t ai) {
                 return isCallBoundedClosureArgPosition(call, ai);
             };
+            kw.keptSiteStmts = &keptSitesOf[key];
+            kw.targetAssignStmts = &assignsOf[key];
             for (auto& s : body) kw.stmt(s.get());
             if (kw.keptWithoutReference_) kept.insert(key);
             if (kw.isCapturedCellSlot_) captured.insert(key);
+            for (const ast::Stmt* a : assignsOf[key])
+                if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(a))
+                    closureReassignKeepsOld_.erase(
+                        static_cast<const void*>(as->target.get()));
         }
+
+        // fix #8753 (§28.9 / §27.5, v0.359): for a REASSIGNED
+        // closure local, "kept" is a property of a DEFINITION, not of the
+        // local. The flow-insensitive verdict above (a reassigned `b` is
+        // kept if any of its values is, and never donates) lost a value:
+        //
+        //   - #8753: `fs.Add(b); b := g;`. The value `fs` keeps is `b`'s
+        //     initial one, whose only reference is `b`'s, and
+        //     `lowerClosureLocalReassign` released it at `b := g;`. MEASURED
+        //     (200x, `--sanitize=address`) on b279e8daf and on r30-c1:
+        //     heap-use-after-free on the caller's first call through
+        //     `fs[0]`. The same happens to a value `b := lambda …;` stores,
+        //     at the next reassignment or at `b`'s scope-end release.
+        //
+        // The rule: a forward may-analysis over the body tracks which
+        // definitions of `b` reach each point (`reach`), and which of those
+        // have been kept since they were made (`keptSince`). A site that
+        // keeps `b` (keptSiteStmts, or the statement where `b`'s value passes
+        // into a local whose definition there is itself kept) marks every
+        // reaching definition kept. `b := b;` is not a kept site: the
+        // definitions reaching it still reach past it. Then:
+        //   * a definition whose reference is the slot's own (the initial
+        //     producer value, or `b := <producer>`) is donated by the slot
+        //     once kept: a reassignment that finds such a definition kept
+        //     does not release the old value (closureReassignKeepsOld_), and
+        //     if one can reach `b`'s scope end kept, `b` has no scope-end or
+        //     call-site release (closureReassignedKeptAtExit_) (#8753).
+        // Joins are unions and loops iterate to a fixpoint, so every
+        // imprecision keeps a reference (a leak, the #5866 residual) rather
+        // than releasing one. A local a lambda captures (#8790), one assigned
+        // where the analysis cannot see, or one assigned other than by a
+        // plain `:=` that `lowerClosureLocalReassign` lowers keeps the
+        // flow-insensitive verdict. A `try` body's every point reaches its
+        // catch arms and finally clause; an exception that leaves the method
+        // is not modelled, as nowhere else in this pass.
+        using DefSet = std::set<const void*>;
+        struct FlowState {
+            DefSet reach, keptSince;
+            bool live = false;
+        };
+        auto sameState = [](const FlowState& a, const FlowState& b2) {
+            return a.live == b2.live && a.reach == b2.reach &&
+                   a.keptSince == b2.keptSince;
+        };
+        auto joinInto = [](FlowState& into, const FlowState& from) {
+            if (!from.live) return;
+            into.live = true;
+            into.reach.insert(from.reach.begin(), from.reach.end());
+            into.keptSince.insert(from.keptSince.begin(),
+                                  from.keptSince.end());
+        };
+        struct DefFlow {
+            bool complete = true;
+            DefSet keptDefs;
+            std::set<const ast::AssignmentStmt*> keepOld;
+            bool keptAtExit = false;
+        };
+        auto nodeKey = [](const ast::Node* n) {
+            return static_cast<const void*>(n);
+        };
+        auto analyzeDefs = [&](const void* b,
+                               const std::unordered_set<const void*>& sites) {
+            DefFlow out;
+            DefSet ownDefs;
+            // An owned alias's initial reference is the bind's retain of its
+            // source, which the edge into it already accounts for.
+            if (!closureAliasOwned_.count(b)) ownDefs.insert(b);
+            std::unordered_set<const void*> visited;
+            bool everKeptOwn = false;
+            bool declAtTop = false;
+            for (auto& s : body)
+                if (nodeKey(s.get()) == b) declAtTop = true;
+            FlowState exitSt;
+            struct LoopFrame {
+                FlowState brk, cont;
+            };
+            std::vector<LoopFrame*> loops;
+            std::vector<FlowState*> tryAccs;
+            ClosureEscapeWalker bw{ctx_, b};
+            auto hasOwn = [&](const DefSet& d) {
+                for (const void* x : d)
+                    if (ownDefs.count(x)) return true;
+                return false;
+            };
+            auto keepHere = [&](FlowState& st) {
+                if (!st.live) return;
+                for (const void* d : st.reach) {
+                    out.keptDefs.insert(d);
+                    st.keptSince.insert(d);
+                }
+                if (hasOwn(st.keptSince)) everKeptOwn = true;
+            };
+            std::function<void(const ast::Stmt*, FlowState&)> flow;
+            auto flowList = [&](const std::vector<std::unique_ptr<ast::Stmt>>& v,
+                                FlowState& st) {
+                for (auto& s : v) {
+                    for (FlowState* acc : tryAccs) joinInto(*acc, st);
+                    flow(s.get(), st);
+                }
+                for (FlowState* acc : tryAccs) joinInto(*acc, st);
+            };
+            auto loopFixpoint = [&](const std::vector<std::unique_ptr<ast::Stmt>>& v,
+                                    FlowState& st, bool headerKeeps) {
+                FlowState head = st;
+                FlowState h;
+                LoopFrame fr;
+                for (int iter = 0; iter < 64; ++iter) {
+                    h = head;
+                    if (headerKeeps) keepHere(h);
+                    fr = LoopFrame{};
+                    FlowState bodySt = h;
+                    loops.push_back(&fr);
+                    flowList(v, bodySt);
+                    loops.pop_back();
+                    FlowState next = head;
+                    joinInto(next, bodySt);
+                    joinInto(next, fr.cont);
+                    if (sameState(next, head)) break;
+                    head = next;
+                    if (iter == 63) out.complete = false;
+                }
+                st = h;
+                joinInto(st, fr.brk);
+            };
+            flow = [&](const ast::Stmt* s, FlowState& st) {
+                if (!s) return;
+                const void* sk = nodeKey(s);
+                visited.insert(sk);
+                auto* ws = dynamic_cast<const ast::WhileStmt*>(s);
+                // `b := b;` passes the value into `b` itself, which the
+                // assignment below models; it keeps nothing elsewhere.
+                auto* selfAs = dynamic_cast<const ast::AssignmentStmt*>(s);
+                const bool selfPass = selfAs && selfAs->op == ":=" &&
+                                      bw.isTargetIdent(selfAs->target.get()) &&
+                                      bw.isTargetIdent(selfAs->value.get());
+                if (sites.count(sk) && !ws && !selfPass) keepHere(st);
+                if (ws) {
+                    loopFixpoint(ws->body, st, sites.count(sk) != 0);
+                    return;
+                }
+                // LOCALDECL-ONLY: `b` is reassigned, so it is never a §21.1
+                // `const` local; any other declaration is not a definition of
+                // `b`, and a LocalConstDecl falls through to the end as one.
+                if (dynamic_cast<const ast::LocalDecl*>(s)) {
+                    if (sk == b && st.live) {
+                        st.reach = DefSet{b};
+                        st.keptSince.clear();
+                    }
+                    return;
+                }
+                if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+                    auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->target.get());
+                    auto* loc = id ? dynamic_cast<sema::LocalSymbol*>(
+                                         ctx_.exprSymbol(*id))
+                                   : nullptr;
+                    if (!loc || !loc->decl || nodeKey(loc->decl) != b) return;
+                    if (as->op != ":=" || !as->value ||
+                        !bw.isClosureTypedLocalAssign(*as->target)) {
+                        out.complete = false;
+                        return;
+                    }
+                    if (!st.live) return;
+                    if (isPlusOneClosureProducer(as->value.get()) ||
+                        isUserMethodClosureReturnCall(as->value.get()))
+                        ownDefs.insert(sk);
+                    if (hasOwn(st.keptSince)) out.keepOld.insert(as);
+                    // `b := b;` (or `b := n ?? b;`): the slot holds a fresh
+                    // reference, but the value may be the one it held.
+                    if (bw.forwardsTarget(as->value.get(), /*sawWrap=*/true))
+                        st.reach.insert(sk);
+                    else
+                        st.reach = DefSet{sk};
+                    st.keptSince.clear();
+                    return;
+                }
+                if (dynamic_cast<const ast::ReturnStmt*>(s) ||
+                    dynamic_cast<const ast::ThrowStmt*>(s)) {
+                    joinInto(exitSt, st);
+                    st.live = false;
+                    return;
+                }
+                if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+                    if (ys->isBreak) {
+                        joinInto(exitSt, st);
+                        st.live = false;
+                    }
+                    return;
+                }
+                auto loopFrame = [&](int offset) -> LoopFrame* {
+                    const int i = static_cast<int>(loops.size()) - 1 - offset;
+                    return i >= 0 && offset >= 0 ? loops[i] : nullptr;
+                };
+                if (auto* bs = dynamic_cast<const ast::BreakStmt*>(s)) {
+                    if (LoopFrame* f = loopFrame(bs->targetLoopOffset))
+                        joinInto(f->brk, st);
+                    else
+                        out.complete = false;
+                    st.live = false;
+                    return;
+                }
+                if (auto* cs = dynamic_cast<const ast::ContinueStmt*>(s)) {
+                    if (LoopFrame* f = loopFrame(cs->targetLoopOffset))
+                        joinInto(f->cont, st);
+                    else
+                        out.complete = false;
+                    st.live = false;
+                    return;
+                }
+                if (auto* is2 = dynamic_cast<const ast::IfStmt*>(s)) {
+                    FlowState acc;
+                    auto branch =
+                        [&](const std::vector<std::unique_ptr<ast::Stmt>>& v) {
+                            FlowState bs2 = st;
+                            flowList(v, bs2);
+                            joinInto(acc, bs2);
+                        };
+                    branch(is2->ifBranch.body);
+                    for (auto& br : is2->elifBranches) branch(br.body);
+                    if (is2->hasElse || !is2->elseBody.empty())
+                        branch(is2->elseBody);
+                    else
+                        joinInto(acc, st);
+                    st = acc;
+                    return;
+                }
+                if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                    loopFixpoint(fs->body, st, /*headerKeeps=*/false);
+                    return;
+                }
+                if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                    flowList(d->body, st);
+                    return;
+                }
+                if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+                    // Any point of the protected body can reach a catch arm
+                    // or the finally clause.
+                    FlowState acc;
+                    tryAccs.push_back(&acc);
+                    FlowState bodySt = st;
+                    flowList(ts->body, bodySt);
+                    FlowState after = bodySt;
+                    const FlowState catchEntry = acc;
+                    for (auto& c : ts->catches) {
+                        FlowState cs2 = catchEntry;
+                        flow(c.body.get(), cs2);
+                        joinInto(after, cs2);
+                    }
+                    tryAccs.pop_back();
+                    if (ts->hasFinally || !ts->finallyBody.empty()) {
+                        FlowState fin = after;
+                        joinInto(fin, acc);
+                        flowList(ts->finallyBody, fin);
+                        joinInto(exitSt, fin);
+                        after = fin;
+                    }
+                    st = after;
+                    return;
+                }
+                if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                    FlowState acc;
+                    joinInto(acc, st);
+                    for (auto& arm : cs->arms) {
+                        FlowState as2 = st;
+                        flowList(arm.stmts, as2);
+                        joinInto(acc, as2);
+                    }
+                    st = acc;
+                    return;
+                }
+            };
+            FlowState st;
+            st.live = true;
+            flowList(body, st);
+            joinInto(exitSt, st);
+            for (const ast::Stmt* r : keptSitesOf[b])
+                if (!visited.count(nodeKey(r))) out.complete = false;
+            for (const ast::Stmt* r : assignsOf[b])
+                if (!visited.count(nodeKey(r))) out.complete = false;
+            for (const void* r : sites)
+                if (!visited.count(r)) out.complete = false;
+            out.keptAtExit =
+                declAtTop ? hasOwn(exitSt.keptSince) : everKeptOwn;
+            return out;
+        };
+        std::unordered_map<const void*, DefFlow> defFlows;
+        std::unordered_map<const void*, std::unordered_set<const void*>>
+            sitesOf;
+        for (const ast::Node* c : candidates) {
+            const void* key = static_cast<const void*>(c);
+            if (!assignedLocals.count(key) || captured.count(key)) continue;
+            for (const ast::Stmt* r : keptSitesOf[key])
+                sitesOf[key].insert(nodeKey(r));
+            DefFlow f = analyzeDefs(key, sitesOf[key]);
+            if (f.complete) defFlows.emplace(key, std::move(f));
+        }
+        auto edgeCounts = [&](const DonorEdge& e) {
+            return kept.count(e.dst) && passesThrough(e.dst);
+        };
         for (bool changed = true; changed;) {
             changed = false;
-            for (const auto& [x, dst] : edges) {
-                if (kept.count(dst) && passesThrough(dst) &&
-                    kept.insert(x).second)
+            for (const DonorEdge& e : edges) {
+                if (!edgeCounts(e)) continue;
+                if (kept.insert(e.x).second) changed = true;
+                // The statement where e.x's value passes into a kept
+                // definition of e.dst keeps e.x's value too.
+                if (defFlows.count(e.x) && sitesOf[e.x].insert(e.def).second)
                     changed = true;
+            }
+            if (!changed) break;
+            for (auto it = defFlows.begin(); it != defFlows.end();) {
+                DefFlow f = analyzeDefs(it->first, sitesOf[it->first]);
+                if (!f.complete) {
+                    it = defFlows.erase(it);
+                    continue;
+                }
+                it->second = std::move(f);
+                ++it;
             }
         }
         bool changedAny = false;
@@ -41942,9 +42311,21 @@ void Emitter::collectClosureReleaseEligible(
             changedAny |= closureEscapingScopeEndRelease_.erase(key) != 0;
             if (captured.count(key)) closureKeptCaptureLocals_.insert(key);
         }
+        // fix #8753: see the reaching-definition analysis above.
+        for (const auto& [key, f] : defFlows) {
+            for (const ast::AssignmentStmt* as : f.keepOld)
+                closureReassignKeepsOld_.insert(
+                    static_cast<const void*>(as->target.get()));
+            if (!f.keptAtExit) continue;
+            changedAny |= closureReleaseEligible_.erase(key) != 0;
+            changedAny |= closureEscapingScopeEndRelease_.erase(key) != 0;
+            closureReassignedKeptAtExit_.insert(key);
+        }
         for (bool changed = true; changed;) {
             changed = false;
-            for (const auto& [x, dst] : edges) {
+            for (const DonorEdge& e : edges) {
+                const void* x = e.x;
+                const void* dst = e.dst;
                 if (closureReleaseEligible_.count(dst) &&
                     !returnedByName.count(dst))
                     continue;

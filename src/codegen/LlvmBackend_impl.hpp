@@ -22323,6 +22323,16 @@ private:
     // for such a local, as for capturedLocalReturnedByName. Keyed and
     // rewritten like closureEscapingScopeEndRelease_.
     std::unordered_set<const void*> closureKeptCaptureLocals_;
+    // fix #8753 (§28.9 / §27.5, v0.359): the donor pass's reaching-definition
+    // analysis (end of collectClosureReleaseEligible) for a reassigned
+    // closure local whose value a store keeps without a reference.
+    // closureReassignKeepsOld_: assignment TARGET expressions at which the
+    // old value may be kept, so `lowerClosureLocalReassign` does not release
+    // it. closureReassignedKeptAtExit_: declarations whose final value may
+    // be kept at scope end, so neither a scope-end nor a call-site release
+    // is armed. Rewritten like closureKeptCaptureLocals_.
+    std::unordered_set<const void*> closureReassignKeepsOld_;
+    std::unordered_set<const void*> closureReassignedKeptAtExit_;
     // fix #8743 (§28.9 / §30.5, v0.359): `Object` locals `b` of an async
     // `Task<Object>` body bound by `var b: Object := f as Object;`, where `f`
     // is a closure local this frame holds the one reference of (a lambda
