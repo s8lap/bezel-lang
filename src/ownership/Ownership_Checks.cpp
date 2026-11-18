@@ -13488,7 +13488,24 @@ void MethodOwnership::checkThrowOperandNotBorrowed(const ast::Expr& operand) {
                   !ot->declaration->isValueBuiltin))))
         return;
     if (!ownedArgSourceIsBorrow(operand)) return;
-    report(
+    // fix #8860 (§31.1 *The throw operand*, v0.359): `reportOnce`, not
+    // `report` — TWO INDEPENDENT analyses reach the same operand of a LAMBDA
+    // BODY and both ask this predicate, so the SAME diagnostic was printed
+    // TWICE at the same offset:
+    //   1. the closure scan's ThrowExpr arm ->
+    //      `checkLambdaBodyThrowOperandNotBorrowed` (fix #8802), which installs
+    //      the borrow state and calls THIS predicate, and
+    //   2. the lambda-body pre-pass (`applyUsingVarBorrowPinInLambdaStmt` ->
+    //      `handleLocalDecl` -> `recordMovesIn` -> `handleDischarge` -> here),
+    //      which DOES track the lambda's own locals in `states_`.
+    // The `throw`-in-STATEMENT spelling is reached only by (1); the
+    // `throw`-in-EXPRESSION spelling inside a LocalDecl initializer (e.g.
+    // `var v := n ?? throw b;`) is reached by BOTH, so it was reported twice
+    // (MEASURED on r30-c1 @ 3577f70b8: two byte-identical lines at 11:27).
+    // `reportOnce` folds the repeat: it is a no-op when the engine already
+    // holds this diagnostic at this place, and it changes no other program.
+    // per §31.1, v0.359
+    reportOnce(
         Severity::Error, operand.span.begin,
         "the thrown value must be an OWNED exception — a fresh `new`, an owned "
         "local or `owned` parameter, or a `move`d owned value (\xc2\xa7""31.1); "
