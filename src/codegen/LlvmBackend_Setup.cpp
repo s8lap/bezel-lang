@@ -38502,6 +38502,71 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
     return calleeBodyUsesFormalOnlyByInvocation(*md, p.name);
 }
 
+// fix #8743 (§22.2 / §14.1 / §28.9, v0.359): the argument a call hands
+// straight back as its result, or null. The callee must be a user STATIC
+// method, not async / virtual / abstract / override / imported, whose whole
+// body is `=> x` (§22.2: the single expression "replaces the block") for a
+// plain formal `x` declared at a bare METHOD-OWN type parameter `T` that is
+// also the declared return type — `static method Id<T>(x: T): T => x;`. Such
+// a call's value is the argument's own value, and the body keeps nothing: it
+// stores, captures and forwards nothing but the result. So a function value
+// passed there is held, after the call, only where the RESULT is held, and
+// the closure escape walker reads `Id<F>(e)` as `e` itself (the
+// forwarded-bind pass then decides `e`'s source from what the result does).
+// The return type being a type parameter, not a function type, keeps the
+// call out of isUserMethodClosureReturnCall: the bound local is never a
+// producer candidate whose scope-end release would spend a reference the
+// call did not mint (the expression-bodied generic is lowered inline by
+// emitInlineGenericMethod, which mints none — MEASURED on 932e581ac: no
+// retain and no release around `var g1 := Util.Id<F>(nn!)`). Positional
+// arguments only, one per formal, none with a modifier; anything else is
+// null (the caller keeps its conservative escape).
+inline const ast::Expr* closureIdentityCallForwardedArg(
+        const sema::SemaContext& ctx, const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*call.callee));
+    if (!ms || ms->isOperator || ctx.isImported(ms)) return nullptr;
+    // SEAM-ACCESSOR: local-path cast — `ctx.isImported(ms)` returns early
+    // above (an imported method's body is never reconstructed, and the answer
+    // for it is null: the conservative escape)
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md || md->bodyKind != ast::MethodBodyKind::Expression ||
+        !md->exprBody || !md->returnType || md->returnOwned ||
+        md->genericParams.empty())
+        return nullptr;
+    bool isStatic = false;
+    for (auto mod : md->modifiers) {
+        if (mod == "static") isStatic = true;
+        else if (mod == "async" || mod == "virtual" || mod == "abstract" ||
+                 mod == "override")
+            return nullptr;
+    }
+    if (!isStatic) return nullptr;
+    auto* body = dynamic_cast<const ast::IdentifierExpr*>(md->exprBody.get());
+    if (!body || !body->typeArgs.empty()) return nullptr;
+    auto bareOwnParam = [&](const ast::Type& t) -> std::string_view {
+        if (t.kind != ast::TypeKind::Named || !t.name || t.nullable ||
+            t.name->parts.size() != 1 || !t.genericArgs.empty())
+            return {};
+        for (const auto& gp : md->genericParams)
+            if (gp.name == t.name->parts.front()) return gp.name;
+        return {};
+    };
+    std::size_t pidx = md->params.size();
+    for (std::size_t j = 0; j < md->params.size(); ++j)
+        if (md->params[j].name == body->name) { pidx = j; break; }
+    if (pidx >= md->params.size()) return nullptr;
+    const ast::Param& p = md->params[pidx];
+    if (!p.modifier.empty() || !p.type) return nullptr;
+    const std::string_view tp = bareOwnParam(*p.type);
+    if (tp.empty() || tp != bareOwnParam(*md->returnType)) return nullptr;
+    if (call.args.size() != md->params.size()) return nullptr;
+    for (const auto& a : call.args)
+        if (!a.name.empty() || !a.modifier.empty() || a.isDiscard || !a.value)
+            return nullptr;
+    return call.args[pidx].value.get();
+}
+
 
 // #422 / §27.5 / §28.9: a strict, conservative walk that decides whether a
 // SPECIFIC closure (function-typed) `var` local ever escapes its scope. A
@@ -38747,6 +38812,31 @@ struct ClosureEscapeWalker {
     // — so an assignment TO `b` is not an escape of `b`'s value. Its
     // right-hand side is still walked.
     bool targetAssignIsPlainStore = false;
+    // fix #8743 (§9.1 / §9.7 / §28.9, v0.359): set on the walk of a RECORD
+    // local bound by `var rb := new RB(… g …)` (recordCtorForwardsTarget).
+    // Its function-typed component holds g's value and no reference of its
+    // own (a record's reference-typed fields "are always borrows; the
+    // record does not own what they point to", §9.7; MEASURED on 932e581ac:
+    // the constructor stores the raw pointer, no retain, and nothing
+    // releases it when the record dies). So the walk FAILS CLOSED: every
+    // occurrence of the record is an escape, except the receiver of a call
+    // of one of its function-typed components (`rb.F(1)`, §27.7: the
+    // invocation borrows the value for the call). The relief arms keyed on
+    // a function-typed target (reference equality, `is`, the argument
+    // reliefs, a case scrutinee, an `Object`-member receiver) do not apply
+    // to a record holding one, and are all read as escapes here.
+    bool recordHolderMode = false;
+    bool allowRecordHolderRead_ = false;  // the one admitted receiver read
+    // fix #8743 (§22.2 / §28.9, v0.359): read an identity call
+    // (closureIdentityCallForwardedArg) as its forwarded argument. Set ONLY
+    // around a local's bind (`var g1 := Id<F>(n ?? g);`: the forwarded-bind
+    // pass then walks `g1`), never at another position: the positions that
+    // relieve a forwarded `??` do so because their lowering MINTS a
+    // reference for it (a function-typed `return`, a class-field store), and
+    // none mints for a call's result, which it takes as already owned —
+    // MEASURED: with the reading at every position, `return Id<F>(n ?? g);`
+    // from a `Task<F>` body is a heap-use-after-free in the awaiting caller.
+    bool identityCallForwards_ = false;
 
     // fix-forward #8479 (§28.9, v0.357): true when a store into `t` is one
     // `Emitter::lowerClosureFieldStore` handles, i.e. `t` is what
@@ -38839,7 +38929,114 @@ struct ClosureEscapeWalker {
         if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e))
             return sawWrap && (forwardsTarget(c->thenValue.get(), true) ||
                                forwardsTarget(c->elseValue.get(), true));
+        // fix #8743: `Id<F>(e)` is `e` (closureIdentityCallForwardedArg),
+        // at a local's bind only (identityCallForwards_).
+        if (identityCallForwards_)
+            if (auto* c = dynamic_cast<const ast::CallExpr*>(e))
+                if (const ast::Expr* fa =
+                        closureIdentityCallForwardedArg(ctx, *c))
+                    return forwardsTarget(fa, true);
         return sawWrap && isTargetIdent(e);
+    }
+    // fix #8743 (§9.1 / §9.7, v0.359): is `e` a `new RB(…)` of a
+    // POSITIONAL-ONLY, non-generic record (`record RB(F: (int) -> int);`)
+    // one of whose arguments, at a function-typed component, yields
+    // target's own value (target itself, `target!`, or through `??` / `as`
+    // / an identity call)? §9.1 generates exactly one constructor for such a
+    // record, "whose parameters are the positional fields", and the record
+    // declares no other member, so the construction runs no user code: the
+    // argument is stored into the component and nothing else holds it.
+    // Arguments must be positional, one per field, with no modifier.
+    // `isFwdArg` (optional) receives which arguments forward target.
+    bool recordCtorForwardsTarget(const ast::Expr* e,
+                                  std::vector<bool>* isFwdArg = nullptr) const {
+        auto* n = dynamic_cast<const ast::NewExpr*>(e);
+        if (!n || !n->type) return false;
+        const sema::TypeRef* rt = ctx.resolvedType(*n->type);
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->nullable ||
+            !rt->declaration)
+            return false;
+        if (ctx.isImported(rt->declaration)) return false;
+        // SEAM-ACCESSOR: local-path cast — an imported record returns early
+        // above (no AST; the answer for it is false: the conservative escape)
+        auto* td = dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
+        if (!td ||
+            td->kind != ast::TypeDeclKind::Record || !td->hasPositionalFields ||
+            !td->isRecordShorthand || !td->genericParams.empty() ||
+            !td->members.empty() ||
+            n->args.size() != td->positionalFields.size())
+            return false;
+        bool any = false;
+        std::vector<bool> fwd(n->args.size(), false);
+        for (std::size_t i = 0; i < n->args.size(); ++i) {
+            const auto& a = n->args[i];
+            if (!a.name.empty() || !a.modifier.empty() || a.isDiscard ||
+                !a.value)
+                return false;
+            const ast::Param& pf = td->positionalFields[i];
+            if (!pf.type) return false;
+            const sema::TypeRef* ft = ctx.resolvedType(*pf.type);
+            if (!ft || ft->kind != sema::TypeRef::Kind::Function) continue;
+            if (forwardsTarget(a.value.get(), /*sawWrap=*/true)) {
+                fwd[i] = true;
+                any = true;
+            }
+        }
+        if (any && isFwdArg) *isFwdArg = std::move(fwd);
+        return any;
+    }
+    // fix #8743: the bind side of recordCtorForwardsTarget — a local
+    // declared at the record's own type (written or inferred) whose
+    // initializer is such a construction. When it matches, the arguments
+    // are walked here: each one that forwards target as a SAFE read (the
+    // bind is a read; the forwarded-bind pass decides target from what the
+    // record local does), every other one as an escape, and true is
+    // returned.
+    bool recordBindMatches(const ast::Type* declType, const ast::Expr* init,
+                           std::vector<bool>* fwd = nullptr) const {
+        if (!recordCtorForwardsTarget(init, fwd)) return false;
+        if (!declType) return true;
+        auto* n = static_cast<const ast::NewExpr*>(init);
+        const sema::TypeRef* lt = ctx.resolvedType(*declType);
+        const sema::TypeRef* nt = ctx.resolvedType(*n->type);
+        return lt && nt && lt->kind == sema::TypeRef::Kind::Named &&
+               !lt->nullable && lt->declaration == nt->declaration;
+    }
+    bool recordBindForwardsTarget(const ast::Type* declType,
+                                  const ast::Expr* init) {
+        std::vector<bool> fwd;
+        if (!recordBindMatches(declType, init, &fwd)) return false;
+        auto* n = static_cast<const ast::NewExpr*>(init);
+        for (std::size_t i = 0; i < n->args.size(); ++i)
+            expr(n->args[i].value.get(), /*safeRead=*/fwd[i]);
+        return true;
+    }
+    // fix #8743: is `ma` (the callee of a call) a function-typed positional
+    // field of the same kind of record recordCtorForwardsTarget admits, and
+    // not a method of that name (an extension; §26.5)?
+    bool recordHolderCalleeIsFunctionComponent(
+            const ast::MemberAccessExpr& ma) const {
+        if (!ma.target) return false;
+        if (dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(ma)))
+            return false;
+        const sema::TypeRef* rt = ctx.exprType(*ma.target);
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->nullable ||
+            !rt->declaration || ctx.isImported(rt->declaration))
+            return false;
+        // SEAM-ACCESSOR: local-path cast — an imported record returns early
+        // above (no AST; the answer for it is false: the receiver read stays
+        // an escape)
+        auto* td = dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
+        if (!td || td->kind != ast::TypeDeclKind::Record ||
+            !td->hasPositionalFields || !td->isRecordShorthand ||
+            !td->genericParams.empty() || !td->members.empty())
+            return false;
+        for (const ast::Param& pf : td->positionalFields) {
+            if (pf.name != ma.member || !pf.type) continue;
+            const sema::TypeRef* ft = ctx.resolvedType(*pf.type);
+            return ft && ft->kind == sema::TypeRef::Kind::Function;
+        }
+        return false;
     }
     // fix #8717: a call argument that is target or yields it through `??` /
     // `as`. The argument reliefs of the CallExpr arm are premises about the
@@ -39254,7 +39451,10 @@ struct ClosureEscapeWalker {
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
             // FINDING [1]: inside a lambda body, a captured-local read always
             // escapes — the env outlives the scope (safe-read does not apply).
-            if (isTargetIdent(id) && (!safeRead || inLambda)) {
+            // fix #8743: see recordHolderMode.
+            if (isTargetIdent(id) &&
+                (!safeRead || inLambda ||
+                 (recordHolderMode && !allowRecordHolderRead_))) {
                 escaped = true;
                 // fix #8480: see escapeBeforeReassign_'s comment.
                 if (reassignSeen_) escapeAfterReassign_ = true;
@@ -39351,6 +39551,35 @@ struct ClosureEscapeWalker {
         // never outlive the call, regardless of whether it arrives as a
         // literal or a `var`-bound reference — only WHO releases it differs.
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            // fix #8743: `Id<F>(e)` hands `e`'s own value on to the position
+            // the call occupies (closureIdentityCallForwardedArg), so `e`
+            // inherits that position, as through `!` — at a bind only
+            // (identityCallForwards_).
+            if (const ast::Expr* fa = identityCallForwards_
+                        ? closureIdentityCallForwardedArg(ctx, *c)
+                        : nullptr) {
+                exprCallee(c->callee.get());
+                for (auto& a : c->args)
+                    expr(a.value.get(),
+                         /*safeRead=*/a.value.get() == fa ? safeRead : false);
+                return;
+            }
+            // fix #8743: the one admitted read of a record holder — the
+            // receiver of a call of its own function-typed component
+            // (`rb.F(1)`), outside any lambda. See recordHolderMode.
+            if (recordHolderMode && !inLambda) {
+                auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(c->callee.get());
+                if (ma && isTargetIdent(ma->target.get()) &&
+                    recordHolderCalleeIsFunctionComponent(*ma)) {
+                    allowRecordHolderRead_ = true;
+                    expr(ma->target.get(), /*safeRead=*/true);
+                    allowRecordHolderRead_ = false;
+                    for (auto& a : c->args)
+                        expr(a.value.get(), /*safeRead=*/false);
+                    return;
+                }
+            }
             bool getOrAddFactoryTargetSafe = false;
             if (c->args.size() == 2 && c->args[1].value &&
                 argIsTarget(c->args[1].value.get())) {  // fix #8717
@@ -39669,10 +39898,20 @@ struct ClosureEscapeWalker {
             // a read; whether the BOUND local's value then outlives the
             // scope is decided once every local's verdict is known
             // (collectClosureReleaseEligible, the forwarded-bind pass).
-            if (!inLambda && forwardsTarget(ld->initializer.get(), false)) {
-                expr(ld->initializer.get(), /*safeRead=*/true);
+            const bool ldSavedIdFwd = identityCallForwards_;
+            identityCallForwards_ = true;  // fix #8743
+            const bool ldFwd =
+                !inLambda && forwardsTarget(ld->initializer.get(), false);
+            if (ldFwd) expr(ld->initializer.get(), /*safeRead=*/true);
+            identityCallForwards_ = ldSavedIdFwd;
+            if (ldFwd) return;
+            // fix #8743: `var rb := new RB(… target …);` — the record local
+            // holds target's value and no reference; the forwarded-bind pass
+            // decides target from what `rb` does (recordHolderMode).
+            if (!inLambda && !ld->isUsing &&
+                recordBindForwardsTarget(ld->type.get(),
+                                         ld->initializer.get()))
                 return;
-            }
             // Binding the target into ANOTHER local escapes it (the new local
             // may itself be returned/stored).
             expr(ld->initializer.get(), /*safeRead=*/false);
@@ -39688,10 +39927,17 @@ struct ClosureEscapeWalker {
                 expr(lc->value.get(), /*safeRead=*/true);
                 return;
             }
-            if (!inLambda && forwardsTarget(lc->value.get(), false)) {
-                expr(lc->value.get(), /*safeRead=*/true);  // fix #8717
-                return;
-            }
+            const bool lcSavedIdFwd = identityCallForwards_;
+            identityCallForwards_ = true;  // fix #8743
+            const bool lcFwd =
+                !inLambda && forwardsTarget(lc->value.get(), false);
+            if (lcFwd) expr(lc->value.get(), /*safeRead=*/true);  // #8717
+            identityCallForwards_ = lcSavedIdFwd;
+            if (lcFwd) return;
+            if (!inLambda &&
+                recordBindForwardsTarget(lc->type.get(), lc->value.get()))
+                return;  // fix #8743
+
             expr(lc->value.get(), /*safeRead=*/false); return;
         }
         if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
@@ -41124,6 +41370,12 @@ void Emitter::collectClosureReleaseEligible(
             std::vector<const void*> sources;
             int ownLevel;  // 0 confined, 1 reference-taking, 2 kept
             bool assignBound = false;  // fix #8743: bound by `b := …`
+            // fix #8743: a record local bound by `new RB(… g …)`
+            // (recordCtorForwardsTarget). It is walked in recordHolderMode,
+            // and any escape is level 2: the record holds no reference of
+            // its own, and no position takes one for a record's component
+            // (no level-1 escape exists for it).
+            bool recordHolder = false;
         };
         std::vector<ForwardedBind> binds;
         std::function<void(const ast::Stmt*)> scanFwd =
@@ -41135,8 +41387,36 @@ void Emitter::collectClosureReleaseEligible(
                 for (const void* x : fwdSources) {
                     if (x == static_cast<const void*>(s)) continue;
                     ClosureEscapeWalker xw{ctx_, x};
+                    xw.identityCallForwards_ = true;  // fix #8743: a bind
                     if (xw.forwardsTarget(v.init, /*sawWrap=*/false))
                         fb.sources.push_back(x);
+                }
+                // fix #8743 (§9.1 / §9.7 / §28.9, v0.359): `var rb := new
+                // RB(n ?? g);` binds a RECORD local whose function-typed
+                // component holds g's value with no reference of its own
+                // (MEASURED on 932e581ac: a raw store, no retain, and no
+                // release when `rb` dies). The walker reads the
+                // construction as a read of g (recordBindForwardsTarget);
+                // here `rb` is walked in recordHolderMode, where its only
+                // non-escaping use is a call of the component (`rb.F(1)`).
+                // `rb` is declared in g's scope or a nested one, so a
+                // confined `rb` dies no later than g's scope-end release:
+                // that release is the last holder's. Any escape keeps g
+                // (level 2). A source the body reassigns is not admitted.
+                if (fb.sources.empty() && !v.isUsing) {
+                    for (const void* x : fwdSources) {
+                        if (x == static_cast<const void*>(s) ||
+                            assignedLocals.count(x))
+                            continue;
+                        ClosureEscapeWalker xw{ctx_, x};
+                        if (xw.recordBindMatches(v.type, v.init))
+                            fb.sources.push_back(x);
+                    }
+                    if (!fb.sources.empty()) {
+                        fb.recordHolder = true;
+                        binds.push_back(std::move(fb));
+                        fb = ForwardedBind{nullptr, {}, 0};
+                    }
                 }
                 if (!fb.sources.empty()) {
                     // fix #8743: a bound local is itself a source for the
@@ -41187,7 +41467,12 @@ void Emitter::collectClosureReleaseEligible(
             bw.walkWholeBody = true;
             bw.assignBinds = &assignBinds;  // fix #8743
             bw.targetAssignIsPlainStore = fb.assignBound;  // fix #8743
+            bw.recordHolderMode = fb.recordHolder;  // fix #8743
             for (auto& s : body) bw.stmt(s.get());
+            if (fb.recordHolder) {  // fix #8743: see recordHolder
+                fb.ownLevel = (bw.escaped || bw.mayOutliveScope_) ? 2 : 0;
+                continue;
+            }
             if (bw.escaped || bw.mayOutliveScope_) {
                 const bool kept =
                     bw.keptWithoutReference_ || bw.isCapturedCellSlot_ ||

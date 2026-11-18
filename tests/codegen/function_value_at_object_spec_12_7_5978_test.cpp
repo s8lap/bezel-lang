@@ -1000,6 +1000,10 @@ std::string fwdChainProgram(const std::string& fill, bool viaObject) {
     return std::string(
         "module M; "
         "type Fn := (int, int) -> int; "
+        "public record RB8743(F: (int, int) -> int); "
+        "public class U8743 "
+        "  public static method Id<T>(x: T): T => x; "
+        "end U8743; "
         "public class Dog "
         "  public N: int; "
         "  public constructor() N := 1; end constructor; "
@@ -1064,4 +1068,33 @@ BEZEL_TEST(function_value_at_object_spec_12_7_5978,
                         /*viaObject=*/true),
         "fv8743_assign_obj", /*detectLeaks=*/false);
     BEZEL_EXPECT_EQ(rc, 0);
+}
+
+// #8743 control (§9.1 / §9.7 / §22.2 / §28.9, v0.359): a record local bound
+// by `new RB8743(n ?? g)` and a local bound by the identity call
+// `U8743.Id<Fn>(n ?? g)` hold `g`'s own value with no reference of their
+// own, so they are read as forwarded binds of `g` — and here the value goes
+// on into a collection (the record's component; the identity call's result,
+// bound or direct), so `g` must be kept past `Fill`. Green on the base too
+// (it leaked there: the record argument and the call argument were escapes
+// of `g`). MEASURED: it goes RED (heap-use-after-free in `fs.Add(rb.F)`)
+// under the plausible wrong fix that admits the record holder without
+// consulting its walk (the holder's level set to 0 whatever `rb` does).
+BEZEL_TEST(function_value_at_object_spec_12_7_5978,
+          record_and_identity_forwards_into_collection_keep_source_7_7) {
+    const char* fills[] = {
+        "    var rb := new RB8743(n ?? g); "
+        "    fs.Add(rb.F); ",
+        "    var g1 := U8743.Id<Fn>(n ?? g); "
+        "    fs.Add(g1); ",
+        "    fs.Add(U8743.Id<Fn>(n ?? g)); ",
+    };
+    const char* tags[] = {"fv8743_rec_add", "fv8743_id_bound_add",
+                          "fv8743_id_direct_add"};
+    for (int i = 0; i < 3; ++i) {
+        int rc = bezel::test::runUnderAsanExitCode(
+            fwdChainProgram(fills[i], /*viaObject=*/false), tags[i],
+            /*detectLeaks=*/false);
+        BEZEL_EXPECT_EQ(rc, 0);  // -1: no ASan runtime; 99: sanitizer report
+    }
 }
