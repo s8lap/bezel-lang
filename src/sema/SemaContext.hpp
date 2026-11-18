@@ -1680,7 +1680,7 @@ inline bool isValueBuiltinByName(std::string_view n) {
     return false;
 }
 
-// fix #8591 (spec §14.2 "Type-parameter bounds" table, stdlib §2.5/§2.6,
+// fix #8591 (spec §14.2 bounds table; stdlib §2.5 `TimeSpan`, §2.6 `Guid`;
 // v0.357): is `t` a STDLIB VALUE BUILTIN — one of the compiler-intrinsic
 // value types the standard library declares as a `public record`?
 //

@@ -13798,7 +13798,7 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
     if (item.kind == "class") {
         // §14.2: non-nullable reference types only.
         if (arg->nullable) { report("class"); return; }
-        // fix #8591 (§14.2 "Type-parameter bounds" table, stdlib §2.5/§2.6,
+        // fix #8591 (§14.2 bounds table; stdlib §2.5 `TimeSpan`, §2.6 `Guid`;
         // v0.357): a STDLIB VALUE BUILTIN is a VALUE type — the standard
         // library declares it as a `public record` (stdlib §2.5/§2.6) — so
         // the `class` bound refuses it. The compiler-intrinsic symbol the
