@@ -944,6 +944,19 @@ inline bool isLambdaExprBodyVoidBuiltin(const ast::LambdaExpr& lam) {
 bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
                                           std::string_view name);
 
+// fix #8743 (§7.7 / §12.7 / §28.14, v0.359): the same fail-closed walk, which
+// ALSO admits a comparison of the formal against the `null` literal and an
+// `is` / `is not` type test of it. Neither reads a value out of the formal
+// nor keeps one, so a callee whose body only invokes, null-tests and
+// type-tests the formal (`ApN(f: F?)`: `if f = null then return -1; end;
+// return f(n);`; `T(o: Object?)`: `if o = null ...; return $"{o is
+// string}";`) keeps nothing the caller passed there. Used only by
+// ClosureEscapeWalker's argument reliefs (closureArgBindsMethodOwnTypeParamBorrow,
+// LlvmBackend_Setup.cpp), which release at the local's scope end; the
+// lowerCallDispatch literal arm keeps the invocation-only walk.
+bool calleeBodyUsesFormalOnlyByInvocationOrInspection(
+        const ast::MethodDecl& md, std::string_view name);
+
 // fix #5611 (§28.14 / §28.9 / §8.6, v0.334): true when a PLAIN (no-modifier)
 // parameter's DECLARED type is a function type, however it is SPELLED.
 //

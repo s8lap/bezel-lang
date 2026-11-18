@@ -38450,12 +38450,41 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
     // into a field of `new Sub(f)` is a hard rejection under both spellings.
     // `calleeBodyUsesFormalOnlyByInvocation` below is a second, independent
     // fail-closed guard that does not consult sema at all.
+    //
+    // fix #8743 (§28.14 / §7.7, v0.359): a NULLABLE function-typed formal or
+    // argument too (`ApN(f: ((int) -> int)?)` called with `nn` or `nn ??
+    // null`), and a callee body that also null-tests the formal (`if f =
+    // null then return -1; end;`). §28.14 makes the plain function-typed
+    // parameter call-bounded whatever its nullability, and sema's
+    // callBoundedScan enforces it (MEASURED on r30-c1: `fs.Add(f!)` over a
+    // plain `f: F?` formal is rejected). The non-nullable requirement was
+    // this arm's own narrowing, not a premise of its argument, and the
+    // inspection walk keeps the independent fail-closed guard.
     if (resolvedFormalIsFunction(*p.type, ctx)) {
         const sema::TypeRef* at0 = ctx.exprType(*a.value);
         if (at0 && at0->kind == sema::TypeRef::Kind::Function &&
-            !at0->nullable && calleeBodyUsesFormalOnlyByInvocation(*md, p.name))
+            calleeBodyUsesFormalOnlyByInvocationOrInspection(*md, p.name))
             return true;
         return false;
+    }
+    // fix #8743 (§8.1 / §12.7 / §28.9, v0.359): arm (c) — a formal declared
+    // `Object` (or `Object?`) whose callee body only null-tests and
+    // type-tests it (`T(o: Object?)`: `if o = null then …; return $"{o is
+    // string}";`). §8.1: a function type reaches `Object` "via [its]
+    // reference-type heap representation", so the callee receives the very
+    // cell, and the walk proves it stores, returns, forwards and captures
+    // nothing; the caller's reference is the only one, and its scope-end
+    // release is the one that frees the cell. Unlike arm (b) there is no
+    // sema backstop here (an `Object` formal is not call-bounded), so the
+    // callee-body walk is the whole proof: it fails closed on every node it
+    // does not know, on a virtual / abstract / override callee, and above
+    // on an async, imported or modifier-carrying formal.
+    {
+        const sema::TypeRef* ft = ctx.resolvedType(*p.type);
+        if (ft && ft->kind == sema::TypeRef::Kind::Primitive &&
+            ft->primitive == sema::PrimitiveType::Object)
+            return calleeBodyUsesFormalOnlyByInvocationOrInspection(*md,
+                                                                   p.name);
     }
     // arm (a) — narrow #5129: a bare METHOD-OWN generic `U` instantiated at
     // this call site to a non-nullable function type.
@@ -38700,6 +38729,24 @@ struct ClosureEscapeWalker {
     // value for the new local, so two references exist from then on and each
     // local releases its own. See the LocalDecl arm of stmt().
     const std::unordered_set<const void*>* ownedAliasDecls = nullptr;
+    // fix #8743 (§7.7 / §28.9, v0.359): the ASSIGNMENT spelling of the #8717
+    // forwarded bind. Each entry is (target, AssignmentStmt) for a `b := n
+    // ?? target;` that collectClosureReleaseEligible's pre-scan proved binds
+    // a local holding no reference of its own, declared in target's own
+    // statement list (see the pre-scan for the conditions). The walk reads
+    // such an assignment as the LocalDecl arm reads `var b := n ?? target;`
+    // — a read — and the forwarded-bind pass decides target's verdict from
+    // what `b` does.
+    const std::set<std::pair<const void*, const void*>>* assignBinds =
+        nullptr;
+    // fix #8743: set on the walk of such a bound `b`. Its assignments are
+    // plain stores — no reference is taken for the new value and none is
+    // released for the old one (MEASURED on r30-c1 for both kinds the
+    // pre-scan admits, a nullable function-typed local and an `Object`
+    // local: the overwritten function value is neither freed nor retained)
+    // — so an assignment TO `b` is not an escape of `b`'s value. Its
+    // right-hand side is still walked.
+    bool targetAssignIsPlainStore = false;
 
     // fix-forward #8479 (§28.9, v0.357): true when a store into `t` is one
     // `Emitter::lowerClosureFieldStore` handles, i.e. `t` is what
@@ -38762,6 +38809,23 @@ struct ClosureEscapeWalker {
     // `as`. A bare `target`, `target!` and `(if c then target else x)` are
     // NOT matched from the top (`sawWrap` false): they keep the verdicts
     // their own arms have always given them.
+    // fix #8743 (§12.7 / §14.2 / §8.1, v0.359): is `t` an `as` whose target
+    // type is a CLASS or an INTERFACE? Such a cast never yields a function
+    // value: §14.2 "`string`, interfaces and function types are not
+    // classes", and a function value reaches `Object` through its own heap
+    // representation (§8.1) with no interface of its own, so §12.7's test
+    // fails and `x as Dog` / `x as IBar` over a function value is `null`.
+    // Its operand is therefore only inspected, like `is`. `as Object`, `as`
+    // a type parameter and `as` a function type are not matched (they can
+    // yield the value), nor is anything sema did not resolve.
+    bool asCannotYieldFunctionValue(const ast::TypeTestExpr& t) const {
+        if (t.op != "as" || !t.testType) return false;
+        const sema::TypeRef* rt = ctx.resolvedType(*t.testType);
+        return rt && rt->kind == sema::TypeRef::Kind::Named &&
+               rt->declaration &&
+               (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                rt->declaration->kind == ast::TypeDeclKind::Interface);
+    }
     bool forwardsTarget(const ast::Expr* e, bool sawWrap) const {
         if (!e) return false;
         if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
@@ -38770,7 +38834,8 @@ struct ClosureEscapeWalker {
             return b->op == "??" && (forwardsTarget(b->left.get(), true) ||
                                      forwardsTarget(b->right.get(), true));
         if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e))
-            return t->op == "as" && forwardsTarget(t->operand.get(), true);
+            return t->op == "as" && !asCannotYieldFunctionValue(*t) &&
+                   forwardsTarget(t->operand.get(), true);
         if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e))
             return sawWrap && (forwardsTarget(c->thenValue.get(), true) ||
                                forwardsTarget(c->elseValue.get(), true));
@@ -39428,8 +39493,11 @@ struct ClosureEscapeWalker {
             // operand; the result of `as` is a borrow of it ("`var maybeDog
             // := thing as Dog;` — borrow; thing still owned"), so `as` is
             // read as its own position reads a value, like `??` above.
+            // fix #8743: an `as` a class or interface type yields no
+            // function value (asCannotYieldFunctionValue) — a read, as `is`.
             expr(t->operand.get(),
-                 /*safeRead=*/t->op == "as" ? safeRead : true);
+                 /*safeRead=*/(t->op == "as" && !asCannotYieldFunctionValue(*t))
+                     ? safeRead : true);
             return;
         }
         // A member access NOT in callee position, an indexing, and an
@@ -39707,6 +39775,17 @@ struct ClosureEscapeWalker {
             expr(ts->value.get(), /*safeRead=*/false); return;
         }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            // fix #8743: see targetAssignIsPlainStore / assignBinds.
+            if (!inLambda && as->op == ":=" && targetAssignIsPlainStore &&
+                isTargetIdent(as->target.get())) {
+                expr(as->value.get(), /*safeRead=*/false);
+                return;
+            }
+            if (!inLambda && assignBinds &&
+                assignBinds->count({target, static_cast<const void*>(as)})) {
+                expr(as->value.get(), /*safeRead=*/true);
+                return;
+            }
             // Reassigning the local itself → escape (overwrite handling is out of
             // this increment). The RHS escapes.
             if (isTargetIdent(as->target.get())) {
@@ -40573,6 +40652,114 @@ void Emitter::collectClosureReleaseEligible(
     // alias and a store into a class instance field leave the value with a
     // reference of its own, so the source may still be released (the
     // alias-source pass after the main loop handles its cell).
+    // fix #8743 (§7.7 / §28.9, v0.359): the ASSIGNMENT spelling of #8717's
+    // forwarded bind — `var b: F? := null; b := n ?? g; ApN(b, 1);` and
+    // `var a: Object := "s"; a := n ?? throw; T(a);`. Without this the
+    // assignment is an escape of `g` (its value goes into another local)
+    // and `g` leaks even when `b` is used only where nothing keeps it. A
+    // pair (g, assignment) is approved when ALL of these hold:
+    //   - the value forwards `g` (forwardsTarget: `??` / `as` / `!` over a
+    //     bare `g`) and `g` is a candidate or borrow candidate the body
+    //     never assigns (so `g`'s value stays the one `b` holds);
+    //   - the target `b` is a bare local, declared with a written type that
+    //     is a NULLABLE function type or `Object` / `Object?`, initialised
+    //     with `null`, a string literal or nothing, and is not itself a
+    //     candidate, a borrow candidate or an owned alias. Such a slot holds
+    //     no reference of its own: a store into it neither retains the new
+    //     function value nor releases the old one (MEASURED on r30-c1 under
+    //     `--sanitize=address`, both kinds) — exactly the LocalDecl spelling
+    //     #8717 reasons about;
+    //   - `b` is declared in the SAME statement list as `g`, so `b` cannot be
+    //     read after `g`'s scope-end release;
+    //   - the assignment is a plain `:=` statement outside any lambda body.
+    // An approved assignment is read as a read of `g`, and `b` joins the
+    // forwarded-bind pass below as a bound local: what `b` does decides what
+    // `g` may do, exactly as for `var b := n ?? g;`.
+    std::set<std::pair<const void*, const void*>> assignBinds;
+    std::vector<std::pair<const void*, std::vector<const void*>>>
+        assignBound;  // b -> the approved sources forwarded into it
+    {
+        std::unordered_set<const void*> fwdSrcSet;
+        for (const ast::Node* x : candidates)
+            fwdSrcSet.insert(static_cast<const void*>(x));
+        for (const ast::Node* x : borrowCandidates)
+            fwdSrcSet.insert(static_cast<const void*>(x));
+        std::unordered_set<const void*> excluded(fwdSrcSet);
+        for (const void* k : closureAliasOwned_) excluded.insert(k);
+        std::unordered_map<const void*, const void*> declList;
+        std::vector<const ast::AssignmentStmt*> assigns;
+        std::function<void(const std::vector<std::unique_ptr<ast::Stmt>>&)>
+            scanList;
+        auto scanStmt = [&](const ast::Stmt* s,
+                            const void* list) {
+            if (!s) return;
+            if (dynamic_cast<const ast::LocalDecl*>(s) ||
+                dynamic_cast<const ast::LocalConstDecl*>(s))
+                declList[static_cast<const void*>(s)] = list;
+            if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s))
+                assigns.push_back(as);
+            if (auto* is2 = dynamic_cast<const ast::IfStmt*>(s)) {
+                scanList(is2->ifBranch.body);
+                for (auto& br : is2->elifBranches) scanList(br.body);
+                scanList(is2->elseBody);
+            } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                scanList(ws->body);
+            } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                scanList(fs->body);
+            } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                scanList(d->body);
+            }
+        };
+        scanList = [&](const std::vector<std::unique_ptr<ast::Stmt>>& v) {
+            for (auto& st : v) scanStmt(st.get(), static_cast<const void*>(&v));
+        };
+        scanList(body);
+        auto boundSlotOk = [&](const ast::Node* decl) -> bool {
+            // LOCALDECL-ONLY: the bound slot is an assignment TARGET, and a
+            // §21.1 `const` local is not assignable, so it never reaches here.
+            auto* ld = dynamic_cast<const ast::LocalDecl*>(decl);
+            if (!ld || ld->isUsing || !ld->type) return false;
+            if (ld->initializer &&
+                !dynamic_cast<const ast::NullLiteralExpr*>(
+                    ld->initializer.get()) &&
+                !dynamic_cast<const ast::StringLiteralExpr*>(
+                    ld->initializer.get()))
+                return false;
+            const sema::TypeRef* t = ctx_.resolvedType(*ld->type);
+            if (!t) return false;
+            if (t->kind == sema::TypeRef::Kind::Function) return t->nullable;
+            return t->kind == sema::TypeRef::Kind::Primitive &&
+                   t->primitive == sema::PrimitiveType::Object;
+        };
+        for (const ast::AssignmentStmt* as : assigns) {
+            if (as->op != ":=" || !as->value) continue;
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                as->target.get());
+            if (!id) continue;
+            auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+            if (!loc || !loc->decl) continue;
+            const void* b = static_cast<const void*>(loc->decl);
+            if (excluded.count(b) || !boundSlotOk(loc->decl)) continue;
+            auto bl = declList.find(b);
+            if (bl == declList.end()) continue;
+            for (const void* x : fwdSrcSet) {
+                if (assignedLocals.count(x)) continue;
+                auto xl = declList.find(x);
+                if (xl == declList.end() || xl->second != bl->second) continue;
+                ClosureEscapeWalker xw{ctx_, x};
+                if (!xw.forwardsTarget(as->value.get(), /*sawWrap=*/false))
+                    continue;
+                assignBinds.insert({x, static_cast<const void*>(as)});
+                auto it = std::find_if(assignBound.begin(), assignBound.end(),
+                                       [&](const auto& e) { return e.first == b; });
+                if (it == assignBound.end())
+                    assignBound.push_back({b, {x}});
+                else if (std::find(it->second.begin(), it->second.end(), x) ==
+                         it->second.end())
+                    it->second.push_back(x);
+            }
+        }
+    }
     std::unordered_set<const void*> sourceSafeAliases;
     {
         std::unordered_set<const void*> keptAliases;
@@ -40584,6 +40771,7 @@ void Emitter::collectClosureReleaseEligible(
             aw.coalesceReturnTransfers = coalesceReturnTransfers;  // #6176
             aw.ownedAliasDecls = &closureAliasOwned_;
             aw.scrutineeBorrowMode = true;
+            aw.assignBinds = &assignBinds;  // fix #8743
             aw.assignedSomewhere = assignedLocals.count(key) != 0;
             aw.walkWholeBody = true;
             for (auto& s : body) aw.stmt(s.get());
@@ -40619,6 +40807,7 @@ void Emitter::collectClosureReleaseEligible(
         // fix-forward #8479: unless that alias hands the value on to a site
         // that keeps it without a reference (sourceSafeAliases, above).
         w.ownedAliasDecls = &sourceSafeAliases;
+        w.assignBinds = &assignBinds;  // fix #8743
         // fix #2481 (consumer 3/3): OPT-IN the case-scrutinee relaxation —
         // see the scrutineeBorrowMode flag comment (struct ClosureEscapeWalker,
         // above) for the full soundness argument. A closure-typed producer
@@ -40894,6 +41083,7 @@ void Emitter::collectClosureReleaseEligible(
         // exactly one reference and the escape walk proves no alias outlives
         // the scope).
         w.scrutineeBorrowMode = true;
+        w.assignBinds = &assignBinds;  // fix #8743
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             closureBorrowRetainEligible_.insert(
@@ -40922,13 +41112,18 @@ void Emitter::collectClosureReleaseEligible(
     // A chain (`b := n ?? g; c := n ?? b;`) propagates, hence the fixpoint;
     // a demoted owned alias demotes its own source as above.
     {
-        std::vector<const ast::Node*> fwdSources(candidates);
-        fwdSources.insert(fwdSources.end(), borrowCandidates.begin(),
-                          borrowCandidates.end());
+        std::vector<const void*> fwdSources;
+        for (const ast::Node* x : candidates)
+            fwdSources.push_back(static_cast<const void*>(x));
+        for (const ast::Node* x : borrowCandidates)
+            fwdSources.push_back(static_cast<const void*>(x));
+        // fix #8743: and the locals the approved assignments bind.
+        for (const auto& ab : assignBound) fwdSources.push_back(ab.first);
         struct ForwardedBind {
             const void* bound;
             std::vector<const void*> sources;
             int ownLevel;  // 0 confined, 1 reference-taking, 2 kept
+            bool assignBound = false;  // fix #8743: bound by `b := …`
         };
         std::vector<ForwardedBind> binds;
         std::function<void(const ast::Stmt*)> scanFwd =
@@ -40937,13 +41132,25 @@ void Emitter::collectClosureReleaseEligible(
             LocalDeclInitView v = localDeclInitView(s);
             if (v.init) {
                 ForwardedBind fb{static_cast<const void*>(s), {}, 0};
-                for (const ast::Node* x : fwdSources) {
-                    if (x == s) continue;
-                    ClosureEscapeWalker xw{ctx_, static_cast<const void*>(x)};
+                for (const void* x : fwdSources) {
+                    if (x == static_cast<const void*>(s)) continue;
+                    ClosureEscapeWalker xw{ctx_, x};
                     if (xw.forwardsTarget(v.init, /*sawWrap=*/false))
-                        fb.sources.push_back(static_cast<const void*>(x));
+                        fb.sources.push_back(x);
                 }
-                if (!fb.sources.empty()) binds.push_back(std::move(fb));
+                if (!fb.sources.empty()) {
+                    // fix #8743: a bound local is itself a source for the
+                    // binds after it, so a chain through a local that is
+                    // not a candidate (`var o: Object := n ?? g; var q := o
+                    // as Fn; fs.Add(q!);`) carries `q`'s verdict back to
+                    // `g`. Before, only candidates were sources: `o`'s walk
+                    // read `o as Fn` as a read, `q` was never walked, and
+                    // `g` was released while `fs` held it (MEASURED on
+                    // r30-c1 under `--sanitize=address`:
+                    // heap-use-after-free).
+                    fwdSources.push_back(static_cast<const void*>(s));
+                    binds.push_back(std::move(fb));
+                }
             }
             if (auto* is2 = dynamic_cast<const ast::IfStmt*>(s)) {
                 for (auto& b : is2->ifBranch.body) scanFwd(b.get());
@@ -40966,11 +41173,20 @@ void Emitter::collectClosureReleaseEligible(
             }
         };
         for (auto& s : body) scanFwd(s.get());
+        // fix #8743: the locals the approved assignments bind (see the
+        // pre-scan above `sourceSafeAliases`).
+        for (const auto& [b, xs] : assignBound) {
+            ForwardedBind fb{b, xs, 0};
+            fb.assignBound = true;
+            binds.push_back(std::move(fb));
+        }
         for (ForwardedBind& fb : binds) {
             ClosureEscapeWalker bw{ctx_, fb.bound};
             bw.coalesceReturnTransfers = coalesceReturnTransfers;  // #6176
             bw.scrutineeBorrowMode = true;
             bw.walkWholeBody = true;
+            bw.assignBinds = &assignBinds;  // fix #8743
+            bw.targetAssignIsPlainStore = fb.assignBound;  // fix #8743
             for (auto& s : body) bw.stmt(s.get());
             if (bw.escaped || bw.mayOutliveScope_) {
                 const bool kept =

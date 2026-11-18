@@ -32,6 +32,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"          // runAot / runAotChecked
+#include "support/run_under_asan.hpp"        // runUnderAsanExitCode
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
@@ -981,4 +982,86 @@ BEZEL_TEST(function_value_at_object_spec_12_7_5978,
         "    var s := $\"{Program.Dflt()} {Program.Dflt(o)} "
         "{Util.T(t.Result)}\"; ",
         "False/False False/False False/False");
+}
+
+// #8743 (§7.7 / §12.7 / §28.9, v0.359): a forwarded bind CHAINED through a
+// local that is not itself a closure candidate. `o` holds `g`'s own function
+// value (§7.7: "`a ?? b` returns `a` if non-null, else `b`"), holds no
+// reference of its own, and `q` takes that same value out of it (§12.7: the
+// test succeeds — `g`'s own type is `Fn`). `fs` then holds it past `Fill`, so
+// `g` must not be released at `Fill`'s end (§28.9: a function value's cell
+// is released when its last holder goes). Before: only candidates were
+// sources of a forwarded bind, so `q` was never walked, `g` was released
+// with its capture cell, and the caller's `f(5, 2)` read freed memory
+// (heap-use-after-free under `--sanitize=address`). Leaks are not this row's
+// question (LSan off): the collection-held value is the #5967 family.
+namespace {
+std::string fwdChainProgram(const std::string& fill, bool viaObject) {
+    return std::string(
+        "module M; "
+        "type Fn := (int, int) -> int; "
+        "public class Dog "
+        "  public N: int; "
+        "  public constructor() N := 1; end constructor; "
+        "end Dog; "
+        "public class C "
+        "  public static method Fill(fs: Array<(int, int) -> int>, "
+        "                            os: Array<Object>, k: int) "
+        "    var g: (int, int) -> int := "
+        "      lambda(x: int, y: int) => x - y + k - k; "
+        "    var n: ((int, int) -> int)? := null; ") + fill +
+        "  end Fill; "
+        "  public static method Main(): int "
+        "    var t := 0; "
+        "    for var i in 0..<200 do "
+        "      var fs: Array<(int, int) -> int> := "
+        "        new Array<(int, int) -> int>(); "
+        "      var os: Array<Object> := new Array<Object>(); "
+        "      Fill(fs, os, i); " +
+        (viaObject
+             ? "      for var o in os do var q := o as Fn; "
+               "        if q <> null then t := t + q!(5, 2); end; end for; "
+             : "      for var f in fs do t := t + f(5, 2); end for; ") +
+        "    end for; "
+        "    if t <> 600 then return 3; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+}
+}  // namespace
+
+BEZEL_TEST(function_value_at_object_spec_12_7_5978,
+          forwarded_bind_chain_through_object_local_keeps_source_7_7) {
+    int rc = bezel::test::runUnderAsanExitCode(
+        fwdChainProgram("    var o: Object := n ?? g; "
+                        "    var d := o as Dog; "
+                        "    var q := o as Fn; "
+                        "    if d = null and q <> null then fs.Add(q!); end; ",
+                        /*viaObject=*/false),
+        "fv8743_chain", /*detectLeaks=*/false);
+    BEZEL_EXPECT_EQ(rc, 0);  // -1: no ASan runtime; 99: sanitizer report
+}
+
+// #8743 control (§7.7 / §28.9, v0.359): the ASSIGNMENT spelling of the
+// forwarded bind (`b := n ?? g;`, `a := n ?? g;`) is a read of `g` only while
+// what `b` / `a` does lets `g` go; here the bound local goes on into a
+// collection, so `g` must be kept. Green on the base too (it leaked there,
+// the assignment being an escape of `g`): it pins that the new reading
+// still routes the bound local's own escape back to `g`.
+BEZEL_TEST(function_value_at_object_spec_12_7_5978,
+          assignment_forwarded_bind_into_collection_keeps_source_7_7) {
+    int rc = bezel::test::runUnderAsanExitCode(
+        fwdChainProgram("    var b: ((int, int) -> int)? := null; "
+                        "    b := n ?? g; "
+                        "    fs.Add(b!); ",
+                        /*viaObject=*/false),
+        "fv8743_assign_fn", /*detectLeaks=*/false);
+    BEZEL_EXPECT_EQ(rc, 0);  // -1: no ASan runtime; 99: sanitizer report
+    rc = bezel::test::runUnderAsanExitCode(
+        fwdChainProgram("    var a: Object := \"s\"; "
+                        "    a := n ?? g; "
+                        "    os.Add(a); ",
+                        /*viaObject=*/true),
+        "fv8743_assign_obj", /*detectLeaks=*/false);
+    BEZEL_EXPECT_EQ(rc, 0);
 }

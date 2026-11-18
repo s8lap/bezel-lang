@@ -20748,6 +20748,22 @@ namespace {
 struct FormalInvocationOnlyWalk {
     std::string_view name;
     bool ok = true;
+    // fix #8743 (§7.7 / §12.7 / §28.14, v0.359): also admit the two
+    // INSPECTIONS of the formal that read nothing out of it and keep
+    // nothing: a comparison against the `null` literal (`name = null`,
+    // `name <> null`, either operand order) and a type test (`name is T`,
+    // `name is not T`; never `as`, whose result is a value). Off for the
+    // lowerCallDispatch literal arm; see
+    // calleeBodyUsesFormalOnlyByInvocationOrInspection.
+    bool allowInspection = false;
+    bool isNullTestOfName(const ast::BinaryExpr& be) const {
+        if (be.op != "=" && be.op != "<>") return false;
+        auto isNull = [](const ast::Expr* e) {
+            return dynamic_cast<const ast::NullLiteralExpr*>(e) != nullptr;
+        };
+        return (isName(be.left.get()) && isNull(be.right.get())) ||
+               (isNull(be.left.get()) && isName(be.right.get()));
+    }
 
     bool isName(const ast::Expr* e) const {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -20879,6 +20895,7 @@ struct FormalInvocationOnlyWalk {
             return;
         }
         if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            if (allowInspection && isNullTestOfName(*be)) return;  // #8743
             expr(be->left.get());
             expr(be->right.get());
             return;
@@ -20888,6 +20905,9 @@ struct FormalInvocationOnlyWalk {
             return;
         }
         if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            if (allowInspection && tt->op != "as" &&
+                isName(tt->operand.get()))
+                return;  // fix #8743: `name is T` / `name is not T`
             expr(tt->operand.get());
             return;
         }
@@ -20955,13 +20975,15 @@ bool resolvedFormalIsFunction(const ast::Type& t,
     return rt && rt->kind == sema::TypeRef::Kind::Function;
 }
 
-bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
-                                          std::string_view name) {
+static bool calleeBodyUsesFormalOnly(const ast::MethodDecl& md,
+                                     std::string_view name,
+                                     bool allowInspection) {
     if (name.empty()) return false;
     for (auto mod : md.modifiers)
         if (mod == "virtual" || mod == "abstract" || mod == "override")
             return false;
     FormalInvocationOnlyWalk w{name};
+    w.allowInspection = allowInspection;
     if (md.bodyKind == ast::MethodBodyKind::Expression) {
         if (!md.exprBody) return false;
         w.expr(md.exprBody.get());
@@ -20971,6 +20993,16 @@ bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
         return false;
     }
     return w.ok;
+}
+
+bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
+                                          std::string_view name) {
+    return calleeBodyUsesFormalOnly(md, name, /*allowInspection=*/false);
+}
+
+bool calleeBodyUsesFormalOnlyByInvocationOrInspection(
+        const ast::MethodDecl& md, std::string_view name) {
+    return calleeBodyUsesFormalOnly(md, name, /*allowInspection=*/true);
 }
 
 
