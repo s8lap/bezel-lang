@@ -28468,6 +28468,42 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
     // Break/Continue: nothing to scan.
 }
 
+// fix #8786 (§27.6, §28.3 closure bullet *Set-erasing positions* clause 4,
+// v0.359): the receiver check of an extension call whose head is `Object`
+// over a function value with a non-empty source set.  `callee` is the member
+// access (`f.M` / `f?.M`): at a call it is the call's callee (fix #7259);
+// uncalled it is a §27.6 method-reference formation, where "every
+// receiver-side rule of the call the formation resolves as is read at the
+// formation" (fix #8786).
+void MethodOwnership::checkObjectExtensionReceiver(const ast::Expr& callee) {
+    const ast::Expr* recv = nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&callee))
+        recv = ma->target.get();
+    else if (auto* nm =
+                 dynamic_cast<const ast::NullCondMemberExpr*>(&callee))
+        recv = nm->target.get();
+    if (recv) {
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(
+            ctx_.exprSymbol(callee));
+        const sema::TypeRef* head =
+            (ms && ms->extensionDecl && ms->extensionDecl->targetType)
+                ? ctx_.resolvedType(*ms->extensionDecl->targetType)
+                : nullptr;
+        if (head && head->kind == sema::TypeRef::Kind::Primitive &&
+            head->primitive == sema::PrimitiveType::Object &&
+            exprIsFunctionValueWithNonEmptyCaptureSet(*recv)) {
+            report(Severity::Error, recv->span.begin,
+                   std::string("function value carries captured "
+                               "borrow(s) and may not be the receiver of "
+                               "an extension call whose head is `Object` "
+                               "— `Object` announces no source set; use a "
+                               "capture-free function value (§28.3 "
+                               "closure bullet, *Set-erasing positions*, "
+                               "clause 4, v0.359)"));
+        }
+    }
+}
+
 void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
     // Call-like nodes: run the §28.14 admission for each arg whose formal is
     // `scoped`, then descend.
@@ -28515,36 +28551,10 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
     // (§7.5): MEASURED on the base tree, BOTH reach the extension body
     // (`EXT-RAN` printed), so both put the receiver at that position.  A
     // member access that is NOT called is a §27.6 method-reference
-    // FORMATION, which captures the receiver under §27.6's own rule, and
-    // is left alone.
-    if (callee) {
-        const ast::Expr* recv = nullptr;
-        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
-            recv = ma->target.get();
-        else if (auto* nm =
-                     dynamic_cast<const ast::NullCondMemberExpr*>(callee))
-            recv = nm->target.get();
-        if (recv) {
-            auto* ms = dynamic_cast<sema::MethodSymbol*>(
-                ctx_.exprSymbol(*callee));
-            const sema::TypeRef* head =
-                (ms && ms->extensionDecl && ms->extensionDecl->targetType)
-                    ? ctx_.resolvedType(*ms->extensionDecl->targetType)
-                    : nullptr;
-            if (head && head->kind == sema::TypeRef::Kind::Primitive &&
-                head->primitive == sema::PrimitiveType::Object &&
-                exprIsFunctionValueWithNonEmptyCaptureSet(*recv)) {
-                report(Severity::Error, recv->span.begin,
-                       std::string("function value carries captured "
-                                   "borrow(s) and may not be the receiver of "
-                                   "an extension call whose head is `Object` "
-                                   "— `Object` announces no source set; use a "
-                                   "capture-free function value (§28.3 "
-                                   "closure bullet, *Set-erasing positions*, "
-                                   "clause 4, v0.359)"));
-            }
-        }
-    }
+    // FORMATION; §27.6 reads "every receiver-side rule of the call the
+    // formation resolves as ... at the formation", so the same check runs
+    // there (fix #8786, in the structural-recursion `MemberAccessExpr` arm).
+    if (callee) checkObjectExtensionReceiver(*callee);
     if (const auto* args = scopedArgsOf(e)) {
         // fix #7025 (follow-up, §27.6 / §28.2, v0.343): an ARGUMENT is a
         // formation site — `Take(d.Dispose)` forms a §27.6 method group over
@@ -28713,6 +28723,9 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
             // the CALL spelling to the call spelling's own check, so the two
             // spellings cannot disagree and no program is diagnosed twice.
             checkDisposeReceiverOwnershipAtFormation(*ma);
+            // fix #8786 (§27.6, §28.3 clause 4, v0.359): the extension-
+            // `Object` receiver rule, read at the formation too.
+            checkObjectExtensionReceiver(*ma);
         }
         if (ma->target) scopedPreScanExpr(*ma->target);
         return;

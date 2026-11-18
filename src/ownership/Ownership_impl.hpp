@@ -3220,6 +3220,7 @@ private:
     // `DisposeAsync` (the call spelling's own check lives in
     // `handleDischarge`). See the definition's comment.
     void checkDisposeReceiverOwnershipAtFormation(const ast::MemberAccessExpr& ma);
+    void checkObjectExtensionReceiver(const ast::Expr& callee);  // #7259/#8786
     void collectIdentifiersIn(
         const ast::Expr& e,
         std::vector<const ast::IdentifierExpr*>& out) const;

@@ -1,4 +1,4 @@
-// Regression tests for issue #7259 — §28.3 closure bullet *Set-erasing
+// Regression tests for issues #7259 and #8786 — §28.3 closure bullet *Set-erasing
 // positions*, clause 4 ("Receivers"), v0.359.
 //
 //   "A function value as the receiver of a member `Object` declares
@@ -39,6 +39,14 @@
 // The `?.` spelling is the SAME call (§7.5): MEASURED on the base tree, both
 // `f.Hold()` and `f?.Hold()` reach the extension body (the body printed
 // "EXT-RAN"), so both put the receiver at that position.
+//
+// #8786 — the UNCALLED spelling.  §27.6 (v0.359): "every receiver-side rule of
+// the call the formation resolves as is read at the formation — §9.7's
+// extension-receiver sentence rejects `v.Ext` over a value that holds borrows
+// at an `extension Object` as it rejects `v.Ext()`."  So `var g := f.Hold;`
+// over a capture-bearing `f` is rejected exactly as `f.Hold()` is (§28.3
+// clause 4).  The capture-free, class-receiver and static-reference twins
+// stay admitted: conformance-corpus candidates, not gtest rows.
 
 #include <string>
 
@@ -146,4 +154,65 @@ BEZEL_TEST(set_erasing_extension_object_receiver_7259,
                     "end Program; "));
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§28.3"));
+}
+
+// #8786 — REJECT: the uncalled spelling `f.Hold`, a §27.6 method-reference
+// FORMATION over a capture-bearing function value at an `extension Object`
+// receiver (§27.6 + §28.3 clause 4, v0.359).  RED on the base tree: the call
+// form was rejected since #7259 but this formation compiled.
+BEZEL_TEST(set_erasing_extension_object_receiver_7259,
+           capturing_function_value_extension_object_method_reference_rejected_8786) {
+    auto r = runAotChecked(
+        std::string("module M; "
+                    "import System; "
+                    "class Res "
+                    "  public constructor() end constructor; "
+                    "  public method Use(): int return 3; end Use; "
+                    "end Res; "
+                    "extension Object "
+                    "  public method Hold(): int => 1; "
+                    "end; "
+                    "public class Program "
+                    "  public static method Main(): int "
+                    "    using var payload := new Res(); "
+                    "    var f: () -> int := lambda() => payload.Use(); "
+                    "    var g: () -> int := f.Hold; "
+                    "    Console.WriteLine(g()); "
+                    "    return 0; "
+                    "  end Main; "
+                    "end Program; "));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "may not be the receiver of an extension call whose head is "
+           "`Object`"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§28.3"));
+}
+
+// #8786 — REJECT: the same formation at a CALL ARGUMENT (a formation site,
+// §27.6), so the check is not tied to the local-initializer spelling.
+BEZEL_TEST(set_erasing_extension_object_receiver_7259,
+           capturing_function_value_extension_object_method_reference_argument_rejected_8786) {
+    auto r = runAotChecked(
+        std::string("module M; "
+                    "import System; "
+                    "class Res "
+                    "  public constructor() end constructor; "
+                    "  public method Use(): int return 3; end Use; "
+                    "end Res; "
+                    "extension Object "
+                    "  public method Hold(): int => 1; "
+                    "end; "
+                    "public class Program "
+                    "  static method Take(h: () -> int): int return h(); end Take; "
+                    "  public static method Main(): int "
+                    "    using var payload := new Res(); "
+                    "    var f: () -> int := lambda() => payload.Use(); "
+                    "    Console.WriteLine(Take(f.Hold)); "
+                    "    return 0; "
+                    "  end Main; "
+                    "end Program; "));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "may not be the receiver of an extension call whose head is "
+           "`Object`"));
 }
