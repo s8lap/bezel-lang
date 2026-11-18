@@ -2264,6 +2264,40 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
         }
     }
     checkBorrowReturnedThroughOwningType(exprBody);
+    // fix #7450 (§28.3.8 sink rule / §22.2, v0.359): an expression-bodied
+    // member `M(): T => E` IS `return E;` for ownership purposes — §22.2 says
+    // "When the body is a single expression, `=> expression` replaces the
+    // block" — so §28.3.8's announcement-erasing sink rule ("While its source
+    // set is non-empty, a function value … may not be returned from the
+    // enclosing method") applies to the `=>` body exactly as it does to a
+    // block body's `return`.
+    //
+    // The block-body path drives that rule from handleReturn's
+    // `checkClosureEscapesOnReturn(e)`; the `=>` path had NO driver, so the
+    // sink rule was unreachable from an expression body: the v0.348 §28.3.8
+    // example — `public static method Label(i: Item): () -> string =>
+    // lambda() => i.Name;  // error (sink rule): a return slot announces no
+    // source set` — compiled with zero diagnostics, while the byte-identical
+    // block-bodied `return lambda() => i.Name;` was rejected (the #4709
+    // plain-parameter capture leg). MEASURED (base b279e8daf): the accepted
+    // program is a heap-use-after-free at run time (ASan: heap-use-after-free,
+    // READ of size 8 in `lam$0`, freed by `main`) — the returned closure
+    // reads the `Item` the caller's `using var` disposed at scope end.
+    //
+    // The leg that fires is the §28.3.8 closure-bullet plain-parameter
+    // capture (#4709): `i` is a plain (borrowing) parameter of this method,
+    // so its only source is this call, and the returned closure necessarily
+    // outlives the call — a function type announces no source set, so no
+    // caller could bound the escaping borrow. `methodParamSet_` is seeded
+    // above (as `run()` seeds it), so `isPlainBorrowParam` sees this
+    // method's own parameters; a lambda's OWN parameter is not a capture
+    // (#4757) and stays admitted.
+    //
+    // Placed BEFORE the #6634 receiver-capture arm, mirroring handleReturn's
+    // own order (`checkClosureEscapesOnReturn(e)` then the receiver leg), so
+    // the two body kinds report the same diagnostic for the same program.
+    // // per §28.3.8, §22.2
+    checkClosureEscapesOnReturn(exprBody, EscapeScope::Method);
     // fix #6634 (§28.3 sink rule, §9.4, v0.340): `M(): () -> T => lambda() =>
     // this.x` returns the lambda exactly as the block form's `return` does.
     if (const ast::IdentifierExpr* cap = receiverCaptureIn(exprBody))
