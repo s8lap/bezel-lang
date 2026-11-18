@@ -19701,6 +19701,9 @@ private:
                              pendingOwnedParams_;
         std::optional<Disposal> pendingArgsDisposal_;
         std::vector<Disposal> pendingChainOutDisposals_;  // fix #4975
+        // fix #8827 (§27.5 / §28.3, v0.359): the caller's pending capture cells
+        // belong to the caller's call site, not to the nested body.
+        std::vector<LastCellEntry> lastLambdaCells_;
         // --- SAVED AND RESTORED BUT DELIBERATELY NOT CLEARED (see the .cpp) ---
         std::unordered_map<std::string_view, const sema::TypeRef*>
                              genericSubstSemaTy_;

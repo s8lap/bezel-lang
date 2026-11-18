@@ -206,6 +206,77 @@ const char* kCtorTwoDistinctCaptures =
     "  end; "
     "end; ";
 
+// A generic method whose SPECIALISED body declares its own closure local, called
+// with a lambda argument that captures a caller local. The specialised body is
+// lowered in the middle of the caller's call; its consume of its own closure
+// local must not drain the CALLER's pending capture cell (that registered a
+// boxedCellFree on the caller's alloca inside the callee: malformed IR).
+const char* kGenericBodyClosureLocalOneLambda =
+    "module T; "
+    "public static class Program "
+    "  public static method G<T>(f: () -> T): T "
+    "    var h := lambda() => 1; "
+    "    var z := h(); "
+    "    return f(); "
+    "  end; "
+    "  public static method Main(args: Array<string>): int "
+    "    var i: int := 0; "
+    "    while i < 200 do "
+    "      var n: int := 41; "
+    "      var r := G<int>(lambda() => n); "
+    "      Console.WriteLine(r.ToString()); "
+    "      i := i + 1; "
+    "    end; "
+    "    return 0; "
+    "  end; "
+    "end; ";
+
+const char* kGenericBodyClosureLocalDistinctCaptures =
+    "module T; "
+    "public static class Program "
+    "  public static method Pick<T>(a: () -> T, b: () -> T): T "
+    "    var c := lambda() => 0; "
+    "    var z := c(); "
+    "    return b(); "
+    "  end; "
+    "  public static method Main(args: Array<string>): int "
+    "    var i: int := 0; "
+    "    while i < 200 do "
+    "      var n: int := 41; "
+    "      var m: int := 1; "
+    "      var r := Pick<int>(lambda() => n, lambda() => m); "
+    "      Console.WriteLine(r.ToString()); "
+    "      i := i + 1; "
+    "    end; "
+    "    return 0; "
+    "  end; "
+    "end; ";
+
+const char* kGenericBodyClosureLocalSharedTwoLambdas =
+    "module T; "
+    "public static class Program "
+    "  public static method G<T>(f: () -> T, g: () -> T): T "
+    "    var h := lambda() => 1; "
+    "    var z := h(); "
+    "    var a := f(); "
+    "    return g(); "
+    "  end; "
+    "  public static method A(k: int): int "
+    "    var n: int := k; "
+    "    return G<int>(lambda() => n, lambda() => n + 1); "
+    "  end; "
+    "  public static method Main(args: Array<string>): int "
+    "    var i: int := 0; "
+    "    var tot: int := 0; "
+    "    while i < 200 do "
+    "      tot := tot + A(i); "
+    "      i := i + 1; "
+    "    end; "
+    "    Console.WriteLine(tot.ToString()); "
+    "    return 0; "
+    "  end; "
+    "end; ";
+
 // The output each program prints: one line per iteration.
 std::string repeatedLine(const std::string& line, int times) {
     std::string out;
@@ -251,4 +322,31 @@ BEZEL_TEST(ctor_arg_shared_capture_cell_8827,
            two_ctor_arg_lambdas_capturing_distinct_locals_reclaim_both_cells) {
     auto r = runAotChecked(kCtorTwoDistinctCaptures);
     expectClean(r, 0, repeatedLine("48", 200));
+}
+
+// ===========================================================================
+// D, E, F — the nested-body half of the #8827 fix. Removing the clear alone
+// made a generic method's specialised body (lowered mid-call) drain the
+// CALLER's pending capture cell: malformed IR ("Referring to an instruction in
+// another function!"), a compile failure of a valid program. The pending
+// channel is now saved, cleared and restored around every nested body.
+// RED on 341583204 (IR verification failure); the base leaked the caller's
+// cell instead.
+// ===========================================================================
+BEZEL_TEST(ctor_arg_shared_capture_cell_8827,
+           generic_body_closure_local_with_one_lambda_arg_compiles_and_reclaims) {
+    auto r = runAotChecked(kGenericBodyClosureLocalOneLambda);
+    expectClean(r, 0, repeatedLine("41", 200));
+}
+
+BEZEL_TEST(ctor_arg_shared_capture_cell_8827,
+           generic_body_closure_local_with_distinct_capture_lambda_args_compiles_and_reclaims) {
+    auto r = runAotChecked(kGenericBodyClosureLocalDistinctCaptures);
+    expectClean(r, 0, repeatedLine("1", 200));
+}
+
+BEZEL_TEST(ctor_arg_shared_capture_cell_8827,
+           generic_body_closure_local_with_shared_capture_lambda_args_compiles_and_reclaims) {
+    auto r = runAotChecked(kGenericBodyClosureLocalSharedTwoLambdas);
+    expectClean(r, 0, "20100\n");
 }
