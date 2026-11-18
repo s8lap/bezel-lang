@@ -38792,18 +38792,86 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
     }
     // arm (a) — narrow #5129: a bare METHOD-OWN generic `U` instantiated at
     // this call site to a non-nullable function type.
-    if (md->genericParams.empty()) return false;
+    //
+    // fix #8854 (§28.3 *Set-erasing positions* / §28.14 / §28.9 / §27.5,
+    // v0.359): the CLASS-OWN twin of arm (a) — a formal declared at the
+    // ENCLOSING TYPE's type parameter (`class Keep<T> … method Put(a: T)`).
+    // The two arms are the same shape one level out, and §28.3's *Set-erasing
+    // positions* bullet names this very call: "a field …, parameter, return
+    // slot, `ref` or `out` location, … whose declared, pre-substitution type
+    // … is a bare type parameter, at an instantiation substituting a function
+    // type or `Object`, nullable or not, for it — `k.Put(f)` at
+    // `k: Keep<Object>` over `Put(a: T)`". The bullet's verdict: "At every
+    // set-erasing position a function value with a non-empty source set is
+    // rejected, and a capture-free one is admitted"; and the position is
+    // ANNOUNCEMENT-ERASING (§28.3's sink rule — "a position that holds a
+    // function value beyond that comparison, or converts it, is
+    // announcement-erasing when its declared type — a function type, `Object`,
+    // or a type parameter an instantiation substitutes with either —
+    // announces no source set"), so the callee holds no reference past the
+    // call and the CALLER keeps the obligation. §28.14's call-bounded default
+    // says the same for the function-typed substitution ("A function-typed
+    // parameter declared *without* `scoped` is **call-bounded**"), and §28.9
+    // makes the function value itself runtime-managed (the heap-allocated
+    // closure object), so the caller's local must release it at its scope
+    // end.
+    //
+    // BEFORE THIS ARM the argument was classified as an ESCAPE at every
+    // class-generic call: arms (b) and (c) above cannot fire either, because
+    // the formal's DECLARED type is the bare `Named` head `T` (never a
+    // resolved function type, never `Primitive Object`), and arm (a) reads
+    // only the callee METHOD's own `genericParams`. The walk therefore
+    // withheld the caller's scope-end `bz_closure_release` and the closure
+    // cell (64 B) leaked on every call (MEASURED: 12800 B / 200 allocations
+    // over 200 iterations, both at `Keep<Object>` and at `Keep<() -> int>`;
+    // `main` carried ZERO `bz_closure_release` call sites, against two for
+    // the same program at a METHOD-OWN `G<T>(a: T)` and for the same program
+    // at a plain `Object` formal).
+    //
+    // WHY THE WALK IS STILL THE WHOLE PROOF. The callee body may STORE the
+    // formal (a capture-free function value IS admitted at a set-erasing
+    // position), and a store that keeps the cell alive while the caller
+    // releases it would be a use-after-free (#5216's shape).
+    // calleeBodyUsesFormalOnlyByInvocationOrInspection is the fail-closed
+    // walk that rules it out: it admits only an invocation of the formal and
+    // the two inspections that read nothing out of it (a `null` comparison
+    // and a type test), and fails on every other use — a store, a forward, a
+    // return, a capture, a shadowing binding. It is the same walk arms (b)
+    // and (c) use, which is exactly right here: the class-own formal's
+    // EFFECTIVE type at this call site is either a function type (arm (b)'s
+    // shape) or `Object` (arm (c)'s shape) — the argument is a function
+    // value, so the substitution can be nothing else — and both of those arms
+    // use this walk. Arm (a) keeps the stricter invocation-only walk, because
+    // a method-own `U` may also be substituted with a CLASS type, where the
+    // callee may own the value it is handed.
+    //
+    // The class-own arm is reached ONLY when the argument's own sema type is
+    // a function type (the test arm (a) makes), so the callee's formal is
+    // function-typed or `Object` at this instantiation and never a class
+    // type the callee could own and dispose of.
     if (p.type->kind != ast::TypeKind::Named || !p.type->name ||
         p.type->name->parts.size() != 1 || p.type->nullable)
         return false;
+    const std::string_view formalHead = p.type->name->parts.front();
     bool methodOwn = false;
     for (const auto& gp : md->genericParams)
-        if (gp.name == p.type->name->parts.front()) { methodOwn = true; break; }
-    if (!methodOwn) return false;
+        if (gp.name == formalHead) { methodOwn = true; break; }
+    if (methodOwn) {
+        const sema::TypeRef* at = ctx.exprType(*a.value);
+        if (!at || at->kind != sema::TypeRef::Kind::Function || at->nullable)
+            return false;
+        return calleeBodyUsesFormalOnlyByInvocation(*md, p.name);
+    }
+    // arm (d) — fix #8854: the ENCLOSING TYPE's own type parameter.
+    bool classOwn = false;
+    if (ms->parent)
+        for (const sema::Symbol* gp : ms->parent->genericParams)
+            if (gp && gp->name == formalHead) { classOwn = true; break; }
+    if (!classOwn) return false;
     const sema::TypeRef* at = ctx.exprType(*a.value);
     if (!at || at->kind != sema::TypeRef::Kind::Function || at->nullable)
         return false;
-    return calleeBodyUsesFormalOnlyByInvocation(*md, p.name);
+    return calleeBodyUsesFormalOnlyByInvocationOrInspection(*md, p.name);
 }
 
 // fix #8743 (§22.2 / §14.1 / §28.9, v0.359): the argument a call hands
