@@ -88,9 +88,28 @@ var maybe: string? := "text";
 var numbers: Array<int> := [3, -1, 2];
 
 //@ local source
-// spec §29.2 Desugaring of `for` (v0.254) — the examples enumerate it (`for var x in source`,
-// and the spelled-out `GetEnumerator`/`MoveNext`/`Current` expansion).
+// spec §29.2 Desugaring of `for` (v0.254) — the `for var x in source` example enumerates it.
+// An OWNED local: §29.2's sugared loop admits one (the desugaring "is adjusted"
+// for it, v0.359). The spelled-out expansion takes `sourceBorrowed` below instead.
 var source: Array<int> := [1, 2, 3];
+
+//@ local sourceBorrowed
+// spec §29.2 Desugaring of `for` (v0.359) — the spelled-out `IEnumerable<T>` expansion,
+// `using var __source := source;` written literally. §29.2 names the sources it is
+// written for: "When `source` is a value-type expression, a runtime-managed expression
+// (e.g. a string), or a borrowed local of class type, the `using var __source := source;`
+// is a no-op (... per §28.10 a `using var` initialized from a borrow does not assume a
+// disposal obligation but does pin the source for the loop's duration)". Over an owned
+// local it is NOT the program the loop compiles to ("`using var __source := source;` is
+// replaced by a borrow that pins `source`"), and written out it is §28.10's compile error
+// ("An unmarked `using var y := x;` is a compile error when its right-hand side is a named
+// owned binding whose declared type ... is a class or interface type"). So `source` is
+// bound here as a borrowed local of class type: a plain `var` view of an owned
+// `Array<int>` (§28.3: "A read of a named owned binding on the right-hand side is a borrow
+// unless it carries the explicit transfer marker"). Keyed `sourceBorrowed` because the
+// entry above binds the same pronoun in the owned state — see the note on keys.
+var sourceOwner: Array<int> := [1, 2, 3];
+var source := sourceOwner;
 
 //@ member _name
 // spec §13.6 Accessor visibility (v0.254) — the example is `public property Name: string

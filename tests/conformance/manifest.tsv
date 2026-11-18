@@ -238,7 +238,7 @@ spec_0235	spec	2812-Asynchronous-disposal	skip	n/a	skip:incomplete-fragment
 spec_0236	spec	2813-Shared-ownership-SharedT-and-WeakT	fragment	compiles	preamble; env:Connect; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0237	spec	291-The-protocol	fragment	compiles	
 spec_0238	spec	292-Desugaring-of-for	fragment	compiles	wrap:mixed; env:source
-spec_0239	spec	292-Desugaring-of-for	fragment	compiles	wrap:mixed; env:source
+spec_0239	spec	292-Desugaring-of-for	fragment	compiles	wrap:mixed; env:sourceBorrowed
 spec_0240	spec	292-Desugaring-of-for	skip	n/a	skip:incomplete-fragment
 spec_0241	spec	293-Iterator-methods	fragment	compiles	
 spec_0242	spec	298-Iterators-with-owned-parameters	skip	n/a	blocked-on-#1394 (stdlib-unresolved: StreamReader)
