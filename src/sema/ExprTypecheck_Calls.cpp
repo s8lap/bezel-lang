@@ -2026,8 +2026,8 @@ void reportCollectionLiteralDictFormBadTarget(DiagnosticEngine& diags,
 // fix #8450 (§15.4, v0.357; stdlib §5): the receiver heads stdlib §5's
 // `extension IEnumerable<T>` block reaches — the built-in heap collections
 // (stdlib §4.4-§4.11, §4.17-§4.19) and the built-in collection interfaces
-// the §5 operators are actually lowered on (stdlib §4.1's `IEnumerable<T>` /
-// `IList<T>` / `IReadOnlyList<T>`).
+// the §5 operators are actually lowered on (stdlib §4.12's `IEnumerable<T>`
+// and stdlib §4.1's `IList<T>` / `IReadOnlyList<T>`).
 //
 // `ICollection<T>` / `IReadOnlyCollection<T>` are deliberately NOT here:
 // fix #7544's own note records that the §5 operators are NOT lowered on them
