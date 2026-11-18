@@ -30985,14 +30985,30 @@ MethodOwnership::SetErasingSourceSet MethodOwnership::setErasingSourceSet(
     if (ls && callBoundedAlias_.count(sym)) return Set::NonEmpty;
     if (!visited.insert(id).second) return Set::Empty;
 
-    // The definitions: the declaration (a parameter's incoming value is
-    // untraced — clause 3's plain function-typed parameter is not judged
-    // here) and every assignment.
+    // The definitions: the declaration and every assignment.
+    //
+    // fix #8896 (§28.3 closure bullet, *Provenance* clause 3, v0.359): "A
+    // **plain function-typed parameter** of the enclosing body contributes
+    // itself: its signature announces no set (K2.4), so the value is bounded
+    // by the call, §28.14's call-bounded tier." Its incoming value is a
+    // definition with a NON-EMPTY set, so a read it reaches is rejected at a
+    // set-erasing position ("a function value with a non-empty source set is
+    // rejected"). `callBoundedParams_` is exactly that set: the method's and
+    // every lambda's own parameters with no modifier whose type is a function
+    // type (seeded before this pre-scan, never popped). Like any definition,
+    // the incoming value is cut off by an overwrite that dominates the read
+    // (clause 6, "over every assignment that reaches the read"). Any other
+    // parameter's incoming value (a `scoped` one, a non-function-typed one)
+    // stays untraced.
     std::vector<SetErasingFlowDef> defs;
     bool flowInsensitive = !seFlowComplete_ || seFlowCaptured_.count(sym) != 0;
     if (ps) {
-        defs.push_back({nullptr, /*traced=*/false, /*kills=*/true,
-                        /*positioned=*/true, SetErasingFlowPos{}});
+        const bool callBounded = callBoundedParams_.count(sym) != 0;
+        SetErasingFlowDef entry{nullptr, /*traced=*/callBounded,
+                                /*kills=*/true, /*positioned=*/true,
+                                SetErasingFlowPos{}};
+        entry.nonEmpty = callBounded;
+        defs.push_back(entry);
     } else {
         const ast::Expr* init = nullptr;
         bool known = false;
@@ -31032,6 +31048,8 @@ MethodOwnership::SetErasingSourceSet MethodOwnership::setErasingSourceSet(
             continue;
         if (!d.traced)
             r = join(r, Set::Untraced);
+        else if (d.nonEmpty)
+            r = Set::NonEmpty;
         else if (d.value)
             r = join(r, setErasingSourceSet(*d.value, /*direct=*/false, visited));
     }

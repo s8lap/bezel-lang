@@ -9,7 +9,7 @@
 //   capture-free lambda → Object:          ACCEPTED
 //   capture-bearing lambda → bare T:        REJECTED
 //   capture-free lambda → bare T:          ACCEPTED
-//   plain function-typed param → bare T:  ACCEPTED
+//   plain function-typed param → bare T:  REJECTED   (clause 3, v0.359; #8896)
 //   property access → Object:              ACCEPTED
 //   static method reference → bare T:      ACCEPTED   (empty set: no receiver)
 //   instance method reference → bare T:    REJECTED   (the receiver is a capture)
@@ -125,11 +125,17 @@ BEZEL_TEST(set_erasing_position_5514,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
-// ACCEPT: plain function-typed parameter → bare type parameter
-// A plain function-typed parameter is binding, not a capture.
-// The value it receives (if capture-free) has empty source set.
+// REJECT: plain function-typed parameter → bare type parameter.
+// FLIPPED by fix #8896 (was `..._accepted`, which read the parameter as
+// carrying only what its caller happens to pass).  §28.3 closure bullet,
+// *Provenance*, clause 3 (v0.359): "A **plain function-typed parameter** of
+// the enclosing body contributes itself: its signature announces no set
+// (K2.4), so the value is bounded by the call" — so `f`'s set is non-empty
+// whatever `Main` passes, and `Util.Take(f)` (T := `() -> int`) is a
+// set-erasing position, where "a function value with a non-empty source set
+// is rejected".
 BEZEL_TEST(set_erasing_position_5514,
-           plain_function_typed_param_to_bare_type_param_accepted) {
+           plain_function_typed_param_to_bare_type_param_rejected) {
     auto r = runAot(
         std::string("module M; ") + kUtilTakeClass +
         "class Test "
@@ -142,8 +148,10 @@ BEZEL_TEST(set_erasing_position_5514,
         "    return Run(h); "
         "  end Main; "
         "end Test;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 5);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "may not be passed where the parameter is declared at a bare type "
+           "parameter"));
 }
 
 // ACCEPT: property access → Object parameter

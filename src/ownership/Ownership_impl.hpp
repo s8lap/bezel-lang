@@ -7561,6 +7561,11 @@ private:
         bool kills;              // a plain `:=` or a declaration
         bool positioned;         // false: reaches every read
         SetErasingFlowPos pos;
+        // fix #8896 (§28.3 *Provenance* clause 3, v0.359): with `traced` and
+        // a null `value`, a definition whose set is NON-EMPTY on its own — a
+        // plain function-typed parameter's incoming value, which "contributes
+        // itself".
+        bool nonEmpty = false;
     };
     std::vector<SetErasingFlowNode> seFlowNodes_;
     int seFlowCur_ = 0;
@@ -7598,8 +7603,8 @@ private:
                                const std::vector<SetErasingFlowDef>& defs) const;
     // The source set of a function-valued expression, as far as this body
     // traces it. `Untraced` is a form whose provenance the trace does not
-    // follow (a call result, a member read, an `out` argument, a parameter's
-    // incoming value). // per §28.3
+    // follow (a call result, a member read, an `out` argument, a `scoped`
+    // parameter's incoming value). // per §28.3
     enum class SetErasingSourceSet { Empty, NonEmpty, Untraced };
     SetErasingSourceSet setErasingSourceSet(
         const ast::Expr& e, bool direct,
