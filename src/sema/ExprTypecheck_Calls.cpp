@@ -444,6 +444,33 @@ static std::string_view builtinTimeValueHead(const TypeRef* t) {
     return {};
 }
 
+// fix #8741 (§14.2 *A type parameter as the type argument*, v0.359): is `t` a
+// TYPE PARAMETER IN SCOPE at the call -- a declaration-less Named the resolver
+// resolved to a type parameter? Only the resolver's own record counts: a
+// spelling it never resolved, or resolved to a concrete type, is not one.
+static bool isOpenTypeParamRef(const TypeRef* t) {
+    return t && t->kind == TypeRef::Kind::Named && !t->declaration &&
+           t->genericArgs.empty() && t->isResolvedTypeParam();
+}
+
+// fix #8741 (§14.2 *Type-parameter bounds*, v0.359): `where S: U`, where U's
+// substitution is an OPAQUE TYPE PARAMETER IN SCOPE and so has no declaration
+// to walk. "A substitution S for `T` satisfies `where T: U` exactly when S is
+// non-nullable and is a *subtype of* the substitution for `U`": a primitive or
+// a declared argument is a subtype of it only by the parameter's own
+// constraints, which name no concrete type, so neither is. An argument that is
+// itself a type parameter or an unresolved type stays undecided (false): the
+// conservative direction.
+static bool bareBoundSubstitutionRejects(const TypeRef* arg,
+                                         const TypeRef* u) {
+    if (!arg || !u) return false;
+    const bool argPrim = arg->kind == TypeRef::Kind::Primitive;
+    const bool argDeclared =
+        arg->kind == TypeRef::Kind::Named && arg->declaration;
+    if (isOpenTypeParamRef(u)) return argPrim || argDeclared;
+    return false;
+}
+
 static bool isBuiltinTimeValueRecord(const TypeRef* t) {
     return !builtinTimeValueHead(t).empty();
 }
@@ -10237,6 +10264,76 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 !classParent->genericParams.empty())
                                 boundSubst = substituteMemberType(
                                     bound, classRecv, classParent);
+                            // fix #8741 (§14.2 *A type parameter as the type
+                            // argument*, v0.359): a class argument that is a
+                            // TYPE PARAMETER IN SCOPE at the call
+                            // (`d: D<T>`) substitutes into the bound as a
+                            // declaration-less marker, which the conformance
+                            // walk reads as "the constraint's OWN parameter"
+                            // and so compares the candidate with ITSELF. The
+                            // class argument is an opaque type there; mark
+                            // each such substituted leaf concrete so the walk
+                            // compares it by what it names. `boundOpenArg`
+                            // is the bare-bound twin: the whole bound IS the
+                            // opaque class argument (`where S: Y`).
+                            //
+                            // A receiver that IS the generic class (`this`,
+                            // or an implicit `this` call inside `Q<Y>`) fixes
+                            // no class argument: the class's OWN parameters
+                            // are the in-scope type parameters, and they stay
+                            // in the bound as the markers they are.
+                            const bool selfRecv =
+                                bound && boundSubst == bound && classParent &&
+                                !classParent->genericParams.empty() &&
+                                currentType_ == classParent &&
+                                (!classRecv ||
+                                 (dynamic_cast<const ast::IdentifierExpr*>(
+                                      classRecv) &&
+                                  static_cast<const ast::IdentifierExpr*>(
+                                      classRecv)->name == "this"));
+                            auto isClassParamLeaf = [&](const TypeRef* t) {
+                                if (!isOpenTypeParamRef(t)) return false;
+                                for (const Symbol* gp :
+                                     classParent->genericParams)
+                                    if (gp && gp->name == t->headName())
+                                        return true;
+                                return false;
+                            };
+                            const bool boundOpenArg =
+                                boundSubst &&
+                                (boundSubst != bound
+                                     ? isOpenTypeParamRef(boundSubst)
+                                     : (selfRecv &&
+                                        isClassParamLeaf(boundSubst)));
+                            bool openClassArgMarked = false;
+                            if (bound && boundSubst &&
+                                boundSubst->kind == TypeRef::Kind::Named &&
+                                bound->kind == TypeRef::Kind::Named &&
+                                boundSubst->genericArgs.size() ==
+                                    bound->genericArgs.size()) {
+                                TypeRef* marked = nullptr;
+                                for (std::size_t ai2 = 0;
+                                     ai2 < bound->genericArgs.size(); ++ai2) {
+                                    TypeRef* sa = boundSubst->genericArgs[ai2];
+                                    const bool open =
+                                        boundSubst != bound
+                                            ? (sa != bound->genericArgs[ai2] &&
+                                               isOpenTypeParamRef(sa))
+                                            : (selfRecv &&
+                                               isClassParamLeaf(sa));
+                                    if (!open) continue;
+                                    if (!marked)
+                                        marked = ctx_.makeTypeRef(*boundSubst);
+                                    TypeRef* sc = ctx_.makeTypeRef(*sa);
+                                    sc->typeParam =
+                                        TypeRef::TypeParamBinding::NotParam;
+                                    marked->genericArgs[ai2] = sc;
+                                }
+                                if (marked) {
+                                    boundSubst = marked;
+                                    openClassArgMarked = true;
+                                }
+                            }
                             // #1867 / §14.2 clause 5 + §28.2/§9.7: a
                             // PRIMITIVE argument against `IDisposable`/
                             // `IAsyncDisposable` — which only classes
@@ -10294,7 +10391,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 if (ui != subst.end() && ui->second) {
                                     uSubst = ui->second;
                                 } else if (boundSubst &&
-                                           boundSubst->declaration) {
+                                           (boundSubst->declaration ||
+                                            boundOpenArg)) {
                                     // the ENCLOSING CLASS's own parameter,
                                     // substituted with the receiver's class
                                     // argument (#8663: §14.2's
@@ -10316,6 +10414,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                                !isSubtype(
                                                    argDecl,
                                                    uSubst->declaration)) {
+                                        report(uName);
+                                    } else if (!uSubst->declaration &&
+                                               bareBoundSubstitutionRejects(
+                                                   argRef, uSubst)) {
+                                        // fix #8741 (§14.2 *Type-parameter
+                                        // bounds*, v0.359): the bound's
+                                        // substitution is an opaque type
+                                        // parameter in scope: it has no
+                                        // declaration to walk, and S is a
+                                        // subtype of it only as
+                                        // `bareBoundSubstitutionRejects`
+                                        // decides.
                                         report(uName);
                                     }
                                     // else: U's or T's substitution is not
@@ -10384,6 +10494,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // Defer keeps the historical conservative
                                 // accept when the arg is not a decided
                                 // concrete primitive.
+                                // fix #8741 (§14.2 *A type parameter as the
+                                // type argument*, v0.359): the bound names an
+                                // OPAQUE class argument (`IComparable<T>` for
+                                // a type parameter `T` in scope), and a
+                                // primitive conforms to a builtin interface
+                                // only at an instantiation naming a concrete
+                                // type -- `T`'s constraints establish none.
+                                if (openClassArgMarked) {
+                                    report(std::string(bn));
+                                    continue;
+                                }
                                 if (primitiveConformsToBuiltinInstanceIface(
                                         argRef->primitive, bn,
                                         boundSubst->genericArgs) ==
