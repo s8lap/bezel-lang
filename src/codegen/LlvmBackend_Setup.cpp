@@ -50491,6 +50491,11 @@ void Emitter::collectCellFreeEligible(
         // over-free), which is why a node kind this walk does not descend
         // into needs no special handling here.
         std::unordered_set<const void*>& ownFrameBindings;
+        // fix #7031 (§27.5 / §28.9, v0.359): the frame's OWN body — the scope
+        // the frame-level forwarding admission (admitFrameLevelForwarder
+        // below) proves the consumption over. The LambdaFinder is constructed
+        // with the body it walks, so this is that body.
+        const std::vector<std::unique_ptr<ast::Stmt>>& frameBodyStmts;
         // fix #2334: anchors for `using var` initializer CallExprs (form 2
         // of §28.14 — `using var sub := cs.Token.Register(lambda)`). Populated
         // by stmt() before the initializer is walked; consulted by expr() to
@@ -50507,8 +50512,69 @@ void Emitter::collectCellFreeEligible(
         // escaping. Filled by the #3766 arm, read by the widening walker.
         std::unordered_set<const void*> resultConsumedLocally4525;
 
+        // fix #7031 (§27.5 / §28.9, v0.359): the FRAME-level twin of #4525's
+        // admission — a local `L` of the frame whose initializer is a
+        // transparently forwarding lambda `G` (G's bare expression body is
+        // the nested lambda `H`) produces `H` at every call of `L`. When the
+        // call's result is consumed INSIDE the frame — the `L(...)(...)`
+        // shape, whose temporary `H` closure is released right after the call
+        // — `H` cannot outlive the frame, so `H`'s captures are NOT escaping
+        // and the captured local's cell may be freed at the frame's own scope
+        // end (the route #429 arms).
+        //
+        // THE DEFECT this admits (issue #7031). `var f2 := lambda() =>
+        // lambda() => k + 1; f2()()` leaked `k`'s 4-byte capture cell: the
+        // nested lambda was classified ESCAPING by the §27.5/#1135
+        // nested-lambda widening (a nested lambda is conservatively
+        // escaping), which blocks the scope-end route (`declsCapturedByEscap-
+        // ing_`), while the envdtor route (#3426's sharedCellEnvdtorFreeOwner_)
+        // declines it because the nested lambda does not escape the FUNCTION
+        // (it is consumed inside the frame, so it is not in
+        // `definitelyEscapingLambdas_`). Nobody reclaimed the cell.
+        // MEASURED: 4 B / 1 allocation per program (8 B for a `string`
+        // capture), allocated in `main`.
+        //
+        // THE PROOF, in pieces.
+        //   * `G` must FORWARD to `H` (G's bare expression body IS `H`) — the
+        //     shape collectTransparentForwardTargets recognizes.
+        //   * The ClosureEscapeWalker over the frame's body must not see `L`
+        //     ESCAPED: `L` is never read in an escaping position and never
+        //     referenced inside a nested lambda body (FINDING [1] marks such
+        //     a reference escaped, and the reference would create `H` — and
+        //     its closure — after the frame's scope end). This is the SAME
+        //     guard collectTransparentForwardTargets applies to its own
+        //     `calledAtMostOnce`.
+        //   * Every call of `L` in the frame's body must have its result
+        //     consumed at once (`L(...)(...)`) — the shape whose temporary
+        //     closure the call site releases immediately — and there must be
+        //     EXACTLY ONE such call, so `H` is instantiated once per
+        //     execution of the frame (the same multiplicity guard #3804's own
+        //     test row 3 pins; a second call keeps the conservative leak).
+        // ⇒ `H` never outlives the frame ⇒ its captures are non-escaping.
+        void admitFrameLevelForwarder(const ast::LocalDecl* ld) {
+            if (!ld->initializer) return;
+            auto* g = dynamic_cast<const ast::LambdaExpr*>(ld->initializer.get());
+            if (!g || !g->stmts.empty()) return;
+            auto* h = dynamic_cast<const ast::LambdaExpr*>(g->exprBody.get());
+            if (!h) return;
+            // `L` is never read in an escaping position, and never inside a
+            // nested lambda body (the closure would then be created after
+            // the frame's scope end).
+            ClosureEscapeWalker hw{ctx, static_cast<const void*>(ld)};
+            for (auto& s : frameBodyStmts) hw.stmt(s.get());
+            if (hw.escaped) return;
+            bool sawInvokedAtOnce = false;
+            int calls = 0;
+            if (!resultConsumedLocally(frameBodyStmts, /*exprBody=*/nullptr, ld,
+                                       &sawInvokedAtOnce, &calls))
+                return;
+            if (!sawInvokedAtOnce) return;  // only the `L(...)(...)` shape
+            if (calls != 1) return;         // exactly one call to `L`
+            resultConsumedLocally4525.insert(static_cast<const void*>(g));
+        }
+
         // fix #4525 (§27.3 / §27.5 / §28.9, v0.338): is every occurrence of
-        // the local `gDecl` in `outer`'s body a call `g(...)` whose result is
+        // the local `gDecl` in the enclosing scope a call `g(...)` whose result is
         // either invoked at once (`g(...)(...)`: the temporary is released
         // after the call, like an IIFE) or is the whole initializer of a
         // `var/const h := g(...)` whose binding `h` the ClosureEscapeWalker
@@ -50517,8 +50583,19 @@ void Emitter::collectCellFreeEligible(
         // ClosureEscapeWalker (FINDING [1] marks it escaped), so this walk
         // skips LambdaExpr bodies. Fail-closed: any node kind not enumerated
         // here answers "no", leaving the documented #1135 leak.
-        bool resultConsumedLocally(const ast::LambdaExpr* outer,
-                                   const ast::Stmt* gDecl) const {
+        //
+        // fix #7031 (§27.5 / §28.9, v0.359): the enclosing scope is a
+        // PARAMETER (`stmts` + `exprBody`) instead of a lambda, so the same
+        // proof also runs over a FRAME's own body — the frame-level twin of
+        // #4525's admission (see admitFrameLevelForwarder below). The two
+        // out-params report WHICH consumption shape the walk proved
+        // (`sawInvokedAtOnce`: the `g(...)(...)` shape, whose temporary dies
+        // INSIDE the enclosing scope) and how many calls to `g` it saw
+        // (`sawCalls`).
+        bool resultConsumedLocally(
+            const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+            const ast::Expr* exprBody, const ast::Stmt* gDecl,
+            bool* sawInvokedAtOnce = nullptr, int* sawCalls = nullptr) const {
             bool ok = true;
             auto isG = [&](const ast::Expr* e) {
                 auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -50531,8 +50608,8 @@ void Emitter::collectCellFreeEligible(
             };
             auto bindingStaysLocal = [&](const ast::Stmt* decl) {
                 ClosureEscapeWalker hw{ctx, static_cast<const void*>(decl)};
-                if (outer->exprBody) hw.expr(outer->exprBody.get(), false);
-                for (auto& s : outer->stmts) hw.stmt(s.get());
+                if (exprBody) hw.expr(exprBody, false);
+                for (auto& s : stmts) hw.stmt(s.get());
                 return !hw.escaped;
             };
             std::function<void(const ast::Expr*)> ex;
@@ -50559,6 +50636,12 @@ void Emitter::collectCellFreeEligible(
                     if (auto* ic = dynamic_cast<const ast::CallExpr*>(
                             c->callee.get()))
                         if (isG(ic->callee.get())) {
+                            // fix #7031: record the shape and the count —
+                            // the frame-level admission (admitFrameLevel-
+                            // Forwarder) admits ONLY this shape, and only for
+                            // a forwarding local called exactly ONCE.
+                            if (sawInvokedAtOnce) *sawInvokedAtOnce = true;
+                            if (sawCalls) ++*sawCalls;
                             for (auto& a : ic->args) ex(a.value.get());
                             for (auto& a : c->args) ex(a.value.get());
                             return;
@@ -50623,6 +50706,10 @@ void Emitter::collectCellFreeEligible(
                     dynamic_cast<const ast::LocalConstDecl*>(s)) {
                     if (auto* c = dynamic_cast<const ast::CallExpr*>(v.init))
                         if (isG(c->callee.get())) {
+                            // fix #7031: the `var h := g(...)` shape — the
+                            // call is counted here too (the frame-level
+                            // admission counts calls, not shapes).
+                            if (sawCalls) ++*sawCalls;
                             for (auto& a : c->args) ex(a.value.get());
                             if (!bindingStaysLocal(s)) ok = false;
                             return;
@@ -50678,8 +50765,8 @@ void Emitter::collectCellFreeEligible(
                 }
                 ok = false;  // CaseStmt, YieldStmt, future kinds
             };
-            if (outer->exprBody) ex(outer->exprBody.get());
-            for (auto& s : outer->stmts) st(s.get());
+            if (exprBody) ex(exprBody);
+            for (auto& s : stmts) st(s.get());
             return ok;
         }
 
@@ -51076,7 +51163,8 @@ void Emitter::collectCellFreeEligible(
                                 if (nl->stmts.empty() &&
                                     dynamic_cast<const ast::LambdaExpr*>(
                                         nl->exprBody.get()) &&
-                                    resultConsumedLocally(lam,
+                                    resultConsumedLocally(lam->stmts,
+                                                          lam->exprBody.get(),
                                                           currentParentStmt))
                                     resultConsumedLocally4525.insert(
                                         static_cast<const void*>(nl));
@@ -51818,6 +51906,15 @@ void Emitter::collectCellFreeEligible(
                 // collectLambdaCaptures path the form-5 receiver case uses.
                 if (ld->isUsing && ld->initializer)
                     usingInitOf[ld->initializer.get()] = ld;
+                // fix #7031 (§27.5 / §28.9, v0.359): the frame-level
+                // forwarding admission — a local whose initializer FORWARDS to
+                // a nested lambda, whose every call's result is consumed
+                // inside this scope. It must run BEFORE the initializer is
+                // walked: the nested lambda's classification (the #4525
+                // branch of the §27.5/#1135 widening) reads the set this
+                // fills.
+                if (nonEsc && ld->initializer)
+                    admitFrameLevelForwarder(ld);
                 if (ld->initializer)
                     expr(ld->initializer.get(), nonEsc);
                 return;
@@ -51960,7 +52057,8 @@ void Emitter::collectCellFreeEligible(
                         escapingCapturersOf, nestedWidenedKeys,
                         transparentTailNonEscaping3805,
                         forwardTargets3804,
-                        ownFrameBindings};
+                        ownFrameBindings,
+                        body};
     for (auto& s : body) finder.stmt(s.get());
 
     // fix #3426 (§27.5 / §28.9, v0.283): record the sole out-of-frame holder of
