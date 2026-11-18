@@ -38765,6 +38765,19 @@ struct ClosureEscapeWalker {
     // True while the walk is inside one of the two reference-taking escape
     // sites named above.
     bool inReferenceTakingSite_ = false;
+    // fix #8723 (§28.9 / §27.5, v0.359): the KEPT walk
+    // collectClosureReleaseEligible runs over every closure-local candidate
+    // to ask only "can a value of target be kept by a site that takes no
+    // reference?" (keptWithoutReference_). Two more sites take a reference
+    // of their own there: an assignment into a non-nullable closure-typed
+    // local or parameter (`lowerClosureLocalReassign` retains every value it
+    // stores that is not a fresh producer, so `b := target` hands `b` its own
+    // reference; what `b` then does is a question about `b`), and an argument
+    // at a §28.14 call-bounded parameter position (`callBoundedArg`: the
+    // callee holds no reference once the call returns). Off on every other
+    // walk, whose verdicts are unchanged.
+    bool closureLocalAssignTakesReference = false;
+    std::function<bool(const ast::CallExpr&, std::size_t)> callBoundedArg;
     // fix-forward #8479 (§7.7 / §28.9, v0.357): set by the #6176 arm of
     // stmt(): a `return nn ?? e;` where NOTHING mints the caller's
     // reference, so the slot's own reference is the one the caller
@@ -39714,7 +39727,14 @@ struct ClosureEscapeWalker {
                     argIsTarget(c->args[ai].value.get()) &&
                     isBuiltinArrayComparerArg(c->callee.get(), ai, ctx))
                     safeArg = true;
+                // fix #8723: see closureLocalAssignTakesReference.
+                const bool savedSite = inReferenceTakingSite_;
+                if (!safeArg && callBoundedArg &&
+                    argIsTarget(c->args[ai].value.get()) &&
+                    callBoundedArg(*c, ai))
+                    inReferenceTakingSite_ = true;
                 expr(c->args[ai].value.get(), /*safeRead=*/safeArg);
+                inReferenceTakingSite_ = savedSite;
             }
             return;
         }
@@ -40207,6 +40227,12 @@ struct ClosureEscapeWalker {
                 if (as->op == ":=" && as->target && as->value &&
                     isTargetIdent(as->value.get()) &&
                     storeTargetTakesReference(*as->target))
+                    inReferenceTakingSite_ = true;
+                // fix #8723: see closureLocalAssignTakesReference.
+                if (closureLocalAssignTakesReference && as->op == ":=" &&
+                    as->target && as->value &&
+                    isClosureTypedLocalAssign(*as->target) &&
+                    forwardsTarget(as->value.get(), /*sawWrap=*/true))
                     inReferenceTakingSite_ = true;
                 expr(as->value.get(), /*safeRead=*/false);
                 inReferenceTakingSite_ = savedSite;
@@ -41631,6 +41657,157 @@ void Emitter::collectClosureReleaseEligible(
             }
         }
         if (anyDemoted) demoteSourcesOfUnconfinedAliases();
+    }
+
+    // fix #8723 (§28.9 / §27.5, v0.359): a value that passes from
+    // one closure local into another keeps the verdict of where it ENDS UP.
+    //
+    // §28.9 puts a function value's lifetime with the runtime ("the type's
+    // lifetime is managed by the runtime without user involvement"), and
+    // §27.5 keeps a closure's captures alive as long as the closure, so a
+    // stored function value must stay callable while it is reachable. A
+    // collection store keeps the pointer and takes no reference (#5866,
+    // keptWithoutReference_), so the value it keeps lives on a reference
+    // some slot leaves unreleased.
+    //
+    //   - #8723: `b := g; fs.Add(b);`. The #4473 arm above releases `g` (its
+    //     only escape is the assignment into a closure local), and `b`
+    //     releases the reference the assignment took for it, so the value
+    //     `fs` keeps is released twice. MEASURED: heap-use-after-free on the
+    //     caller's first call through `fs[0]`. With `return b;` in place of
+    //     the store, `g` stayed in closureReleaseEligible_, whose lambda's
+    //     capture cells collectCellFreeEligible frees at scope end; the
+    //     caller's call read the freed cell.
+    //
+    // The model: a slot whose every value carries a reference of its own (a
+    // reassigned local: `lowerClosureLocalReassign` retains what it stores;
+    // an owned alias: the bind retains) passes "kept" back to every local
+    // assigned or bound into it; a local that holds the reference it was
+    // initialised with and is never reassigned is where the kept value's
+    // reference comes from. That local DONATES its reference: it leaves both
+    // scope-end release sets. The stored value then leaks, as `fs.Add(g)`
+    // alone does: the accepted #5866 residual. A target that is not kept but still leaves
+    // the frame (returned, stored with a reference, captured) moves each
+    // source out of closureReleaseEligible_ into
+    // closureEscapingScopeEndRelease_: its release stays armed, its capture
+    // cells are no longer freed with the scope.
+    //
+    // Not handled (left as they were): a reassigned local's INITIAL value
+    // reaching a kept site (`fs.Add(b); b := g;` releases it at the
+    // reassignment), assignments inside a lambda body, and targets that are
+    // not candidates (parameters, borrow candidates).
+    {
+        std::unordered_set<const void*> candKeys;
+        for (const ast::Node* c : candidates)
+            candKeys.insert(static_cast<const void*>(c));
+        std::vector<std::pair<const void*, const void*>> edges;  // src -> dst
+        auto addEdgesInto = [&](const void* dst, const ast::Expr* value,
+                                bool viaAssign) {
+            for (const ast::Node* c : candidates) {
+                const void* x = static_cast<const void*>(c);
+                if (x == dst) continue;
+                ClosureEscapeWalker xw{ctx_, x};
+                const bool flows =
+                    viaAssign ? xw.forwardsTarget(value, /*sawWrap=*/true)
+                              : xw.containsTargetAnywhere(value);
+                if (flows &&
+                    std::find(edges.begin(), edges.end(),
+                              std::make_pair(x, dst)) == edges.end())
+                    edges.push_back({x, dst});
+            }
+        };
+        std::function<void(const ast::Stmt*)> scanEdges =
+                [&](const ast::Stmt* s) {
+            if (!s) return;
+            if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+                auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(as->target.get());
+                auto* loc = id ? dynamic_cast<sema::LocalSymbol*>(
+                                     ctx_.exprSymbol(*id))
+                               : nullptr;
+                if (as->op == ":=" && as->value && loc && loc->decl &&
+                    candKeys.count(static_cast<const void*>(loc->decl)))
+                    addEdgesInto(static_cast<const void*>(loc->decl),
+                                 as->value.get(), /*viaAssign=*/true);
+            }
+            if (auto* is2 = dynamic_cast<const ast::IfStmt*>(s)) {
+                for (auto& b : is2->ifBranch.body) scanEdges(b.get());
+                for (auto& br : is2->elifBranches)
+                    for (auto& b : br.body) scanEdges(b.get());
+                for (auto& b : is2->elseBody) scanEdges(b.get());
+            } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                for (auto& b : ws->body) scanEdges(b.get());
+            } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                for (auto& b : fs->body) scanEdges(b.get());
+            } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                for (auto& b : d->body) scanEdges(b.get());
+            } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+                for (auto& b : ts->body) scanEdges(b.get());
+                for (auto& c : ts->catches) scanEdges(c.body.get());
+                for (auto& b : ts->finallyBody) scanEdges(b.get());
+            } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                for (auto& arm : cs->arms)
+                    for (auto& a : arm.stmts) scanEdges(a.get());
+            }
+        };
+        for (auto& s : body) scanEdges(s.get());
+        for (const ast::Node* c : candidates) {
+            const void* key = static_cast<const void*>(c);
+            if (!closureAliasOwned_.count(key)) continue;
+            LocalDeclInitView av = localDeclInitView(c);
+            if (av.init) addEdgesInto(key, av.init, /*viaAssign=*/false);
+        }
+        auto passesThrough = [&](const void* k) {
+            return assignedLocals.count(k) != 0 ||
+                   closureAliasOwned_.count(k) != 0;
+        };
+        // The KEPT walk (see closureLocalAssignTakesReference).
+        std::unordered_set<const void*> kept;
+        for (const ast::Node* c : candidates) {
+            const void* key = static_cast<const void*>(c);
+            ClosureEscapeWalker kw{ctx_, key};
+            kw.coalesceReturnTransfers = coalesceReturnTransfers;
+            kw.ownedAliasDecls = &closureAliasOwned_;
+            kw.scrutineeBorrowMode = true;
+            kw.assignBinds = &assignBinds;
+            kw.assignedSomewhere = assignedLocals.count(key) != 0;
+            kw.walkWholeBody = true;
+            kw.closureLocalAssignTakesReference = true;
+            kw.callBoundedArg = [this](const ast::CallExpr& call,
+                                       std::size_t ai) {
+                return isCallBoundedClosureArgPosition(call, ai);
+            };
+            for (auto& s : body) kw.stmt(s.get());
+            if (kw.keptWithoutReference_) kept.insert(key);
+        }
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (const auto& [x, dst] : edges) {
+                if (kept.count(dst) && passesThrough(dst) &&
+                    kept.insert(x).second)
+                    changed = true;
+            }
+        }
+        bool changedAny = false;
+        for (const ast::Node* c : candidates) {
+            const void* key = static_cast<const void*>(c);
+            if (!kept.count(key) || passesThrough(key)) continue;
+            changedAny |= closureReleaseEligible_.erase(key) != 0;
+            changedAny |= closureEscapingScopeEndRelease_.erase(key) != 0;
+        }
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (const auto& [x, dst] : edges) {
+                if (closureReleaseEligible_.count(dst) &&
+                    !returnedByName.count(dst))
+                    continue;
+                if (closureReleaseEligible_.erase(x)) {
+                    closureEscapingScopeEndRelease_.insert(x);
+                    changed = changedAny = true;
+                }
+            }
+        }
+        if (changedAny) demoteSourcesOfUnconfinedAliases();
     }
 }
 
