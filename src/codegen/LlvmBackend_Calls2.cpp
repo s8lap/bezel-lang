@@ -1,5 +1,6 @@
 #include "codegen/LlvmBackend_impl.hpp"
 #include "llvm/ADT/STLFunctionalExtras.h"  // llvm::function_ref (fix #4901 shared-event gate)
+#include "sema/BuiltinInterfaceAncestors.hpp"  // fix #6828: the §26.5 built-in interface table — the ONE copy, shared with sema's §14.5 phase-1 unification
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 #include "sema/ConstFold.hpp"  // fix #7285: §17.14 constant folding for the radix argument (§5.1)
 #include "sema/LinqStdlibOverloads.hpp"  // fix #8445: stdlib §5's operator overload table (§5 / §4.1)
@@ -21537,12 +21538,25 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
         }
         binds.push_back({name, Binding{t, loc, bare, false}});
     };
-    // Structural descent through a constructed formal (`Array<T>`,
-    // `Dictionary<T, int>`): same head, same arity, recurse pairwise.
+    // §14.5 phase 1: unify the FORMAL's type arguments against an
+    // INSTANTIATION's, pairwise (the component-wise descent).
     std::function<void(const sema::TypeRef*, const sema::TypeRef*,
                        SourceLocation)>
-        unify = [&](const sema::TypeRef* f, const sema::TypeRef* a,
+        unify;
+    std::function<void(const std::vector<sema::TypeRef*>&,
+                       const std::vector<sema::TypeRef*>&,
+                       SourceLocation)>
+        unifyArgs;
+    unifyArgs = [&](const std::vector<sema::TypeRef*>& fs,
+                    const std::vector<sema::TypeRef*>& as,
                     SourceLocation loc) {
+        if (fs.size() != as.size()) return;
+        for (std::size_t i = 0; i < fs.size(); ++i) unify(fs[i], as[i], loc);
+    };
+    // Structural descent through a constructed formal (`Array<T>`,
+    // `Dictionary<T, int>`): same head, same arity, recurse pairwise.
+    unify = [&](const sema::TypeRef* f, const sema::TypeRef* a,
+                SourceLocation loc) {
             if (!f || !a) return;
             std::string_view n = ownParamName(f);
             if (!n.empty()) {
@@ -21550,16 +21564,98 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
                 if (t) bind(n, t, loc, false);
                 return;
             }
+            // fix #6828 (§14.5 phase 1, v0.359): "a function-typed parameter
+            // unifies component-wise — each parameter slot against the
+            // argument's slot in order, the return slot against the return
+            // slot — and only against a function type of the SAME parameter
+            // count". A function-typed formal (`f: () -> T`) reached neither
+            // the bare-`T` arm above nor the constructed arm below, so `T`
+            // was never bound and the imported generic ran its `int`
+            // placeholder template: MEASURED on 6d709c00f,
+            // `G.ShowF(lambda() => char(97))` printed 97 (same-module: a).
+            // The arm is sema's own (#4089 / #8626, ExprTypecheck_Calls.cpp
+            // `unifyArgSubst`), read on the RESOLVED shapes the importer
+            // carries.
+            if (f->kind == sema::TypeRef::Kind::Function) {
+                if (a->kind != sema::TypeRef::Kind::Function) return;
+                if (f->funcParams.size() != a->funcParams.size()) return;
+                for (std::size_t i = 0; i < f->funcParams.size(); ++i) {
+                    const sema::TypeRef* fp = f->funcParams[i].type;
+                    const sema::TypeRef* ap = a->funcParams[i].type;
+                    if (fp && ap) unify(fp, ap, loc);
+                }
+                if (f->funcReturn && a->funcReturn)
+                    unify(f->funcReturn, a->funcReturn, loc);
+                return;
+            }
             if (f->kind != sema::TypeRef::Kind::Named ||
                 a->kind != sema::TypeRef::Kind::Named ||
-                f->genericArgs.empty() ||
-                f->genericArgs.size() != a->genericArgs.size())
+                f->genericArgs.empty())
                 return;
-            if (!(f->declaration && f->declaration == a->declaration) &&
-                f->headName() != a->headName())
+            if ((f->declaration && f->declaration == a->declaration) ||
+                f->headName() == a->headName()) {
+                unifyArgs(f->genericArgs, a->genericArgs, loc);
                 return;
-            for (std::size_t i = 0; i < f->genericArgs.size(); ++i)
-                unify(f->genericArgs[i], a->genericArgs[i], loc);
+            }
+            // fix #6828 (§14.5 phase 1, v0.359): the OTHER half of the
+            // constructed-parameter bullet — "or against the unique
+            // instantiation of `G` that the argument's type implements or
+            // extends (an `Array<int>` argument against `xs: IEnumerable<T>`
+            // binds `T` to `int`)". A formal whose head DIFFERS from the
+            // argument's (`IEnumerable<T>` against `Array<char>`) reached NO
+            // instantiation here, so `T` was never bound and the imported
+            // generic ran its `int` placeholder template: MEASURED on
+            // 6d709c00f, `G.ShowE(xs)` over `Array<char>` {char(97)} printed
+            // 97 (same-module: a). The walk below is the §14.5 one sema
+            // applies (`unifyArgSubst`'s #4183 arm): the same two sources,
+            // read the same way, so the gate and the inference agree.
+            //
+            // "Reaches MORE THAN ONE instantiation" is §14.5's own
+            // non-unique case — never resolved by choice — so the gate
+            // stands down for it, exactly as the inference does.
+            std::vector<const sema::TypeRef*> insts;
+            std::vector<std::vector<sema::TypeRef*>> instArgs;
+            if (f->declaration) {
+                // A USER head (an interface or a base class): the argument's
+                // type must be a USER class reaching it through its declared
+                // bases, at ONE concrete instantiation.
+                if (!a->declaration ||
+                    !sema::isUserDeclaredTypeSym(a->declaration))
+                    return;
+                for (auto& [base, baseArgs] :
+                     collectConcreteGenericBaseInsts(a->declaration)) {
+                    if (base != f->declaration) continue;
+                    std::vector<sema::TypeRef*> args;
+                    args.reserve(baseArgs.size());
+                    for (const sema::TypeRef* ba : baseArgs)
+                        args.push_back(const_cast<sema::TypeRef*>(ba));
+                    insts.push_back(nullptr);
+                    instArgs.push_back(std::move(args));
+                }
+                if (insts.size() != 1) return;
+                unifyArgs(f->genericArgs, instArgs[0], loc);
+                return;
+            }
+            // A BUILT-IN head: the argument's built-in collection type
+            // reaches it through the §26.5 hierarchy table — the ONE copy,
+            // shared with sema (sema/BuiltinInterfaceAncestors.hpp).
+            std::vector<std::unique_ptr<sema::TypeRef>> owned;
+            for (const sema::TypeRef* anc :
+                 sema::builtinInterfaceAncestorsOf(a, owned)) {
+                if (sema::namedTypeSimpleName(anc) != f->headName()) continue;
+                // The §26.5 hierarchy has DIAMONDS (`IList` reaches
+                // `IReadOnlyCollection` through BOTH `IReadOnlyList` and
+                // `ICollection`), so the SAME instantiation is reached twice;
+                // §14.5's "unique instantiation" counts DISTINCT ones, and
+                // sema's own walk dedupes them the same way (its
+                // `collectBuiltinAncestorInstantiationsOf`).
+                bool dup = false;
+                for (const sema::TypeRef* seen : insts)
+                    if (sema::typeRefEqual(seen, anc)) { dup = true; break; }
+                if (!dup) insts.push_back(anc);
+            }
+            if (insts.size() != 1) return;
+            unifyArgs(f->genericArgs, insts[0]->genericArgs, loc);
         };
     for (std::size_t ai = off; ai < args.size() && ai < argExprs->size();
          ++ai) {

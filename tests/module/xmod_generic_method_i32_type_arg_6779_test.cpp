@@ -31,6 +31,12 @@
 // so passed both the #5057 carrier check and the i32 test, and any non-`int`
 // type bound only through a constructed formal (`Array<long>`,
 // `Array<string>`, ...), which no width gate sees.
+//
+// #6828 rows (below): the two §14.5 phase-1 shapes the inferred-binding arm
+// never unified — a FUNCTION-TYPED formal (`f: () -> T`) and a formal whose
+// head differs from the argument's (`IEnumerable<T>` against `Array<char>`).
+// Both bound `T` to a concrete `char` and both ran the `int` placeholder
+// template, printing 97 where the same-module twin prints `a`.
 
 #include <string>
 
@@ -54,6 +60,15 @@ const char* kLib6779 =
     "  public static method Pair<T>(a: T, b: T): string => $\"{a}{b}\";\n"
     "  public static method Count<T>(a: T): int => 7;\n"
     "  public static method D<T>(a: T): string => $\"[{default(T)}]\";\n"
+    // fix #6828 (§14.5 phase 1, v0.359): a FUNCTION-TYPED formal (`() -> T`)
+    // and an INTERFACE formal fed a concrete collection (`IEnumerable<T>`
+    // against `Array<char>`) — the two shapes whose `T` the #6779 gate's
+    // inferred-binding arm never reached.
+    "  public static method ShowF<T>(f: () -> T): string => $\"{f()}\";\n"
+    "  public static method ShowE<T>(xs: IEnumerable<T>): string\n"
+    "    for var x in xs do return $\"{x}\"; end;\n"
+    "    return \"\";\n"
+    "  end ShowE;\n"
     "end H;\n"
     "public class V\n"
     "  public constructor() end constructor;\n"
@@ -422,6 +437,47 @@ BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, explicit_array_string_rejected
                  "var xs := new Array<string>(); xs.Add(\"hi\"); "
                  "Console.WriteLine(H.ShowA<string>(xs));",
                  "xs));", "ShowA", "string");
+}
+
+// ── #6828: a FUNCTION-TYPED formal and an INTERFACE formal fed a concrete
+// collection ───────────────────────────────────────────────────────────────
+//
+// §14.5 phase 1: "a function-typed parameter unifies component-wise — each
+// parameter slot against the argument's slot in order, the return slot against
+// the return slot"; and "a constructed parameter type `G<P1, …, Pn>` unifies
+// component-wise and invariantly against an argument of the same generic type,
+// or against the unique instantiation of `G` that the argument's type
+// implements or extends (an `Array<int>` argument against `xs: IEnumerable<T>`
+// binds `T` to `int`)".
+//
+// The #6779 gate's inferred-binding arm unified only a bare-`T` formal and a
+// same-head constructed formal (`Array<T>` against `Array<char>`), so NEITHER
+// shape below ever produced a binding: the imported generic ran the defining
+// module's `int` (i32) placeholder template. MEASURED on 6d709c00f, the
+// issue's own two-module repro printed `97` and `97` where the same program in
+// ONE module prints `a` and `a`.
+//
+// §2.8.2 clause 2 (v0.359): "An external instantiation behaves identically to
+// a same-module instantiation of the same generic at the same arguments", and
+// "An implementation unable to carry some body shape in its interface format
+// must reject the export, or the import, with a diagnostic naming the shape;
+// it must not alter the instantiation's semantics." The located reject is the
+// conforming interim, as in #1943 / #6779 / #6818 / #7876.
+//
+// The `int` twins of both shapes are BASE-GREEN (they run on the base too, and
+// must keep running): they are in the conformance corpus, not here — see
+// `corpus-candidates/` in the lane's probe directory.
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, show_function_formal_char_rejected_at_argument_6828) {
+    expectReject("1", "Console.WriteLine(H.ShowF(lambda() => char(97)));",
+                 "lambda() => char(97))", "ShowF", "char");
+}
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, show_interface_formal_char_rejected_at_argument_6828) {
+    expectReject("1",
+                 "var xs := new Array<char>(); xs.Add(char(97)); "
+                 "Console.WriteLine(H.ShowE(xs));",
+                 "xs));", "ShowE", "char");
 }
 
 // ── #6818 control: the same calls within one module ────────────────────────
