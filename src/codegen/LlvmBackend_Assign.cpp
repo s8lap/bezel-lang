@@ -3555,8 +3555,17 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         auto* slot = entryAlloca(argVals[k]->getType());
         builder_.CreateStore(argVals[k], slot);
         paramSlots_[ps->indexerParams[k]] = slot;
+        loopBodyDeclaredSlots_.insert(slot);  // fix #8864: fresh per invocation
     }
-    llvm::Value* result = lowerExpr(*getterExpr);
+    llvm::Value* result = nullptr;
+    {
+        // fix #8864 (§23.4 / §27.5, v0.359): this expression body opens no
+        // scope, so its indexer parameters are declared in the CURRENT one —
+        // the depth #3403's captured-parameter guard compares against (see
+        // lowerIndexerSet's block-body twin).
+        CapturedParamScopeDepth idxParamScopeDepth(this, disposeStack_.size());
+        result = lowerExpr(*getterExpr);
+    }
     // fix #2761 (§8.6 "Boxing" / §23.4 "Indexers", v0.240): the INDEXER
     // spelling of the expression-getter box — `property [i: int]: Object =>
     // _n + i;` read as `h[0]` handed the caller a raw i32 in an `Object`, so
@@ -4456,6 +4465,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
         auto* slot = entryAlloca(argVals[k]->getType());
         builder_.CreateStore(argVals[k], slot);
         paramSlots_[ps->indexerParams[k]] = slot;
+        loopBodyDeclaredSlots_.insert(slot);  // fix #8864: fresh per invocation
     }
     // `value` param: look for the LocalSymbol anchored on pd.
     // The codegen's `lowerPropertySet` uses locals_[pd] for `value`.
@@ -4463,6 +4473,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
         auto* slot = entryAlloca(val->getType());
         builder_.CreateStore(val, slot);
         locals_[pd] = slot;
+        loopBodyDeclaredSlots_.insert(slot);  // fix #8864: fresh per invocation
     }
     // fix #2712 / §28.1 / §28.9 / §23.4 (v0.240): the INLINED-SETTER twin of
     // #2696's `inlineCtorBody` retain, and the site #2712 was filed against.
@@ -4482,6 +4493,9 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
     if (setterStmts)
         retainAssignedStringParams(*setterStmts, ps->indexerParams, pd);
     if (setterExpr) {
+        // fix #8864: an expression body declares its parameters in the
+        // current scope (see the block-body arm below).
+        CapturedParamScopeDepth idxParamScopeDepth(this, disposeStack_.size());
         lowerExpr(*setterExpr);
     } else if (setterStmts) {
         // §23.3 / §23.5 (#1236): mirror lowerPropertySetValue (§21.7 / #739) —
@@ -4504,6 +4518,20 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
             // the body.
             AccessorClosureScope setterClosureScope(*this, *setterStmts,
                                                      nullptr);
+            // fix #8864 (§23.4 / §27.5, v0.359): the indexer parameters and
+            // `value` are now boxed FRESH per invocation (their slots are in
+            // `loopBodyDeclaredSlots_`, above), so a capture cell is allocated
+            // on every pass instead of once. #3403's captured-parameter guard
+            // declines the cell's free whenever the capture site is deeper
+            // than depth 1, which for this INLINED body is every capture —
+            // one 4 B cell leaked per call (MEASURED: 200 B in 50 allocations
+            // over 50 `h[i] := ...` calls). The parameters are declared in
+            // the scope `lowerScopedBlock` opens for this body, exactly as an
+            // inlined constructor body's are (#8765's
+            // `CapturedParamScopeDepth` in inlineCtorBody), so the same RAII
+            // states that depth for the body's duration.
+            CapturedParamScopeDepth idxParamScopeDepth(
+                this, disposeStack_.size() + 1);
             term = lowerScopedBlock(*setterStmts);
         }
         inlinedAccessorEnd_ = savedAccEnd;
@@ -5540,12 +5568,14 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
          k < idxSlots.size(); ++k) {
         if (!idxSlots[k]) continue;
         paramSlots_[ps->indexerParams[k]] = idxSlots[k];
+        loopBodyDeclaredSlots_.insert(idxSlots[k]);  // fix #8864
     }
     // Bind `value` (anchored on the PropertyDecl, per §22.10 / lowerIndexerSet).
     {
         llvm::AllocaInst* vslot = entryAlloca(newVal->getType());
         builder_.CreateStore(newVal, vslot);
         locals_[pd] = vslot;
+        loopBodyDeclaredSlots_.insert(vslot);  // fix #8864
     }
     // fix #2712 / §28.1 / §28.9 / §23.4 (v0.240): the COMPOUND-ASSIGNMENT twin
     // of lowerIndexerSet's retain — this setter body is inlined into the
@@ -5554,8 +5584,17 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
     // same `heap-use-after-free`. See lowerIndexerSet for the full argument.
     if (setterStmts)
         retainAssignedStringParams(*setterStmts, ps->indexerParams, pd);
-    if (setterExpr) lowerExpr(*setterExpr);
-    else if (setterStmts) lowerScopedBlock(*setterStmts);
+    // fix #8864 (§23.4 / §27.5, v0.359): the parameters' declaring scope for
+    // #3403's guard — the current one for an expression body, the one
+    // lowerScopedBlock opens for a block body (see lowerIndexerSet).
+    if (setterExpr) {
+        CapturedParamScopeDepth idxParamScopeDepth(this, disposeStack_.size());
+        lowerExpr(*setterExpr);
+    } else if (setterStmts) {
+        CapturedParamScopeDepth idxParamScopeDepth(this,
+                                                   disposeStack_.size() + 1);
+        lowerScopedBlock(*setterStmts);
+    }
     // fix #2567 (§23.4/§28.9/§4.6, v0.236): the COMPOUND-ASSIGNMENT twin of
     // #2548's inline-body `emitProducerRelease()` (this file, line 2153-2154).
     // `lowerIndexerCompound` desugars `a[i] OP= rhs` to `a[i] := a[i] OP rhs`:
@@ -9595,6 +9634,22 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
         llvm::AllocaInst* slot = entryAlloca(v->getType());
         builder_.CreateStore(v, slot);
         locals_[pd] = slot;
+        // fix #8864 (§23.3 / §27.5, v0.359): `value` is a parameter of the
+        // setter, and every invocation binds it afresh. This body is INLINED
+        // into the caller, so the binding store above re-executes in the
+        // caller's function each time the assignment does (a loop body
+        // included), exactly like a local declared inside a loop body. Without
+        // this mark, boxLocalSlot picks fresh-each-pass boxing only when the
+        // binding store sits in the capture's own basic block; a call earlier
+        // in the setter body (the first lambda's `g()`) splits the block, the
+        // GUARDED strategy then allocates the capture cell once, and every
+        // later pass hands the capturing lambda the FIRST pass's `value`.
+        // Every inlined accessor parameter binding (the indexer parameters
+        // and `value` in lowerIndexerGet / lowerIndexerSet /
+        // lowerIndexerCompoundCore, the instance branch below) is marked the
+        // same way. A separate-function accessor needs no mark: its entry
+        // block re-runs per call.
+        loopBodyDeclaredSlots_.insert(slot);
         // fix #2712 / §23.3 / §28.9 (v0.240): the STATIC-property twin of the
         // inlined-indexer-setter retain — found by sweeping the shape rather
         // than listed on the issue, and reproduced mechanically (`value := "zz"`
@@ -9802,6 +9857,7 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
     llvm::AllocaInst* slot = entryAlloca(v->getType());
     builder_.CreateStore(v, slot);
     locals_[pd] = slot;
+    loopBodyDeclaredSlots_.insert(slot);  // fix #8864: see the static branch
     // fix #2712 / §23.3 / §28.9 (v0.240): the INSTANCE-property twin of the
     // static branch's retain immediately above — same inlined body, same
     // unpaired drop-on-overwrite release, reproduced the same way. See
