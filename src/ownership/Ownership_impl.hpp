@@ -5056,6 +5056,38 @@ private:
     // #2342/#2527 already settled for the §28.14 capture walk.
     bool isPlainBorrowParam(sema::Symbol* sym);
 
+    // fix #8849 (§28.3 *Provenance* clause 1, v0.359): the PLAIN (borrowing)
+    // PARAMETER of the analysed body that the captured binding `sym` is an
+    // ALIAS of — nullptr when it is not one.
+    //
+    // §28.3 counts a captured binding by "that binding's source" (provenance
+    // clause 1: "a captured borrowed local or parameter that binding's
+    // source"), and §28.3's producers make an ALIAS a BORROW of its
+    // initializer's root (§28.3.4: "Local-variable read `x` where `x` is
+    // borrowed | Borrowed (source: same as `x`'s source)"; K3.13: "`var y :=
+    // x;` … is a borrow"): `var b := w;` binds `b` to a BORROW of `w`, so a
+    // captured `b` contributes `w`'s source. A plain (borrowing) parameter's
+    // own source is "this call" — the premise `isPlainBorrowParam` reads —
+    // and a returned closure necessarily outlives the call, so the alias
+    // carries exactly the hazard the DIRECT capture has. The escape check
+    // must see it: the direct leg answers about a captured PARAMETER, and an
+    // alias resolves to a LOCAL, so the leg above never fires for it and the
+    // alias's provenance was dropped on the way in.
+    //
+    // The chain is walked through the DECLARATION's initializer and its ROOT
+    // identifier, exactly as `borrowSourceForExpr`'s Shape 1 reads a
+    // re-borrow's root (`identifierRootThroughCastBang`), and the SHAPE set
+    // is Shape 1's: a bare identifier or a member / null-conditional-member /
+    // index read. The borrow-vs-copy gate is `returnedExprMayBorrow`, Shape
+    // 1's own: a value-typed projection (`var n := w.v;` over an `int`
+    // field) is a COPY, not a borrow, and carries no source set at all
+    // (§28.3's producers).
+    //
+    // The alias must be a LOCAL of this body: a PARAMETER is the direct case
+    // (`isPlainBorrowParam`), and a LAMBDA's own parameter resolves inside
+    // the lambda and contributes no source (§28.3, v0.307, #4757).
+    sema::Symbol* plainBorrowParamAliasSource(sema::Symbol* sym);
+
     // §28.3 *Diagnostics* "The trust-admission report" (v0.307, #4605).
     // `trustFieldStoreCarrier` — is this borrow carrier one the report mode
     // names (the receiver, or a plain reference-typed parameter of this body)?

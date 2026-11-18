@@ -7569,6 +7569,68 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                     "the closure does not escape)");
                 return;  // one diagnostic per return is enough
             }
+            // fix #8849 (§28.3 *Provenance* clause 1, v0.359): the ALIAS of
+            // a plain (borrowing) parameter — the SAME rule as the direct leg
+            // above, reached through the alias's own provenance.
+            //
+            // §28.3 counts a captured binding by "that binding's source"
+            // (provenance clause 1: "a captured borrowed local or parameter
+            // that binding's source"), and §28.3's producers make an ALIAS a
+            // BORROW of its initializer's root (§28.3.4: "Local-variable read
+            // `x` where `x` is borrowed | Borrowed (source: same as `x`'s
+            // source)"), so `var b := w;` binds `b` to a borrow of the plain
+            // parameter `w` — whose own source is "this call" ("Parameter `p`
+            // (no modifier) | Borrowed (source: caller)"). A returned closure
+            // necessarily outlives the call, so the alias carries exactly the
+            // hazard the DIRECT capture has.
+            //
+            // MEASURED (issue #8849's repro): `var b := w; return lambda() =>
+            // b.v;` over a plain `w: Widget` parameter compiled with ZERO
+            // diagnostics before this fix, while the DIRECT capture of `w`
+            // was rejected by the leg above — the alias resolves to a LOCAL,
+            // so no leg recognised it and its provenance was dropped on the
+            // way in.
+            //
+            // This arm reads the DECLARATION chain, not the dataflow, so it
+            // does not need `states_` — a `const` local is not tracked there
+            // at all, and the `const` spelling of the same alias
+            // (`const b := w;`) must be rejected too. It sits BEFORE the
+            // §9.7 record/span/choice leg and the §28.3 owned-capture leg
+            // below, which answer about a VALUE-typed carrier and about an
+            // OWNED capture respectively — neither of which a plain borrow
+            // parameter's alias is.
+            //
+            // An OWNED capture is EXCLUDED: that is the §28.3 owned-capture
+            // obligation below, which names it precisely ("whose source is
+            // disposed at scope end") and must keep that wording. A MOVE-ONLY
+            // capture is the §28.9 exception below, likewise.
+            if (scope == EscapeScope::Method) {
+                auto ownedIt = states_.find(sym);
+                const bool ownedCapture =
+                    ownedIt != states_.end() &&
+                    ownedIt->second.state == OwnershipState::Owned;
+                if (!ownedCapture && !isLiveMoveOnlyChoiceLocal(sym)) {
+                    if (sema::Symbol* param =
+                            plainBorrowParamAliasSource(sym)) {
+                        report(
+                            Severity::Error, id->span.begin,
+                            std::string("returned closure captures `") +
+                            std::string(sym->name) +
+                            "`, an alias of the plain (borrowing) "
+                            "parameter `" +
+                            std::string(param->name) +
+                            "` — its source is this call, which the returned "
+                            "closure necessarily outlives; a function type "
+                            "announces no source set, so no caller could "
+                            "bound the escaping borrow (§27.5 closure-capture "
+                            "rule / §28.3 *Provenance* clause 1, v0.359; copy "
+                            "the data you need into an owned value the "
+                            "closure can capture, or restructure so the "
+                            "closure does not escape)");
+                        return;  // one diagnostic per return is enough
+                    }
+                }
+            }
             // §9.7 (#2144): "A borrow-bearing record may not be captured by a
             // closure that escapes its source's scope." A captured local of
             // borrow-bearing record / builtin-span type is a VALUE — never
@@ -8928,6 +8990,72 @@ bool MethodOwnership::isPlainBorrowParam(sema::Symbol* sym) {
     const sema::TypeRef* declTy =
         ps->declType ? ctx_.resolvedType(*ps->declType) : ps->resolvedDeclType;
     return isBorrowableType(declTy);
+}
+
+// fix #8849 (§28.3 *Provenance* clause 1, v0.359): the PLAIN (borrowing)
+// PARAMETER of the analysed body that the captured binding `sym` is an ALIAS
+// of — nullptr when it is not one.
+//
+// §28.3 counts a captured binding by "that binding's source" (provenance
+// clause 1: "a captured borrowed local or parameter that binding's source"),
+// and §28.3's producers make an ALIAS a BORROW of its initializer's root
+// (§28.3.4: "Local-variable read `x` where `x` is borrowed | Borrowed
+// (source: same as `x`'s source)"; K3.13: "`var y := x;` … is a borrow"):
+// `var b := w;` binds `b` to a BORROW of `w`, so a captured `b` contributes
+// `w`'s source. A plain (borrowing) parameter's own source is "this call" —
+// the premise `isPlainBorrowParam` reads — and a returned closure necessarily
+// outlives the call, so the alias carries exactly the hazard the DIRECT
+// capture has.
+//
+// The chain is walked through the DECLARATION's initializer and its ROOT
+// identifier, exactly as `borrowSourceForExpr`'s Shape 1 reads a re-borrow's
+// root (`identifierRootThroughCastBang`), and the SHAPE set is Shape 1's: a
+// bare identifier or a member / null-conditional-member / index read. A CALL
+// result is not followed here: §28.3's announcement table gives a call its own
+// source (the receiver for a receiver-sourced return), which is a DIFFERENT
+// route to the same hazard and is filed separately.
+//
+// The borrow-vs-copy gate is `returnedExprMayBorrow` — the same predicate
+// Shape 1 uses: a value-typed projection (`var n := w.v;` over an `int` field)
+// is a COPY, not a borrow, and carries no source set at all (§28.3's
+// producers).
+//
+// The alias must be a LOCAL of this body: a PARAMETER is the direct case
+// (`isPlainBorrowParam`), and a LAMBDA's own parameter resolves inside the
+// lambda and contributes no source (§28.3, v0.307, #4757).
+//
+// `sym` may be an alias of an alias (`var b := w; var c := b;`): the walk
+// follows the chain to the plain parameter at its root. The chain is a DAG
+// over declaration order (a link always points at an EARLIER declaration), so
+// the walk terminates; the depth bound is a belt-and-braces guard against a
+// malformed cycle.
+sema::Symbol* MethodOwnership::plainBorrowParamAliasSource(sema::Symbol* sym) {
+    sema::Symbol* cur = sym;
+    for (int depth = 0; depth < 64 && cur; ++depth) {
+        auto* ls = dynamic_cast<sema::LocalSymbol*>(cur);
+        if (!ls) return nullptr;  // a parameter is the DIRECT case
+        const ast::Expr* init = nullptr;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
+            init = ld->initializer.get();
+        else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(ls->decl))
+            init = lc->value.get();
+        if (!init) return nullptr;
+        // The alias's VALUE must be a borrow (a reference), not a copy.
+        if (!returnedExprMayBorrow(*init)) return nullptr;
+        const ast::Expr* core = peelTopCastBang(init);
+        if (!dynamic_cast<const ast::IdentifierExpr*>(core) &&
+            !dynamic_cast<const ast::MemberAccessExpr*>(core) &&
+            !dynamic_cast<const ast::NullCondMemberExpr*>(core) &&
+            !dynamic_cast<const ast::IndexExpr*>(core))
+            return nullptr;
+        const ast::IdentifierExpr* root = identifierRootThroughCastBang(*init);
+        if (!root) return nullptr;
+        sema::Symbol* src = ctx_.exprSymbol(*root);
+        if (!src) return nullptr;
+        if (isPlainBorrowParam(src)) return src;
+        cur = src;  // another local — keep walking the chain
+    }
+    return nullptr;
 }
 
 // fix #7468 (§28.3 *Diagnostics* "The trust-admission report", v0.357): is this
