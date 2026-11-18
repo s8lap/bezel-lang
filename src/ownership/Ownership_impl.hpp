@@ -4930,6 +4930,44 @@ private:
     // operand's own discharge walk. // per §31.1, §17.12
     void checkThrowOperandNotBorrowed(const ast::Expr& operand);
 
+    // fix #8802 (§31.1 *The throw operand*, v0.359): the LAMBDA-BODY LOCAL
+    // half of the same rule. §31.1: "The operand is consumed as an owned
+    // value under the ownership rules below, so a *borrowed* class reference
+    // is not a valid operand." The rule names no scope; the METHOD body
+    // rejects a borrowed operand through checkThrowOperandNotBorrowed, and a
+    // closure body never reaches that arm (ownership's statement walks do
+    // not enter a lambda body), so `throw b` of a closure's own borrowed
+    // local compiled and core-dumped. The captured-borrow case is #8781's
+    // and the captured-owned case is #7920's; this is the LOCAL one.
+    //
+    // The operand must be a bare read (peeling `!` per §17.8 and `move` per
+    // §28.8.1) of a local DECLARED IN THE CURRENT LAMBDA BODY whose value at
+    // the throw is a borrow on every path. The verdict is handed to
+    // checkThrowOperandNotBorrowed itself (with the local's borrow state
+    // installed in `states_` for that one call), so the closure body draws
+    // the METHOD arm's diagnostic, at the method arm's position. Called from
+    // the closure scan's ThrowStmt and ThrowExpr arms.
+    // // per §31.1, v0.359
+    void checkLambdaBodyThrowOperandNotBorrowed(const ast::Expr& operand);
+
+    // fix #8802 (§31.1, v0.359): does the lambda-body local `ls` hold a
+    // BORROW at the source offset `atOffset`? Every binding of the local
+    // that precedes the offset (its `var` declaration and each plain
+    // reassignment) is classified by `producerState` of the bound
+    // expression -- the same first-cut classification the method body's own
+    // `handleLocalDecl` seeds `states_` from -- and the local holds a borrow
+    // only when EVERY such binding is a borrow. One-sided on purpose: an
+    // owned binding makes the state ambiguous (the binding may be on a path
+    // that does not reach the throw), and an ambiguous state is not a
+    // borrow, so the check under-approximates and never rejects a program
+    // the method body's dataflow would admit. The bindings are collected
+    // with `forEachNestedStmt` (the one statement grammar) over the
+    // lambda's own statements, which never crosses into a nested lambda.
+    // // per §31.1, §28.3, v0.359
+    bool lambdaBodyLocalHoldsBorrow(sema::LocalSymbol* ls,
+                                    const ast::LambdaExpr& lam,
+                                    std::uint32_t atOffset);
+
     // §31.1 / §28.3.7 (axiom A5, v0.350; issue #7412, owner ruling "reading
     // 1"): the `throw` operand is consumed as an owned value passed to the
     // runtime's exception machinery -- a move OUT of the binding's scope -- and

@@ -6937,6 +6937,11 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
         // spelling of the throw-consume, see the ThrowStmt arm.
         if (insideLambda && th->operand)
             reportCapturedThrowOperand(*th->operand);
+        // fix #8802 (§31.1 *The throw operand*, v0.359): the LAMBDA-BODY
+        // LOCAL case — a closure's own borrowed local thrown from its body.
+        // The captured-borrow case is #8781's; this arm is the local one.
+        if (insideLambda && th->operand)
+            checkLambdaBodyThrowOperandNotBorrowed(*th->operand);
         if (th->operand) scanCapturedOwnedConsumeExpr(*th->operand, insideLambda);
         return;
     }
@@ -7054,6 +7059,12 @@ void MethodOwnership::scanCapturedOwnedConsumeStmt(const ast::Stmt& s,
         // fix #7920 (§28.3 *Captured owned bindings*, §31.1 *The throw
         // operand*, v0.359): `throw c;` over a captured owned `c`.
         if (insideLambda && th->value) reportCapturedThrowOperand(*th->value);
+        // fix #8802 (§31.1 *The throw operand*, v0.359): the LAMBDA-BODY
+        // LOCAL case — `throw b;` where `b` is a borrowed local of the
+        // closure's own body. The captured-borrow case is #8781's; this arm
+        // is the local one (see the function's own header).
+        if (insideLambda && th->value)
+            checkLambdaBodyThrowOperandNotBorrowed(*th->value);
         if (th->value) scanCapturedOwnedConsumeExpr(*th->value, insideLambda);
         return;
     }
@@ -13416,6 +13427,184 @@ void MethodOwnership::checkThrowOperandNotBorrowed(const ast::Expr& operand) {
         "(\xc2\xa7""31.2.4); to propagate a caught exception's information, chain "
         "a fresh instance through its snapshot constructor \xe2\x80\x94 "
         "`throw new Exception(ex.Message, ex)` (\xc2\xa7""31.4)");
+}
+
+// fix #8802 (§31.1 *The throw operand*, v0.359): the LAMBDA-BODY LOCAL half.
+//
+// §31.1 "The throw operand": "The operand is consumed as an owned value under
+// the ownership rules below, so a *borrowed* class reference is not a valid
+// operand." The rule names NO scope. The METHOD body rejects a borrowed
+// operand through `checkThrowOperandNotBorrowed` ("the thrown value must be an
+// OWNED exception"); a closure body never reaches that arm — ownership's
+// statement walks do not enter a lambda body (Ownership.cpp: "the statement
+// walk never enters a lambda body") — and the closure scan's own throw hook
+// (`reportCapturedThrowOperand`, fix #7920) asks only whether the operand is a
+// CAPTURED OWNED binding. So `throw b` of a lambda's OWN borrowed local
+// (`var c := new R(); var b := c; throw b;`) compiled (rc=0) and core-dumped
+// at run time (MEASURED on r30-c1 @ 80439bb9d: rc=139): the borrow's owner
+// and the runtime both disposed the instance.
+//
+// This closes exactly that gap, and nothing wider:
+//
+//   * The operand must be a bare read of a local DECLARED IN THIS LAMBDA
+//     BODY. A CAPTURED binding is #7920's (owned) and #8781's (borrowed)
+//     case, and a lambda PARAMETER is #8781's case: those are asked
+//     `checkThrowOperandNotBorrowed` in the ENCLOSING frame, where the
+//     binding IS tracked in `states_`. A lambda-body local is tracked in NO
+//     frame, so that check cannot see it — it is the one shape it misses.
+//
+//   * The local's value at the throw must be a BORROW. The local's ownership
+//     state is its BINDING's §28.3 producers-table classification — the SAME
+//     `producerState` the method body's own `handleLocalDecl` uses to seed
+//     `states_` (`lo.state = producerState(*ld.initializer)`) — so a local
+//     bound to an owned production (`var b := new R();`) stays admitted, and a
+//     local REASSIGNED to an owned value before the throw
+//     (`var b := c; b := new R(); throw b;`) is admitted too, exactly as the
+//     method body's dataflow admits it.
+//
+// The verdict is then handed to the METHOD arm's own predicate: the local's
+// borrow state is installed in `states_` for the duration of that one call and
+// removed immediately after, so the closure body draws the method arm's
+// diagnostic, at the method arm's position, with the method arm's wording —
+// the two arms cannot drift apart. `ownedArgSourceIsBorrow` reads `states_`
+// and has no side effects of its own (its own header says so), so the
+// temporary entry is the only state the call touches.
+//
+// Flow-insensitive in ONE direction only, and deliberately: the check reports a
+// borrow only when EVERY binding of the local that precedes the throw is a
+// borrow. A binding to an owned value makes the state at the throw ambiguous
+// (the binding may not run), and an ambiguous state is NOT reported — the
+// conservative direction, which can leave a hole but never rejects a legal
+// program.
+//
+// `throw b!` is covered: §17.8 classifies `x!` by its position exactly as the
+// bare read `x`. `throw move b` is covered: §28.8.1 reads the underlying
+// PLACE, so a borrow place under `move` is still a borrow. // per §31.1,
+// v0.359, #8802
+void MethodOwnership::checkLambdaBodyThrowOperandNotBorrowed(
+    const ast::Expr& operand) {
+    if (closureScanStack_.empty()) return;
+    const ast::LambdaExpr* lam = closureScanStack_.back();
+    if (!lam) return;
+    // Peel the `!` (§17.8) and the `move` (§28.8.1): both classify the
+    // UNDERLYING place, so `throw b!` and `throw move b` are the same
+    // question as `throw b`.
+    const ast::Expr* op = lookThroughForceUnwrap(&operand);
+    if (!op) return;
+    if (const auto* un = dynamic_cast<const ast::UnaryExpr*>(op)) {
+        if (un->op == "move" && un->operand)
+            op = lookThroughForceUnwrap(un->operand.get());
+    }
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(op);
+    if (!id) return;
+    if (id->name == "this" || id->name == "base") return;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    if (!sym) return;
+    // A lambda PARAMETER is #8781's case (the closure's own non-`owned`
+    // parameter) and a catch-arm binding is rejected with this very text by
+    // the catch walk already in the tree (#8781 records the same skip) — so
+    // this arm is the LAMBDA-BODY LOCAL only.
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls) return;
+    if (isCatchBorrow(sym)) return;
+    // The local must be declared IN THIS LAMBDA BODY. The span test is the
+    // one `collectHeldBorrowsOfClosureCaptures` already uses to tell a
+    // closure's own binding from a captured one: a binding declared inside
+    // the lambda's own source range is the closure's own.
+    const std::uint32_t lamLo = lam->span.begin.offset;
+    const std::uint32_t lamHi = lam->span.end.offset;
+    std::uint32_t declOff = sym->declLoc.offset;
+    bool declKnown = sym->declLoc.line != 0;
+    if (!declKnown && sym->decl) {
+        declOff = sym->decl->span.begin.offset;
+        declKnown = sym->decl->span.begin.line != 0;
+    }
+    if (!declKnown) return;
+    if (declOff < lamLo || declOff >= lamHi) return;
+    // The local's value at the throw must be a borrow on every path.
+    if (!lambdaBodyLocalHoldsBorrow(ls, *lam, operand.span.begin.offset))
+        return;
+    // Hand the verdict to the METHOD arm's own predicate, with the local's
+    // borrow state installed for the duration of that one call. The entry is
+    // removed on the way out, so the enclosing frame's `states_` is exactly
+    // as it was.
+    auto saved = states_.find(ls);
+    const bool hadSaved = saved != states_.end();
+    LocalOwnership savedEntry = hadSaved ? saved->second : LocalOwnership{};
+    LocalOwnership borrowState;
+    borrowState.state = OwnershipState::Borrowed;
+    states_[ls] = borrowState;
+    checkThrowOperandNotBorrowed(operand);
+    if (hadSaved) states_[ls] = savedEntry;
+    else states_.erase(ls);
+}
+
+// fix #8802 (§31.1, v0.359): the local's ownership state at a source offset.
+//
+// The lambda body's own bindings, in source order, are the local's history:
+// each `var` declaration and each plain reassignment binds the local to a
+// value whose §28.3 producers-table classification is `producerState` of the
+// bound expression — the SAME first-cut classification the method body's own
+// `handleLocalDecl` seeds `states_` from.
+//
+// A local holds a BORROW at `atOffset` when EVERY binding that precedes that
+// offset is a borrow. The rule is deliberately one-sided: an owned binding
+// anywhere in the history makes the state at the throw ambiguous (the
+// binding may be on a path that does not reach the throw), and an ambiguous
+// state is not a borrow — so the check under-approximates and never rejects
+// a program the method body's dataflow would admit.
+//
+// The bindings are collected with `forEachNestedStmt` — the ONE statement
+// grammar (StmtWalker.hpp, fix #3656) — over the lambda's own top-level
+// statements. That walker does not cross into a nested lambda (a nested
+// lambda's body is walked with ITS own bindings), so a nested lambda's local
+// is never mistaken for this lambda's. // per §31.1, §28.3, v0.359
+bool MethodOwnership::lambdaBodyLocalHoldsBorrow(sema::LocalSymbol* ls,
+                                                  const ast::LambdaExpr& lam,
+                                                  std::uint32_t atOffset) {
+    bool sawBinding = false;
+    bool everyBindingBorrow = true;
+    auto consider = [&](const ast::Expr* bound, std::uint32_t off) {
+        if (!bound) return;
+        // A binding that comes after the throw is not live at the throw.
+        if (off >= atOffset) return;
+        sawBinding = true;
+        if (producerState(*bound) != OwnershipState::Borrowed)
+            everyBindingBorrow = false;
+    };
+    for (const auto& top : lam.stmts) {
+        if (!top) continue;
+        forEachNestedStmt(*top, [&](const ast::Stmt& cur) {
+            if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
+                if (findLocalSymbol(cur) != ls) return;
+                consider(ld->initializer.get(), ld->span.begin.offset);
+                return;
+            }
+            // §21.1's runtime `const` is a SEPARATE AST node
+            // (`LocalConstDecl`, fix #3591), so a `const` binding needs its
+            // own arm: `const b := c;` binds `b` to the same borrow a `var`
+            // would, and the METHOD body rejects `throw b` over it (the
+            // `const`'s initializer can never be an owned production —
+            // §21.1 — so a class-typed `const` always holds a borrow).
+            if (const auto* lc =
+                    dynamic_cast<const ast::LocalConstDecl*>(&cur)) {
+                if (findLocalSymbol(cur) != ls) return;
+                consider(lc->value.get(), lc->span.begin.offset);
+                return;
+            }
+            if (const auto* as =
+                    dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
+                if (!as->target || !as->value) return;
+                const auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    as->target.get());
+                if (!tid) return;
+                if (ctx_.exprSymbol(*tid) != ls) return;
+                consider(as->value.get(), as->span.begin.offset);
+                return;
+            }
+        });
+    }
+    return sawBinding && everyBindingBorrow;
 }
 
 // §31.1 / §28.3.7 (axiom A5, v0.350; issue #7412): see the header. The operand
