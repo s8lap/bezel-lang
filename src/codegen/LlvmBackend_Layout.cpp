@@ -8001,6 +8001,7 @@ llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
     auto savedParams = paramSlots_;
     auto savedRefParams = refParams_;
     auto savedDisposeStack = disposeStack_;
+    PendingLambdaCellsScope pendingLambdaCells(*this);  // fix #8827 (§27.5 / §28.3, v0.359)
     auto savedLoopStack = loopStack_;
     auto savedFinallyStack = finallyStack_;
     auto savedFinallyBodies = finallyBodyStack_;
@@ -8119,6 +8120,7 @@ llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
     locals_ = std::move(savedLocals); paramSlots_ = std::move(savedParams);
     refParams_ = std::move(savedRefParams);
     disposeStack_ = std::move(savedDisposeStack);
+    pendingLambdaCells.restore();  // fix #8827
     loopStack_ = std::move(savedLoopStack);
     finallyStack_ = std::move(savedFinallyStack);
     finallyBodyStack_ = std::move(savedFinallyBodies);
@@ -8478,6 +8480,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     auto savedParams = paramSlots_;
     auto savedRefParams = refParams_;
     auto savedDisposeStack = disposeStack_;
+    PendingLambdaCellsScope pendingLambdaCells(*this);  // fix #8827 (§27.5 / §28.3, v0.359)
     auto savedLoopStack = loopStack_;
     // #2281 / §31.2: the method thunk is a separate function. Preserve the
     // caller's active try/finally frames across this nested emission; keep the
@@ -8850,6 +8853,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     locals_ = std::move(savedLocals); paramSlots_ = std::move(savedParams);
     refParams_ = std::move(savedRefParams);
     disposeStack_ = std::move(savedDisposeStack);
+    pendingLambdaCells.restore();  // fix #8827
     loopStack_ = std::move(savedLoopStack);
     finallyStack_ = std::move(savedFinallyStack);          // #2281 / §31.2
     finallyBodyStack_ = std::move(savedFinallyBodies);     // #2281 / §29.7
@@ -8935,6 +8939,7 @@ llvm::Value* Emitter::makeObjectMemberThunk(const ast::MemberAccessExpr& ma,
     auto savedParams = paramSlots_;
     auto savedRefParams = refParams_;
     auto savedDisposeStack = disposeStack_;
+    PendingLambdaCellsScope pendingLambdaCells(*this);  // fix #8827 (§27.5 / §28.3, v0.359)
     auto savedLoopStack = loopStack_;
     auto savedFinallyStack = finallyStack_;
     auto savedFinallyBodies = finallyBodyStack_;
@@ -9084,6 +9089,7 @@ llvm::Value* Emitter::makeObjectMemberThunk(const ast::MemberAccessExpr& ma,
         locals_ = std::move(savedLocals); paramSlots_ = std::move(savedParams);
         refParams_ = std::move(savedRefParams);
         disposeStack_ = std::move(savedDisposeStack);
+        pendingLambdaCells.restore();  // fix #8827
         loopStack_ = std::move(savedLoopStack);
         finallyStack_ = std::move(savedFinallyStack);
         finallyBodyStack_ = std::move(savedFinallyBodies);
@@ -9144,6 +9150,7 @@ llvm::Value* Emitter::makeObjectMemberThunk(const ast::MemberAccessExpr& ma,
     locals_ = std::move(savedLocals); paramSlots_ = std::move(savedParams);
     refParams_ = std::move(savedRefParams);
     disposeStack_ = std::move(savedDisposeStack);
+    pendingLambdaCells.restore();  // fix #8827
     loopStack_ = std::move(savedLoopStack);
     finallyStack_ = std::move(savedFinallyStack);
     finallyBodyStack_ = std::move(savedFinallyBodies);
@@ -9247,6 +9254,7 @@ llvm::Value* Emitter::makePrimIntrinsicThunk(const ast::MemberAccessExpr& ma,
     auto savedParams = paramSlots_;
     auto savedRefParams = refParams_;
     auto savedDisposeStack = disposeStack_;
+    PendingLambdaCellsScope pendingLambdaCells(*this);  // fix #8827 (§27.5 / §28.3, v0.359)
     auto savedLoopStack = loopStack_;
     auto savedFinallyStack = finallyStack_;
     llvm::BasicBlock* savedUnwind = unwindTarget_;
@@ -9322,6 +9330,7 @@ llvm::Value* Emitter::makePrimIntrinsicThunk(const ast::MemberAccessExpr& ma,
     locals_ = std::move(savedLocals); paramSlots_ = std::move(savedParams);
     refParams_ = std::move(savedRefParams);
     disposeStack_ = std::move(savedDisposeStack);
+    pendingLambdaCells.restore();  // fix #8827
     loopStack_ = std::move(savedLoopStack);
     finallyStack_ = std::move(savedFinallyStack);
     unwindTarget_ = savedUnwind; propagateBB_ = savedProp;

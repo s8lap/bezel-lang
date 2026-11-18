@@ -277,6 +277,52 @@ const char* kGenericBodyClosureLocalSharedTwoLambdas =
     "  end; "
     "end; ";
 
+// G, H — a generic type's static initialiser, itself containing a call with a
+// lambda argument, first touched as an ARGUMENT after a capturing lambda
+// argument (review r42-rev-s79 probes s01 / s03).
+const char* kGenericSfinitAfterLambdaArg =
+    "module T; "
+    "public class Reg<T> "
+    "  public static readonly V: int := Reg<T>.Seed(lambda() => 2); "
+    "  private static method Seed(f: () -> int): int => f() + 40; "
+    "end; "
+    "public static class Program "
+    "  public static method Two(f: () -> int, v: int): int => f() + v; "
+    "  public static method Main(args: Array<string>): int "
+    "    var i: int := 0; "
+    "    var tot: int := 0; "
+    "    while i < 200 do "
+    "      var n: int := 1; "
+    "      tot := tot + Two(lambda() => n, Reg<int>.V); "
+    "      i := i + 1; "
+    "    end; "
+    "    Console.WriteLine(tot.ToString()); "
+    "    return 0; "
+    "  end; "
+    "end; ";
+
+const char* kGenericSfinitBetweenSharedLambdaArgs =
+    "module T; "
+    "public class Reg<T> "
+    "  public static readonly V: int := Reg<T>.Seed(lambda() => 2); "
+    "  private static method Seed(f: () -> int): int => f() + 40; "
+    "end; "
+    "public static class Program "
+    "  public static method Three(f: () -> int, v: int, g: () -> int): int "
+    "    => f() + v + g(); "
+    "  public static method Main(args: Array<string>): int "
+    "    var i: int := 0; "
+    "    var tot: int := 0; "
+    "    while i < 200 do "
+    "      var n: int := 1; "
+    "      tot := tot + Three(lambda() => n, Reg<int>.V, lambda() => n + 1); "
+    "      i := i + 1; "
+    "    end; "
+    "    Console.WriteLine(tot.ToString()); "
+    "    return 0; "
+    "  end; "
+    "end; ";
+
 // The output each program prints: one line per iteration.
 std::string repeatedLine(const std::string& line, int times) {
     std::string out;
@@ -349,4 +395,30 @@ BEZEL_TEST(ctor_arg_shared_capture_cell_8827,
            generic_body_closure_local_with_shared_capture_lambda_args_compiles_and_reclaims) {
     auto r = runAotChecked(kGenericBodyClosureLocalSharedTwoLambdas);
     expectClean(r, 0, "20100\n");
+}
+
+// ===========================================================================
+// G, H — a nested body emitted LAZILY mid-call: the per-instantiation static
+// initialiser of `Reg<int>` (genericInstSfinitFn) is built at the first touch
+// of `Reg<int>.V`, which is an argument lowered AFTER a capturing lambda
+// argument. §22.12 / §14.1: the statics of `G<Arg>` are initialised at that
+// access; §27.5: the caller's capture cell is reclaimed once. Without the
+// save/clear/restore of the pending channel around that body, the
+// initialiser's own `Seed(lambda() => 2)` call consumed the CALLER's pending
+// cell and pushed it onto the initialiser's EMPTY disposeStack_: bezelc
+// SEGFAULTS (rc=139) on bd25bc94a, the intermediate fix-forward this guards
+// (r42-rev-s79). On the base r30-c1 the inner lambda's clear dropped the
+// caller's entry instead, so the caller's cell leaked (800 B / 200
+// allocations). RED on both; GREEN with the fix.
+// ===========================================================================
+BEZEL_TEST(ctor_arg_shared_capture_cell_8827,
+           generic_static_init_first_touched_after_a_lambda_arg_compiles_and_reclaims) {
+    auto r = runAotChecked(kGenericSfinitAfterLambdaArg);
+    expectClean(r, 0, "8600\n");
+}
+
+BEZEL_TEST(ctor_arg_shared_capture_cell_8827,
+           generic_static_init_first_touched_between_shared_lambda_args_compiles_and_reclaims) {
+    auto r = runAotChecked(kGenericSfinitBetweenSharedLambdaArgs);
+    expectClean(r, 0, "9000\n");
 }

@@ -3304,6 +3304,7 @@ llvm::Value* Emitter::makeBuiltinListMemberThunk(const ast::MemberAccessExpr& ma
     auto savedParams = paramSlots_;
     auto savedRefParams = refParams_;
     auto savedDisposeStack = disposeStack_;
+    PendingLambdaCellsScope pendingLambdaCells(*this);  // fix #8827 (§27.5 / §28.3, v0.359)
     auto savedLoopStack = loopStack_;
     auto savedFinallyStack = finallyStack_;
     auto savedFinallyBodies = finallyBodyStack_;
@@ -3402,6 +3403,7 @@ llvm::Value* Emitter::makeBuiltinListMemberThunk(const ast::MemberAccessExpr& ma
     locals_ = std::move(savedLocals); paramSlots_ = std::move(savedParams);
     refParams_ = std::move(savedRefParams);
     disposeStack_ = std::move(savedDisposeStack);
+    pendingLambdaCells.restore();  // fix #8827
     loopStack_ = std::move(savedLoopStack);
     finallyStack_ = std::move(savedFinallyStack);
     finallyBodyStack_ = std::move(savedFinallyBodies);
@@ -3516,6 +3518,7 @@ llvm::Value* Emitter::makeClassDisposeThunk(const ast::MemberAccessExpr& ma) {
     auto savedParams = paramSlots_;
     auto savedRefParams = refParams_;
     auto savedDisposeStack = disposeStack_;
+    PendingLambdaCellsScope pendingLambdaCells(*this);  // fix #8827 (§27.5 / §28.3, v0.359)
     auto savedLoopStack = loopStack_;
     auto savedFinallyStack = finallyStack_;
     auto savedFinallyBodies = finallyBodyStack_;
@@ -3552,6 +3555,7 @@ llvm::Value* Emitter::makeClassDisposeThunk(const ast::MemberAccessExpr& ma) {
     locals_ = std::move(savedLocals); paramSlots_ = std::move(savedParams);
     refParams_ = std::move(savedRefParams);
     disposeStack_ = std::move(savedDisposeStack);
+    pendingLambdaCells.restore();  // fix #8827
     loopStack_ = std::move(savedLoopStack);
     finallyStack_ = std::move(savedFinallyStack);
     finallyBodyStack_ = std::move(savedFinallyBodies);

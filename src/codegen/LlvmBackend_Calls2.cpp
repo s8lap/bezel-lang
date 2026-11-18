@@ -23933,8 +23933,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // body is a separate function, lowered mid-call; its own consumes must
     // not drain them (a boxedCellFree on the caller's alloca inside the
     // callee is a cross-function reference).
-    auto savedPendingLambdaCells = std::move(lastLambdaCapturedCells_);
-    lastLambdaCapturedCells_.clear();
+    PendingLambdaCellsScope pendingLambdaCells(*this);
 
     currentFn_ = specFn;
     // #1060 / #1061: a STATE-MACHINE method (async / iterator) must have its
@@ -24255,7 +24254,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     pendingOwnedParams_ = std::move(savedPendingOwnedParams);
     pendingArgsDisposal_ = std::move(savedPendingArgsDisposal);
     pendingChainOutDisposals_ = std::move(savedPendingChainOutDisposals);  // fix #4975
-    lastLambdaCapturedCells_ = std::move(savedPendingLambdaCells);  // fix #8827
+    pendingLambdaCells.restore();  // fix #8827
 
     return specFn;
 }
@@ -25521,8 +25520,7 @@ llvm::Value* Emitter::emitInlineGenericMethod(
     // fix #8827 (§27.5 / §28.3, v0.359): the caller's pending capture cells
     // belong to its call site; the inlined body's own consumes must not
     // drain them.
-    auto savedPendingLambdaCells = std::move(lastLambdaCapturedCells_);
-    lastLambdaCapturedCells_.clear();
+    PendingLambdaCellsScope pendingLambdaCells(*this);
 
     // Bind this and params.
     currentThis_ = (!args.empty() && !isStaticMethod(ms))
@@ -25783,7 +25781,7 @@ llvm::Value* Emitter::emitInlineGenericMethod(
     unwindScopeDepth_ = savedUnwindDepth;
     diverged_ = savedDiverged;
     currentSpecMethodSymbol_ = savedSpecMs;  // fix #628 (phase a)
-    lastLambdaCapturedCells_ = std::move(savedPendingLambdaCells);  // fix #8827
+    pendingLambdaCells.restore();  // fix #8827
 
     // fix #5009: the constraint-route backstop (see the top of this function).
     if (constraintRoute) {

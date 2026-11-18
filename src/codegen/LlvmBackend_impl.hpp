@@ -19708,6 +19708,41 @@ private:
         std::unordered_map<std::string_view, const sema::TypeRef*>
                              genericSubstSemaTy_;
     };
+    // fix #8827 (§27.5 / §28.3, v0.359): the ONE guard for the pending
+    // capture-cell channel (`lastLambdaCapturedCells_`) around a function body
+    // that is emitted LAZILY, in the middle of a caller's call. The entries a
+    // caller's already-lowered lambda arguments left in the channel belong to
+    // the caller's call site; a nested body lowered under a swapped
+    // `currentFn_` and a cleared `disposeStack_` must neither consume them (a
+    // boxedCellFree on the caller's alloca inside another function, or a push
+    // onto the nested body's EMPTY disposeStack_) nor leave its own stale
+    // entries behind for the caller. The constructor moves the channel out
+    // and clears it; `restore()` (call it next to the site's own
+    // `disposeStack_` restore) puts the caller's entries back and discards the
+    // nested body's leftovers; the destructor restores on any path that did
+    // not. Used by every lazy body emitter that saves `disposeStack_`
+    // (genericInstSfinitFn, the specialised disposer/reclaim builders, the
+    // Layout.cpp/Calls.cpp method-group thunks, buildSpecializedMethodFn,
+    // emitInlineGenericMethod). `NestedBodyScope` carries the same
+    // save/clear/restore as a member, and lowerLambda does it inline.
+    struct PendingLambdaCellsScope {
+        explicit PendingLambdaCellsScope(Emitter& e)
+            : e_(e), saved_(std::move(e.lastLambdaCapturedCells_)) {
+            e_.lastLambdaCapturedCells_.clear();
+        }
+        ~PendingLambdaCellsScope() { restore(); }
+        PendingLambdaCellsScope(const PendingLambdaCellsScope&) = delete;
+        PendingLambdaCellsScope& operator=(const PendingLambdaCellsScope&) = delete;
+        void restore() {
+            if (!active_) return;
+            e_.lastLambdaCapturedCells_ = std::move(saved_);
+            active_ = false;
+        }
+
+        Emitter& e_;
+        std::vector<LastCellEntry> saved_;
+        bool active_ = true;
+    };
     // ---- Yield-specific live state (used only when smKind_ == Yield) ----
     unsigned iterCurrentValField_ = 0;
     llvm::Type* iterElemTy_ = nullptr;

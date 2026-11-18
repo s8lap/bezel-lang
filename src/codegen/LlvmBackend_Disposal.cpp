@@ -2660,6 +2660,7 @@ llvm::Function* Emitter::emitSpecializedDisposer(const sema::TypeSymbol* ts,
     auto savedParamSlots = paramSlots_;
     auto savedRefParams = refParams_;
     auto savedDisposeStack = disposeStack_;
+    PendingLambdaCellsScope pendingLambdaCells(*this);  // fix #8827 (§27.5 / §28.3, v0.359)
     auto savedLoopStack = loopStack_;
     auto savedFinallyStack = finallyStack_;
     llvm::BasicBlock* savedPropagate = propagateBB_;
@@ -2712,6 +2713,7 @@ llvm::Function* Emitter::emitSpecializedDisposer(const sema::TypeSymbol* ts,
     paramSlots_ = std::move(savedParamSlots);
     refParams_ = std::move(savedRefParams);
     disposeStack_ = std::move(savedDisposeStack);
+    pendingLambdaCells.restore();  // fix #8827
     loopStack_ = std::move(savedLoopStack);
     finallyStack_ = std::move(savedFinallyStack);
     propagateBB_ = savedPropagate;
@@ -2783,6 +2785,7 @@ llvm::Function* Emitter::emitSpecializedReclaim(const sema::TypeSymbol* ts,
     auto savedParamSlots = std::move(paramSlots_);
     auto savedRefParams = std::move(refParams_);
     auto savedDisposeStack = std::move(disposeStack_);
+    PendingLambdaCellsScope pendingLambdaCells(*this);  // fix #8827 (§27.5 / §28.3, v0.359)
     auto savedLoopStack = std::move(loopStack_);
     auto savedFinallyStack = std::move(finallyStack_);
     llvm::BasicBlock* savedPropagate = propagateBB_;
@@ -2803,6 +2806,7 @@ llvm::Function* Emitter::emitSpecializedReclaim(const sema::TypeSymbol* ts,
     paramSlots_ = std::move(savedParamSlots);
     refParams_ = std::move(savedRefParams);
     disposeStack_ = std::move(savedDisposeStack);
+    pendingLambdaCells.restore();  // fix #8827
     loopStack_ = std::move(savedLoopStack);
     finallyStack_ = std::move(savedFinallyStack);
     propagateBB_ = savedPropagate;
@@ -8262,6 +8266,7 @@ llvm::Function* Emitter::specializedDisposerCoreFor(const sema::TypeSymbol* ts) 
     auto savedParamSlots = paramSlots_;
     auto savedRefParams = refParams_;
     auto savedDisposeStack = disposeStack_;
+    PendingLambdaCellsScope pendingLambdaCells(*this);  // fix #8827 (§27.5 / §28.3, v0.359)
     auto savedLoopStack = loopStack_;
     auto savedFinallyStack = finallyStack_;
     llvm::BasicBlock* savedPropagate = propagateBB_;
@@ -8279,6 +8284,7 @@ llvm::Function* Emitter::specializedDisposerCoreFor(const sema::TypeSymbol* ts) 
     paramSlots_ = std::move(savedParamSlots);
     refParams_ = std::move(savedRefParams);
     disposeStack_ = std::move(savedDisposeStack);
+    pendingLambdaCells.restore();  // fix #8827
     loopStack_ = std::move(savedLoopStack);
     finallyStack_ = std::move(savedFinallyStack);
     propagateBB_ = savedPropagate;

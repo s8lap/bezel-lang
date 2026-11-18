@@ -1818,6 +1818,11 @@ llvm::Function* Emitter::genericInstSfinitFn(const sema::TypeSymbol* ts,
     auto savedRef = refParams_;
     auto savedOutOwned = outOwnedRecipients_;
     auto savedDispose = disposeStack_;
+    // fix #8827 (§27.5 / §28.3, v0.359): the first touch of `G<Arg>`'s static
+    // state can be an ARGUMENT of a caller's call, after a lambda argument
+    // whose capture cells are pending in `lastLambdaCapturedCells_`; this
+    // body's own calls must not consume them (disposeStack_ is empty here).
+    PendingLambdaCellsScope pendingLambdaCells(*this);
     auto savedLoop = loopStack_;
     auto savedFinally = finallyStack_;
     llvm::BasicBlock* savedProp = propagateBB_;
@@ -2103,6 +2108,7 @@ llvm::Function* Emitter::genericInstSfinitFn(const sema::TypeSymbol* ts,
     refParams_ = std::move(savedRef);
     outOwnedRecipients_ = std::move(savedOutOwned);
     disposeStack_ = std::move(savedDispose);
+    pendingLambdaCells.restore();  // fix #8827
     loopStack_ = std::move(savedLoop);
     finallyStack_ = std::move(savedFinally);
     propagateBB_ = savedProp;
