@@ -9634,7 +9634,26 @@ bool Emitter::lowerDictBackedSetFor(const ast::ForStmt& fs) {
     // comparator from #2550, the dictionary-entry wrap for records, etc.) so
     // the §4.18 promise holds for every SortedSet element type the wrapper
     // supports.
-    if (n == "SortedSet" && !buildSortedKeyComparator(elemTy)) {
+    // fix #8816 (stdlib §4.18 / §9.6, v0.359): a `string` element KEEPS this
+    // deferral, even though `buildSortedKeyComparator` now RANKS a string (the
+    // #2553 gate below was keyed on "the comparator cannot rank this
+    // element", and that is no longer true of a string). The generic path
+    // this deferral skips binds the TABLE's own string — a borrow — while
+    // the SortedSet-aware wrap it routes to COPIES each element (§4.18's
+    // snapshot contract, #370: "The snapshot decouples iteration from the
+    // live table (a body that mutates the set/dict does not invalidate the
+    // loop)"): a mid-loop `s.Remove(v)` frees the table's string the generic
+    // path bound, leaving the loop variable dangling, while the wrap's copy
+    // stays valid. The ORDER is the same either way — both rank by
+    // `bz_str_compare_cp`, the §9.6 relation `string.CompareTo` is — so the
+    // per-element copy is the only difference, and it is the one §4.18's
+    // snapshot owes. `reportSortedElementNeedsCompareTo` (the one ordering
+    // authority) DECLINES a string element — a string is neither a record
+    // nor a class/interface, so it is not "eligible only via the hash-only
+    // branches" — so this deferral stays a deferral, not a rejection.
+    bool stringElem = isStringTypeRefNonNull(elemTy);
+    if (n == "SortedSet" &&
+        (!buildSortedKeyComparator(elemTy) || stringElem)) {
         // fix #3976 (stdlib §4.18, v0.295): fix #3947 rejected a no-CompareTo
         // eligible element at `.Add`/`.Contains`/etc (LlvmBackend_Calls.cpp's
         // Set-family arm) but for-in iteration is a SEPARATE call site that

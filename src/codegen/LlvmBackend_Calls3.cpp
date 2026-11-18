@@ -1758,6 +1758,72 @@ llvm::Function* Emitter::buildSortedKeyComparator(const sema::TypeRef* keyTy) {
         return fn;
     }
 
+    // fix #8816 (stdlib §9.6 / §4.18, spec §14.2, v0.359): a `string`
+    // element/key IS orderable — stdlib §9.6 declares
+    //
+    //     public class String: IEnumerable<char>, IComparable<string>, IEquatable<string>
+    //       public method CompareTo(other: string): int;  // satisfies IComparable<string>
+    //
+    // so `SortedSet<string>` is a LEGAL instantiation of stdlib §4.18's
+    //
+    //     public class SortedSet<T>: IReadOnlyCollection<T> where T: IComparable<T>
+    //
+    // and §4.18's `public pure readonly property First: T;` (least) and
+    // `Last: T` (greatest) MUST be admitted. Before this arm a `string`
+    // element fell through to the `else return nullptr` at the end of this
+    // function — a string lowers to a POINTER, so it is neither an integer
+    // nor a float; it is not a class/interface (`hasObjectHeaderEquality`
+    // reads `PrimitiveType::Object` only); and it is not a record — so
+    // every consumer of this comparator reported "the element type does not
+    // implement `IComparable<T>`" about a type the stdlib declares
+    // `IComparable<string>` (issue #8816: `SortedSet<string>.First`/`.Last`,
+    // BOTH spellings, were refused).
+    //
+    // THE STORAGE. A `SortedSet<string>` is backed by the GENERIC-key hash
+    // table (fix #2550): each element is a malloc(8) buffer holding the
+    // `bz_string_struct*` POINTER — the keys are pointers, not chars. So
+    // this comparator's `const void*` arguments point at an 8-byte slot
+    // holding the string pointer; ONE ptrTy-load per argument recovers the
+    // `bz_string_struct*` (a DOUBLE load would read the string's DATA
+    // field — the #2550 regression), and the relation is
+    // `bz_str_compare_cp`, the §9.6 ordinal code-point relation
+    // `string.CompareTo` IS (fix #4487/#4495) — the SAME runtime call the
+    // `CompareTo` member dispatches to, and the same one the §4.18
+    // ascending snapshot uses (`sortedSetSnapshotToSortedArray`'s
+    // `bz$sscmp$string`), so the order of a `SortedSet<string>` and the
+    // order of `Array<string>.Sort()` cannot drift apart (#4495's
+    // cross-check row).
+    //
+    // The comparator is emitted under the SAME internal name the snapshot
+    // path uses (`bz$sscmp$string`), so a module that both iterates a
+    // `SortedSet<string>` and reads its `.First`/`.Last` carries ONE
+    // comparator function.
+    //
+    // A NULLABLE `string?` is not matched: a type-bound constraint implies
+    // a non-null type argument (spec §14.2), and a nullable element is
+    // stored as the nullable CARRIER, whose bytes are not a string pointer.
+    if (isStringTypeRefNonNull(resolveTypeParamRef(keyTy))) {
+        const char* name = "bz$sscmp$string";
+        if (llvm::Function* existing = module_->getFunction(name))
+            return existing;
+        auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                          name, module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
+        // A LOCAL IRBuilder, not `builder_`: this thunk is emitted in the
+        // middle of another function's lowering, and touching `builder_` /
+        // `currentFn_` here would drag `propagateBB_` / `unwindTarget_` with
+        // it (the same hazard `buildObjectCompareToThunk`'s own comment
+        // records).
+        llvm::IRBuilder<> strB(bb);
+        llvm::Value* aStr = strB.CreateLoad(ptrTy(), fn->getArg(0), "ka");
+        llvm::Value* bStr = strB.CreateLoad(ptrTy(), fn->getArg(1), "kb");
+        auto* cmpCp = declareC("bz_str_compare_cp", i32(),
+                               {ptrTy(), ptrTy(), i32()});
+        strB.CreateRet(strB.CreateCall(cmpCp, {aStr, bStr, strB.getInt32(0)}));
+        return fn;
+    }
+
     // Build a unique name per key LLVM type to cache it per module.
     std::string name = "bz$sdcmp$";
     // per stdlib §2.5 (#7716): a DateTime is an i64 carrying its Kind in bits
