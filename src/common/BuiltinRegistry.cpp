@@ -3018,16 +3018,43 @@ const std::vector<BuiltinPropertyDecl>& builtinPropertyDecls() {
         {"IReadOnlyCollection", "Count", "int", "4.1", false, false, true, true},
         {"IReadOnlyList", "Count", "int", "4.1", false, true, true, true},
         {"ICollection", "Count", "int", "4.1", false, false, true, true},
-        // `IsReadOnly` is a PROPERTY too (stdlib §4.1), but its CALL spelling
-        // is already refused by the #2457 backstop and is NOT this lane's
-        // scope — the table does not add a second report on the same access.
-        {"ICollection", "IsReadOnly", "bool", "4.1", false, true, false, false},
+        // fix #8651 (stdlib §4.1 / §4.2, spec §26.5 rule 1, §27.1, §27.7,
+        // §7.5, v0.357): `IsReadOnly` is a PROPERTY of these FOUR heads —
+        // stdlib §4.1 declares it on `ICollection<T>` ("readonly property
+        // IsReadOnly: bool;"), which `IList<T>` extends, and stdlib §4.2
+        // declares it on `IOwningCollection<T>`, which `IOwningList<T>`
+        // extends. (`IReadOnlyCollection<T>` / `IReadOnlyList<T>` declare no
+        // `IsReadOnly` — the six heads of #8633 are the `Count` heads.)
+        //
+        // A property of a NON-function type is not callable (§27.1, §27.7),
+        // and the lookup commits to the instance member by name (§26.5 rule 1),
+        // so the CALL spelling has no candidate: the same #7543 refusal
+        // `Count` gets. Before this fix the rows carried `refusesCall = false`,
+        // so sema stayed silent and the call fell through to codegen's #2457
+        // backstop — "produced no value … either `IsReadOnly` is not on that
+        // surface (a misspelling), or it is documented but not implemented by
+        // this compiler" — a diagnostic that sends the reader looking for a
+        // misspelling for a member the stdlib DOES declare.
+        //
+        // `refusesNullCondCall = true` as well: §7.5's `?.` spelling performs
+        // the SAME access the `.` spelling does (and §26.5 resolves the `?.`
+        // receiver at its underlying non-nullable type), so `c?.IsReadOnly()`
+        // must be refused with the SAME diagnostic. Before this fix it was
+        // NOT refused at all — it degraded SILENTLY behind the internal #2434
+        // zero-initializer warning and answered a zero-initialised `false`.
+        //
+        // `readModelled = true` on all four: the property READ is a modelled
+        // spelling on every one of them (stdlib §4.1 fixes the value — "`IsReadOnly`
+        // is `false` for every standard collection implementing `ICollection<T>`" —
+        // and codegen's #7017 arm lowers the read to that constant on all four
+        // heads), so the refusal may offer the `.IsReadOnly` remedy.
+        {"ICollection", "IsReadOnly", "bool", "4.1", false, true, true, true},
         {"IList", "Count", "int", "4.1", false, true, true, true},
-        {"IList", "IsReadOnly", "bool", "4.1", false, true, false, false},
+        {"IList", "IsReadOnly", "bool", "4.1", false, true, true, true},
         {"IOwningCollection", "Count", "int", "4.2", false, false, true, true},
-        {"IOwningCollection", "IsReadOnly", "bool", "4.2", false, true, false, false},
+        {"IOwningCollection", "IsReadOnly", "bool", "4.2", false, true, true, true},
         {"IOwningList", "Count", "int", "4.2", false, true, true, true},
-        {"IOwningList", "IsReadOnly", "bool", "4.2", false, true, false, false},
+        {"IOwningList", "IsReadOnly", "bool", "4.2", false, true, true, true},
         {"Array", "Count", "int", "4.4", false, true},
         {"Array", "Capacity", "int", "4.4", false, true},
         {"OwningArray", "Count", "int", "4.5", false, true},
