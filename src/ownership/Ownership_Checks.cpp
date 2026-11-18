@@ -10158,6 +10158,37 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
     // source), so the store-escape and return-escape checks that consume this
     // source now see them.
     const ast::Expr* shape1Core = peelTopCastBang(&rhs);
+    // fix #8832 (§28.3 *Provenance* clause 6 + the local-scope bullet, v0.359):
+    // a bare read of a FUNCTION-typed local carries the set the flow analysis
+    // traces it to — `var f := lambda() => a.Count; g := f;` gives `g` the
+    // set `{a}`, so "each later assignment [is] checked on its own" against
+    // `a`'s scope exactly as `g := lambda() => a.Count;` is. The function
+    // type answers false to returnedExprMayBorrow's borrow-vs-copy gate below
+    // (a capture-free function value IS a plain value), so the holder's
+    // tracked source (Shape 3, recorded at its declaration / reassignment)
+    // was never read through the alias. Flow-sensitive on purpose: the
+    // holder's CURRENT `states_` source, not the syntactic fixpoint, so a
+    // holder rebound to a capture-free value carries nothing. And only a
+    // source the capture fixpoint ATTESTS for this holder (a captured leaf,
+    // or the source of a captured borrowed leaf): a function value that came
+    // out of a set-erasing position (`var g := r as Fn;` off an `Object`) is
+    // capture-free by clause 4, so a re-borrow source Shape 1 recorded for it
+    // is no closure source and must not be read here.
+    if (const auto* fid = dynamic_cast<const ast::IdentifierExpr*>(shape1Core)) {
+        sema::Symbol* fsym = ctx_.exprSymbol(*fid);
+        if (fsym && isFunctionTypedLocal(fsym)) {
+            auto it = states_.find(fsym);
+            if (it != states_.end() && it->second.source &&
+                it->second.source->sym &&
+                (isEscapeBoundLocal(it->second.source->sym) ||
+                 isFreshOwnedArrayMaterializerLocal(it->second.source->sym))) {
+                sema::Symbol* src = it->second.source->sym;
+                for (sema::Symbol* leaf : captureSourcesOf(fsym))
+                    if (leaf == src || capturedAliasEscapeBoundSource(leaf) == src)
+                        return src;
+            }
+        }
+    }
     if (dynamic_cast<const ast::IdentifierExpr*>(shape1Core) ||
         dynamic_cast<const ast::MemberAccessExpr*>(shape1Core) ||
         dynamic_cast<const ast::NullCondMemberExpr*>(shape1Core) ||
@@ -15096,6 +15127,11 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
         std::function<bool(const ast::Expr&)> hasLambda =
             [&](const ast::Expr& e) -> bool {
                 if (dynamic_cast<const ast::LambdaExpr*>(&e)) return true;
+                // fix #8832 (§28.3, v0.359): a function-typed local read is
+                // the closure it holds (`g := f;`), so the closure wording
+                // applies to it as to the literal.
+                if (auto* fid = dynamic_cast<const ast::IdentifierExpr*>(&e))
+                    return isFunctionTypedLocal(ctx_.exprSymbol(*fid));
                 if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e))
                     return (cd->thenValue && hasLambda(*cd->thenValue)) ||
                            (cd->elseValue && hasLambda(*cd->elseValue));
