@@ -11587,6 +11587,15 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     if (!diverged_) {
                         for (llvm::Value* cl : ctorClosureArgs)
                             emitClosureRelease(cl);
+                        // fix #6628 (§28.14 / §27.5 / §28.9, v0.359): the
+                        // CAPTURE-CELL half, as lowerCall's #3498 site. The
+                        // pre-scan (collectCellFreeEligible's NewExpr arm)
+                        // classifies a lambda literal at a call-bounded ctor
+                        // formal non-escaping, so lowerLambda recorded its
+                        // cells; they are dropped unless this site consumes
+                        // them. Gated on the same vector the release uses.
+                        if (!ctorClosureArgs.empty())
+                            consumeLastLambdaCapturedCells();
                     }
                     // §22.16 (v0.240, #2941): construction exit on the
                     // explicit-ctor / non-generic / no-inline path —

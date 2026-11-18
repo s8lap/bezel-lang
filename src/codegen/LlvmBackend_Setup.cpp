@@ -51231,7 +51231,67 @@ void Emitter::collectCellFreeEligible(
                 expr(r->lo.get(), false); expr(r->hi.get(), false);
                 expr(r->step.get(), false); return; }
             if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
-                for (auto& a : n->args) expr(a.value.get(), false); return; }
+                // fix #6628 (§28.14 the CALL-BOUNDED DEFAULT / §27.5 / §28.9,
+                // v0.359): the CONSTRUCTOR twin of the #3498 arm above. A
+                // lambda LITERAL passed into a plain (no-modifier)
+                // function-typed formal of a non-generic class constructor is
+                // call-bounded exactly as at a method call: lowerNew already
+                // releases the closure there (#2305, `ctorClosureArgs`, gated
+                // by `isPlusOneClosureProducer` and the same
+                // `resolvedFormalIsFunction` test) and `ownership`'s
+                // `verifiedCallBoundedFormalAt` already covers `ast::NewExpr`.
+                // Without this the generic recursion below classified the
+                // lambda ESCAPING and the captured local's cell was reclaimed
+                // by nobody (8 B once another local existed). The same
+                // positional-exact-arity / no-modifier / unnamed shape as
+                // `isCallBoundedClosureArgPosition`; a generic class is
+                // declined (lowerNew inlines its constructor, so no release
+                // runs there: a leak, the safe direction).
+                const sema::TypeRef* nnt = n->type ? ctx.resolvedType(*n->type)
+                                                   : ctx.exprType(*n);
+                // The constructor lowerNew will call: ctorForArgs adopts
+                // sema's published choice when there is one and otherwise
+                // searches by arity, which is what a single-constructor
+                // class needs (sema publishes only an ambiguous choice).
+                const sema::ConstructorSymbol* ncs =
+                    nnt && nnt->kind == sema::TypeRef::Kind::Named &&
+                            nnt->declaration
+                        ? em.ctorForArgs(nnt->declaration, n->args)
+                        : nullptr;
+                // Read off the SYMBOLS, not the AST (#3152's seam: an imported
+                // constructor's declaration is not here; it is declined).
+                bool ctorShapeOk =
+                    ncs && !ctx.isImported(ncs) && !ncs->isStatic && nnt &&
+                    nnt->kind == sema::TypeRef::Kind::Named &&
+                    nnt->declaration &&
+                    nnt->declaration->kind == ast::TypeDeclKind::Class &&
+                    nnt->declaration->genericParams.empty() &&
+                    n->args.size() == ncs->params.size();
+                if (ctorShapeOk)
+                    for (const auto& a : n->args)
+                        if (!a.name.empty() || !a.modifier.empty() ||
+                            a.isDiscard) { ctorShapeOk = false; break; }
+                for (std::size_t ai = 0; ai < n->args.size(); ++ai) {
+                    if (ctorShapeOk)
+                        if (auto* argLam = dynamic_cast<const ast::LambdaExpr*>(
+                                n->args[ai].value.get())) {
+                            auto* fps = dynamic_cast<const sema::ParameterSymbol*>(
+                                ncs->params[ai]);
+                            const sema::TypeRef* fpt =
+                                fps && fps->declType
+                                    ? ctx.resolvedType(*fps->declType)
+                                    : nullptr;
+                            if (fps && fps->modifier.empty() && fpt &&
+                                !fpt->nullable &&
+                                fpt->kind == sema::TypeRef::Kind::Function) {
+                                collectLambdaCaptures(argLam, em,
+                                                      /*isNonEscaping=*/true);
+                                continue;
+                            }
+                        }
+                    expr(n->args[ai].value.get(), false);
+                }
+                return; }
             if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
                 expr(w->source.get(), false);
                 for (auto& a : w->assigns) expr(a.value.get(), false); return; }
