@@ -33640,6 +33640,32 @@ struct StringEscapeWalker {
             walkAllEscape();
             return;
         }
+        // fix #8654 (§28.9, §28.11, v0.357): the fill constructor
+        // `new Array<string>(size, fill)`. Every slot takes its OWN reference
+        // to `fill` (the retain in the constructor's fill loop), so a local
+        // passed as the fill keeps its reference and its scope-end release —
+        // the position is a call-bounded borrow, the §31.4 arm's model above.
+        // Without this the local stayed tainted and unreleased: that used to
+        // stand in for the reference the single slot of a `size = 1` array
+        // never took, and with the slots now taking theirs it would be one
+        // leaked string per construction. NARROW: the built-in `Array` at a
+        // written `string` element and exactly the two-argument shape the
+        // lowering fills from; the size argument is an `int` and is walked as
+        // a read. Every other built-in construction keeps the escape.
+        if (stringReleaseMode && rt &&
+            rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+            rt->astNode && rt->astNode->name &&
+            !rt->astNode->name->parts.empty() &&
+            rt->astNode->name->parts.back() == "Array" &&
+            rt->genericArgs.size() == 1 && rt->genericArgs[0] &&
+            rt->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
+            rt->genericArgs[0]->primitive == sema::PrimitiveType::String &&
+            !rt->genericArgs[0]->nullable && ne->args.size() == 2) {
+            for (const ast::CallArgument& a : ne->args)
+                expr(a.value.get(),
+                     a.modifier.empty() && !a.isDiscard);
+            return;
+        }
         // fix #8136 (stdlib §4.8, v0.355; §28.9 / §9.7): the
         // `DictionaryEntry<K, V>` twin of the §31.4 built-in-exception
         // relaxation above — the DECLARED positional primary constructor of

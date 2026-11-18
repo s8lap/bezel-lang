@@ -8403,6 +8403,11 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         // loop pattern at §4.14 / #778).
                         llvm::AllocaInst* fillSlot = entryAlloca(elemLlvmTy);
                         builder_.CreateStore(fillVal, fillSlot);
+                        const bool fillIsString =
+                            fillVal->getType()->isPointerTy() &&
+                            !rt->genericArgs.empty() &&
+                            isStringTypeRefNonNull(
+                                resolveTypeParamRef(rt->genericArgs[0]));
                         // for i = 0 ..<  sizeArg: bz_array_set(buf, i, fillSlot, esz)
                         llvm::AllocaInst* iSlot = entryAlloca(i64());
                         builder_.CreateStore(builder_.getInt64(0), iSlot);
@@ -8424,10 +8429,24 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             {ptrTy(), i64(), ptrTy(), i64()});
                         builder_.CreateCall(setFn,
                             {buf, iv, fillSlot, builder_.getInt64(elemSize)});
+                        // fix #8654 (§28.9, §28.11, v0.357): an
+                        // `Array<string>` holds ONE reference per slot — `Add`
+                        // takes it, and the array's free gives one back per
+                        // slot — but this loop byte-copied the fill pointer
+                        // into every slot and took none. Each slot now takes
+                        // its own (a no-op on a literal).
+                        if (fillIsString) emitStringRetain(fillVal);
                         builder_.CreateStore(
                             builder_.CreateAdd(iv, builder_.getInt64(1)), iSlot);
                         builder_.CreateBr(hdrBB);
                         builder_.SetInsertPoint(doneBB);
+                        // The slots hold their own references, so a +1 fill
+                        // value's own reference is surplus: release it (this
+                        // also covers `size = 0`, where no slot took one).
+                        if (fillIsString &&
+                            isPlusOneStringProducer(
+                                ne.args[fillArgIdx].value.get()))
+                            emitStringRelease(fillVal);
                     }
                     // fix #6557: stamped AFTER the fill, so the stamp's walk
                     // takes one Key reference per pre-populated slot.

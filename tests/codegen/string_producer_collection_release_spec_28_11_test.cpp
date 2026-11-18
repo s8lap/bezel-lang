@@ -165,3 +165,43 @@ BEZEL_TEST(codegen_str_collection_release, concrete_pop_into_generic_store_is_no
         "end C;");
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
 }
+
+// #8654 (§28.11 / §28.9): `new Array<string>(size, fill)` — every slot owns
+// a reference to the fill string, a +1 fill is released once the slots hold
+// theirs (size 0 included), and a local passed as the fill stays the
+// caller's. Before the fix the slots shared ONE reference (a use after free
+// under ASan at size 3). 200x.
+BEZEL_TEST(codegen_str_collection_release, string_fill_constructor_takes_a_reference_per_slot_8654_spec_28_11) {
+    auto r = runAotChecked(
+        "module M; "
+        "class H "
+        "  private _n: int; "
+        "  public constructor(n: int) _n := n; end constructor; "
+        "  public method Mint(): string return \"KM\" + _n.ToString(); end Mint; "
+        "  public method Long(): string return \"long-producer-string-no-\" + _n.ToString(); end Long; "
+        "  public method MintQ(): string? return \"KQ\" + _n.ToString(); end MintQ; "
+        "  public property P: string get => \"KP\" + _n.ToString(); end P; "
+        "end H; "
+        "class C "
+        "  public static method Main(): int "
+        "    var i := 0; var tot := 0; "
+        "    var h := new H(7); "
+        "    while i < 200 do "
+        "      i := i + 1; "
+        "      var n := 0; "
+        "      var a := new Array<string>(3, h.Long()); "
+        "      n := n + a.Count + a[2].Length; "
+        "      var b := new Array<string>(0, h.Long()); "
+        "      n := n + b.Count; "
+        "      var t := h.Mint(); "
+        "      var c := new Array<string>(2, t); "
+        "      c[0] := \"z\"; "
+        "      n := n + c[1].Length + t.Length; "
+        "      if n = 3 + 25 + 0 + 3 + 3 then tot := tot + 1; end; "
+        "    end while; "
+        "    if tot = 200 then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
+}
