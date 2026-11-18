@@ -39341,6 +39341,19 @@ struct ClosureEscapeWalker {
                     return forwardsTarget(fa, true);
         return sawWrap && isTargetIdent(e);
     }
+    // fix #8863 (§8.1 / §28.9, v0.359): is `init` a BARE read of target bound
+    // to a local DECLARED `Object` / `Object?` (`var g: Object := f;`)? Such
+    // a slot holds no reference of its own (a function value reaches `Object`
+    // through its own heap representation, §8.1, with no retain at the
+    // bind), exactly like the `n ?? f` bind #8717 reasons about, so it is a
+    // forwarded bind: what `g` does decides what `f` may do.
+    bool bareObjectBind(const ast::Type* declType,
+                        const ast::Expr* init) const {
+        if (!declType || !init || !isTargetIdent(init)) return false;
+        const sema::TypeRef* t = ctx.resolvedType(*declType);
+        return t && t->kind == sema::TypeRef::Kind::Primitive &&
+               t->primitive == sema::PrimitiveType::Object;
+    }
     // fix #8743 (§9.1 / §9.7, v0.359): is `e` a `new RB(…)` of a
     // POSITIONAL-ONLY, non-generic record (`record RB(F: (int) -> int);`)
     // one of whose arguments, at a function-typed component, yields
@@ -40341,7 +40354,9 @@ struct ClosureEscapeWalker {
             const bool ldSavedIdFwd = identityCallForwards_;
             identityCallForwards_ = true;  // fix #8743
             const bool ldFwd =
-                !inLambda && forwardsTarget(ld->initializer.get(), false);
+                !inLambda && (forwardsTarget(ld->initializer.get(), false) ||
+                              bareObjectBind(ld->type.get(),
+                                             ld->initializer.get()));
             if (ldFwd) expr(ld->initializer.get(), /*safeRead=*/true);
             identityCallForwards_ = ldSavedIdFwd;
             if (ldFwd) return;
@@ -40370,7 +40385,9 @@ struct ClosureEscapeWalker {
             const bool lcSavedIdFwd = identityCallForwards_;
             identityCallForwards_ = true;  // fix #8743
             const bool lcFwd =
-                !inLambda && forwardsTarget(lc->value.get(), false);
+                !inLambda && (forwardsTarget(lc->value.get(), false) ||
+                              bareObjectBind(lc->type.get(),
+                                             lc->value.get()));
             if (lcFwd) expr(lc->value.get(), /*safeRead=*/true);  // #8717
             identityCallForwards_ = lcSavedIdFwd;
             if (lcFwd) return;
@@ -41843,7 +41860,8 @@ void Emitter::collectClosureReleaseEligible(
                     if (x == static_cast<const void*>(s)) continue;
                     ClosureEscapeWalker xw{ctx_, x};
                     xw.identityCallForwards_ = true;  // fix #8743: a bind
-                    if (xw.forwardsTarget(v.init, /*sawWrap=*/false))
+                    if (xw.forwardsTarget(v.init, /*sawWrap=*/false) ||
+                        xw.bareObjectBind(v.type, v.init))  // fix #8863
                         fb.sources.push_back(x);
                 }
                 // fix #8743 (§9.1 / §9.7 / §28.9, v0.359): `var rb := new
