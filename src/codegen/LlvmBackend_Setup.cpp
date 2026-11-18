@@ -25971,9 +25971,9 @@ void Emitter::registerUnwindOwnedLocal(const ast::LocalDecl* ld) {
 // It is true only when ALL of these hold:
 //  (1) the callee's SHAPE lets every direct call site mark before the call
 //      (the callee-side mirror of the call site's `calleeEntryMayThrow` gate:
-//      no vtable/itable slot, not imported, no `requires`, a block body, not
-//      async, no checked-mode entry guard on an instance member, not
-//      generic);
+//      no vtable/itable slot, not imported, no contract clause, a block
+//      body, not async, no checked-mode entry guard on an instance member,
+//      not generic);
 //  (2) it is NOT reachable from another module when this is a library
 //      artifact (an importer's call sites and method references are not
 //      visible here);
@@ -25981,20 +25981,38 @@ void Emitter::registerUnwindOwnedLocal(const ast::LocalDecl* ld) {
 //      (`collectPlainMoveOnlyForwardSites`);
 //  (4) no direct call of that name forwards a parameter the forwarding
 //      function does not itself own — a lambda's parameter, a constructor /
-//      accessor / operator parameter — and every METHOD whose parameter is
-//      forwarded is itself admitted (a least fixed point over the forward
-//      edges); the argument a direct call of that name is handed is a plain
-//      LOCAL, such a parameter, or a case construction — nothing else (a
-//      setter's implicit `value`, a pattern binding, a getter's or
+//      accessor / operator parameter — and no forward edge joins it to a
+//      method that is not admitted, in EITHER direction: every method whose
+//      parameter is forwarded to that name is admitted, and every name its
+//      own parameter is forwarded to is admitted (a least fixed point over
+//      the forward edges); the argument a direct call of that name is handed
+//      is a plain LOCAL, such a parameter, or a case construction — nothing
+//      else (a setter's implicit `value`, a pattern binding, a getter's or
 //      property's result that may be a receiver's FIELD) is a value the
-//      caller's mark can give up;
-//  (5) no method of that name reads its own parameter where the value may be
-//      consumed without a zero-store of the parameter's slot — the argument
-//      of a call through a function value, of a constructor or an indexer,
-//      an operator operand, a store into a field or property, a lambda
-//      capture (the scan's `Unknown` position).
+//      caller's mark can give up; and no `?.` call names it;
+//  (5) DEFAULT-DENY: every read of its own parameter, in every method of
+//      that name, is one PROVED to leave the parameter's slot zeroed or
+//      untouched on every edge — a borrow nothing can outlive (a receiver of
+//      a scalar-valued member, a `case` scrutinee no arm binds a payload
+//      of, or one whose arm bindings are contained under (7))
+//      or a move in a spelling the consumer's lowering
+//      zero-stores (a local's initializer, a `return`, a marked `case move`
+//      scrutinee, a case-construction argument, a forward under (4)).
+//      Anything else declines it: the argument of a call through a function
+//      value or `?.`, of a constructor or an indexer, an operator operand,
+//      an if-expression, a `const` local, any assignment, a lambda capture,
+//      an iterator body.
+//  (6) the binding a direct call of that name is handed is not read anywhere
+//      the value, or a borrow of its payload, can still be held when the
+//      callee disposes it (the scan's read ledger);
+//  (7) an arm of a `case` over its own parameter that BINDS a payload keeps
+//      that borrow inside the arm: the binding (or a borrowing `using var`
+//      alias of it, §28.10) is read only as the receiver of a scalar-valued
+//      member, and the parameter itself is not read again while the arm is
+//      open.
 // Keyed by NAME, not symbol, on purpose: an overloaded or re-resolved callee
-// cannot slip past the scan; a collision only declines (a leak).
+// cannot slip past the scan; a collision only declines (a leak). A use the
+// scan does not prove costs the base's leak, never a second disposal.
 bool Emitter::plainMoveOnlyCalleeShapeAdmits(sema::MethodSymbol* cms) {
     if (!cms) return false;
     // (1g) A GENERIC method, or a member of a generic type: its bodies are
@@ -26016,6 +26034,9 @@ bool Emitter::plainMoveOnlyCalleeShapeAdmits(sema::MethodSymbol* cms) {
     if (ctx_.isImported(cms)) return false;
     // (1c) A `requires` clause (own or inherited) runs in the ENTRY prologue,
     //      ahead of the root scope: on that raise the callee disposes nothing.
+    //      An `ensures` clause reads the parameter on the EXIT edge, after
+    //      the body's moves — a read the forward scan does not prove — so any
+    //      contract clause declines.
     if (!cms->inheritedRequiresClauses.empty()) return false;
     // SEAM-ACCESSOR: the null arm IS the imported answer (declined: the
     // base's behaviour), and (1b) has already declined every imported
@@ -26024,8 +26045,7 @@ bool Emitter::plainMoveOnlyCalleeShapeAdmits(sema::MethodSymbol* cms) {
     // kind has no symbol-side channel.
     const auto* cmd = dynamic_cast<const ast::MethodDecl*>(cms->decl);
     if (!cmd) return false;
-    for (const auto& c : cmd->contractClauses)
-        if (c.kind == ast::ContractClause::Kind::Requires) return false;
+    if (!cmd->contractClauses.empty()) return false;
     // (1d) An EXPRESSION body opens no root scope (#7707).
     if (cmd->bodyKind != ast::MethodBodyKind::Block) return false;
     // (1e) An ASYNC method's static initializer runs in its task entry.
@@ -26072,48 +26092,127 @@ bool Emitter::plainMoveOnlyParamDischargedByCallee(sema::MethodSymbol* cms) {
 // unrecognised node kind sets `plainMoveOnlyScanIncomplete_`, and the
 // predicate then admits nothing.
 //
-// fix-forward (r42-rev-s76, r42-s87-7722): every expression is visited at a
-// POSITION, and the verdict is read off the position rather than off the set
-// of calls the walk happens to be inside:
-//   * `Arg`     — the immediate argument (through `!`, `move` and an
-//                 if-expression's branches, which §17.8 / §20 classify by the
-//                 position of the whole) of a DIRECT call of a method or a
-//                 choice case — the calls whose lowering marks the caller's
-//                 source (`lowerCallDispatch`, `lowerNullCondCall`, the
-//                 #6182 case-construction mark);
-//   * `Safe`    — a position whose lowering zero-stores a moved parameter
-//                 source (a local's initializer [#7415], a `return` [#7890],
-//                 an assignment to a local) or only BORROWS it (a member
-//                 access's or a call's receiver, a `case` scrutinee);
-//   * `Unknown` — everything else: the argument of a call through a FUNCTION
-//                 VALUE, of a constructor, of an indexer; an operator operand;
-//                 a store into a field or property; a lambda capture; ...
+// fix-forward 3 (r42-rev-s87, r42-f35-7722): the scan is DEFAULT-DENY. A
+// method keeps its admission only if EVERY read of its by-value parameter is
+// one of the few spellings whose lowering is known to leave the parameter's
+// slot zeroed (or untouched, for a borrow) on EVERY edge out of the read;
+// every other use — and every write — declines the method. The earlier scans
+// classified a read by the position of the enclosing expression and let `!`,
+// `move` and an if-expression pass the position through, so a spelling the
+// lowering's mark does not recognise was admitted with it (MEASURED on
+// 9fbdc5699, heap-use-after-free where r30-c1 is clean or leaks:
+// `return move o!`, `var x := move (if c then o else E)`,
+// `return move (if c then o else E)`, `N(move (if c then o else E))` at an
+// `owned` formal, `Outer.W(o!)`, `const x := o; return x;`, `o := x`).
+//
+// Every expression is visited at a POSITION:
+//   * `Proved`      — the parameter is BORROWED where no borrow can outlive
+//                     the read (the receiver of a member read or a method call
+//                     with a scalar result, a `case` scrutinee no arm binds a
+//                     payload of) or MOVED by a spelling its consumer
+//                     zero-stores: `provedSource` below lists the spellings
+//                     per consumer;
+//   * `Arg`         — the argument of a DIRECT `.`-call of a method, in a
+//                     spelling the pre-call mark zero-stores, at a formal that
+//                     every method of that name declares by value at a choice
+//                     type. Sound only if the callee is admitted too: the
+//                     forward EDGE the fixed point below closes over;
+//   * `ArgUnproved` — the argument of a direct call whose formal could not be
+//                     established: `Arg` for the callee's argument-shape rule,
+//                     `Unknown` for the parameter's owner;
+//   * `Unknown`     — everything else.
 void Emitter::collectPlainMoveOnlyForwardSites() {
     if (plainMoveOnlyScanDone_) return;
     plainMoveOnlyScanDone_ = true;
 
     // Which METHOD owns a parameter symbol. A parameter with no entry here (a
     // lambda's, a constructor's, an accessor's) is never owned by an admitted
-    // body.
+    // body. And every method of a NAME, the unit the fixed point decides.
     auto& paramOwner = plainMoveOnlyParamOwner_;
+    std::unordered_map<std::string, std::vector<sema::MethodSymbol*>>
+        methodsNamed;
     for (const auto& sym : ctx_.symbols())
-        if (auto* m = dynamic_cast<sema::MethodSymbol*>(sym.get()))
+        if (auto* m = dynamic_cast<sema::MethodSymbol*>(sym.get())) {
+            methodsNamed[std::string(m->name)].push_back(m);
             for (sema::Symbol* p : m->params)
                 if (p) paramOwner[p] = m;
+        }
 
-    std::vector<std::pair<std::string, sema::MethodSymbol*>> edges;
+    struct Edge {
+        std::string callee;
+        sema::MethodSymbol* owner = nullptr;
+        bool calleeDeclined = false;  // by a candidate's shape
+    };
+    std::vector<Edge> edges;
     auto block = [&](std::string_view n) {
         plainMoveOnlyBlockedNames_.insert(std::string(n));
     };
 
-    enum class Pos { Unknown, Safe, Arg };
+    enum class Pos { Unknown, Proved, Arg, ArgUnproved };
     // The position of the expression `walkExpr` is about to visit, and — for
-    // `Arg` — the NAME of the direct call it is an argument of. `walkExpr`
-    // reads both on entry and resets them, so a child is `Unknown` unless its
-    // parent visits it through `walkAt`.
+    // the two argument positions — the NAME of the direct call it is an
+    // argument of. `walkExpr` reads both on entry and resets them, so a child
+    // is `Unknown` unless its parent visits it through `walkAt`. NO wrapper
+    // passes its position to its operand: a read is `Proved` or `Arg` only
+    // when the consumer's own matcher (`provedSource`) found it.
     Pos pos = Pos::Unknown;
     std::string_view argCallee;
+    // Is the direct call an argument position belongs to one whose RESULT may
+    // carry a borrow of that argument (anything but a scalar)?
+    bool argHeld = false;
+    // ... and is some method that call could be lowered against declined by
+    // its SHAPE (`argFormal`)?
+    bool argDeclined = false;
     int lambdaDepth = 0;
+    std::string_view currentMethod;
+
+    // THE READ LEDGER behind (6): every read of an owning-choice LOCAL or
+    // PARAMETER, with the UNIT (the outermost expression) it sits in. A
+    // callee that disposes its argument frees a payload the caller's binding
+    // no longer owns, so every OTHER read of that binding must be one that
+    // cannot still be holding the value, or a borrow of its payload, when the
+    // callee runs.
+    struct Read {
+        unsigned unit = 0;
+        std::string callee;    // non-empty: the argument of a direct call
+        bool calleeDeclined = false;  // ... declined by a candidate's SHAPE
+        bool held = false;     // ... whose result is not a scalar
+        bool isMove = false;   // a proved move (a consumer zero-stores it)
+        bool unproved = false; // neither: the value or a borrow may persist
+    };
+    std::unordered_map<const sema::Symbol*, std::vector<Read>> reads;
+    // The lambda depth each plain local was declared at: a read at another
+    // depth is a capture.
+    std::unordered_map<const ast::Node*, int> localDepth;
+    // (7) The payload bindings of the arms that are open over a method's own
+    // parameter, by NAME (the innermost wins; a shadowing local of the same
+    // name is only judged more strictly), and the parameters those `case`s
+    // are open over.
+    struct ArmName {
+        std::string_view name;
+        sema::MethodSymbol* owner;
+    };
+    std::vector<ArmName> armNames;
+    std::vector<const sema::Symbol*> pinnedParams;
+    unsigned unit = 0;
+    int exprNesting = 0;
+    auto newUnit = [&] {
+        if (exprNesting == 0) ++unit;
+    };
+    // A type no borrow can ride on: a non-`string` primitive, an enum, unit.
+    auto isScalar = [](const sema::TypeRef* t) {
+        if (!t) return false;
+        if (t->kind == sema::TypeRef::Kind::Unit) return true;
+        if (t->kind == sema::TypeRef::Kind::Primitive)
+            return t->primitive != sema::PrimitiveType::None &&
+                   t->primitive != sema::PrimitiveType::String &&
+                   t->primitive != sema::PrimitiveType::Object;
+        return t->kind == sema::TypeRef::Kind::Named && t->declaration &&
+               t->declaration->kind == ast::TypeDeclKind::Enum;
+    };
+    auto isArgPos = [](Pos p) {
+        return p == Pos::Arg || p == Pos::ArgUnproved;
+    };
 
     // Does this expression carry an owning choice? Unknown counts as yes.
     auto mayBeOwningChoice = [&](const ast::Expr& e) {
@@ -26130,9 +26229,166 @@ void Emitter::collectPlainMoveOnlyForwardSites() {
         if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) c = ce->callee.get();
         return c && dynamic_cast<sema::ChoiceCaseSymbol*>(ctx_.exprSymbol(*c));
     };
-    // A READ of a named binding (`x`, `owned x`) at position `here`.
+    // A FRESH value nobody else owns: a case construction, or an
+    // if-expression every branch of which is one (no source to mark).
+    std::function<bool(const ast::Expr*)> isFreshValue =
+        [&](const ast::Expr* e) -> bool {
+        if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e))
+            return isFreshValue(co->thenValue.get()) &&
+                   isFreshValue(co->elseValue.get());
+        return isCaseConstruction(e);
+    };
+
+    // THE SPELLINGS A CONSUMER ZERO-STORES. Each arm is the exact set its
+    // lowering recognises over a parameter source, read off that lowering —
+    // never a superset; an if-expression is in none of them (its guarded mark
+    // exists only where `lowerConditional` recorded a selection flag, which
+    // this scan cannot establish, so it stays `Unknown`):
+    //   * LocalInit — `var x := E` (`markOwningChoiceLocalMovedFrom`): any
+    //     mix of `!` and `move` over the name, except two `move`s and no `!`
+    //     (the core takes `x` and `move x` only, and substitutes the peeled
+    //     name only when a `!` was peeled);
+    //   * Return    — `return E` (the #7890 mark): `!`s at the top, then the
+    //     name or `move` of the name. NOT `move x!`: the mark's `namesParam`
+    //     admits a `!` only under an if-expression;
+    //   * ArgPlain  — the pre-call mark at an admitted plain formal
+    //     (`markMoveOnlyChoiceArgsMovedFrom`): ONE `!` at the top, then the
+    //     name or `move` of the name;
+    //   * MoveOnly  — the pre-call mark at an `owned` formal and the #6182
+    //     case-construction sweep, which peel nothing: the name or `move` of
+    //     the name.
+    // `move x with e` (§28.8.1) is in none of them.
+    auto bareMoveOperand = [](const ast::Expr* e) -> const ast::Expr* {
+        auto* u = dynamic_cast<const ast::UnaryExpr*>(e);
+        return (u && u->op == "move" && !u->replacement) ? u->operand.get()
+                                                         : nullptr;
+    };
+    auto asIdentifier = [](const ast::Expr* e) {
+        return dynamic_cast<const ast::IdentifierExpr*>(e);
+    };
+    enum class Form { LocalInit, Return, ArgPlain, MoveOnly };
+    auto provedSource = [&](const ast::Expr* e,
+                            Form f) -> const ast::IdentifierExpr* {
+        switch (f) {
+        case Form::LocalInit: {
+            int moves = 0;
+            bool bang = false;
+            for (;;) {
+                if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+                    e = pb->operand.get();
+                    bang = true;
+                    continue;
+                }
+                if (const ast::Expr* op = bareMoveOperand(e)) {
+                    e = op;
+                    ++moves;
+                    continue;
+                }
+                break;
+            }
+            return (bang || moves <= 1) ? asIdentifier(e) : nullptr;
+        }
+        case Form::Return:
+            while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
+                e = pb->operand.get();
+            if (const ast::Expr* op = bareMoveOperand(e)) e = op;
+            return asIdentifier(e);
+        case Form::ArgPlain:
+            if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
+                e = pb->operand.get();
+            if (const ast::Expr* op = bareMoveOperand(e)) e = op;
+            return asIdentifier(e);
+        case Form::MoveOnly:
+            if (const ast::Expr* op = bareMoveOperand(e)) e = op;
+            return asIdentifier(e);
+        }
+        return nullptr;
+    };
+    // A BORROWED binding: the name, under any number of `!` (§17.8: `x!`
+    // "does not move, copy, or borrow beyond what reading `x` already does").
+    auto borrowedBinding = [&](const ast::Expr* e) {
+        while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
+            e = pb->operand.get();
+        return asIdentifier(e);
+    };
+
+    // The formal a direct call of `name` binds its `i`-th argument to, over
+    // EVERY method of that name the call could be lowered against (the
+    // lowering may be handed another overload than the one the AST resolved
+    // to — the §11.8 redirect): each one whose formal at that position could
+    // take an owning choice at all (a choice, an interface, `Object`, a type
+    // parameter, an unresolved type). `form` is 1 when each declares it by
+    // value, unmarked, at a choice type; 2 when some declare it `owned`; 0
+    // when any does not (a `ref` / `out` / `scoped` formal, another type) or
+    // there is none, which leaves the argument unproved. `declined` tells
+    // whether any of them is declined by its SHAPE (or there is none). The
+    // mapping is the pre-call mark's own (positional, else by name).
+    struct ArgFormal {
+        int form = 0;
+        bool declined = true;
+    };
+    auto argFormal = [&](std::string_view name, std::size_t i,
+                         const ast::CallArgument& a) -> ArgFormal {
+        ArgFormal out;
+        auto it = methodsNamed.find(std::string(name));
+        if (it == methodsNamed.end()) return out;
+        bool any = false, anyOwned = false, unproved = false, declined = false;
+        for (sema::MethodSymbol* m : it->second) {
+            std::size_t pi = m->params.size();
+            if (a.name.empty()) {
+                pi = i;
+            } else {
+                for (std::size_t j = 0; j < m->params.size(); ++j)
+                    if (m->params[j] && m->params[j]->name == a.name) {
+                        pi = j;
+                        break;
+                    }
+            }
+            if (pi >= m->params.size()) continue;  // cannot bind it
+            auto* fp = dynamic_cast<const sema::ParameterSymbol*>(m->params[pi]);
+            const sema::TypeRef* ft = fp ? fp->resolvedDeclType : nullptr;
+            if (fp && !ft && fp->declType) ft = ctx_.resolvedType(*fp->declType);
+            bool isChoice = false;
+            if (ft) {
+                switch (ft->kind) {
+                case sema::TypeRef::Kind::Unit:
+                case sema::TypeRef::Kind::InlineArray:
+                case sema::TypeRef::Kind::Function:
+                    continue;  // can never take a choice
+                case sema::TypeRef::Kind::Primitive:
+                    if (ft->primitive != sema::PrimitiveType::Object) continue;
+                    break;
+                case sema::TypeRef::Kind::Named:
+                    if (ft->declaration) {
+                        const auto k = ft->declaration->kind;
+                        isChoice = k == ast::TypeDeclKind::Choice;
+                        if (!isChoice && k != ast::TypeDeclKind::Interface)
+                            continue;
+                    }
+                    break;
+                default:
+                    break;
+                }
+            }
+            any = true;
+            if (!plainMoveOnlyCalleeShapeAdmits(m)) declined = true;
+            if (!fp || !isChoice) {
+                unproved = true;
+                continue;
+            }
+            if (fp->modifier == "owned") anyOwned = true;
+            else if (!fp->modifier.empty()) unproved = true;
+        }
+        out.declined = declined || !any;
+        out.form = (!any || unproved) ? 0 : anyOwned ? 2 : 1;
+        return out;
+    };
+
+    // A READ of a named binding (`x`, `owned x`) at position `here`; `moved`
+    // tells a proved MOVE from a proved borrow, `held` is `argHeld`.
     auto noteBindingRead = [&](const ast::Expr& e, Pos here,
-                               std::string_view callee) {
+                               std::string_view callee, bool moved,
+                               bool held, bool calleeDeclined) {
         if (!mayBeOwningChoice(e)) return;
         sema::Symbol* s = ctx_.exprSymbol(e);
         auto* ps = dynamic_cast<sema::ParameterSymbol*>(s);
@@ -26141,15 +26397,47 @@ void Emitter::collectPlainMoveOnlyForwardSites() {
             auto it = paramOwner.find(ps);
             if (it != paramOwner.end()) owner = it->second;
         }
-        // (5) A method's OWN parameter read where no zero-store follows (or
+        auto* lsym = dynamic_cast<sema::LocalSymbol*>(s);
+        // (7) The parameter read again while an arm's borrow of its payload
+        //     is open: a consumer there would dispose the payload under the
+        //     binding, so neither the method nor that consumer is admitted.
+        const bool pinnedRead =
+            ps && std::find(pinnedParams.begin(), pinnedParams.end(), s) !=
+                      pinnedParams.end();
+        if (ps || lsym) {
+            Read r;
+            r.unit = unit;
+            bool captured = lambdaDepth > 0 && ps != nullptr;
+            if (lsym) {
+                auto it = localDepth.find(lsym->decl);
+                captured = it == localDepth.end() || it->second != lambdaDepth;
+            }
+            if (here == Pos::Unknown || captured || pinnedRead) {
+                r.unproved = true;
+            } else if (isArgPos(here)) {
+                r.callee = std::string(callee);
+                r.calleeDeclined = calleeDeclined;
+                r.held = held;
+            } else {
+                r.isMove = moved;
+            }
+            reads[s].push_back(std::move(r));
+        }
+        if (pinnedRead) {
+            if (owner) block(owner->name);
+            if (isArgPos(here)) block(callee);
+            return;
+        }
+        // (5) A method's OWN parameter read where no zero-store is proved (or
         //     captured by a lambda, whose body runs on a path the method's
         //     scope end cannot see): the value may be consumed there — moved
         //     into the target's local, MEASURED for `f(o)` through a function
         //     value (d01/d02/d03/d09) and for an indexer argument (d07) — so
         //     the method must not discharge it as well.
-        if (owner && (lambdaDepth > 0 || here == Pos::Unknown))
+        if (owner && (lambdaDepth > 0 || here == Pos::Unknown ||
+                      here == Pos::ArgUnproved))
             block(owner->name);
-        if (here != Pos::Arg) return;
+        if (!isArgPos(here)) return;
         // (4) The argument of a direct call of `callee`. The caller's mark
         //     zero-stores only a plain LOCAL (`ast::LocalDecl`) or a PARAMETER
         //     (`markOwningChoiceMovedFromCore`), so any other binding — a
@@ -26161,12 +26449,12 @@ void Emitter::collectPlainMoveOnlyForwardSites() {
             const bool byValue =
                 ps->modifier.empty() || ps->modifier == "owned";
             if (owner && lambdaDepth == 0 && byValue)
-                edges.emplace_back(std::string(callee), owner);
+                edges.push_back({std::string(callee), owner, calleeDeclined});
             else
                 block(callee);
             return;
         }
-        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(s))
+        if (auto* ls = lsym)
             // LOCALDECL-ONLY: deliberately narrow. A §21.1 `const` local is a
             // binding `markOwningChoiceMovedFromCore` does not zero-store, so
             // it must fall through to `block` (decline: the base's leak,
@@ -26184,62 +26472,285 @@ void Emitter::collectPlainMoveOnlyForwardSites() {
         if (sema::MethodSymbol* sel = ctx_.methodRefSelectedOverload(e))
             block(sel->name);
     };
+    auto noteIdentifier = [&](const ast::IdentifierExpr& id, Pos here,
+                              std::string_view callee, bool moved = false,
+                              bool held = false, bool calleeDeclined = false) {
+        // (7) An arm binding over a method's own parameter is a borrow of
+        //     the parameter's payload (§15.3 *Pattern binding*, v0.359). It
+        //     is contained only as the receiver of a scalar-valued member;
+        //     read any other way (returned, stored, passed on, captured) it
+        //     may outlive the method's scope end, where the payload dies. A
+        //     scalar binding is a copy and is not a borrow at all.
+        for (auto it = armNames.rbegin(); it != armNames.rend(); ++it) {
+            if (it->name != id.name) continue;
+            if (!isScalar(ctx_.exprType(id)) &&
+                (here != Pos::Proved || moved || lambdaDepth > 0))
+                block(it->owner->name);
+            break;
+        }
+        noteBindingRead(id, here, callee, moved, held, calleeDeclined);
+        noteValueName(id, id.name);
+    };
 
     std::function<void(const ast::Expr*)> walkExpr;
     std::function<void(const ast::Stmt*)> walkStmt;
-    auto walkAt = [&](Pos p, std::string_view callee, const ast::Expr* e) {
+    auto walkAt = [&](Pos p, std::string_view callee, bool held,
+                      bool calleeDeclined, const ast::Expr* e) {
         const Pos savedPos = pos;
         const std::string_view savedCallee = argCallee;
+        const bool savedHeld = argHeld;
+        const bool savedDeclined = argDeclined;
         pos = p;
         argCallee = callee;
+        argHeld = held;
+        argDeclined = calleeDeclined;
         walkExpr(e);
         pos = savedPos;
         argCallee = savedCallee;
+        argHeld = savedHeld;
+        argDeclined = savedDeclined;
     };
-    auto walkSafe = [&](const ast::Expr* e) { walkAt(Pos::Safe, {}, e); };
+    // A RECEIVER whose member only reads through it (a field or property
+    // read, a method call: `this` is a borrow) borrows a named binding — and
+    // the borrow is CONTAINED only when the read's result is a scalar and,
+    // for a call, so is every argument: any other result (a payload handed
+    // out as a borrow, `o.Get()`) or argument (a holder the member may store
+    // a payload borrow in) can outlive the binding's value. Not contained is
+    // `Unknown`.
+    auto walkReceiver = [&](const ast::Expr* target, bool borrows,
+                            const ast::Expr& whole,
+                            const std::vector<ast::CallArgument>* args) {
+        bool contained = borrows && isScalar(ctx_.exprType(whole));
+        if (contained && args)
+            for (const ast::CallArgument& a : *args)
+                if (!a.modifier.empty() || !a.value ||
+                    !isScalar(ctx_.exprType(*a.value))) {
+                    contained = false;
+                    break;
+                }
+        if (contained)
+            if (auto* id = borrowedBinding(target)) {
+                newUnit();
+                noteIdentifier(*id, Pos::Proved, {});
+                return;
+            }
+        walkExpr(target);
+    };
+    // Does a pattern introduce a binding? An arm's binding over an owning
+    // choice is a BORROW of its payload (§15.3 *Pattern binding*), and the
+    // arm may hand it on. Fail closed: an unrecognised pattern binds.
+    std::function<bool(const ast::Pattern*)> patternBinds =
+        [&](const ast::Pattern* p) -> bool {
+        if (!p) return false;
+        if (dynamic_cast<const ast::DiscardPattern*>(p)) return false;
+        if (dynamic_cast<const ast::NullPattern*>(p)) return false;
+        if (dynamic_cast<const ast::NamedPattern*>(p)) return false;
+        if (dynamic_cast<const ast::ConstantPattern*>(p)) return false;
+        if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(p)) {
+            for (const ast::PositionalPattern& sp : dp->subPatterns)
+                if (!sp.nakedBinding.empty() || !sp.pattern ||
+                    patternBinds(sp.pattern.get()))
+                    return true;
+            return false;
+        }
+        return true;
+    };
+    // A `case` scrutinee: `move x` is §35.5's marked scrutinee transfer,
+    // zero-stored at the consume site (#4609); the bare name is a borrow,
+    // contained only when no arm binds a payload.
+    auto walkScrutinee = [&](const ast::Expr* e,
+                             const std::vector<ast::CaseArm>& arms) {
+        if (auto* id = asIdentifier(bareMoveOperand(e))) {
+            newUnit();
+            noteIdentifier(*id, Pos::Proved, {}, /*moved=*/true);
+            return;
+        }
+        bool binds = false;
+        for (const ast::CaseArm& arm : arms)
+            if (patternBinds(arm.pattern.get())) binds = true;
+        if (!binds)
+            if (auto* id = borrowedBinding(e)) {
+                newUnit();
+                noteIdentifier(*id, Pos::Proved, {});
+                return;
+            }
+        walkExpr(e);
+    };
+    // (7) The names an arm's pattern binds; false when the pattern is not one
+    // this scan reads (fail closed: the scrutinee is then `Unknown`).
+    std::function<bool(const ast::Pattern*, std::vector<std::string_view>&)>
+        armBindingNames = [&](const ast::Pattern* p,
+                              std::vector<std::string_view>& out) -> bool {
+        if (!p) return true;
+        if (dynamic_cast<const ast::DiscardPattern*>(p)) return true;
+        if (dynamic_cast<const ast::NullPattern*>(p)) return true;
+        if (dynamic_cast<const ast::NamedPattern*>(p)) return true;
+        if (dynamic_cast<const ast::ConstantPattern*>(p)) return true;
+        if (auto* bp = dynamic_cast<const ast::BindingPattern*>(p)) {
+            out.push_back(bp->name);
+            return true;
+        }
+        if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(p)) {
+            for (const ast::PositionalPattern& sp : dp->subPatterns) {
+                if (!sp.nakedBinding.empty())
+                    out.push_back(sp.nakedBinding);
+                else if (!sp.pattern ||
+                         !armBindingNames(sp.pattern.get(), out))
+                    return false;
+            }
+            return true;
+        }
+        return false;
+    };
+    // A whole `case`. Over the enclosing method's OWN parameter, named
+    // bare, binding arms are walked under (7): the scrutinee is a contained
+    // borrow on condition that every binding read is, and the parameter is
+    // pinned while the arms are open. Any other `case` keeps
+    // `walkScrutinee`'s rule (binding arms: `Unknown`).
+    auto walkCase = [&](const ast::Expr* scrutinee,
+                        const std::vector<ast::CaseArm>& arms) {
+        const ast::IdentifierExpr* id = asIdentifier(scrutinee);
+        sema::MethodSymbol* owner = nullptr;
+        const sema::Symbol* psym = nullptr;
+        std::vector<std::vector<std::string_view>> names(arms.size());
+        if (id && lambdaDepth == 0)
+            if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    ctx_.exprSymbol(*id))) {
+                auto it = paramOwner.find(ps);
+                if (it != paramOwner.end() &&
+                    it->second->name == currentMethod) {
+                    owner = it->second;
+                    psym = ps;
+                }
+            }
+        bool binds = false;
+        for (std::size_t i = 0; owner && i < arms.size(); ++i) {
+            if (!armBindingNames(arms[i].pattern.get(), names[i]))
+                owner = nullptr;
+            else if (!names[i].empty())
+                binds = true;
+        }
+        if (!owner || !binds) {
+            walkScrutinee(scrutinee, arms);
+            for (const ast::CaseArm& arm : arms) {
+                walkExpr(arm.guard.get());
+                walkExpr(arm.exprBody.get());
+                for (const auto& s : arm.stmts) walkStmt(s.get());
+            }
+            return;
+        }
+        newUnit();
+        noteIdentifier(*id, Pos::Proved, {});
+        pinnedParams.push_back(psym);
+        for (std::size_t i = 0; i < arms.size(); ++i) {
+            const std::size_t mark = armNames.size();
+            for (std::string_view n : names[i])
+                armNames.push_back({n, owner});
+            walkExpr(arms[i].guard.get());
+            walkExpr(arms[i].exprBody.get());
+            for (const auto& s : arms[i].stmts) walkStmt(s.get());
+            armNames.resize(mark);
+        }
+        pinnedParams.pop_back();
+    };
     // A call's CALLEE names the method it calls; that is not a formation. Only
-    // a callee that RESOLVES to a method or a choice case is a direct call;
-    // any other (a function-typed local, parameter, field or property, or an
-    // unresolved one) runs a body the caller's mark does not reach, so its
-    // arguments are `Unknown`.
-    auto walkCall = [&](const ast::Expr* callee,
-                        const std::vector<ast::CallArgument>& args) {
+    // a `.`-call whose callee RESOLVES to a method or a choice case is a
+    // direct call; any other (a function-typed local, parameter, field or
+    // property, or an unresolved one) runs a body the caller's mark does not
+    // reach, so its arguments are `Unknown`. A `?.` call is NOT direct either
+    // (MEASURED, r42-rev-s87 e34 / e34b: heap-use-after-free on the NORMAL
+    // edge): `lowerNullCondCall` makes no pre-call mark where the call's
+    // result is an owning choice and has no post-dispatch sweep, so neither
+    // side is proved there and the name declines.
+    auto walkCall = [&](const ast::Expr& whole, const ast::Expr* callee,
+                        const std::vector<ast::CallArgument>& args,
+                        bool nullCond) {
         std::string_view name;
+        const ast::Expr* receiver = nullptr;
+        bool dotCallee = false;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(callee)) {
             name = id->name;
+            dotCallee = true;
         } else if (auto* ma =
                        dynamic_cast<const ast::MemberAccessExpr*>(callee)) {
             name = ma->member;
-            walkSafe(ma->target.get());
+            receiver = ma->target.get();
+            dotCallee = true;
         } else if (auto* nm =
                        dynamic_cast<const ast::NullCondMemberExpr*>(callee)) {
             name = nm->member;
-            walkSafe(nm->target.get());
+            receiver = nm->target.get();
         } else {
             walkExpr(callee);
         }
         sema::Symbol* cs = callee ? ctx_.exprSymbol(*callee) : nullptr;
-        const bool direct =
-            !name.empty() && (dynamic_cast<sema::MethodSymbol*>(cs) ||
-                              dynamic_cast<sema::ChoiceCaseSymbol*>(cs));
+        const bool toMethod = dynamic_cast<sema::MethodSymbol*>(cs) != nullptr;
+        const bool toCase = dynamic_cast<sema::ChoiceCaseSymbol*>(cs) != nullptr;
+        const bool direct = !name.empty() && dotCallee && !nullCond &&
+                            (toMethod || toCase);
+        if (receiver)
+            walkReceiver(receiver, toMethod && direct, whole, &args);
+        const bool held = !isScalar(ctx_.exprType(whole));
         // Fail closed: a NAMED callee that does not resolve to a method may
         // still be one this module declares (an unresolved or re-resolved
         // call), so the name declines too.
         if (!direct && !name.empty()) block(name);
-        for (const ast::CallArgument& a : args) {
-            if (direct) walkAt(Pos::Arg, name, a.value.get());
-            else walkExpr(a.value.get());
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            const ast::CallArgument& a = args[i];
+            // A `ref` / `out` / `scoped` argument lends its storage (§22.3):
+            // the callee may write it, which no rule here proves.
+            if (!direct || !a.modifier.empty()) {
+                walkExpr(a.value.get());
+                continue;
+            }
+            if (toCase) {
+                // The #6182 sweep in `lowerCall` zero-stores the source after
+                // the construction, which cannot raise in between.
+                if (auto* id = provedSource(a.value.get(), Form::MoveOnly))
+                    noteIdentifier(*id, Pos::Proved, {}, /*moved=*/true);
+                else
+                    walkExpr(a.value.get());
+                continue;
+            }
+            const ArgFormal af = argFormal(name, i, a);
+            if (af.form != 0)
+                if (auto* id = provedSource(
+                        a.value.get(),
+                        af.form == 1 ? Form::ArgPlain : Form::MoveOnly)) {
+                    noteIdentifier(*id, Pos::Arg, name, false, held,
+                                   af.declined);
+                    continue;
+                }
+            walkAt(af.form != 0 ? Pos::Arg : Pos::ArgUnproved, name, held,
+                   af.declined, a.value.get());
         }
     };
     auto walkArgsUnknown = [&](const std::vector<ast::CallArgument>& args) {
         for (const ast::CallArgument& a : args) walkExpr(a.value.get());
     };
+    // Does this member access READ storage (a field, a property), as opposed
+    // to forming a bound method reference, which captures its receiver?
+    auto readsStorage = [&](const ast::Expr& e) {
+        sema::Symbol* s = ctx_.exprSymbol(e);
+        return s && !dynamic_cast<sema::MethodSymbol*>(s);
+    };
 
+    std::function<void(const ast::Expr*)> walkExprIn;
     walkExpr = [&](const ast::Expr* e) {
+        newUnit();
+        ++exprNesting;
+        walkExprIn(e);
+        --exprNesting;
+    };
+    walkExprIn = [&](const ast::Expr* e) {
         const Pos here = pos;
         const std::string_view hereCallee = argCallee;
+        const bool hereHeld = argHeld;
+        const bool hereDeclined = argDeclined;
         pos = Pos::Unknown;
         argCallee = {};
+        argHeld = false;
+        argDeclined = false;
         if (!e) return;
         if (dynamic_cast<const ast::IntLiteralExpr*>(e)) return;
         if (dynamic_cast<const ast::FloatLiteralExpr*>(e)) return;
@@ -26253,59 +26764,58 @@ void Emitter::collectPlainMoveOnlyForwardSites() {
         if (dynamic_cast<const ast::DefaultExpr*>(e)) return;
         if (dynamic_cast<const ast::UnitExpr*>(e)) return;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
-            noteBindingRead(*id, here, hereCallee);
-            noteValueName(*id, id->name);
+            noteIdentifier(*id, here, hereCallee, false, hereHeld,
+                           hereDeclined);
             return; }
         if (dynamic_cast<const ast::MarkedTransferExpr*>(e)) {
-            // `owned x` names a binding; an unresolved one declines.
-            noteBindingRead(*e, here, hereCallee);
-            return; }
-        // `x!` and `move x` are classified by the position of the whole
-        // (§17.8: "Over a named owned binding, `x!` is therefore classified by
-        // its position exactly as the bare read `x` is").
-        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
-            walkAt(here, hereCallee, pb->operand.get()); return; }
-        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
-            if (ue->op == "move") {
-                walkAt(here, hereCallee, ue->operand.get());
-                return;
-            }
-            if (here == Pos::Arg && mayBeOwningChoice(*e)) block(hereCallee);
-            walkExpr(ue->operand.get());
-            return; }
-        // An if-expression's selected branch takes the position of the whole
-        // (§20 *Ownership*); its condition is an ordinary read.
-        if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e)) {
-            walkExpr(co->condition.get());
-            walkAt(here, hereCallee, co->thenValue.get());
-            walkAt(here, hereCallee, co->elseValue.get());
+            // `owned x` names a binding, in a spelling no mark recognises: it
+            // is `Unknown` for the binding's owner and declines the callee it
+            // is an argument of.
+            noteBindingRead(*e, Pos::Unknown, {}, false, false, false);
+            if (isArgPos(here)) block(hereCallee);
             return; }
         // (4') THE ARGUMENT SHAPE. An argument of a direct call of `callee`
-        // that may carry an owning choice and is not a named binding (above)
-        // or a case construction (a fresh value nobody else owns) declines the
-        // callee: the caller's mark cannot zero it, and it need not be fresh —
-        // a getter or expression property that returns a FIELD hands out a
-        // value its receiver still disposes (MEASURED: `Take(h.Get())` and
-        // `Take(h.P)`, c28 / c28b / c28c; whether such a read is admitted at
-        // all is #6233's question, not this predicate's).
-        if (here == Pos::Arg && !isCaseConstruction(e) &&
+        // that may carry an owning choice and is neither a named binding in a
+        // spelling the mark zero-stores (matched by the call, above) nor a
+        // fresh value declines the callee: the caller's mark cannot zero it,
+        // and it need not be fresh — a getter or expression property that
+        // returns a FIELD hands out a value its receiver still disposes
+        // (MEASURED: `Take(h.Get())` and `Take(h.P)`, c28 / c28b / c28c;
+        // whether such a read is admitted at all is #6233's question, not
+        // this predicate's). `x!`, `move x` and an if-expression are NOT
+        // transparent here: only the spellings `provedSource` lists are.
+        if (isArgPos(here) && !isFreshValue(e) &&
             !dynamic_cast<const ast::LambdaExpr*>(e) && mayBeOwningChoice(*e))
             block(hereCallee);
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            walkExpr(pb->operand.get()); return; }
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            walkExpr(ue->operand.get());
+            walkExpr(ue->replacement.get());
+            return; }
+        if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            walkExpr(co->condition.get());
+            walkExpr(co->thenValue.get());
+            walkExpr(co->elseValue.get());
+            return; }
         if (auto* si = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
             for (const auto& part : si->parts) walkExpr(part.expr.get());
             return; }
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
             noteValueName(*ma, ma->member);
-            walkSafe(ma->target.get()); return; }
+            walkReceiver(ma->target.get(), readsStorage(*ma), *ma, nullptr);
+            return; }
         if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
             noteValueName(*nm, nm->member);
-            walkSafe(nm->target.get()); return; }
+            walkExpr(nm->target.get()); return; }
         if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
-            walkCall(ce->callee.get(), ce->args); return; }
+            walkCall(*ce, ce->callee.get(), ce->args, /*nullCond=*/false);
+            return; }
         if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
-            walkCall(nc->callee.get(), nc->args); return; }
+            walkCall(*nc, nc->callee.get(), nc->args, /*nullCond=*/true);
+            return; }
         if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
-            walkSafe(ix->target.get()); walkArgsUnknown(ix->indices); return; }
+            walkExpr(ix->target.get()); walkArgsUnknown(ix->indices); return; }
         if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
             walkArgsUnknown(ne->args); return; }
         if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
@@ -26337,30 +26847,17 @@ void Emitter::collectPlainMoveOnlyForwardSites() {
             --lambdaDepth;
             return; }
         if (auto* cx = dynamic_cast<const ast::CaseExpr*>(e)) {
-            walkSafe(cx->scrutinee.get());
-            for (const ast::CaseArm& arm : cx->arms) {
-                walkExpr(arm.guard.get());
-                walkExpr(arm.exprBody.get());
-                for (const auto& s : arm.stmts) walkStmt(s.get());
-            }
+            walkCase(cx->scrutinee.get(), cx->arms);
             return; }
         if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
-            for (const auto& c : bx->clauses) walkStmt(c.get());
+            // A binding atom's clause (§17.15) is not the statement-level
+            // local the #7415 mark is emitted for: its initializer is
+            // `Unknown`.
+            for (const auto& c : bx->clauses)
+                if (c) walkExpr(c->initializer.get());
             walkExpr(bx->body.get());
             return; }
         plainMoveOnlyScanIncomplete_ = true;
-    };
-
-    // Is this assignment target a plain LOCAL (the local-to-local transfer,
-    // whose lowering zero-stores the source)?
-    auto isLocalTarget = [&](const ast::Expr* t) {
-        auto* id = dynamic_cast<const ast::IdentifierExpr*>(t);
-        if (!id) return false;
-        auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
-        // LOCALDECL-ONLY: `t` is an ASSIGNMENT target, and §21.1 makes a
-        // runtime `const` single-assignment, so a const local is never one;
-        // a non-match only leaves the value `Unknown` (decline).
-        return ls && dynamic_cast<const ast::LocalDecl*>(ls->decl);
     };
 
     walkStmt = [&](const ast::Stmt* s) {
@@ -26368,18 +26865,61 @@ void Emitter::collectPlainMoveOnlyForwardSites() {
         argCallee = {};
         if (!s) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            walkSafe(ld->initializer.get()); return; }
+            // `var x := o` — the #7415 mark, emitted for every statement-level
+            // local right after its store.
+            localDepth[ld] = lambdaDepth;
+            // (7) `using var x := r` over an arm binding `r` (§28.10,
+            //     v0.359: the `using var` "does not assume a disposal
+            //     obligation" over a borrow) only ALIASES the borrow: `x`
+            //     is held to the same rule as `r` for the rest of the arm.
+            if (ld->isUsing && !ld->isAwaitUsing &&
+                ld->usingVarSourceIsBorrow && lambdaDepth == 0)
+                if (auto* id = asIdentifier(ld->initializer.get()))
+                    if (!mayBeOwningChoice(*id)) {
+                        sema::MethodSymbol* aliasOwner = nullptr;
+                        for (auto it = armNames.rbegin();
+                             it != armNames.rend(); ++it)
+                            if (it->name == id->name) {
+                                aliasOwner = it->owner;
+                                break;
+                            }
+                        if (aliasOwner) {
+                            armNames.push_back({ld->name, aliasOwner});
+                            return;
+                        }
+                    }
+            if (auto* id = provedSource(ld->initializer.get(),
+                                        Form::LocalInit)) {
+                newUnit();
+                noteIdentifier(*id, Pos::Proved, {}, /*moved=*/true);
+            } else {
+                walkExpr(ld->initializer.get());
+            }
+            return; }
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
-            walkSafe(lc->value.get()); return; }
+            // A §21.1 `const` local ALIASES the value and is never
+            // zero-stored: `const x := o; return x;` hands the caller a value
+            // the parameter's slot still holds (MEASURED on 9fbdc5699:
+            // heap-use-after-free).
+            walkExpr(lc->value.get()); return; }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
-            walkSafe(as->target.get());
-            if (isLocalTarget(as->target.get())) walkSafe(as->value.get());
-            else walkExpr(as->value.get());
+            // Neither side is proved. A WRITE to the parameter (`o := x`)
+            // stores a value its source still disposes (MEASURED on
+            // 9fbdc5699: heap-use-after-free), and the assignment's mark sits
+            // behind lowering arms this scan does not mirror.
+            walkExpr(as->target.get());
+            walkExpr(as->value.get());
             return; }
         if (auto* is = dynamic_cast<const ast::IncrementStmt*>(s)) {
             walkExpr(is->target.get()); return; }
         if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
-            walkSafe(rs->value.get()); return; }
+            if (auto* id = provedSource(rs->value.get(), Form::Return)) {
+                newUnit();
+                noteIdentifier(*id, Pos::Proved, {}, /*moved=*/true);
+            } else {
+                walkExpr(rs->value.get());
+            }
+            return; }
         if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
             walkExpr(es->expr.get()); return; }
         if (auto* th = dynamic_cast<const ast::ThrowStmt*>(s)) {
@@ -26387,6 +26927,9 @@ void Emitter::collectPlainMoveOnlyForwardSites() {
         if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
             walkExpr(ds->value.get()); return; }
         if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            // An ITERATOR's body runs in a frame resumed by its consumer, not
+            // under the call that bound the parameter: not proved.
+            if (!currentMethod.empty()) block(currentMethod);
             walkExpr(ys->value.get()); return; }
         if (dynamic_cast<const ast::BreakStmt*>(s)) return;
         if (dynamic_cast<const ast::ContinueStmt*>(s)) return;
@@ -26416,12 +26959,7 @@ void Emitter::collectPlainMoveOnlyForwardSites() {
             for (const auto& b : tr->finallyBody) walkStmt(b.get());
             return; }
         if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
-            walkSafe(cs->scrutinee.get());
-            for (const ast::CaseArm& arm : cs->arms) {
-                walkExpr(arm.guard.get());
-                walkExpr(arm.exprBody.get());
-                for (const auto& a : arm.stmts) walkStmt(a.get());
-            }
+            walkCase(cs->scrutinee.get(), cs->arms);
             return; }
         plainMoveOnlyScanIncomplete_ = true;
     };
@@ -26440,10 +26978,18 @@ void Emitter::collectPlainMoveOnlyForwardSites() {
             }
             return; }
         if (auto* md = dynamic_cast<const ast::MethodDecl*>(mem)) {
+            const std::string_view savedMethod = currentMethod;
+            currentMethod = md->name;
             walkExpr(md->exprBody.get());
             for (const auto& s : md->stmts) walkStmt(s.get());
             for (const ast::Param& p : md->params)
                 walkExpr(p.defaultValue.get());
+            // A contract clause (§22.16) is an expression like any other: a
+            // method formed as a value there, or a parameter read there, is
+            // seen. (A method that HAS one is declined by its shape.)
+            for (const ast::ContractClause& c : md->contractClauses)
+                walkExpr(c.expr.get());
+            currentMethod = savedMethod;
             return; }
         if (auto* od = dynamic_cast<const ast::OperatorDecl*>(mem)) {
             walkExpr(od->exprBody.get());
@@ -26453,10 +26999,13 @@ void Emitter::collectPlainMoveOnlyForwardSites() {
             for (const auto& s : cd->body) walkStmt(s.get());
             for (const ast::Param& p : cd->params)
                 walkExpr(p.defaultValue.get());
+            for (const ast::ContractClause& c : cd->contractClauses)
+                walkExpr(c.expr.get());
             return; }
         if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(mem)) {
             for (const auto& s : dd->body) walkStmt(s.get()); return; }
-        if (dynamic_cast<const ast::InvariantDecl*>(mem)) return;
+        if (auto* iv = dynamic_cast<const ast::InvariantDecl*>(mem)) {
+            walkExpr(iv->expr.get()); return; }
         if (dynamic_cast<const ast::EventDecl*>(mem)) return;
         if (auto* kd = dynamic_cast<const ast::ConstDecl*>(mem)) {
             walkExpr(kd->value.get()); return; }
@@ -26482,18 +27031,99 @@ void Emitter::collectPlainMoveOnlyForwardSites() {
         }
     }
 
-    // (4) The least fixed point over the forward edges: a call of `n` that
-    // forwards a parameter of method F is admitted only if F itself is (F
-    // then owns the parameter and the pre-call mark zeroes F's slot).
+    // (6) THE ARGUMENT BINDING. A callee that disposes its parameter frees a
+    // payload while the caller's binding is still in scope, so a binding
+    // handed to a direct call must not be read anywhere the value, or a
+    // borrow of its payload, can still be held when that callee runs
+    // (MEASURED on 9fbdc5699, heap-use-after-free where r30-c1 leaks:
+    // `Take2(a, a)`, `Take2(a, Take(a))`, `var rr := a.Get(); Take(a);
+    // rr.V`, a payload binding of `case a of` read after `Take(a)` — sema
+    // moves a local at the END of the statement and treats a plain parameter
+    // as a borrow, so it rejects none of these). A consuming name declines
+    // when its argument binding
+    //   * has a read that is not proved (`unproved`: a capture, an
+    //     if-expression, a non-scalar receiver read, a binding `case`, ...);
+    //   * is read twice in the unit of the call (an earlier operand still
+    //     holds the value the callee frees);
+    //   * is also the argument of a DECLINED call whose result is not a
+    //     scalar — a borrow of the binding may ride on that result (decided in
+    //     the fixed point: `heldBy`).
+    // A parameter moved twice in one unit declines its owner as well.
+    struct HeldBy {
+        std::string callee;
+        bool calleeDeclined = false;
+        std::vector<std::string> consumers;
+    };
+    std::vector<HeldBy> heldBy;
+    for (const auto& [sym, rs] : reads) {
+        std::vector<std::string> consumers;
+        std::unordered_map<unsigned, unsigned> perUnit;
+        bool bad = false;
+        for (const Read& r : rs) {
+            ++perUnit[r.unit];
+            if (!r.callee.empty()) consumers.push_back(r.callee);
+            if (r.unproved) bad = true;
+        }
+        bool crowdedMove = false;
+        for (const Read& r : rs) {
+            if (perUnit[r.unit] < 2) continue;
+            if (!r.callee.empty()) bad = true;
+            if (r.isMove) crowdedMove = true;
+        }
+        if (crowdedMove) {
+            auto it = paramOwner.find(sym);
+            if (it != paramOwner.end()) block(it->second->name);
+        }
+        if (consumers.empty()) continue;
+        if (bad) {
+            for (const std::string& c : consumers) block(c);
+            continue;
+        }
+        if (rs.size() < 2) continue;
+        for (const Read& r : rs)
+            if (!r.callee.empty() && r.held)
+                heldBy.push_back({r.callee, r.calleeDeclined, consumers});
+    }
+
+    // (4) The least fixed point over the forward edges, in BOTH directions.
+    // An edge `(n, F)` is a direct call of a method named `n` handed a
+    // parameter of method F in a spelling the pre-call mark zero-stores.
+    //   * F not admitted  =>  `n` declines. F's caller kept its own value (no
+    //     pre-call mark at a declined F), so a callee that disposed it would
+    //     meet that caller's disposal.
+    //   * `n` not admitted  =>  F declines (r42-rev-s87, e33a / e33b / e33e /
+    //     e33f / e33g: heap-use-after-free on the UNWIND edge). The call makes
+    //     no pre-call mark at a declined callee, and the post-dispatch sweep
+    //     in `lowerCall` runs on the normal edge only, so a callee that
+    //     consumes the value and then throws leaves F's slot populated for
+    //     F's own unwind disposal. `n` is not admitted when the name is
+    //     blocked or when ANY method of that name the call could be lowered
+    //     against is declined by its shape (`argFormal`).
+    // Both rules only ever ADD names, so the loop terminates, and at its
+    // fixed point no edge joins an admitted method to a declined one: the
+    // admitted set is closed under the forward edges in both directions.
+    auto declined = [&](const std::string& n, bool byShape) {
+        return byShape || plainMoveOnlyBlockedNames_.count(n) != 0;
+    };
     for (bool changed = true; changed;) {
         changed = false;
-        for (const auto& [n, owner] : edges) {
-            if (plainMoveOnlyBlockedNames_.count(n)) continue;
-            if (plainMoveOnlyCalleeShapeAdmits(owner) &&
-                !plainMoveOnlyBlockedNames_.count(std::string(owner->name)))
-                continue;
-            plainMoveOnlyBlockedNames_.insert(n);
-            changed = true;
+        for (const Edge& e : edges) {
+            const std::string ownerName(e.owner->name);
+            const bool ownerAdmitted =
+                plainMoveOnlyCalleeShapeAdmits(e.owner) &&
+                !plainMoveOnlyBlockedNames_.count(ownerName);
+            if (!ownerAdmitted &&
+                plainMoveOnlyBlockedNames_.insert(e.callee).second)
+                changed = true;
+            if (declined(e.callee, e.calleeDeclined) &&
+                plainMoveOnlyBlockedNames_.insert(ownerName).second)
+                changed = true;
+        }
+        for (const HeldBy& h : heldBy) {
+            if (!declined(h.callee, h.calleeDeclined)) continue;
+            for (const std::string& c : h.consumers)
+                if (plainMoveOnlyBlockedNames_.insert(c).second)
+                    changed = true;
         }
     }
 }
