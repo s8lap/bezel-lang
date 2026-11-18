@@ -21365,6 +21365,27 @@ private:
             if (c.kind == ast::ContractClause::Kind::Ensures) return true;
         return false;
     }
+    // fix #8764 (§28.9, v0.359): the constructor twin of the method overload
+    // above — §22.16 gives a constructor an `ensures` clause too ("`ensures`
+    // over a constructor evaluates at body completion"), and that epilogue
+    // runs AFTER the body's scope-end disposals, so a parameter it reads must
+    // keep its reference. Same conservative answer for an unknown callee.
+    //
+    // The parameter is the DECL, not the symbol: `emitConstructorBody` already
+    // holds the `ast::ConstructorDecl*` its `cs->decl` produced (and returns
+    // early when it is not a constructor decl), so the caller's `cd` IS this
+    // function's `cd` — the answer is unchanged. Taking the decl instead of
+    // the symbol keeps this file's class-3 imported-symbol read count where it
+    // was: a `Symbol::decl` is null for an IMPORTED symbol (#3152's ratchet,
+    // `scripts/check_imported_symbol_reads.py`), so reading it here would
+    // answer "unknown ⇒ conservatively yes" for an imported constructor and
+    // would add one more class-3 read to this file's baseline.
+    static bool hasEnsuresClause(const ast::ConstructorDecl* cd) {
+        if (!cd) return true;  // unknown: conservatively "yes" (no release)
+        for (const auto& c : cd->contractClauses)
+            if (c.kind == ast::ContractClause::Kind::Ensures) return true;
+        return false;
+    }
     // fix #5253: the StringEscapeWalker verdict for a PARAMETER (keyed on its
     // symbol rather than a LocalDecl), run over `body` with the same opt-ins
     // collectStringReleaseEligible uses for a borrow local.
@@ -21395,7 +21416,18 @@ private:
     // .cpp for the full argument and the CO-GATE rationale).
     void retainAssignedClosureParams(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
-        const std::vector<sema::Symbol*>& params);
+        const std::vector<sema::Symbol*>& params,
+        bool armScopeEndRelease = false);
+    // fix #8764 (§28.9, v0.359): the ClosureEscapeWalker verdict for a
+    // closure-typed PARAMETER (keyed on its symbol rather than a LocalDecl) —
+    // the closure twin of stringParamReleaseEligible (fix #5253). A `true`
+    // verdict means the parameter's value never LEAVES the frame (not
+    // returned, not captured, not stored, not passed but as a call's callee),
+    // so the frame's own reference to the slot's final value can be released
+    // at scope end. See the .cpp for the full argument.
+    bool closureParamReleaseEligible(
+        const sema::Symbol* sym,
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) const;
 
     // fix #2115 / §28.9 / §35.4: the set of `var` value-like choice LocalDecl
     // nodes whose initializer is a choice construction every string payload arg

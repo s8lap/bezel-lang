@@ -24108,7 +24108,16 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
         // Paired with the closureReleaseEligibleFn_ = specFn pin just above,
         // exactly as retainAssignedStringParams is paired with
         // stringReleaseEligibleFn_ = specFn above it.
-        retainAssignedClosureParams(*ci.stmts, ms->params);
+        //
+        // fix #8764 (§28.9, v0.359): the scope-end release of the parameter's
+        // final value — the closure twin of the string twin's own
+        // `armScopeEndRelease` above. The root lowerScopedBlock below drains
+        // the queued release (pendingChainOutDisposals_ is saved/cleared
+        // above), so arm it — unless an `ensures` clause could read the
+        // parameter after that release (§22.16's epilogue runs after the
+        // body's scope-end disposals).
+        retainAssignedClosureParams(*ci.stmts, ms->params,
+                                    /*armScopeEndRelease=*/!hasEnsuresClause(ms));
     }
 
     // Emit the body. fix #580: handle both EXPRESSION and block bodies, so a

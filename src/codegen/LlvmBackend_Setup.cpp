@@ -11879,8 +11879,16 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // retainAssignedClosureParams' own comment. Paired with the
     // collectClosureReleaseEligible(*ci.stmts) / closureReleaseEligibleFn_ =
     // fn pin earlier in this function.
+    //
+    // fix #8764 (§28.9, v0.359): the scope-end release of the parameter's
+    // FINAL value — the closure twin of the string twin's own
+    // `armScopeEndRelease` above. This body's root lowerScopedBlock drains
+    // the queued release, so arm it — unless an `ensures` clause could read
+    // the parameter after that release (§22.16's epilogue runs after the
+    // body's scope-end disposals).
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts)
-        retainAssignedClosureParams(*ci.stmts, ms->params);
+        retainAssignedClosureParams(*ci.stmts, ms->params,
+                                    /*armScopeEndRelease=*/!hasEnsuresClause(ms));
 
     // §22.16 (v0.203, #2053): the requires prologue. A `requires` clause
     // evaluates on EVERY invocation, AFTER argument binding completes and
@@ -13721,7 +13729,18 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     // below, co-gated with the release the pin above arms (a function-typed
     // parameter assigned in the body must own an independent +1, or the
     // drop-on-overwrite release frees the CALLER's borrow).
-    retainAssignedClosureParams(cd->body, cs->params);
+    //
+    // fix #8764 (§28.9, v0.359): the scope-end release of the parameter's
+    // final value — the closure twin of the string twin's own
+    // `armScopeEndRelease`. The constructor body's root lowerScopedBlock
+    // (below) drains the queued release, so arm it — unless an `ensures`
+    // clause could read the parameter after that release (§22.16's epilogue
+    // runs after the body's scope-end disposals). The gate takes the
+    // constructor's DECL — `cd` is this `cs`'s own `ast::ConstructorDecl`
+    // (the null case returned above), so the answer is the same as the
+    // symbol-keyed twin's, and no `cs->decl` read is added here.
+    retainAssignedClosureParams(cd->body, cs->params,
+                                /*armScopeEndRelease=*/!hasEnsuresClause(cd));
     // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §22.8 (v0.240): run the
     // `var` STRING-local refcount analysis for the COMPILED constructor body and
     // pin the token to this fn. EVERY consumer of the three string sets gates on
@@ -31251,7 +31270,8 @@ void Emitter::retainAssignedStringParams(
 // setter `value` parameter — nothing to retain there.
 void Emitter::retainAssignedClosureParams(
     const std::vector<std::unique_ptr<ast::Stmt>>& body,
-    const std::vector<sema::Symbol*>& params) {
+    const std::vector<sema::Symbol*>& params,
+    bool armScopeEndRelease) {
     // 0. CO-GATE WITH THE RELEASE. lowerClosureLocalReassign's own call site
     //    (LlvmBackend_Stmts.cpp) is gated on `currentFn_ ==
     //    closureReleaseEligibleFn_`, mirroring retainAssignedStringParams'
@@ -31320,6 +31340,45 @@ void Emitter::retainAssignedClosureParams(
         llvm::AllocaInst* slot = paramSlots_[const_cast<sema::Symbol*>(sym)];
         if (!slot) continue;
         emitClosureRetain(builder_.CreateLoad(ptrTy(), slot, "clo.parm"));
+        // fix #8764 (§28.9, v0.359): the scope-end release of the parameter's
+        // FINAL value — the closure twin of retainAssignedStringParams' own
+        // step-3 release (fix #5253, above).
+        //
+        // The retain above gives THIS frame an independent +1 on the incoming
+        // argument; lowerClosureLocalReassign (fix #4174) keeps the slot at
+        // exactly one reference across every overwrite (retain-or-transfer the
+        // new value, release the displaced old one), so the frame owns
+        // exactly one reference to whatever the slot holds at scope end — the
+        // caller's argument (if no overwrite ran) or the replacement closure
+        // (if one did). Without a release for it, the replacement closure's
+        // +1 leaks on every call: MEASURED on r30-c1 (#8764's own repro,
+        // `bezelc --sanitize=address`), "3600 byte(s) leaked in 100
+        // allocation(s)" over 50 iterations of a method that assigns a lambda
+        // to its function-typed parameter.
+        //
+        // §28.9 (v0.359), "Runtime-managed types": "the type's lifetime is
+        // managed by the runtime without user involvement" — the runtime
+        // reclaims the value, and the frame that holds the last reference
+        // drops it. The CALLER's argument is a BORROW (§28.3's marker
+        // economy: an unmarked read of a function-typed binding is a borrow),
+        // so this release never touches the caller's own reference: the +1
+        // it drops is the frame's, taken at bind.
+        //
+        // Gated on closureParamReleaseEligible: the parameter's value must
+        // not LEAVE the frame (not returned, not captured by a nested lambda,
+        // not stored, not passed but as a call's callee). A value that leaves
+        // keeps the frame's +1 (the safe direction — a bounded per-call
+        // leak), exactly as the `string` twin's own escape walk does.
+        //
+        // Queued for the body's ROOT scope (lowerScopedBlock drains
+        // pendingChainOutDisposals_ there), so only a caller whose root
+        // lowerScopedBlock follows directly asks for it — the same constraint
+        // the `string` twin's `armScopeEndRelease` carries.
+        if (armScopeEndRelease && closureParamReleaseEligible(sym, body)) {
+            Disposal d{slot, nullptr};
+            d.closureRelease = true;
+            pendingChainOutDisposals_.push_back(d);
+        }
     }
 }
 
@@ -39228,6 +39287,12 @@ inline const ast::Expr* closureIdentityCallForwardedArg(
 struct ClosureEscapeWalker {
     const sema::SemaContext& ctx;
     const void* target;   // the LocalDecl node we are testing
+    // fix #8764 (§28.9, v0.359): when set, the tracked binding is this
+    // PARAMETER symbol (a ParameterSymbol has no LocalDecl to key on), and
+    // `isTargetIdent` matches an identifier resolving to it — the closure
+    // twin of StringEscapeWalker's own `targetSym` (fix #5253). Null for
+    // every LocalDecl-keyed walk, leaving them bit-identical.
+    const sema::Symbol* targetSym = nullptr;
     bool escaped = false;
     // fix #2107-follow-up (§27.5 / §28.9, v0.298): true when the ONLY escape
     // observed for `target` came from a direct reassignment to `target`
@@ -39551,6 +39616,10 @@ struct ClosureEscapeWalker {
     bool isTargetIdent(const ast::Expr* e) const {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
         if (!id) return false;
+        // fix #8764 (§28.9, v0.359): the PARAMETER-keyed mode — a
+        // ParameterSymbol has no LocalDecl to key on, so the symbol itself is
+        // the identity. Null for every LocalDecl-keyed walk.
+        if (targetSym) return ctx.exprSymbol(*id) == targetSym;
         auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(*id));
         return loc && loc->decl &&
                static_cast<const void*>(loc->decl) == target;
@@ -40794,6 +40863,36 @@ struct ClosureEscapeWalker {
             expr(ts->value.get(), /*safeRead=*/false); return;
         }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            // fix #8764 (§28.9, v0.359): the PARAMETER-keyed mode's rebinding
+            // arm. An assignment TO a closure-typed parameter is a REBIND of
+            // the slot, not an escape of the parameter's value:
+            // `Emitter::lowerClosureLocalReassign` (fix #4174) keeps the slot
+            // at exactly one reference across the overwrite — it retains (or
+            // transfers) the new value and releases the displaced old one —
+            // and `Emitter::retainAssignedClosureParams` (fix #4174
+            // follow-up) gave the slot an independent +1 at bind, so the
+            // displaced value's release discharges THIS frame's own reference
+            // and the caller's borrow is untouched. So the rebinding leaves
+            // the frame owning exactly one reference to whatever the slot
+            // holds — the shape the scope-end release needs, and the shape
+            // the LOCAL case reaches through the post-walk override
+            // (`w.escapedDueToReassign && !leavesFrame` → `w.escaped =
+            // false`). The right-hand side is walked as a SAFE READ, exactly
+            // as StringEscapeWalker's `stringReleaseMode` relaxation walks a
+            // plain `:=` to the tracked string binding (fix #1997): the new
+            // value is stored INTO the slot, so it does not leave the frame,
+            // and a self-assignment `f := f;` keeps the slot at one
+            // reference.
+            //
+            // Only for the PARAMETER mode (`targetSym` set): a LOCAL's
+            // reassignment keeps the conservative escape below, whose
+            // post-walk override (in collectClosureReleaseEligible, a
+            // different function) is what clears it there.
+            if (targetSym && !inLambda && as->op == ":=" &&
+                isTargetIdent(as->target.get())) {
+                expr(as->value.get(), /*safeRead=*/true);
+                return;
+            }
             // fix #8743: see targetAssignIsPlainStore / assignBinds.
             if (!inLambda && as->op == ":=" && targetAssignIsPlainStore &&
                 isTargetIdent(as->target.get())) {
@@ -43701,6 +43800,56 @@ bool Emitter::stringParamReleaseEligible(
     w.borrowRetainedAliases = &stringBorrowAll_;
     w.objectStringBorrowAliases = &objectStringBorrowAll_;
     w.objectStringReassignRetain = &objectStringReassignRetain_;  // fix #8598
+    for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+    return !w.escaped;
+}
+
+
+// fix #8764 (§28.9, v0.359): the ClosureEscapeWalker verdict for a
+// closure-typed PARAMETER (keyed on its symbol rather than a LocalDecl) — the
+// closure twin of stringParamReleaseEligible (fix #5253) above.
+//
+// A `true` verdict means the parameter's value never LEAVES the frame: it is
+// not returned, not captured by a nested lambda, not stored into a field or a
+// collection, and not passed anywhere but a call's CALLEE position (a call
+// borrows the function value for the invocation, §27.7). The frame's own
+// reference to the slot's final value can then be released at scope end.
+//
+// WHY THE FRAME OWNS A REFERENCE AT ALL. `retainAssignedClosureParams`
+// (fix #4174 follow-up) gives the slot an independent +1 at bind, and
+// `lowerClosureLocalReassign` (fix #4174) keeps it at exactly one reference
+// across every overwrite (retain-or-transfer the new value, release the
+// displaced old one). So the frame owns exactly one reference to whatever the
+// slot holds at scope end — the caller's argument (the bind's +1, released by
+// the first overwrite) or the replacement closure (the overwrite's +1). The
+// scope-end release drops that one reference; the CALLER's own reference to
+// the argument it passed is untouched, which is why the caller's argument is
+// never released here (§28.3's marker economy: an unmarked read of a
+// function-typed binding is a borrow).
+//
+// THE TWO RELAXATIONS this mode makes, and why both are sound:
+//   * an assignment TO the parameter is a REBIND of the slot (the walker's
+//     own AssignmentStmt arm, above) — the slot keeps exactly one reference,
+//     so the value does not leave the frame;
+//   * a `return` of the parameter IS an escape (the walker's own ReturnStmt
+//     arm, with `assignedSomewhere` set below) — for a LOCAL a returned value
+//     is re-minted for the caller by the frame's own return arm, but a
+//     PARAMETER has no such arm, so a release at scope end could free the
+//     value the caller received. The conservative verdict (no release) is
+//     the safe direction.
+//
+// `assignedSomewhere` is set because the caller of this predicate has already
+// proved the body ASSIGNS to the parameter (that is the gate
+// `retainAssignedClosureParams` applies before it retains the slot at all),
+// and `walkWholeBody` because the verdict must not depend on where the
+// assignment sits relative to the first escape in source order.
+bool Emitter::closureParamReleaseEligible(
+    const sema::Symbol* sym,
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) const {
+    ClosureEscapeWalker w{ctx_, nullptr};
+    w.targetSym = sym;
+    w.assignedSomewhere = true;
+    w.walkWholeBody = true;
     for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
     return !w.escaped;
 }

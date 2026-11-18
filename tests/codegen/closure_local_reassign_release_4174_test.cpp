@@ -81,12 +81,26 @@
 // the runLenientOut helper's own comment for why: each has a FINAL closure
 // value that is, on BOTH the pre-fix and post-fix compiler, excluded from
 // the scope-end release set by the pre-existing, documented "a reassigned
-// local's (or an assigned-to parameter's) final value leaks safely"
-// trade-off (mirroring `lowerStringLocalReassign` / `retainAssignedString
-// Params`'s own for `string`), which is unrelated to this fix and would
-// otherwise trip LeakSanitizer for a program that in fact ran correctly
-// (measured: a one-shot 40-byte leak DOES clear LSan's report threshold in
-// this harness — confirmed empirically, no floor to rely on).
+// local's final value leaks safely" trade-off (mirroring
+// `lowerStringLocalReassign` / `retainAssignedStringParams`'s own for
+// `string`), which is unrelated to this fix and would otherwise trip
+// LeakSanitizer for a program that in fact ran correctly (measured: a
+// one-shot 40-byte leak DOES clear LSan's report threshold in this
+// harness — confirmed empirically, no floor to rely on).
+//
+// UPDATE (fix #8764, §28.9, v0.359): this header used to read "a
+// reassigned local's (OR AN ASSIGNED-TO PARAMETER'S) final value leaks
+// safely". The PARAMETER half is STALE for the four body kinds #8764 armed
+// — a plain method/function body, a constructor body, a specialized method
+// function, and an async method: there an assigned-to parameter's final
+// value IS released at scope end (`Emitter::retainAssignedClosureParams`'s
+// `armScopeEndRelease`, the closure twin of the string twin's own), so the
+// parameter row below no longer leaks in those bodies. The LOCAL half is
+// UNCHANGED — a reassigned closure LOCAL's final value is still excluded
+// from the scope-end release set (ClosureEscapeWalker marks any reassigned
+// target as escaped), and the body kinds #8764 did NOT arm (a lambda body,
+// an iterator body, an async-lambda body, an async-iterator body, a record
+// constructor) still leak an assigned-to parameter's final value — #8875.
 //
 // FAIL-WITHOUT / PASS-WITH, measured program-by-program (500x-loop-amplified
 // where noted) on one build of each compiler:

@@ -1995,7 +1995,17 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // retainAssignedClosureParams' own comment. Paired with this
         // function's own collectClosureReleaseEligible(*ci.stmts) /
         // closureReleaseEligibleFn_ = resumeFn pin above.
-        retainAssignedClosureParams(*ci.stmts, ms->params);
+        //
+        // fix #8764 (§28.9, v0.359): the scope-end release of the parameter's
+        // final value — the closure twin of the string twin's own
+        // `armScopeEndRelease` above. The drain added at the body's
+        // disposeStack_.emplace_back() below is the async counterpart; it
+        // must pair with the gate opened here. `!hasEnsuresClause(ms)`
+        // mirrors both existing call sites: an `ensures` epilogue runs AFTER
+        // the body's scope-end disposals (§22.16), so a parameter it reads
+        // must keep its reference.
+        retainAssignedClosureParams(*ci.stmts, ms->params,
+                                    /*armScopeEndRelease=*/!hasEnsuresClause(ms));
 
         // State field GEP — read by the resume dispatch, written at each await.
         llvm::Value* stateGEP =
