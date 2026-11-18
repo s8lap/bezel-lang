@@ -215,241 +215,116 @@ BEZEL_TEST(set_erasing_value_type_capture_8785,
 }
 
 // ---------------------------------------------------------------------------
-// FIX-FORWARD (review r42-rev-m75 REJECTED 687462d48): only a POSITIVELY
-// no-borrow value-type capture contributes nothing.
+// The two named boundary controls (RUN.md, owner 2026-11-12: at most two per
+// suite).  "Contributes nothing" is reached only for a capture POSITIVELY
+// identified as a value type that holds no borrow; both programs below
+// capture a value that HOLDS one, so §28.3 (v0.359), closure bullet,
+// *Provenance*, clause 1 counts it:
 //
-// The first cut of `captureContributesSource` defaulted to "contributes
-// nothing" at every declaration-less type head, so a capture of a stdlib
-// CLASS (`StringBuilder`, `Array<T>`, `Dictionary<K,V>`, `Random`) or of a
-// span — and a record whose field is one — read as a value that holds no
-// borrow, and the three set-erasing positions newly ADMITTED it.  §28.3
-// (v0.359), closure bullet, *Provenance*, clause 1 counts every one of them:
+//   "a captured local or parameter of a value type that holds borrows
+//    ([§3.6]) the sources of the borrows it carries (in a generic body, read
+//    at each instantiation at which the type, after substitution, holds
+//    borrows, ...)"
 //
-//   "a captured borrowed local or parameter that binding's source; a
-//    captured owned local its enclosing scope ...; a captured local or
-//    parameter of a value type that holds borrows ([§3.6]) the sources of the
-//    borrows it carries ...; a captured value that carries no borrow — a
-//    value type that holds none, a null-source value, a `string` —
-//    contributes nothing"
-//
-// and §9.7 makes a field borrow-carrying when "Its type is a reference type
-// (class or interface, nullable or not ...)"; `Span<T>`/`ArraySpan<T>` are
-// borrow-bearing records.  "Contributes nothing" is the exemption for a value
-// type that holds NONE; nothing else reaches it.
-//
-// Every row below is the review's probe (`/var/tmp/bezel-scratch/
-// r42-rev-m63/m75/probes/<id>.bzl`) and is RED at 687462d48 (the program
-// compiled there) and GREEN with the fix-forward (rejected at the set-erasing
-// position).  The base before 687462d48 rejected each of them too; these
-// rows pin the inversion the first cut introduced.  u03 is the run-time
-// witness: at 687462d48 it printed `0` (the disposed StringBuilder) instead
-// of `6`, and leaked under ASan.
+// and *Set-erasing positions*: "a function value with a non-empty source set
+// is rejected".  Each program is REJECTED on the base tree too (it is a
+// base-GREEN control, not a fix row), and each is RED under a named wrong
+// fix: the rejected fix-forward a28e5cb98 ADMITTED both, and under ASan over
+// these 200 iterations each then reported `heap-use-after-free` (review
+// r42-rev-s65, witnesses u01 and u03).  The other must-still-reject shapes
+// (stdlib-class, span, owned-local and borrow-bearing-record captures) are
+// base-green and live in the conformance corpus.
 
 namespace {
 
-// The review's shared probe prelude, trimmed to what the rows use.
-std::string borrowCaptureProgram(const std::string& decls,
-                                 const std::string& members) {
-    return "module M; "
-           "import System; "
-           "import System.Text; "
-           "public class Res "
-           "  public constructor() end constructor; "
-           "  public method Use(): int return 3; end Use; "
-           "end Res; "
-           "extension Object "
-           "  public method Hold(): int => 1; "
-           "end; " +
-           decls +
-           " public class Program "
-           "  public static method Take(o: Object) end Take; " +
-           members + " end Program; ";
-}
-
 const char* kCarriesBorrow = "function value carries captured borrow(s)";
+const char* kAtObject = "may not be passed where the parameter is declared Object";
 
-// Rejected at a §28.3 set-erasing position, with the set-erasing diagnostic
-// (not some unrelated compile error).
-void expectSetErasingReject(const JitResult& r, const char* position) {
+// Rejected at the `Object` argument with the set-erasing diagnostic (not
+// some unrelated compile error).
+void expectSetErasingRejectAtObject(const JitResult& r) {
     BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, kCarriesBorrow));
-    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, position));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, kAtObject));
 }
 
-const char* kAtObject = "may not be passed where the parameter is declared Object";
+// The run-time witness harness: `Reg2.Keep(o: Object)` stores the closure and
+// `RunInt()` calls it after the captured value's borrow source `r` has been
+// disposed at the end of the inner `do` block.
+std::string registryProgram(const std::string& decls,
+                            const std::string& members,
+                            const std::string& storeCall) {
+    return "module M; "
+           "import System; "
+           "public class Res "
+           "  public V: int; "
+           "  public constructor() V := 42; end constructor; "
+           "end Res; "
+           "public class Reg2 "
+           "  private _o: Object? := null; "
+           "  public constructor() end constructor; "
+           "  public method Keep(o: Object) _o := o; end Keep; "
+           "  public method RunInt(): int => (_o as () -> int)!(); "
+           "end Reg2; " +
+           decls +
+           " public class Program " + members +
+           "  public static method Main(): int "
+           "    using var reg := new Reg2(); "
+           "    for var i in 0 ..< 200 do "
+           "      do "
+           "        var r := new Res(); " +
+           storeCall +
+           "      end; "
+           "      Console.WriteLine(reg.RunInt()); "
+           "    end for; "
+           "    return 0; "
+           "  end Main; "
+           "end Program; ";
+}
 
 }  // namespace
 
-// r04: a borrowed `StringBuilder` parameter — "a captured borrowed ...
-// parameter that binding's source".
+// u01 (review r42-rev-s65): a `where T: value` type-parameter capture.  `where
+// T: value` admits a borrow-bearing record (§9.7's generic-body paragraph:
+// `Id<T>(a: T) where T: value` at `Id<Pair>` over `record Pair(Item: Item)`
+// is rejected), and clause 1 reads the capture "at each instantiation at which
+// the type, after substitution, holds borrows".  The body is checked once,
+// with no per-instantiation re-check, so the capture stays COUNTED at every
+// instantiation.  WRONG FIX this catches: a28e5cb98's top-level `where T:
+// value` exemption, which admitted `G<HV>` and printed freed memory.
 BEZEL_TEST(set_erasing_borrow_capture_8785,
-           r04_stringbuilder_param_capture_at_object_rejected) {
-    auto r = runAot(borrowCaptureProgram(
-        "",
-        "public static method F(sb: StringBuilder) Take(lambda() => sb.Length); end F; "
-        "public static method Main(): int var sb := new StringBuilder(); F(sb); "
-        "Console.WriteLine(\"ran\"); return 0; end Main;"));
-    expectSetErasingReject(r, kAtObject);
+           u01_where_value_type_parameter_capture_at_object_rejected) {
+    auto r = runAot(registryProgram(
+        "public interface IGetV "
+        "  method GetV(): int; "
+        "end IGetV; "
+        "record HV(It: Res): IGetV "
+        "  public method GetV(): int => It.V; "
+        "end HV;",
+        "  public static method G<T>(reg: Reg2, x: T) where T: value, IGetV "
+        "    reg.Keep(lambda() => x.GetV()); "
+        "  end G; ",
+        "        G<HV>(reg, new HV(r)); "));
+    expectSetErasingRejectAtObject(r);
 }
 
-// r05: a borrowed `Array<int>` parameter (a trivial-dispose CLASS).
+// u03 (review r42-rev-s65): a body record whose class reference is an
+// AUTO-PROPERTY.  §9.7: "Reference-typed fields in records are always
+// borrows"; an auto-property is a storage component of the record (§9.2), so
+// `BR` holds a borrow and the capture of `h` contributes its source.  WRONG
+// FIX this catches: a28e5cb98's record walk over `sema::anyRecordStorageField`,
+// which skips auto-properties (the #6708 gap) and so read `BR` as holding
+// none.
 BEZEL_TEST(set_erasing_borrow_capture_8785,
-           r05_array_int_param_capture_at_object_rejected) {
-    auto r = runAot(borrowCaptureProgram(
-        "",
-        "public static method F(a: Array<int>) Take(lambda() => a.Count); end F; "
-        "public static method Main(): int var a := new Array<int>(3); F(a); "
-        "Console.WriteLine(\"ran\"); return 0; end Main;"));
-    expectSetErasingReject(r, kAtObject);
-}
-
-// r15: a span local — "a captured local ... of a value type that holds
-// borrows ... the sources of the borrows it carries".
-BEZEL_TEST(set_erasing_borrow_capture_8785,
-           r15_span_local_capture_at_object_rejected) {
-    auto r = runAot(borrowCaptureProgram(
-        "",
-        "public static method F(a: Array<int>) var s := a.AsSpan(); "
-        "Take(lambda() => s.Length); end F; "
-        "public static method Main(): int var a := new Array<int>(3); F(a); "
-        "Console.WriteLine(\"ran\"); return 0; end Main;"));
-    expectSetErasingReject(r, kAtObject);
-}
-
-// r16: an owned plain-`var` `StringBuilder` local — "a captured owned local
-// its enclosing scope".
-BEZEL_TEST(set_erasing_borrow_capture_8785,
-           r16_owned_stringbuilder_local_capture_at_object_rejected) {
-    auto r = runAot(borrowCaptureProgram(
-        "",
-        "public static method Main(): int var sb := new StringBuilder(); "
-        "Take(lambda() => sb.Length); Console.WriteLine(\"ran\"); return 0; end Main;"));
-    expectSetErasingReject(r, kAtObject);
-}
-
-// r17: a borrowed `Array<Res>` parameter.
-BEZEL_TEST(set_erasing_borrow_capture_8785,
-           r17_array_of_class_param_capture_at_object_rejected) {
-    auto r = runAot(borrowCaptureProgram(
-        "",
-        "public static method F(a: Array<Res>) Take(lambda() => a.Count); end F; "
-        "public static method Main(): int var a := new Array<Res>(0); F(a); "
-        "Console.WriteLine(\"ran\"); return 0; end Main;"));
-    expectSetErasingReject(r, kAtObject);
-}
-
-// r20: the `StringBuilder` capture at the extension-`Object` RECEIVER
-// position.
-BEZEL_TEST(set_erasing_borrow_capture_8785,
-           r20_stringbuilder_capture_at_extension_object_receiver_rejected) {
-    auto r = runAot(borrowCaptureProgram(
-        "",
-        "public static method F(sb: StringBuilder): int "
-        "var f: () -> int := lambda() => sb.Length; return f.Hold(); end F; "
-        "public static method Main(): int var sb := new StringBuilder(); "
-        "Console.WriteLine(F(sb)); return 0; end Main;"));
-    expectSetErasingReject(r, "receiver of an extension call");
-}
-
-// r21: the `StringBuilder` capture at a BARE TYPE PARAMETER substituted with
-// `Object` (`Keep<Object>.Put`).
-BEZEL_TEST(set_erasing_borrow_capture_8785,
-           r21_stringbuilder_capture_at_bare_type_parameter_rejected) {
-    auto r = runAot(borrowCaptureProgram(
-        "public class Keep<T> "
-        "  public constructor() end constructor; "
-        "  public method Put(a: T) end Put; "
-        "end Keep;",
-        "public static method F(sb: StringBuilder) using var k := new Keep<Object>(); "
-        "k.Put(lambda() => sb.Length); end F; "
-        "public static method Main(): int var sb := new StringBuilder(); F(sb); "
-        "Console.WriteLine(\"ran\"); return 0; end Main;"));
-    expectSetErasingReject(r, "bare type parameter");
-}
-
-// r22: a borrowed `Dictionary<string, int>` parameter.
-BEZEL_TEST(set_erasing_borrow_capture_8785,
-           r22_dictionary_param_capture_at_object_rejected) {
-    auto r = runAot(borrowCaptureProgram(
-        "",
-        "public static method F(d: Dictionary<string, int>) Take(lambda() => d.Count); end F; "
-        "public static method Main(): int var d := new Dictionary<string, int>(); F(d); "
-        "Console.WriteLine(\"ran\"); return 0; end Main;"));
-    expectSetErasingReject(r, kAtObject);
-}
-
-// r27: an owned local of an OWNING choice (auto-dropped) — "a captured owned
-// local its enclosing scope".
-BEZEL_TEST(set_erasing_borrow_capture_8785,
-           r27_owning_choice_local_capture_at_object_rejected) {
-    auto r = runAot(borrowCaptureProgram(
-        "choice Slot "
-        "  Full(owned c: Res), "
-        "  Empty; "
-        "end Slot;",
-        "public static method Main(): int var s := Slot.Full(new Res()); "
-        "Take(lambda() => (case s of Full(_) => 1, _ => 0)); "
-        "Console.WriteLine(\"ran\"); return 0; end Main;"));
-    expectSetErasingReject(r, kAtObject);
-}
-
-// r28: an owned `[1 owned]Res` inline-array local.
-BEZEL_TEST(set_erasing_borrow_capture_8785,
-           r28_owning_inline_array_local_capture_at_object_rejected) {
-    auto r = runAot(borrowCaptureProgram(
-        "",
-        "public static method Main(): int var arr: [1 owned]Res := [new Res()]; "
-        "Take(lambda() => arr[0].Use()); Console.WriteLine(\"ran\"); return 0; end Main;"));
-    expectSetErasingReject(r, kAtObject);
-}
-
-// r32: an owned plain-`var` `Array<int>` local.
-BEZEL_TEST(set_erasing_borrow_capture_8785,
-           r32_owned_array_local_capture_at_object_rejected) {
-    auto r = runAot(borrowCaptureProgram(
-        "",
-        "public static method Main(): int var a := new Array<int>(2); "
-        "Take(lambda() => a.Count); Console.WriteLine(\"ran\"); return 0; end Main;"));
-    expectSetErasingReject(r, kAtObject);
-}
-
-// r35: a record whose field is a `StringBuilder` — a value type that HOLDS a
-// borrow (§9.7 first bullet), read through clause 1's holds-borrows arm.
-BEZEL_TEST(set_erasing_borrow_capture_8785,
-           r35_record_holding_stringbuilder_capture_at_object_rejected) {
-    auto r = runAot(borrowCaptureProgram(
-        "record SBH(B: StringBuilder);",
-        "public static method F(sb: StringBuilder) var h := new SBH(sb); "
-        "Take(lambda() => h.B.Length); end F; "
-        "public static method Main(): int var sb := new StringBuilder(); F(sb); "
-        "Console.WriteLine(\"ran\"); return 0; end Main;"));
-    expectSetErasingReject(r, kAtObject);
-}
-
-// u03: the run-time witness.  `Registry.Keep(o: Object)` stores the closure
-// and `Run()` calls it after the captured `StringBuilder`'s scope has ended.
-// At 687462d48 this compiled and printed `0` 200 times (the disposed
-// builder) instead of `6`, with an ASan-reported leak; it is rejected at the
-// `Object` argument with the fix.
-BEZEL_TEST(set_erasing_borrow_capture_8785,
-           u03_registry_keep_of_scoped_stringbuilder_capture_rejected) {
-    auto r = runAot(borrowCaptureProgram(
-        "public class Registry "
-        "  private _o: Object? := null; "
-        "  public constructor() end constructor; "
-        "  public method Keep(o: Object) _o := o; end Keep; "
-        "  public method Run(): int => (_o as () -> int)!(); "
-        "end Registry;",
-        "public static method Main(): int "
-        "  using var reg := new Registry(); "
-        "  for var i in 0 ..< 200 do "
-        "    do "
-        "      var sb := new StringBuilder(\"abcdef\"); "
-        "      reg.Keep(lambda() => sb.Length); "
-        "    end; "
-        "    Console.WriteLine(reg.Run()); "
-        "  end for; "
-        "  return 0; "
-        "end Main;"));
-    expectSetErasingReject(r, kAtObject);
+           u03_body_record_auto_property_capture_at_object_rejected) {
+    auto r = runAot(registryProgram(
+        "record BR "
+        "  public readonly property It: Res; "
+        "  public constructor(it: Res) It := it; end constructor; "
+        "end BR;",
+        "  public static method F(reg: Reg2, h: BR) "
+        "    reg.Keep(lambda() => h.It.V); "
+        "  end F; ",
+        "        F(reg, new BR(r)); "));
+    expectSetErasingRejectAtObject(r);
 }

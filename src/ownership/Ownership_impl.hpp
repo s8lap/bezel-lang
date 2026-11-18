@@ -7282,9 +7282,10 @@ private:
     bool captureContributesSource(const sema::Symbol* sym);
     // fix #8785: the closed, positive "a value type that holds none" test of
     // §28.3 clause 1 (§3.6, §9.7, §35.4). `topLevel` is true at the capture's
-    // own declared type, where a `where T: value` type parameter of the
-    // analysed body qualifies; `seen` is the record/choice walk's path guard
-    // and `env` its instantiation substitution. // per §28.3, §3.6, §9.7
+    // own declared type (a captured `string` binding stays counted there; a
+    // type parameter, `where T: value` included, is counted at every level);
+    // `seen` is the record/choice walk's path guard and `env` its
+    // instantiation substitution. // per §28.3, §3.6, §9.7
     bool captureTypeHoldsNoBorrow(
         const sema::TypeRef* t, std::unordered_set<const sema::TypeRef*>& seen,
         const common::RecordSubstEnv* env, bool topLevel);

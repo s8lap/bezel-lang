@@ -29691,10 +29691,9 @@ bool MethodOwnership::captureContributesSource(const sema::Symbol* sym) {
 //   * a span view or a borrow-bearing record or inline array
 //     (`isBorrowBearingRecordOrSpan`) or a choice that holds borrows
 //     (`isBorrowBearingChoice`): no;
-//   * a declaration-less type parameter: yes only at the capture's own
-//     declared type and only when it is one of the analysed body's parameters
-//     constrained `where T: value` (§14.2; §28.1 clause 5); anything else is
-//     read under §28.1's class-or-interface assumption;
+//   * a declaration-less type parameter, `where T: value` included: no
+//     (clause 1 reads it per instantiation, and the body is not re-checked
+//     at one; see the arm below);
 //   * a declaration-less builtin head: yes only for the closed value set
 //     `trustIsDeclarationlessValueBuiltin` names, minus `CancellationToken`
 //     (a borrow-bearing record, §9.7: "a span's and a `CancellationToken`'s
@@ -29702,12 +29701,13 @@ bool MethodOwnership::captureContributesSource(const sema::Symbol* sym) {
 //   * a value builtin with a symbol, an enum: yes (`CancellationToken` and the
 //     spans excepted, as above);
 //   * a record, a choice or an inline array: yes only when EVERY component —
-//     each storage field, each case payload, the element — is itself
-//     positively no-borrow, read through the instantiation's substitution
-//     (`seedRecordSubstEnv`). An `owned` payload or an `owned` inline array
-//     holds an owned reference: no. The structural walk is what reaches a
-//     declaration-less class component (`record R(B: StringBuilder)`), which
-//     §9.7's own field walk does not see;
+//     each storage field and auto-property, each case payload, the element —
+//     is itself positively no-borrow, read through the instantiation's
+//     substitution (`seedRecordSubstEnv`). An `owned` member or payload or an
+//     `owned` inline array holds an owned reference, and a record with an
+//     event holds storage the walk does not classify: no. The walk is what
+//     reaches a declaration-less class component (`record R(B:
+//     StringBuilder)`), which §9.7's own field walk does not see;
 //   * an unresolved or erroneous type: no.
 // `seen` is the PATH guard of the record/choice walk (a type already on the
 // path answers "no": conservative, and terminating).
@@ -29778,16 +29778,21 @@ bool MethodOwnership::captureTypeHoldsNoBorrow(
     if (!t->declaration) {
         // A type parameter is asked first: one may be spelled like a value
         // builtin (`class Box<Guid>`).
+        //
+        // A type parameter is NEVER positively no-borrow here, `where T:
+        // value` included. Clause 1 reads a generic body's capture "at each
+        // instantiation at which the type, after substitution, holds
+        // borrows", and `where T: value` admits a borrow-bearing record
+        // (§9.7's generic-body paragraph: `Id<T>(a: T) where T: value` at
+        // `Id<Pair>` over `record Pair(Item: Item)` is rejected). The body is
+        // checked once, at its declaration, with no per-instantiation re-check,
+        // so the capture stays COUNTED (the conservative over-reject of a
+        // `G<int>` instantiation is the price of having no such re-check).
         if (t->isResolvedTypeParam() ||
             (t->astNode && t->astNode->name &&
              t->astNode->name->parts.size() == 1 &&
-             typeParamIsDeclaredHere(t->astNode->name->parts.front()))) {
-            if (!topLevel) return false;
-            return t->astNode && t->astNode->name &&
-                   t->astNode->name->parts.size() == 1 &&
-                   typeParamIsValueConstrained(
-                       t->astNode->name->parts.front());
-        }
+             typeParamIsDeclaredHere(t->astNode->name->parts.front())))
+            return false;
         if (head.empty()) return false;
         return trustIsDeclarationlessValueBuiltin(head);
     }
@@ -29808,11 +29813,30 @@ bool MethodOwnership::captureTypeHoldsNoBorrow(
     const common::RecordSubstEnv* compEnv = myEnv.map.empty() ? nullptr : &myEnv;
     bool noBorrow = true;
     if (ts->kind == ast::TypeDeclKind::Record) {
-        noBorrow = !sema::anyRecordStorageField(
-            ts, ctx_, [&](const sema::Symbol*, const sema::TypeRef* ft) {
-                return !captureTypeHoldsNoBorrow(ft, seen, compEnv,
-                                                 /*topLevel=*/false);
-            });
+        // EVERY storage member, auto-properties included: §9.2 makes a
+        // positional field an auto-property and an explicit body auto-property
+        // is a storage component too, so `record BR public readonly property
+        // It: Res; … end BR;` holds a borrow (§9.7 "Reference-typed fields in
+        // records are always borrows"). `sema::anyRecordStorageField` skips
+        // auto-properties by contract (the #6708 gap), so the full storage
+        // walk is used instead. An `owned` member holds an owned reference, and
+        // an event is storage this walk does not classify: both answer no.
+        for (const sema::Symbol* ms : ts->members)
+            if (dynamic_cast<const sema::EventSymbol*>(ms)) {
+                noBorrow = false;
+                break;
+            }
+        if (noBorrow)
+            sema::recordStorageMembers(
+                ts, ctx_, [&](const sema::RecordStorageMember& rsm) {
+                    if (rsm.isOwned ||
+                        !captureTypeHoldsNoBorrow(rsm.type, seen, compEnv,
+                                                  /*topLevel=*/false)) {
+                        noBorrow = false;
+                        return false;  // stop
+                    }
+                    return true;
+                });
     } else {
         for (const sema::ChoiceCaseSymbol* ccs : sema::choiceCasesOf(ts)) {
             if (!ccs || !ccs->caseDecl) { noBorrow = false; break; }
