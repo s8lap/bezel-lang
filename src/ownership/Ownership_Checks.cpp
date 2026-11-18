@@ -6184,9 +6184,32 @@ bool MethodOwnership::isCapturedOwnedBinding(const ast::Expr& e) {
 // dispose) and is rejected here; `isCapturedOwnedBinding` limits it to an
 // enclosing-body binding still in the Owned state, so a closure's own local
 // and a borrow are untouched. A `!` is peeled (§17.8 classifies `c!` as `c`).
+//
+// fix #8781 (§31.1 *The throw operand*, v0.359): the BORROWED half. §31.1: "The
+// operand is consumed as an owned value under the ownership rules below, so a
+// *borrowed* class reference is not a valid operand." The rule names no scope,
+// and the method-body arms (`ThrowStmt` / `ThrowExpr` in the dataflow) reject
+// it through `checkThrowOperandNotBorrowed`; a closure body never reaches those
+// arms, so `throw e` of a captured BORROWED binding (a non-`owned` parameter, a
+// Borrowed-state local, `this`) or of the closure's own non-`owned` parameter
+// or catch binding compiled, and the owner and the runtime both disposed the
+// instance (MEASURED: core dump after "caught"). The same predicate answers
+// here, so a closure body draws the method arm's diagnostic: an operand that
+// is NOT a captured Owned binding (reported above) is asked the borrow
+// question. A closure's own owned local carries no tracked state in this scan
+// and is not a borrow, so it stays admitted. // per §31.1, v0.359
 void MethodOwnership::reportCapturedThrowOperand(const ast::Expr& operand) {
     const ast::Expr* op = lookThroughForceUnwrap(&operand);
-    if (!op || !isCapturedOwnedBinding(*op)) return;
+    if (!op) return;
+    if (!isCapturedOwnedBinding(*op)) {
+        // A catch-arm binding re-thrown inside the closure is already rejected
+        // with this very text by the closure's try/catch walk (MEASURED on the
+        // base); asking again would report it twice.
+        if (const auto* cid = dynamic_cast<const ast::IdentifierExpr*>(op))
+            if (isCatchBorrow(ctx_.exprSymbol(*cid))) return;
+        checkThrowOperandNotBorrowed(operand);
+        return;
+    }
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(op);
     reportCapturedOwnedConsume(id->name, id->span.begin, "throw");
 }
