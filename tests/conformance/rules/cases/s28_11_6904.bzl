@@ -7,7 +7,7 @@
 //!   transfer of its source that the store reaches.
 //! cites: 28.11, 28.3
 //! expect: warn
-//! diagnostic: trust admission
+//! diagnostic: borrowing-collection store
 //! flags: --report-trust-admissions
 //! issue: 7468
 //! notes: The exemption is conditioned on the collection not escaping the body and on the

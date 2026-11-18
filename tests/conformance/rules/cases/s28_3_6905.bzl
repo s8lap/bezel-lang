@@ -7,7 +7,7 @@
 //!   parameter (§28.14) makes the bound static.
 //! cites: 28.3, 28.13, 14.1
 //! expect: warn
-//! diagnostic: trust admission
+//! diagnostic: borrowed-field store
 //! flags: --report-trust-admissions
 //! issue: 7468
 //! notes: The first sentence of the same bullet states the rule: a borrow may be stored in

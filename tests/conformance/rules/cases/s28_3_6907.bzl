@@ -1,13 +1,13 @@
 //! case: s28_3_6907
 //! doc: spec
 //! section: 28.3
-//! title: a receiver-sourced Mutex read stored into a field and into a collection draws two
-//!   lines
+//! title: a receiver-sourced Mutex read added to a collection is reported as a collection
+//!   store
 //! rule: the trust-admission report (§28.3) names every such store, and a `scoped`
 //!   parameter (§28.14) makes the bound static.
 //! cites: 28.3, 28.11, 28.13
 //! expect: warn
-//! diagnostic: trust admission
+//! diagnostic: borrowing-collection store
 //! flags: --report-trust-admissions
 //! issue: 7468
 //! notes: The first sentence of the same bullet states the rule: a borrow may be stored in

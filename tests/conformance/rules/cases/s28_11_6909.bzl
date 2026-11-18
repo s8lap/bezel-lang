@@ -9,7 +9,7 @@
 //!   `this` — the binding itself, not a value read through it — is not reported
 //! cites: 28.11, 28.3
 //! expect: warn
-//! diagnostic: trust admission
+//! diagnostic: borrowing-collection store
 //! flags: --report-trust-admissions
 //! issue: 7468
 //! notes: The exemption is conditioned on the collection not escaping the body and on the
