@@ -39041,6 +39041,103 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
     return calleeBodyUsesFormalOnlyByInvocationOrInspection(*md, p.name);
 }
 
+// fix #8872 (§28.14 / §28.9 / §27.5, v0.359): the FUNCTION-VALUE twin of
+// closureArgBindsMethodOwnTypeParamBorrow's arm (b) — the arm that proves the
+// callee-side obligation with the CALLEE'S BODY (the formal is used by
+// invocation / inspection only). That arm can only walk a body: it needs the
+// callee's `ast::MethodDecl` to be in this module.
+//
+// A call THROUGH A FUNCTION VALUE has no such body to walk: the callee is a
+// lambda-typed local (`h(k)`), a function-typed parameter (`g(k)`), a
+// function-typed field, or a method reference. So the argument was classified
+// as an ESCAPE, the closure local's scope-end release was never armed, and one
+// closure cell + its env leaked per call. MEASURED on r30-c1 @ d8e779e5c
+// (`bezelc --sanitize=address`, LSan, 200 iterations): `var k := lambda() => m;
+// var h := lambda(g: () -> int) => g(); return h(k);` leaks 15200 byte(s) in
+// 600 allocation(s) — k's 64-byte cell, k's 8-byte env and m's 4-byte capture
+// cell, every iteration. The method-callee twin (`C.Ap(k)` with
+// `Ap(g: () -> int)`) is clean on the same compiler.
+//
+// THE PROOF IS THE SIGNATURE, NOT THE BODY. §28.14 (v0.359) states the
+// call-bounded default as a property of the PARAMETER, not of the callee's
+// identity: "A function-typed parameter declared *without* `scoped` is
+// **call-bounded**: the callee receives the callback for the duration of the
+// call only ... It may not be stored in a field of any object, ... returned,
+// captured by a closure that itself escapes the callee, or forwarded into a
+// `scoped` parameter position. These obligations are compiler-verified for
+// user-authored callees." The verification runs on EVERY user-authored body —
+// a method's own formals (Ownership.cpp's `run`) AND a lambda's own formals
+// (`MethodOwnership::seedLambdaCallBoundedParams`, walked by the same
+// `callBoundedScan`) — so a callee that stores, returns, captures or forwards
+// the callback is REJECTED at compile time, whichever spelling created the
+// function value. MEASURED: `var h := lambda(g: () -> int) => g;` is rejected
+// with "parameter `g` is call-bounded; declare it `scoped` to store it
+// (§28.14, v0.177) — a plain function-typed parameter may be invoked, bound to
+// locals, and passed to another plain function-typed parameter, but may not be
+// returned". The METHOD arm above reaches the same verdict by walking the
+// callee body; this arm reaches it from the signature, which is the only thing
+// a function-value callee offers.
+//
+// THE ONE §28.14 SHAPE ALLOWED TO RETAIN THE CALLBACK PAST THE CALL is
+// *Call-bounded × deferred activation* — a callee whose call mints a
+// deferred-activation frame (an `async` callee's task, an iterator's frame)
+// holds the plain function-typed parameter in that frame. The callee's
+// function TYPE announces that frame in its RETURN slot, so the clause is
+// decidable from the signature alone: a Task-family or iterable-interface head
+// return declines, exactly as `prepareCallClosureArgRelease`'s
+// `headIsDeferredFrame` declines it for the method path.
+//
+// EVERY CLAUSE FAILS CLOSED: an unrecognised shape returns false, which leaves
+// the argument an escape — a leak, never an early release.
+inline bool closureArgBindsFunctionValueCallBoundedParam(
+        const sema::SemaContext& ctx, const ast::CallExpr& call,
+        std::size_t ai) {
+    if (ai >= call.args.size() || !call.args[ai].value) return false;
+    if (!call.args[ai].modifier.empty()) return false;
+    if (!call.callee) return false;
+    // A METHOD callee is the other arm's job — there the callee's BODY is the
+    // proof, and this arm has no body to read.
+    if (dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*call.callee)))
+        return false;
+    const sema::TypeRef* ft = ctx.exprType(*call.callee);
+    if (!ft || ft->kind != sema::TypeRef::Kind::Function || ft->nullable)
+        return false;
+    // POSITIONAL, exact arity — the only shape in which the syntactic index is
+    // the PARAMETER index (mirrors `isCallBoundedClosureArgPosition`'s
+    // discipline; a named or defaulted argument is declined rather than
+    // guessed at).
+    if (call.args.size() != ft->funcParams.size()) return false;
+    for (const auto& a : call.args)
+        if (!a.name.empty() || !a.modifier.empty() || a.isDiscard) return false;
+    if (ai >= ft->funcParams.size()) return false;
+    const auto& fp = ft->funcParams[ai];
+    // No modifier: `scoped` is storage-bounded (the callee MAY store the
+    // callback — §28.14), `owned` transfers it in, `ref`/`out` alias it.
+    if (!fp.modifier.empty()) return false;
+    // The formal must be FUNCTION-TYPED — the §28.14 call-bounded default is
+    // stated for a function-typed parameter. A bare type parameter resolves to
+    // Kind::Named and can never arm this (the #1921/#2248 lesson: a bare `T`
+    // is Named at every instantiation).
+    if (!fp.type || fp.type->kind != sema::TypeRef::Kind::Function)
+        return false;
+    if (fp.type->isResolvedTypeParam()) return false;
+    // The RETURN slot must not carry the callback out of the call, and must
+    // not announce a deferred-activation frame (§28.14 *Call-bounded ×
+    // deferred activation*).
+    const sema::TypeRef* rt = ft->funcReturn;
+    if (rt) {
+        if (rt->kind == sema::TypeRef::Kind::Function) return false;
+        if (rt->isResolvedTypeParam()) return false;
+        if (rt->kind == sema::TypeRef::Kind::Named) {
+            const std::string_view head = rt->headName();
+            if (common::isTaskFamilyHead(head) ||
+                common::isIterableInterfaceHead(head))
+                return false;
+        }
+    }
+    return true;
+}
+
 // fix #8743 (§22.2 / §14.1 / §28.9, v0.359): the argument a call hands
 // straight back as its result, or null. The callee must be a user STATIC
 // method, not async / virtual / abstract / override / imported, whose whole
@@ -40230,6 +40327,26 @@ struct ClosureEscapeWalker {
                 // through `??` / `as` (argIsTarget).
                 if (!safeArg && argIsTarget(c->args[ai].value.get()) &&
                     closureArgBindsMethodOwnTypeParamBorrow(ctx, *c, ai))
+                    safeArg = true;
+                // fix #8872 (§28.14 / §28.9 / §27.5, v0.359): the
+                // FUNCTION-VALUE callee twin of the arm above. A call through
+                // a function VALUE — a lambda-typed local `h(k)`, a
+                // function-typed parameter `g(k)`, a function-typed field, a
+                // method reference — has no callee body for that arm to walk,
+                // so the argument stayed an escape: the closure local's
+                // scope-end release was never armed and one closure cell +
+                // its env leaked per call (MEASURED: 15200 byte(s) in 600
+                // allocation(s) over 200 iterations on r30-c1 @ d8e779e5c).
+                // §28.14's call-bounded default is a property of the
+                // PARAMETER — "a function-typed parameter declared *without*
+                // `scoped` is call-bounded" — and the compiler verifies the
+                // callee's obligations for every user-authored body (a
+                // method's own formals and a LAMBDA's own formals alike), so
+                // the callee provably holds no reference to the callback once
+                // the call returns. The caller keeps its +1 and releases it at
+                // scope end, exactly as the method-callee twin does.
+                if (!safeArg && argIsTarget(c->args[ai].value.get()) &&
+                    closureArgBindsFunctionValueCallBoundedParam(ctx, *c, ai))
                     safeArg = true;
                 // fix #7803 (stdlib §2.1 / §8.5 / §22.3 / §28.3 / §28.9,
                 // v0.355): a closure local read at the BUILT-IN console's
