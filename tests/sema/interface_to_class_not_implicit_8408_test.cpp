@@ -155,6 +155,7 @@ public class Program
 end Program;
 )bzl");
     BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_EQ(diagnosticMessageCount(r, kRuleReason), 2);
 }
 
