@@ -4062,6 +4062,22 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         std::vector<unsigned> savedAsyncClosurePinFields;
         savedAsyncClosurePinFields.swap(asyncClosurePinFields_);
         asyncClosurePinFrame_ = nullptr;
+        // fix #8930 (§30.1 / §28.9, v0.359): the STRING-PIN publication — the
+        // borrowed `string` parameter's hold — gets the SAME suppression, for
+        // the same reason. `emitAsyncMethod` publishes it in
+        // `asyncStringPinFrame_` / `asyncStringPinFields_` for the whole of
+        // its body emission, and the lambda's completion calls
+        // `emitAsyncStringParamRelease(self)`, which GEPs the field indices
+        // through `smStateStruct_` — the LAMBDA's struct type — while the
+        // indices are the ENCLOSING METHOD's. So it reads a word of the
+        // LAMBDA's frame and releases it as a `string`: a pointer to whatever
+        // that word happened to be, dereferenced by the runtime — a SEGV in
+        // `bz_string_release` (§30.1: the frame "lives until the task
+        // settles", so only the frame that took the hold may drop it).
+        const StateMachineFrame* savedAsyncStringPinFrame = asyncStringPinFrame_;
+        std::vector<unsigned> savedAsyncStringPinFields;
+        savedAsyncStringPinFields.swap(asyncStringPinFields_);
+        asyncStringPinFrame_ = nullptr;
         // fix #4118 (§30.5, v0.295): asyncChainedReturn_ / asyncBorrowedReturn_
         // are the §30.5 Pattern A return-kind detection flags — deliberately
         // NOT part of BEZEL_SM_FRAME_MEMBERS (LlvmBackend_impl.hpp's own
@@ -4208,6 +4224,11 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // still see its own frame's hold. See the save's comment.
         asyncClosurePinFrame_ = savedAsyncClosurePinFrame;
         asyncClosurePinFields_.swap(savedAsyncClosurePinFields);
+        // fix #8930: restore the string-pin publication the save/null above
+        // took aside — the enclosing method's own terminal edge must still
+        // see its own frame's hold. See the save's comment.
+        asyncStringPinFrame_ = savedAsyncStringPinFrame;
+        asyncStringPinFields_.swap(savedAsyncStringPinFields);
         closureLocalCandidates_ =
             std::move(savedClosureLocalCandidates);  // fix #3757 follow-up
         cellFreeEligible_ = std::move(savedCellFreeElig);
@@ -4340,6 +4361,16 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     std::vector<unsigned> savedAsyncClosurePinFieldsSync;
     savedAsyncClosurePinFieldsSync.swap(asyncClosurePinFields_);
     asyncClosurePinFrame_ = nullptr;
+    // fix #8930 (§30.1 / §28.9, v0.359): the STRING-PIN publication gets the
+    // same suppression in the SYNC-lambda branch, for the same reason as in
+    // the async branch above — a nested emission inside this body publishes
+    // its own frame in `smStateStruct_` / `smSelf_`, so a completion site
+    // inside it would GEP the ENCLOSING method's string-pin field indices
+    // through the NESTED frame's struct type.
+    const StateMachineFrame* savedAsyncStringPinFrameSync = asyncStringPinFrame_;
+    std::vector<unsigned> savedAsyncStringPinFieldsSync;
+    savedAsyncStringPinFieldsSync.swap(asyncStringPinFields_);
+    asyncStringPinFrame_ = nullptr;
     asyncChainedReturn_ = false;
     asyncBorrowedReturn_ = false;
     // fix #3738 (§15.1.1 / §15.3 / §27.5, v0.286): pin the §15.3 (#747)
@@ -4919,6 +4950,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // see its own frame's hold. See the save's comment.
     asyncClosurePinFrame_ = savedAsyncClosurePinFrameSync;
     asyncClosurePinFields_.swap(savedAsyncClosurePinFieldsSync);
+    // fix #8930: restore the string-pin publication the save/null above took
+    // aside. See the save's comment.
+    asyncStringPinFrame_ = savedAsyncStringPinFrameSync;
+    asyncStringPinFields_.swap(savedAsyncStringPinFieldsSync);
     asyncChainedReturn_ = savedAsyncChainedReturnSync;       // fix #2747
     asyncBorrowedReturn_ = savedAsyncBorrowedReturnSync;     // fix #2747
     }
