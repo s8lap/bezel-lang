@@ -209,15 +209,18 @@ BEZEL_TEST(own_captured_owned_1967, iife_in_if_condition_unmarked_to_borrow_clea
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// CONTROL: an IIFE that consumes its OWN local owned binding (a `using var`
+// CONTROL: an IIFE that consumes its OWN local owned binding (a plain `var`
 // declared INSIDE the closure body — not captured) must compile. The lambda
 // owns that value; transferring it is legal. Guards the fix against
 // mis-flagging a lambda-body-local owned binding.
+// #8902: this control used `using var q`; §28.3 A5 (v0.359) forbids moving out
+// of a `using var` (the method twin is rejected), so the old row passed only
+// because the lambda walk never read-checked a `return` operand.
 BEZEL_TEST(own_captured_owned_1967, iife_in_if_condition_consumes_own_local_clean_28_9) {
     auto r = parseAndCheckOwnership(wrap(
         "public static method Main(): int "
         "  if (lambda() => do "
-        "    using var q := new R(); "
+        "    var q := new R(); "
         "    return Sink(move q); "
         "  end)() = 0 then return 0; else return 1; end; "
         "  return 0; "

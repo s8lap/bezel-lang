@@ -15892,6 +15892,14 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
         if (rs->value) {
+            // fix #8902 (§28.3, v0.359): the RETURN-operand sibling of the
+            // AssignmentStmt arm below — a `return` that reads a moved-from
+            // owned local was admitted in a lambda body while the method twin
+            // is rejected. Same two narrow `states_`-only calls as that arm
+            // (`checkRead` + `recordMovesIn`), not the full `handleReturn`.
+            if (!isTopLevelConsumingForm(*rs->value))
+                checkRead(*rs->value, /*selfTarget=*/false);
+            recordMovesIn(*rs->value);
             std::vector<const ast::LambdaExpr*> nestedLambdas;
             collectBodyLambdasExpr(*rs->value, nestedLambdas);
             for (const ast::LambdaExpr* nested : nestedLambdas)

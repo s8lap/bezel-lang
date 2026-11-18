@@ -258,15 +258,20 @@ BEZEL_TEST(own_captured_owned_1958, unmarked_arg_to_borrow_param_clean_28_3) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// CONTROL: a closure that consumes its OWN local owned binding (a `using var`
+// CONTROL: a closure that consumes its OWN local owned binding (a plain `var`
 // declared INSIDE the closure body — not captured) must compile. The lambda
 // owns that value; disposing / transferring it is legal. Guards the fix against
 // mis-flagging a lambda-body-local owned binding.
+// #8902: this control used `using var q`; §28.3 A5 (v0.359) forbids moving out
+// of a `using var`, and the byte-identical method body is rejected ("cannot
+// move out of `using var`"), so the old row only passed because the lambda
+// walk never read-checked a `return` operand. A plain owned local is the
+// legal spelling of the same intent.
 BEZEL_TEST(own_captured_owned_1958, closure_consumes_own_local_owned_clean_28_9) {
     auto r = parseAndCheckOwnership(wrap(
         "public static method Main(): int "
         "  var f := lambda() => do "
-        "    using var q := new R(); "
+        "    var q := new R(); "
         "    return Sink(move q); "
         "  end; "
         "  return f(); "
