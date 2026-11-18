@@ -62,7 +62,7 @@ BEZEL_TEST(codegen_cg41, chain_intact) {
     BEZEL_EXPECT_EQ(runProg(std::string(kP) +
         "class C public static method Main(): int "
         "  var a := new N(); var b := new N(); var c := new N(); c.V := 8; "
-        "  a.next := b; b.next := c; var r := a?.next?.next; return r!.V; "
+        "  b.next := c; a.next := b; var r := a?.next?.next; return r!.V; "
         "end Main; end C;"), 8);
 }
 
