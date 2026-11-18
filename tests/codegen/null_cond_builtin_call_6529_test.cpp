@@ -54,15 +54,30 @@ bool hasErrorContaining(const JitResult& r, const std::string& needle) {
 }  // namespace
 
 // Issue repro A (verbatim shape): concrete Array<int>.
-BEZEL_TEST(null_cond_builtin_call_6529, array_count_call_spec_7_5_4_4) {
+//
+// fix #8650 (spec §7.5, §26.5 rule 1, §27.1, §27.7, v0.357): the `?.`
+// spelling names the SAME `Array<T>` PROPERTY the `.` spelling names
+// (stdlib §4.4: "public pure readonly property Count: int;"), and §26.5 rule
+// 1 commits to the instance member BY NAME ("instance resolution is
+// committed and extension blocks are never consulted for that name on that
+// receiver", and a `?.` receiver is read "at its underlying non-nullable
+// type"). A property of a non-function type is not callable, so the call has
+// no candidate and is refused with the house diagnostic. Before this fix the
+// `?.` spelling answered the LINQ extension `IEnumerable<T>.Count()`
+// (stdlib §5) instead, while `a.Count()` was refused — the two spellings of
+// ONE member disagreed.
+BEZEL_TEST(null_cond_builtin_call_6529,
+           array_count_call_is_refused_property_call_8650) {
     JitResult r = runAot(
         "module M; class C "
         "  public static method Main(): int "
         "    var a: Array<int> := [1, 2, 3, 4]; "
         "    return a?.Count() ?? -1; "
         "  end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 4);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(
+        r, "`Count` is a property of `Array`, not a method"));
 }
 
 // Issue repro B: a lazy IEnumerable<int> source (`Where`).
@@ -77,7 +92,15 @@ BEZEL_TEST(null_cond_builtin_call_6529, lazy_where_count_call_spec_7_5_5) {
     BEZEL_EXPECT_EQ(r.exitCode, 3);
 }
 
-BEZEL_TEST(null_cond_builtin_call_6529, receiver_matrix_stdout_spec_7_5) {
+// fix #8650 (spec §7.5, §26.5 rule 1, §27.1, §27.7, v0.357): the two
+// PROPERTY-head receivers of this matrix (`Array<T>`'s and `Dictionary<K, V>`'s
+// `Count` — stdlib §4.4 / §4.8) now REFUSE the `?.` CALL spelling, because
+// the `?.` spelling commits to the instance member by name exactly as the `.`
+// spelling does. The receivers whose `?.` call names a METHOD (the LINQ
+// `IEnumerable<T>` operators over `string` / `Span` / a lazy `Where` source)
+// are unaffected — the companion row below keeps their values pinned.
+BEZEL_TEST(null_cond_builtin_call_6529,
+           receiver_matrix_property_head_calls_are_refused_8650) {
     JitResult r = runAot(prog(
         "  var a: Array<int> := [5, 2, 3, 4]; "
         "  using var d := new Dictionary<string, int>(); "
@@ -90,11 +113,38 @@ BEZEL_TEST(null_cond_builtin_call_6529, receiver_matrix_stdout_spec_7_5) {
         "  Console.WriteLine(s?.Count() ?? -1); "
         "  Console.WriteLine(sp?.IndexOf(3) ?? -1); "
         "  Console.WriteLine(w?.Count() ?? -1); "));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, "4\n2\n3\n2\n3\n");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(
+        r, "`Count` is a property of `Array`, not a method"));
 }
 
-BEZEL_TEST(null_cond_builtin_call_6529, null_receivers_yield_null_spec_7_5) {
+// The receivers whose `?.` CALL names a METHOD (stdlib §5's LINQ operators
+// over `string`, `Span` and a lazy `Where` source) keep their values: the
+// fix #8650 refusal is scoped to the rows whose `?.` spelling names a
+// built-in PROPERTY. BASE-GREEN BOUNDARY CONTROL: green on the base arm and
+// on the fixed arm alike (it catches a wrong fix that refused EVERY `?.` call
+// on a built-in head).
+BEZEL_TEST(null_cond_builtin_call_6529,
+           receiver_matrix_method_heads_still_run_spec_7_5) {
+    JitResult r = runAot(prog(
+        "  var a: Array<int> := [5, 2, 3, 4]; "
+        "  var s: string := \"abc\"; "
+        "  var sp := a.AsSpan(); "
+        "  var w := a.Where(lambda(x: int) => x > 2); "
+        "  Console.WriteLine(s?.Count() ?? -1); "
+        "  Console.WriteLine(sp?.IndexOf(3) ?? -1); "
+        "  Console.WriteLine(w?.Count() ?? -1); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "3\n2\n3\n");
+}
+
+// fix #8650 (spec §7.5, §26.5 rule 1, §27.1, §27.7, v0.357): the two
+// PROPERTY-head receivers of this matrix (`Array<T>`'s and `Dictionary<K, V>`'s
+// `Count`) refuse the `?.` CALL spelling now; the METHOD-typed `?.` calls
+// still yield null on a null receiver.
+BEZEL_TEST(null_cond_builtin_call_6529,
+           null_receivers_property_head_calls_are_refused_8650) {
     JitResult r = runAot(prog(
         "  var a: Array<int>? := null; "
         "  var d: Dictionary<string, int>? := null; "
@@ -106,8 +156,28 @@ BEZEL_TEST(null_cond_builtin_call_6529, null_receivers_yield_null_spec_7_5) {
         "  Console.WriteLine(a?.Sum() ?? -5); "
         "  Console.WriteLine(a?.Any() ?? false); "
         "  Console.WriteLine(a?.Contains(3) ?? false); "));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(
+        r, "`Count` is a property of `Array`, not a method"));
+}
+
+// The null receiver still yields null for the METHOD-typed `?.` calls, so the
+// `??` fallback is what prints. BASE-GREEN BOUNDARY CONTROL: green on the
+// base arm and on the fixed arm alike (it catches a wrong fix that refused
+// every `?.` call on a built-in head, or that stopped yielding null).
+BEZEL_TEST(null_cond_builtin_call_6529,
+           null_receivers_method_heads_still_yield_null_spec_7_5) {
+    JitResult r = runAot(prog(
+        "  var a: Array<int>? := null; "
+        "  var s: string? := null; "
+        "  Console.WriteLine(s?.Count() ?? -3); "
+        "  Console.WriteLine(a?.First() ?? -4); "
+        "  Console.WriteLine(a?.Sum() ?? -5); "
+        "  Console.WriteLine(a?.Any() ?? false); "
+        "  Console.WriteLine(a?.Contains(3) ?? false); "));
     BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, "-1\n-2\n-3\n-4\n-5\nFalse\nFalse\n");
+    BEZEL_EXPECT_EQ(r.stdoutText, "-3\n-4\n-5\nFalse\nFalse\n");
 }
 
 BEZEL_TEST(null_cond_builtin_call_6529, other_members_stdout_spec_7_5_5) {
@@ -124,9 +194,15 @@ BEZEL_TEST(null_cond_builtin_call_6529, other_members_stdout_spec_7_5_5) {
     BEZEL_EXPECT_EQ(r.stdoutText, "5\n14\nTrue\nFalse\nTrue\nFalse\n");
 }
 
-// The `?.` result is `int?`: §7.11 forbids `+` over it. Pins the diagnostic
-// that SURVIVES the fix (the `internal:` backstop is the needle that dies).
-BEZEL_TEST(null_cond_builtin_call_6529, count_call_is_nullable_int_spec_7_11) {
+// fix #8650 (spec §7.5, §26.5 rule 1, §27.1, §27.7, v0.357): the `?.` CALL
+// of the `Array<T>` COUNT PROPERTY (stdlib §4.4) is refused — the property
+// is not function-typed, so the call has no candidate — and that refusal
+// comes FIRST, before §7.11's nullable-operand check could report on the
+// `int?` result. (The §7.11 needle over a legal `?.` call result is pinned by
+// `null_cond_grouping_member_6512` — `n + g?.Count()` over an `IGrouping`,
+// whose `Count` is the LINQ operator.)
+BEZEL_TEST(null_cond_builtin_call_6529,
+           count_call_is_refused_property_call_8650) {
     JitResult r = runAot(
         "module M; class C "
         "  public static method Main(): int "
@@ -134,9 +210,10 @@ BEZEL_TEST(null_cond_builtin_call_6529, count_call_is_nullable_int_spec_7_11) {
         "    var n := 1; "
         "    return n + a?.Count(); "
         "  end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(hasErrorContaining(
-        r, "operator `+` is not defined on a nullable value type"));
+        r, "`Count` is a property of `Array`, not a method"));
 }
 
 // Owned result: `ToArray()` mints a fresh array on the non-null path. Looped

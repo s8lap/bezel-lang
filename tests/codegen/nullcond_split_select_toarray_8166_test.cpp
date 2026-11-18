@@ -194,13 +194,19 @@ BEZEL_TEST(codegen_nullcond_split_select_toarray_8166,
 // is skipped on the same terms and the whole chain's result is `null`"), so
 // the `??` fallback is what prints. The non-null twin (row A) proves the
 // chain is not vacuous: it prints 3 there and the fallback here.
+//
+// fix #8650 (spec §7.5, §26.5 rule 1, §27.1, §27.7, v0.357): the chain's
+// terminal is the `Array<T>` COUNT PROPERTY's READ (`arr?.Count`), not its
+// CALL spelling (`arr?.Count()`) — the `?.` CALL of a built-in property is
+// refused now (it names the `Array<T>` `Count` PROPERTY, stdlib §4.4). The
+// READ is a modelled spelling, so the short-circuit witness is unchanged.
 BEZEL_TEST(codegen_nullcond_split_select_toarray_8166,
            spec_7_5_a_null_receiver_skips_the_whole_chain) {
     auto r = runAotChecked(prog(
         "    var parts := n?.Split(\",\"); "
         "    var lens := parts?.Select(lambda(x) => x.Length); "
         "    var arr := lens?.ToArray(); "
-        "    Console.WriteLine(arr?.Count() ?? -1); "));
+        "    Console.WriteLine(arr?.Count ?? -1); "));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "-1\n");

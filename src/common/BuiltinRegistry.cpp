@@ -2991,7 +2991,7 @@ const std::vector<BuiltinPropertyDecl>& builtinPropertyDecls() {
         {"JsonOptions", "MaxDepth", "int", "2.15", false, true},
         {"ScopeGuard", "IsDismissed", "bool", "2.21", false, true},
         {"StringBuilder", "Length", "int", "3.1", false, true},
-        {"StringBuilder", "Capacity", "int", "3.1", false, false, false, false},
+        {"StringBuilder", "Capacity", "int", "3.1", false, false, false},
         {"Encoding", "Name", "string", "3.2", false, true},
         {"Encoding", "UTF8", "Encoding", "3.2", true, true},
         {"Encoding", "UTF16", "Encoding", "3.2", true, true},
@@ -3015,9 +3015,9 @@ const std::vector<BuiltinPropertyDecl>& builtinPropertyDecls() {
         // heads (`ICollection`, `IReadOnlyCollection`, `IOwningCollection`) do
         // NOT: their READ is refused by codegen's #853 fence (the concrete
         // backing is erased at the interface), so no remedy is offered there.
-        {"IReadOnlyCollection", "Count", "int", "4.1", false, false, true, true},
-        {"IReadOnlyList", "Count", "int", "4.1", false, true, true, true},
-        {"ICollection", "Count", "int", "4.1", false, false, true, true},
+        {"IReadOnlyCollection", "Count", "int", "4.1", false, false, true},
+        {"IReadOnlyList", "Count", "int", "4.1", false, true, true},
+        {"ICollection", "Count", "int", "4.1", false, false, true},
         // fix #8651 (stdlib §4.1 / §4.2, spec §26.5 rule 1, §27.1, §27.7,
         // §7.5, v0.357): `IsReadOnly` is a PROPERTY of these FOUR heads —
         // stdlib §4.1 declares it on `ICollection<T>` ("readonly property
@@ -3036,25 +3036,27 @@ const std::vector<BuiltinPropertyDecl>& builtinPropertyDecls() {
         // this compiler" — a diagnostic that sends the reader looking for a
         // misspelling for a member the stdlib DOES declare.
         //
-        // `refusesNullCondCall = true` as well: §7.5's `?.` spelling performs
-        // the SAME access the `.` spelling does (and §26.5 resolves the `?.`
-        // receiver at its underlying non-nullable type), so `c?.IsReadOnly()`
-        // must be refused with the SAME diagnostic. Before this fix it was
-        // NOT refused at all — it degraded SILENTLY behind the internal #2434
+        // The `?.` spelling is refused with the SAME diagnostic: §7.5's `?.`
+        // spelling performs the SAME access the `.` spelling does (and §26.5
+        // resolves the `?.` receiver at its underlying non-nullable type), so
+        // `c?.IsReadOnly()` must be refused too. Before this fix it was NOT
+        // refused at all — it degraded SILENTLY behind the internal #2434
         // zero-initializer warning and answered a zero-initialised `false`.
+        // (fix #8650 merged the two flags — `refusesCall` now refuses both
+        // spellings — so there is no separate `refusesNullCondCall` here.)
         //
         // `readModelled = true` on all four: the property READ is a modelled
         // spelling on every one of them (stdlib §4.1 fixes the value — "`IsReadOnly`
         // is `false` for every standard collection implementing `ICollection<T>`" —
         // and codegen's #7017 arm lowers the read to that constant on all four
         // heads), so the refusal may offer the `.IsReadOnly` remedy.
-        {"ICollection", "IsReadOnly", "bool", "4.1", false, true, true, true},
-        {"IList", "Count", "int", "4.1", false, true, true, true},
-        {"IList", "IsReadOnly", "bool", "4.1", false, true, true, true},
-        {"IOwningCollection", "Count", "int", "4.2", false, false, true, true},
-        {"IOwningCollection", "IsReadOnly", "bool", "4.2", false, true, true, true},
-        {"IOwningList", "Count", "int", "4.2", false, true, true, true},
-        {"IOwningList", "IsReadOnly", "bool", "4.2", false, true, true, true},
+        {"ICollection", "IsReadOnly", "bool", "4.1", false, true, true},
+        {"IList", "Count", "int", "4.1", false, true, true},
+        {"IList", "IsReadOnly", "bool", "4.1", false, true, true},
+        {"IOwningCollection", "Count", "int", "4.2", false, false, true},
+        {"IOwningCollection", "IsReadOnly", "bool", "4.2", false, true, true},
+        {"IOwningList", "Count", "int", "4.2", false, true, true},
+        {"IOwningList", "IsReadOnly", "bool", "4.2", false, true, true},
         {"Array", "Count", "int", "4.4", false, true},
         {"Array", "Capacity", "int", "4.4", false, true},
         {"OwningArray", "Count", "int", "4.5", false, true},

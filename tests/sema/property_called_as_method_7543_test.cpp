@@ -491,21 +491,28 @@ BEZEL_TEST(property_called_as_method_7543,
 }
 
 // ===========================================================================
-// The `?.` twin of a BUILT-IN property call is NOT refused -- and this is a
-// PIN, not an omission. The conformance corpus, the spec's own executable
-// rules, requires the `?.` CALL spelling of a built-in property to RUN:
-// §7.5's rule cases `s7_5_0009`, `s7_5_0010`, `s7_5_0012` and `s7_5_0013`
-// are `expect: run` cases over `a?.Count()` on an `Array<int>?` -- "With a
-// non-null receiver the access is the call `Count()`, which yields the element
-// count, 2" -- and #6529 (CLOSED) is the issue that made the spelling work.
-// The `?.` form is a DIFFERENT AST node with its own resolver, so the `.`
-// form's refusal does not reach it.
+// The `?.` twin of a BUILT-IN property call is refused too -- and this row's
+// expectation is FLIPPED (it was
+// `null_conditional_builtin_property_call_stays_admitted_conformance_7_5`,
+// which pinned the `?.` CALL spelling ADMITTED because the conformance
+// corpus's §7.5 rule cases `s7_5_0009`, `s7_5_0010`, `s7_5_0011`, `s7_5_0012`
+// and `s7_5_0013` are `expect: run` / `expect: reject` cases over `a?.Count()`
+// on an `Array<int>?`).
+//
+// fix #8650 (spec §7.5, §26.5 rule 1, §27.1, §27.7, v0.357): the `?.`
+// spelling commits to the instance member BY NAME exactly as the `.` spelling
+// does ("with a `?.` or postfix-`!` receiver read at its underlying
+// non-nullable type", §26.5 rule 1), so `a?.Count()` names the `Array<T>`
+// PROPERTY (stdlib §4.4) and has no candidate -- the same refusal the `.`
+// spelling gets. Those five corpus rows change verdict with this fix and are
+// REPORTED, not re-banked (the RULE decides; the corpus vehicle that rode on
+// the old behaviour is the spec owner's to re-cut).
 //
 // A USER-declared property's `?.` twin IS refused -- see
 // `null_conditional_user_property_call_is_rejected_spec_27_7` above.
 BEZEL_TEST(property_called_as_method_7543,
-           null_conditional_builtin_property_call_stays_admitted_conformance_7_5) {
-    expectStdout(
+           null_conditional_builtin_property_call_is_refused_8650) {
+    expectRejectedWith(
         "module M; import System;\n"          // 1
         "class C\n"                            // 2
         "  public static method Main(): int\n"  // 3
@@ -514,7 +521,7 @@ BEZEL_TEST(property_called_as_method_7543,
         "    return 0;\n"                       // 6
         "  end Main;\n"                         // 7
         "end C;\n",                             // 8
-        "2\n");
+        5, builtinPropertyCallMessage("Count", "Array", "4.4", "int"));
 }
 
 // ===========================================================================

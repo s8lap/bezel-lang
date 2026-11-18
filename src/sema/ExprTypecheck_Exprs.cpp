@@ -7669,15 +7669,21 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         // over an `IOwningList<Box>?` degraded to a zero-initialised value
         // behind the internal #2434 warning and printed -1.
         //
-        // The table's `refusesNullCondCall` flag scopes this to the rows whose
-        // `?.` spelling must be refused: the six collection INTERFACE heads.
-        // It is FALSE for the CONCRETE heads, and that is a PIN, not an
-        // omission: the conformance corpus's §7.5 rule cases s7_5_0009 /
-        // s7_5_0010 / s7_5_0012 / s7_5_0013 are `expect: run` cases over
-        // `a?.Count()` on an `Array<int>?`, and #6529 (CLOSED) is the issue
-        // that made the spelling work. The `.` spelling of that shape is
-        // refused (the #7543 rule); the corpus's §7.5 VEHICLE is what differs,
-        // and fix #8633 leaves the corpus alone and reports the difference.
+        // The table's `refusesCall` flag scopes this to the rows whose `?.`
+        // spelling must be refused — the SAME flag the `.` spelling uses, so
+        // the two spellings of ONE member cannot disagree (fix #8650: #8633
+        // split them apart — `refusesCall` / `refusesNullCondCall` — while the
+        // conformance corpus's §7.5 vehicles (`s7_5_0009` / `s7_5_0010` /
+        // `s7_5_0011` / `s7_5_0012` / `s7_5_0013`, `expect: run` /
+        // `expect: reject` over `a?.Count()` on an `Array<int>?`) still
+        // required the CONCRETE heads' `?.` spelling to RUN, and #6529
+        // (CLOSED) is the issue that made the spelling work. Those rows'
+        // verdicts change with fix #8650: they are REPORTED, not re-banked —
+        // §26.5 rule 1 reads a `?.` receiver "at its underlying non-nullable
+        // type" and commits to the instance member BY NAME there exactly as
+        // the `.` spelling does, so `a?.Count()` names the `Array<T>` PROPERTY
+        // (stdlib §4.4) and a property of a non-function type is not callable
+        // (§27.1, §27.7).
         if (nullCondIsCall && currentCallArity_ == 0 && nm->target &&
             ctx_.diagnostics().errorCount() == errorsBeforeNullCond) {
             const std::string_view nullCondHead =
@@ -7685,7 +7691,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             if (!nullCondHead.empty()) {
                 const common::BuiltinPropertyDecl* d =
                     common::builtinDeclaredProperty(nullCondHead, nm->member);
-                if (d && d->refusesNullCondCall) {
+                if (d && d->refusesCall) {
                     auto loc = nm->span.begin;
                     if (loc.line == 0) loc = nm->target->span.begin;
                     ctx_.diagnostics().report(

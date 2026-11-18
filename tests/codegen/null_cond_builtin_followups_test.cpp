@@ -9,6 +9,8 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
@@ -23,14 +25,22 @@ std::string prog(const std::string& body) {
 // #6681 (§7.5): the sema twin of a built-in `?.` call used to name its placeholder
 // receiver after the MEMBER, so an unrelated nullable local of that name made the
 // twin fail and the line vanished at exit 0. Probe j1_unrelated_local_First_nullable.
-BEZEL_TEST(null_cond_builtin_followups, unrelated_local_named_like_member_6681_spec_7_5) {
+//
+// fix #8650 (spec §7.5, §26.5 rule 1, §27.1, §27.7, v0.357): the twin of the
+// `Array<T>` COUNT PROPERTY (stdlib §4.4) is a CALL with no candidate, so the
+// placeholder-receiver shape is now a REFUSAL — and the refusal names the
+// PROPERTY, not the unrelated local named `First`.
+BEZEL_TEST(null_cond_builtin_followups,
+           unrelated_local_named_like_member_is_refused_property_call_8650) {
     JitResult r = runAot(prog(
         "  var First: Array<int>? := null; "
         "  var a: Array<int>? := [4, 2]; "
         "  Console.WriteLine(a?.First() ?? -1); "
         "  Console.WriteLine(First?.Count() ?? -9); "));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, "4\n-9\n");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "`Count` is a property of `Array`, not a method"));
 }
 
 // #6679 (§7.5, stdlib §5, §28.3): `var d := a?.ToDictionary(..)` is a fresh
@@ -145,12 +155,18 @@ BEZEL_TEST(null_cond_builtin_followups, groupby_toarray_local_no_leak_6664_spec_
 // chain's result is `null`"). The #6664 bare-GroupBy path was syntactic, so a USER
 // method named `GroupBy` with a nullable result lost its `?.` guard. Probes g8,
 // g8b. Pre-fix: g8 printed 0 for the Count line; g8b printed -6 plus a warning.
+// fix #8650 (spec §7.5, §26.5 rule 1, §27.1, §27.7, v0.357): the terminal of
+// these rows is the `Array<T>` COUNT PROPERTY's READ (`?.Count`), not its CALL
+// spelling (`?.Count()`) — the `?.` CALL of a built-in property is refused now
+// (it names the `Array<T>` `Count` PROPERTY, stdlib §4.4), while the READ is
+// a modelled spelling. The rows' witness — the `?.` GUARD over a user
+// method's nullable `Array<int>?` result — is unchanged.
 namespace {
 std::string userGroupByProg(const char* decl, const char* ret) {
     return std::string("module M;\n") + decl +
            "class C\n  public static method Main(): int\n"
            "    using var u := new U();\n"
-           "    Console.WriteLine(u.GroupBy(lambda(x: int) => x)?.Count() ?? -5);\n"
+           "    Console.WriteLine(u.GroupBy(lambda(x: int) => x)?.Count ?? -5);\n"
            "    var t := u.GroupBy(lambda(x: int) => x)?.ToArray();\n"
            "    Console.WriteLine(t?.Count ?? -6);\n"
            "    return 0;\n  end Main;\nend C;\n" + ret;
@@ -172,7 +188,7 @@ BEZEL_TEST(null_cond_builtin_followups, user_groupby_nonnull_6664_spec_7_5) {
         "    return [10, 20, 30];\n  end GroupBy;\nend U;\n"
         "class C\n  public static method Main(): int\n"
         "    using var u := new U();\n"
-        "    Console.WriteLine(u.GroupBy(lambda(x: int) => x)?.Count() ?? -5);\n"
+        "    Console.WriteLine(u.GroupBy(lambda(x: int) => x)?.Count ?? -5);\n"
         "    Console.WriteLine(u.GroupBy(lambda(x: int) => x)?.First() ?? -5);\n"
         "    var t := u.GroupBy(lambda(x: int) => x)?.ToArray();\n"
         "    Console.WriteLine(t?.Count ?? -6);\n"

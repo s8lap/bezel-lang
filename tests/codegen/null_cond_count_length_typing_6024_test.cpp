@@ -175,6 +175,14 @@ BEZEL_TEST(null_cond_count_length_typing_6024,
 // own `Count` / `Length` members (value runs; collection `Count` is only
 // compiled here; its value lowering is pinned by the value rows at the end
 // of this file).
+//
+// fix #8650 (spec §7.5, §26.5 rule 1, §27.1, §27.7, v0.357): the `Array<T>`
+// PROPERTY's CALL spelling (`a?.Count()`) left this control — it is refused
+// now (the row below), while the PROPERTY READS (`st?.Count`, `d?.Count`),
+// the LINQ call spelling (`s?.Count()`) and the user class's own members stay
+// admitted. BASE-GREEN BOUNDARY CONTROL: green on the base arm and on the
+// fixed arm alike (it catches a wrong fix that refused the `?.` property
+// READ or the LINQ call spelling).
 BEZEL_TEST(null_cond_count_length_typing_6024,
            nullcond_count_accept_controls_spec_7_5) {
     auto r = runAot(
@@ -187,10 +195,9 @@ BEZEL_TEST(null_cond_count_length_typing_6024,
         "  var st: Set<int>? := new Set<int>(); "
         "  var d: Dictionary<string, int>? := new Dictionary<string, int>(); "
         "  var s: string? := \"abc\"; "
-        "  var a: Array<int>? := new Array<int>(); "
         "  var n: Node? := new Node(); "
         "  var x1 := st?.Count; var x2 := d?.Count; "
-        "  var x3 := s?.Count(); var x4 := a?.Count(); "
+        "  var x3 := s?.Count(); "
         "  Console.WriteLine(n?.Count ?? -1); "
         "  Console.WriteLine(n?.Length ?? -1); "
         "  Console.WriteLine(s?.Length ?? -1); "
@@ -198,6 +205,26 @@ BEZEL_TEST(null_cond_count_length_typing_6024,
         "end Main; end Program;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "3\n4\n3\n");
+}
+
+// fix #8650 (spec §7.5, §26.5 rule 1, §27.1, §27.7, v0.357): the CALL
+// spelling of the `Array<T>` COUNT PROPERTY (stdlib §4.4) is refused with
+// the house "property, not a method" diagnostic — the `?.` spelling commits
+// to the instance member by name exactly as the `.` spelling does, so the
+// call has no candidate.
+BEZEL_TEST(null_cond_count_length_typing_6024,
+           nullcond_array_count_call_is_refused_property_call_8650) {
+    auto r = runAot(
+        "module M6071g; "
+        "class Program public static method Main(): int "
+        "  var a: Array<int>? := new Array<int>(); "
+        "  var x4 := a?.Count(); "
+        "  return 0; "
+        "end Main; end Program;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "`Count` is a property of `Array`, not a method"));
 }
 
 // ─── #6024 (residual): the VALUE of a collection `?.Count` ───

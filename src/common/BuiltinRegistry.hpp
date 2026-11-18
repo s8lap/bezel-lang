@@ -1345,36 +1345,48 @@ struct BuiltinPropertyDecl {
     // NOTHING" in the local-initialiser position) no longer holds — it was
     // true when #7090's family owned the read and is stale now.
     bool readModelled = true;
-    // The CALL spelling of this property is REFUSED (§26.5 rule 1 + §27.1:
-    // the committed member is a PROPERTY, so the call has no candidate).
-    // True for every row but the two whose CALL spelling the house already
+    // The CALL spelling of this property is REFUSED — in BOTH spellings, the
+    // `.` one and the `?.` one (§26.5 rule 1 + §27.1: the committed member is
+    // a PROPERTY, so the call has no candidate; §7.5: the `?.` spelling
+    // performs the SAME access the `.` spelling does, so the two spellings of
+    // ONE member may not disagree — the rule #8582 and #8583 record).
+    // True for every row but the ONE whose CALL spelling the house already
     // refuses with its OWN message:
     //
     //  * `StringBuilder.Capacity` (stdlib §3.1) — #7661's arm refuses the
     //    call with "declared (stdlib §3.1) but is not yet implemented by this
     //    compiler", and it fires FIRST, so the table must not add a second
-    //    report on the same access.
-    //  * the six collection INTERFACE heads' `IsReadOnly` (stdlib §4.1 /
-    //    §4.2) — the call is refused today by the #2457 backstop ("produced
-    //    no value"), which names the member but not the property. Fix #8633
-    //    owns the `Count` PROPERTY only; the `IsReadOnly` call spelling is a
-    //    separate defect (filed alongside it).
-    bool refusesCall = true;
-    // The `?.` CALL spelling is refused too (§7.5: the `?.` spelling performs
-    // the SAME access the `.` spelling does, so the two spellings of ONE
-    // member may not disagree — the rule #8582 and #8583 record).
+    //    report on the same access. MEASURED on this base: that arm fires on
+    //    the `?.` spelling too (`sb?.Capacity()` is refused with the same
+    //    message as `sb.Capacity()`), so the two spellings agree here.
     //
-    // False for the CONCRETE heads, and that is a PIN, not an omission: the
-    // conformance corpus — the spec's own executable rules — requires the
-    // `?.` CALL spelling of a built-in property to RUN. §7.5's rule cases
-    // `s7_5_0009`, `s7_5_0010`, `s7_5_0012` and `s7_5_0013` are `expect: run`
-    // cases over `a?.Count()` on an `Array<int>?` ("With a non-null receiver
-    // the access is the call `Count()`, which yields the element count, 2"),
-    // and #6529 (CLOSED) is the issue that made the spelling work. So
-    // `a?.Count()` is LEGAL on an `Array<int>?` while `a.Count()` is refused
-    // — the corpus vehicle, not the compiler, decides that difference, and
-    // fix #8633 leaves it alone and reports it.
-    bool refusesNullCondCall = false;
+    // fix #8651 (stdlib §4.1 / §4.2, spec §26.5 rule 1, §27.1, §27.7,
+    // §7.5, v0.357): the collection INTERFACE heads' `IsReadOnly` is NOT an
+    // exemption any more. The four rows that carry it (`ICollection`, `IList`,
+    // `IOwningCollection`, `IOwningList`) refuse the CALL spelling with this
+    // house diagnostic, so the two spellings of ONE member agree on the
+    // message instead of the `.` spelling falling through to codegen's #2457
+    // backstop ("produced no value ... either `IsReadOnly` is not on that
+    // surface (a misspelling), or it is documented but not implemented") — a
+    // diagnostic that sends the reader looking for a misspelling in a member
+    // the standard library DOES declare (stdlib §4.1: "readonly property
+    // IsReadOnly: bool;").
+    //
+    // fix #8650 (spec §7.5, §26.5 rule 1, §27.1, §27.7, v0.357): the `?.`
+    // CALL spelling is refused by this ONE flag too — the two flags
+    // (`refusesCall` / `refusesNullCondCall`) that #8633 split apart are
+    // merged back, because §26.5 rule 1 reads a `?.` receiver "at its
+    // underlying non-nullable type" and commits to the instance member BY
+    // NAME there exactly as the `.` spelling does. So `a?.Count()` on an
+    // `Array<int>?` is refused with the same diagnostic as `a.Count()`.
+    // That spelling was LEGAL before this fix and the conformance corpus
+    // pins it — §7.5's rule cases `s7_5_0009`, `s7_5_0010`, `s7_5_0011`,
+    // `s7_5_0012` and `s7_5_0013` are `expect: run` / `expect: reject` cases
+    // over `a?.Count()` on an `Array<int>?` — so those rows' verdicts change
+    // with this fix. They are REPORTED, not re-banked: the RULE (§26.5 rule 1
+    // + §27.1/§27.7) decides, and the corpus vehicle that rode on the old
+    // behaviour is the spec owner's to re-cut.
+    bool refusesCall = true;
 };
 
 // The declared PROPERTY `member` of the built-in head `head`, or nullptr when
