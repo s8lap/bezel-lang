@@ -30265,6 +30265,20 @@ void MethodOwnership::scopedCalleeWalkExpr(const ast::Expr& e) {
                         onThis = true;
                         for (std::string_view mod : ms->modifiers)
                             if (mod == "static") onThis = false;
+                    } else if (resolveChainCtorParams(ce->callee.get(),
+                                                      ce->args)
+                                   .valid()) {
+                        // fix #8803 (§28.14, v0.359): a `this(...)` /
+                        // `base(...)` constructor CHAIN call constructs the
+                        // object under construction — its bounding object
+                        // is `this`, the same object, so forwarding a
+                        // `scoped` parameter into the chain target's
+                        // `scoped` formal is the admitted forward. Without
+                        // this, the remedy #8778's call-bounded diagnostic
+                        // names ("declare `f` itself `scoped`") was itself
+                        // rejected here. Same chain resolver as
+                        // `scopedFormalAt`.
+                        onThis = true;
                     }
                 }
                 if (formalScoped && onThis) continue;  // admitted forward
