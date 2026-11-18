@@ -226,7 +226,6 @@ BEZEL_TEST(lambda_body_owned_field_store_8813,
     int rc = bezel::test::runUnderAsanExitCode(
         std::string(kLambdaOwnedLocalIntoOwnedField),
         "bezel_8813_asan_owned_local", /*detectLeaks=*/true);
-    if (rc == -1) return;  // sanitizer toolchain unavailable: SKIP
     BEZEL_EXPECT_EQ(rc, 1);
 }
 
@@ -250,7 +249,6 @@ BEZEL_TEST(lambda_body_owned_field_store_8813,
     int rc = bezel::test::runUnderAsanExitCode(
         std::string(kLambdaConditionalStoreIntoOwnedField),
         "bezel_8813_asan_conditional_store", /*detectLeaks=*/true);
-    if (rc == -1) return;  // sanitizer toolchain unavailable: SKIP
     BEZEL_EXPECT_EQ(rc, 0);
 }
 
@@ -294,7 +292,6 @@ BEZEL_TEST(lambda_body_owned_field_store_8813,
     int rc = bezel::test::runUnderAsanExitCode(
         std::string(kClosureCallOwnedParamIntoOwnedField),
         "bezel_8813_asan_closure_call", /*detectLeaks=*/true);
-    if (rc == -1) return;  // sanitizer toolchain unavailable: SKIP
     BEZEL_EXPECT_EQ(rc, 3);
 }
 
@@ -326,4 +323,40 @@ BEZEL_TEST(lambda_body_owned_field_store_8813,
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasErrorMessage(
         r, "owned value in `ys` was already moved out at this point"));
+}
+
+// Named control of the rejected f198112a9: a BORROW ALIAS (`var b := ys;`)
+// stored into an owned field on a never-taken path must not become a second
+// owner (the scope-end free of `ys` runs once). Spec §28.3.10 K3.13, v0.359.
+BEZEL_TEST(lambda_body_owned_field_store_8813,
+            asan_lambda_borrow_alias_store_never_taken_no_double_free_28_3_10) {
+    static const char* kSrc = R"BZL(module M;
+class C
+  private owned saved: Array<int>?;
+  public method Go(cond: bool): int
+    var f := lambda(): int => do
+      var ys := new Array<int>(); ys.Add(5);
+      var b := ys;
+      if cond then this.saved := b; end;
+      return ys.Count;
+    end;
+    return f();
+  end Go;
+  public static method Main(): int
+    var n := 0;
+    for var i in 1..200 do
+      using var c := new C();
+      n := n + c.Go(false);
+    end;
+    Console.WriteLine(n);
+    return 0;
+  end Main;
+end C;
+)BZL";
+    JitResult jr = runAot(std::string(kSrc));
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.stdoutText, "200\n");
+    int rc = bezel::test::runUnderAsanExitCode(
+        std::string(kSrc), "bezel_8813_asan_borrow_alias", /*detectLeaks=*/true);
+    BEZEL_EXPECT_EQ(rc, 0);
 }

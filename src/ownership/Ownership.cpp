@@ -16498,7 +16498,14 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                         if (auto* sld =
                                 dynamic_cast<const ast::LocalDecl*>(
                                     sls->decl)) {
-                            if (!sld->isUsing)
+                            // Only a TRACKED OWNED local: a borrow alias
+                            // (`var b := ys;`, §28.3.10 K3.13: "a borrow of
+                            // `ys` that discharges nothing") must not become
+                            // a second owner (b05f double free). Its store
+                            // into an owned field is #8797's business.
+                            const auto* srcSt = lookupStateFor(*srcId);
+                            if (!sld->isUsing && srcSt &&
+                                srcSt->state == OwnershipState::Owned)
                                 const_cast<ast::LocalDecl*>(sld)
                                     ->autoDropAtScopeEnd = true;
                         }
