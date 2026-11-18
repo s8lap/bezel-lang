@@ -12986,7 +12986,27 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (auto* iifeLam =
             dynamic_cast<const ast::LambdaExpr*>(call.callee.get())) {
         // Lower the lambda to a closure struct { fn_ptr, env_ptr, rc }.
+        //
+        // fix #8834 (§27.5 / §28.9, v0.359): arm the SAME `inArgumentLambda_`
+        // signal fix #3778 introduced for a call-ARGUMENT lambda literal. The
+        // IIFE's closure is a statement-bounded temporary exactly like an
+        // argument lambda: `emitClosureRelease(closureObj)` below runs its
+        // envdtor right after the call, inside the captured local's scope.
+        // `lowerLambda`'s first-capture content-release gate
+        // (`declaredShallower || inArgumentLambda_`, LlvmBackend_Exprs2.cpp)
+        // never widened for the CALLEE position, so a capture of a local
+        // declared in the SAME scope (`var s := t + "b"; var r := (lambda()
+        // => s.Length)(); return r + s.Length;`) kept the envdtor's ordinary
+        // content release — the deferred scope-end release of the frame's
+        // ONLY reference — and the later `s.Length` read freed memory
+        // (measured: ASan heap-use-after-free, `freed by bz$lam$0$envdtor`).
+        // The pre-scan already admits an IIFE's captures into
+        // `cellFreeEligible_` (#2182), so the flag alone moves that release to
+        // the local's owner scope, released exactly once.
+        const bool savedInArgumentLambda = inArgumentLambda_;
+        inArgumentLambda_ = true;
         llvm::Value* closureObj = lowerLambda(*iifeLam);
+        inArgumentLambda_ = savedInArgumentLambda;
         if (!closureObj) return nullptr;
         // #2182 / §28.3: an IIFE is non-escaping — emitClosureRelease below
         // frees the closure cell before the enclosing expression ends, so no
