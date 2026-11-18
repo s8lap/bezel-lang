@@ -4247,6 +4247,19 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     if (!lam.exprBody) {
         singleCaptureLocals_.clear();
     }
+    // fix #8811 (§27.5 / §28.9, v0.359): snapshot the ANCESTOR scope's
+    // assignedCaptureVars_ before it is cleared for THIS nested lambda's own
+    // re-scan; merged back below, next to the #4226 / #4240 merges, for the
+    // same blind spot. An EXPRESSION-bodied lambda never re-scans, so the set
+    // stayed empty inside it; a block-bodied one re-scans only its own
+    // statements, so a write in an ancestor body was invisible. A capture of
+    // an ancestor's WRITTEN cell then took mutatedSharedCaptureCell's "false"
+    // path: a retain on the value present at capture and an envdtor release of
+    // the cell's last value, which is the frame's only reference:
+    //     var f2 := lambda() => lambda() => do s := s + "c"; ... end;
+    //     var r := f2()(); return r + s.Length;   // `s` freed by lam$1's envdtor
+    const std::unordered_set<const void*> ancestorAssignedCaptureVars8811 =
+        assignedCaptureVars_;
     assignedCaptureVars_.clear();          // fix #2706
     // fix #4226 (§27.5 / §28.9, v0.298): snapshot the ANCESTOR scope's
     // already-computed returnedCaptureVars_ before it is cleared for THIS
@@ -4400,6 +4413,17 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         multiCaptureLocals_.insert(k);
         singleCaptureLocals_.erase(k);
     }
+    // fix #8811 (§27.5 / §28.9, v0.359): merge the ancestor's
+    // assignedCaptureVars_ back in (see the snapshot above). A union, like
+    // #4226's: "written somewhere in the enclosing chain" is a membership
+    // fact, and a key this body binds itself is one its own re-scan already
+    // found. It can only ADD keys, and a key it adds names an ancestor's cell,
+    // which every capture in this body reaches already boxed — an ADDITIONAL
+    // env whose retain and envdtor release mutatedSharedCaptureCell suppresses
+    // TOGETHER. So it can only turn a balanced-or-over-releasing pair into a
+    // leak of the cell's final value (#2718), never into an over-release.
+    for (const void* k : ancestorAssignedCaptureVars8811)
+        assignedCaptureVars_.insert(k);
     // fix #4261 (§28.3, v0.298): sync lambda body emission clobbers
     // closureReleaseEligibleFn_ (set to the lambda's fn just below), which
     // breaks lowerLocalDecl's `currentFn_ == closureReleaseEligibleFn_` guard
