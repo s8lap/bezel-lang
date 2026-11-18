@@ -20817,6 +20817,15 @@ struct FormalInvocationOnlyWalk {
     // lowerCallDispatch literal arm; see
     // calleeBodyUsesFormalOnlyByInvocationOrInspection.
     bool allowInspection = false;
+    // fix #8482 (§27.5 / §28.14 / §28.9, v0.359): the depth of LambdaExpr
+    // bodies the walk is inside. A lambda that never names the formal cannot
+    // capture it (§27.5: a lambda captures the variables of its enclosing
+    // scope it references, and its own parameters and locals cannot take the
+    // formal's name), so the walk descends into it instead of failing closed
+    // on the node. Inside one, EVERY occurrence of the formal fails: an
+    // invocation or an inspection there is a capture, which the closure's env
+    // holds past the call.
+    int lambdaDepth = 0;
     bool isNullTestOfName(const ast::BinaryExpr& be) const {
         if (be.op != "=" && be.op != "<>") return false;
         auto isNull = [](const ast::Expr* e) {
@@ -20925,12 +20934,15 @@ struct FormalInvocationOnlyWalk {
             return;
         }
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
-            if (!isName(c->callee.get())) expr(c->callee.get());
+            // fix #8482: inside a lambda body the invocation is a capture.
+            if (!isName(c->callee.get()) || lambdaDepth > 0)
+                expr(c->callee.get());
             args(c->args);
             return;
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
-            if (!isName(c->callee.get())) expr(c->callee.get());
+            if (!isName(c->callee.get()) || lambdaDepth > 0)
+                expr(c->callee.get());
             args(c->args);
             return;
         }
@@ -20956,7 +20968,8 @@ struct FormalInvocationOnlyWalk {
             return;
         }
         if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
-            if (allowInspection && isNullTestOfName(*be)) return;  // #8743
+            if (allowInspection && lambdaDepth == 0 && isNullTestOfName(*be))
+                return;  // #8743 (#8482: not inside a lambda, a capture)
             expr(be->left.get());
             expr(be->right.get());
             return;
@@ -20966,7 +20979,7 @@ struct FormalInvocationOnlyWalk {
             return;
         }
         if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
-            if (allowInspection && tt->op != "as" &&
+            if (allowInspection && lambdaDepth == 0 && tt->op != "as" &&
                 isName(tt->operand.get()))
                 return;  // fix #8743: `name is T` / `name is not T`
             expr(tt->operand.get());
@@ -21018,8 +21031,26 @@ struct FormalInvocationOnlyWalk {
             dynamic_cast<const ast::NameOfExpr*>(e) ||
             dynamic_cast<const ast::DefaultExpr*>(e))
             return;
-        // LambdaExpr (a capture retains and may escape anywhere), CaseExpr
-        // (pattern bindings), BindExpr, and anything else: fail closed.
+        // fix #8482 (§27.5 / §28.14, v0.359): a LambdaExpr is walked like
+        // any other subtree, with lambdaDepth raised so that every reference
+        // to the formal inside it (a capture: it retains and may escape
+        // anywhere) fails. A lambda parameter spelled like the formal fails
+        // closed as a shadowing local does. Before this arm every lambda
+        // failed the walk, even one that never names the formal: a closure
+        // local passed to such a callee was never released (64 B per run,
+        // the issue's repro).
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            for (const auto& lp : lam->params)
+                if (lp.name == name) { ok = false; return; }
+            ++lambdaDepth;
+            if (lam->isBlockBody) stmts(lam->stmts);
+            else if (lam->exprBody) expr(lam->exprBody.get());
+            else ok = false;
+            --lambdaDepth;
+            return;
+        }
+        // CaseExpr (pattern bindings), BindExpr, and anything else: fail
+        // closed.
         ok = false;
     }
 };
