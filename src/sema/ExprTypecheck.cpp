@@ -16992,6 +16992,49 @@ void ExprTC::checkObjectClosedSurfaceCall(const ast::CallExpr& ce) {
                 std::string(member) + "(a, b)`");
         return;
     }
+    // fix #8776 (§8.1 / §22.12, v0.359): the same refusal for an INSTANCE of
+    // a declared class, record or interface (any `Kind::Named` value). §8.1
+    // makes every such type derive from `Object` ("classes ... directly
+    // through the inheritance chain", records and the rest "via boxing"), so
+    // it reaches the one static member, and §22.12's "a static member must be
+    // accessed through the type name, not an instance" applies as it does to
+    // the root-`Object` and function-value receivers above. Without this,
+    // `k.ReferenceEquals(k, k2)` compiled with only the #3079 degrade and
+    // printed nothing. The spec has no sentence that names "static through an
+    // instance of a class" (docs handoff #8774); the rule follows the
+    // #8043 / #7270 precedent. A TYPE-NAME target (`K.ReferenceEquals(a, b)`)
+    // has no expression type, so it is not a value receiver and is untouched.
+    // `this` / `base` carry no recorded expression type in a class body
+    // (resolveMemberAccess reads `currentType_` for them), so the enclosing
+    // type stands in. A generic-receiver head (`G<int>.ReferenceEquals`, the
+    // IdentifierExpr with `typeArgs`) is a type name, not a value.
+    std::string instanceOf;
+    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(target)) {
+        if ((tid->name == "this" || tid->name == "base") && !targetTy &&
+            currentType_ && !inStaticMember_)
+            instanceOf = tid->name == "base" ? "base"
+                                             : std::string(currentType_->name);
+        else if (!tid->typeArgs.empty())
+            targetTy = nullptr;
+    }
+    if (instanceOf.empty() && targetTy &&
+        targetTy->kind == TypeRef::Kind::Named) {
+        instanceOf = std::string(namedTypeSimpleName(targetTy));
+        if (instanceOf.empty()) instanceOf = "?";
+    }
+    if (isObjectStaticSurfaceMember(member) && !instanceOf.empty()) {
+        const std::string& recvName = instanceOf;
+        ctx_.diagnostics().report(
+            Severity::Error, ce.span.begin,
+            "cannot call the static member `" + std::string(member) +
+                "` through an instance of `" + recvName + "`: `" +
+                std::string(member) +
+                "` is a static member of the root `Object` (\xC2\xA7""8.1) and "
+                "must be accessed through the type name, not an instance "
+                "(\xC2\xA7""22.12) — write `Object." +
+                std::string(member) + "(a, b)`");
+        return;
+    }
     if (!isRootObjectValueReceiver(targetTy, ctx_)) return;
     if (isObjectStaticSurfaceMember(member)) {
         // fix #8043 (§8.1 / §22.12, v0.350).

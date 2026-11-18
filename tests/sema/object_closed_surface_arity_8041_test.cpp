@@ -310,3 +310,80 @@ BEZEL_TEST(object_surface_arity_7270, function_value_instance_spelling_of_the_st
         r, "cannot call the static member `ReferenceEquals` through a "
            "function value"));
 }
+
+// ---------------------------------------------------------------------------
+// #8776 — the same rule for an INSTANCE of a declared class, record or
+// interface (§8.1 v0.359, §22.12).
+//
+// §8.1: classes derive from `Object` "directly through the inheritance
+// chain" and records via boxing, so they reach the one `static` member,
+// which §22.12 requires through the type name, not an instance. The spec has
+// no sentence naming "static through an instance of a class" (docs handoff
+// #8774); the rule follows the #8043 / #7270 precedent. MEASURED on base
+// 29d38200e: each spelling below compiled with only the #3079 "failed to
+// lower" degrade warning and printed nothing. The admitting twins
+// (`Object.ReferenceEquals(k, k2)`, a differently named instance method) are
+// in the conformance-corpus candidates, not here.
+// ---------------------------------------------------------------------------
+
+namespace {
+const char* kStaticThroughClassInstance =
+    "cannot call the static member `ReferenceEquals` through an instance of "
+    "`K`: `ReferenceEquals` is a static member of the root `Object` (\xC2\xA7""8.1)";
+}  // namespace
+
+BEZEL_TEST(object_surface_arity_8776, class_instance_spelling_of_the_static_member_is_refused) {
+    auto r = runAot(
+        "module M; class K end K; class C public static method Main(): int "
+        "  var k := new K(); var k2 := new K(); "
+        "  Console.WriteLine(k.ReferenceEquals(k, k2)); "
+        "  return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kStaticThroughClassInstance));
+}
+
+BEZEL_TEST(object_surface_arity_8776, record_instance_spelling_of_the_static_member_is_refused) {
+    auto r = runAot(
+        "module M; record K(X: int); class C public static method Main(): int "
+        "  var k := new K(1); var k2 := new K(1); "
+        "  Console.WriteLine(k.ReferenceEquals(k, k2)); "
+        "  return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kStaticThroughClassInstance));
+}
+
+BEZEL_TEST(object_surface_arity_8776, interface_instance_spelling_of_the_static_member_is_refused) {
+    auto r = runAot(
+        "module M; interface K method Foo(): int; end K; "
+        "class Impl: K public method Foo(): int => 1; end Impl; "
+        "class C public static method Take(i: K, j: K): bool => "
+        "  i.ReferenceEquals(i, j); "
+        "  public static method Main(): int "
+        "  Console.WriteLine(C.Take(new Impl(), new Impl())); "
+        "  return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kStaticThroughClassInstance));
+}
+
+BEZEL_TEST(object_surface_arity_8776, null_conditional_and_this_spellings_are_refused) {
+    auto q = runAot(
+        "module M; class K end K; class C public static method Main(): int "
+        "  var k: K? := new K(); var k2 := new K(); "
+        "  Console.WriteLine(k?.ReferenceEquals(k, k2)); "
+        "  return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(q.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(q));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(q, kStaticThroughClassInstance));
+    auto t = runAot(
+        "module M; class K "
+        "  public method Same(o: K): bool => this.ReferenceEquals(this, o); "
+        "end K; class C public static method Main(): int "
+        "  var k := new K(); Console.WriteLine(k.Same(k)); "
+        "  return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(t.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(t));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(t, kStaticThroughClassInstance));
+}
