@@ -71,3 +71,47 @@ BEZEL_TEST(codegen_str_construct_release, string_for_keeps_loop_state_across_awa
         "end C;");
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
 }
+
+// #8647 (§21.4 / §28.9): a `for` over a +1 string is the string's only
+// holder and releases it on every exit: completion, `break`, `continue`,
+// and a `return` from inside the body. 200x.
+BEZEL_TEST(codegen_str_construct_release, string_producer_for_iterable_is_released_8647_spec_21_4) {
+    auto r = runAotChecked(
+        "module M; "
+        "class H "
+        "  private _n: int; "
+        "  public constructor(n: int) _n := n; end constructor; "
+        "  public method Mint(): string return \"KM\" + _n.ToString(); end Mint; "
+        "  public method Long(): string return \"long-producer-string-no-\" + _n.ToString(); end Long; "
+        "  public method MintQ(): string? return \"KQ\" + _n.ToString(); end MintQ; "
+        "  public property P: string get => \"KP\" + _n.ToString(); end P; "
+        "end H; "
+        "class C "
+        "  public static method First(h: H): int "
+        "    for var c in h.Long() do "
+        "      return 1; "
+        "    end; "
+        "    return 0; "
+        "  end First; "
+        "  public static method Main(): int "
+        "    var i := 0; var tot := 0; "
+        "    var s := \"local\" + 1.ToString(); "
+        "    var h := new H(7); "
+        "    while i < 200 do "
+        "      i := i + 1; "
+        "      var n := 0; "
+        "      for var c in h.Long() do n := n + 1; end; "
+        "      for var c in s + \"yz\" do n := n + 1; break; end; "
+        "      for var c in h.Mint() do "
+        "        if c = 'M' then continue; end; "
+        "        n := n + 1; "
+        "      end; "
+        "      n := n + C.First(h); "
+        "      if n = 25 + 1 + 2 + 1 then tot := tot + 1; end; "
+        "    end while; "
+        "    if tot = 200 then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
+}

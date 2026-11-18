@@ -10398,6 +10398,37 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
 }
 
 
+// fix #8647 (§21.4, §28.9, v0.357) — see the declaration.
+void Emitter::backOwnedStringTempSlot(const ast::Node* key,
+                                      llvm::AllocaInst* slot, bool suspends) {
+    if (!slot || !suspends || !smStateStruct_) return;
+    if (smKind_ != SuspendKind::Await && smKind_ != SuspendKind::AsyncYield &&
+        smKind_ != SuspendKind::Yield)
+        return;
+    // A reserved frame field (collectSuspendLocals) carries the slot across
+    // every suspend, and — the slot being in `locals_` — the yield handler
+    // records the slot's Disposal in its §29.7 snapshot, so an iterator
+    // abandoned while suspended inside the construct releases the string.
+    if (smSelf_ && key && smLocalFields_.count(key)) {
+        mapSuspendLocalSlot(key, slot);
+        locals_[key] = slot;
+        return;
+    }
+    // No field (a construct the statement walk does not reach): the side
+    // spill area keeps the value across the suspend.
+    asyncHandlerSpillSlots_.push_back(slot);
+}
+
+void Emitter::unbackOwnedStringTempSlot(const ast::Node* key,
+                                        llvm::AllocaInst* slot) {
+    if (!slot) return;
+    // The construct is complete: no suspend emitted from here on is inside
+    // it, so the slot leaves the per-suspend spill set and the snapshot.
+    smAllocaToField_.erase(slot);
+    auto it = locals_.find(key);
+    if (it != locals_.end() && it->second == slot) locals_.erase(it);
+}
+
 bool Emitter::lowerStringFor(const ast::ForStmt& fs) {
     if (!fs.iterable) return false;
     auto* tt = ctx_.exprType(*fs.iterable);
@@ -10407,6 +10438,28 @@ bool Emitter::lowerStringFor(const ast::ForStmt& fs) {
 
     llvm::Value* strPtr = lowerExpr(*fs.iterable);
     if (!strPtr) return false;
+    // fix #8647 (§21.4, §28.9, v0.357): the loop is the only holder of an
+    // iterable that is a +1 string producer — it reads code points out of the
+    // string and binds nothing to it (the loop variable is a `char` value) —
+    // so the loop releases it, on every exit. The string is parked in a slot
+    // whose release is registered in a scope pushed BEFORE `loopStack_`
+    // records its depth, the `dictEntryForSnapshot` arrangement of
+    // `lowerDictEntryFor` (#4129): a `return` or a throw from inside the body
+    // walks that scope; `break` and normal completion reach `sfor.end`, which
+    // emits the same release and pops the scope without a second emission.
+    // MEASURED on this fix's parent, 200 iterations of
+    // `for var c in h.Mint() do … end` (a user method): one leaked string per
+    // loop, on every exit.
+    llvm::AllocaInst* ownedIterSlot = nullptr;
+    if (!emittingDisposerBody_ && isPlusOneStringProducer(fs.iterable.get())) {
+        ownedIterSlot = entryAllocaNullPtr();
+        builder_.CreateStore(strPtr, ownedIterSlot);
+        disposeStack_.push_back({});
+        Disposal d{ownedIterSlot, nullptr};
+        d.stringRelease = true;
+        d.nullSlotAfterRelease = true;
+        disposeStack_.back().push_back(d);
+    }
     llvm::Value* len = loadStringLen(strPtr);          // i64 code-point count
 
     // Index counter (i64).
@@ -10423,6 +10476,8 @@ bool Emitter::lowerStringFor(const ast::ForStmt& fs) {
     // fixup for a sync iterator, which carries the string pointer and its
     // length across the `yield`.
     registerForLoopSpillSlots(fs, {idxSlot, varSlot});
+    backOwnedStringTempSlot(fs.iterable.get(), ownedIterSlot,
+                            containsYield(fs.body) || containsAwait(fs.body));
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "sfor.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sfor.body", currentFn_);
@@ -10450,6 +10505,13 @@ bool Emitter::lowerStringFor(const ast::ForStmt& fs) {
     builder_.CreateBr(condBB);
 
     builder_.SetInsertPoint(endBB);
+    if (ownedIterSlot) {
+        // #8647: normal completion and `break`. Every `return` / throw from
+        // inside the body already walked this scope.
+        emitDisposals(disposeStack_.back());
+        disposeStack_.pop_back();
+        unbackOwnedStringTempSlot(fs.iterable.get(), ownedIterSlot);
+    }
     return true;
 }
 

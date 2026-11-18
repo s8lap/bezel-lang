@@ -24318,6 +24318,17 @@ private:
     // each char (i32 code point) in order. For ASCII/UTF-8 strings this
     // iterates bytes; full Unicode code-point iteration deferred.
     bool lowerStringFor(const ast::ForStmt& fs);
+    // fix #8647 (§21.4, §28.9, v0.357): the slot a construct parks a +1
+    // string in for its own duration (a `for` iterable, `lowerStringFor`)
+    // must survive a suspend inside the construct. `backOwnedStringTempSlot`
+    // gives it the frame field `collectSuspendLocals` reserved for `key` when
+    // there is one — which also puts its Disposal in the §29.7 abandonment
+    // snapshot (fix #8655) — and the side spill area otherwise. `unback…` is
+    // called once the construct is complete.
+    void backOwnedStringTempSlot(const ast::Node* key, llvm::AllocaInst* slot,
+                                 bool suspends);
+    void unbackOwnedStringTempSlot(const ast::Node* key,
+                                   llvm::AllocaInst* slot);
     // §3.3 / §29.2 / #971 item 2: `for var c in sp do … end` over a
     // ReadOnlyStringSpan — iterates code points over the span's [start, start+len)
     // sub-range of the source string. Same lowering shape as lowerStringFor but
