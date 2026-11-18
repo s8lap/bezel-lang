@@ -357,6 +357,43 @@ bool isNamedIdent(const ast::Expr& e, std::string_view n) {
     return id && id->name == n;
 }
 
+// fix #8787 (§29.3): does `body` contain a `yield`, making its method an
+// iterator? `yield` is a statement (grammar A.6), so only the statement-list
+// owners can hide one; a lambda body is its own scope and is not descended
+// into. Kept in lockstep with the ownership pass's `bodyContainsYield` and
+// codegen's `Emitter::containsYield`, which decide the same question.
+bool stmtsContainYield(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& s : body) {
+        if (!s) continue;
+        if (dynamic_cast<const ast::YieldStmt*>(s.get())) return true;
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
+            if (stmtsContainYield(ifs->ifBranch.body)) return true;
+            for (const auto& el : ifs->elifBranches)
+                if (stmtsContainYield(el.body)) return true;
+            if (ifs->hasElse && stmtsContainYield(ifs->elseBody)) return true;
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
+            if (stmtsContainYield(ws->body)) return true;
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
+            if (stmtsContainYield(fs->body)) return true;
+        } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
+            if (stmtsContainYield(db->body)) return true;
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
+            if (stmtsContainYield(ts->body)) return true;
+            for (const auto& arm : ts->catches) {
+                const ast::Stmt* ab = arm.body.get();
+                if (dynamic_cast<const ast::YieldStmt*>(ab)) return true;
+                if (auto* adb = dynamic_cast<const ast::DoEndBlock*>(ab))
+                    if (stmtsContainYield(adb->body)) return true;
+            }
+            if (stmtsContainYield(ts->finallyBody)) return true;
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s.get())) {
+            for (const auto& arm : cs->arms)
+                if (stmtsContainYield(arm.stmts)) return true;
+        }
+    }
+    return false;
+}
+
 // §22.7 rule 2: a `virtual`/`override`/`abstract` member (dispatching family).
 bool methodIsVirtualFamily(const MethodSymbol& ms) {
     for (auto m : ms.modifiers)
@@ -1001,7 +1038,19 @@ private:
     // a compile error.  Tracking uses intersection semantics at branch joins
     // (parallel to assigned_): a var is "definitely consumed" only when it
     // is consumed on every path reaching the current point.
-    std::unordered_set<std::string_view> consumedLazy_;
+    //
+    // fix #8787: keyed by the DECLARATION (`declKey`, as `assigned_` is since
+    // #5335), not by the name, so a block-local binding that reuses a spent
+    // binding's name (§21.6) starts with its own enumeration right.
+    DaSet consumedLazy_;
+    // fix #8787 (§29.8 / §29.11, v0.359): the locals bound to the iterable an
+    // iterator method mints over an `owned` parameter, mapped to that method's
+    // name for the diagnostic. §29.8: such an iterable "is single-consumption,
+    // under exactly §29.11's rule for a lazy query", so these share
+    // `consumedLazy_` with the lazy queries above. Their type is the declared
+    // `IEnumerable<T>`, never the lazy sentinel, so provenance — the
+    // initializer is a direct call to such a method — is the only signal.
+    std::unordered_map<const ast::Node*, std::string_view> singleUseIterables_;
     // terminated_ = true when the current path ends unconditionally via
     // return/throw — used to suppress the fall-off out-param check on
     // unreachable tails (conservative: only set for top-level or all-
@@ -1271,19 +1320,85 @@ private:
     // compile error if it was already consumed). `context` briefly describes
     // the consumption point for the diagnostic ("enumeration", "LINQ chain",
     // "IEnumerable<T> argument"). per §29.11 v0.165
+    //
+    // fix #8787: also the single-consumption iterables of `singleUseIterables_`
+    // (§29.8 v0.359), whose diagnostic names §29.8's own remedies.
     void markLazyConsumed(const ast::IdentifierExpr& id,
                           const char* context) {
-        if (consumedLazy_.count(id.name)) {
+        const ast::Node* decl = localDeclNode(ctx_, id);
+        DaKey k = declKey(decl, id.name);
+        if (!consumedLazy_.count(k)) {
+            consumedLazy_.insert(k);
+            return;
+        }
+        auto it = decl ? singleUseIterables_.find(decl)
+                       : singleUseIterables_.end();
+        if (it != singleUseIterables_.end()) {
             ctx_.diagnostics().report(
                 Severity::Error, id.span.begin,
-                std::string("bound lazy query `") + std::string(id.name) +
-                "` was already consumed — a lazy LINQ pipeline is "
-                "single-consumption (§29.11); use `.ToArray()` to "
-                "materialise it for multiple uses (consumed again via " +
+                std::string("iterable `") + std::string(id.name) +
+                "` was already consumed — `" + std::string(it->second) +
+                "` declares an `owned` parameter, so the iterable it "
+                "returns is single-consumption (§29.8, §29.11); at a value "
+                "element type materialise it first (`.ToArray()`), or take "
+                "the resource as a plain (borrowing) parameter, which keeps "
+                "the iterable re-iterable (consumed again via " +
                 context + ")");
-        } else {
-            consumedLazy_.insert(id.name);
+            return;
         }
+        ctx_.diagnostics().report(
+            Severity::Error, id.span.begin,
+            std::string("bound lazy query `") + std::string(id.name) +
+            "` was already consumed — a lazy LINQ pipeline is "
+            "single-consumption (§29.11); use `.ToArray()` to "
+            "materialise it for multiple uses (consumed again via " +
+            context + ")");
+    }
+
+    // fix #8787 (§29.8 / §29.11, v0.359): is `id` a local bound to a
+    // single-consumption iterable (see `singleUseIterables_`)?
+    bool isSingleUseIterableLocal(const ast::IdentifierExpr& id) const {
+        const ast::Node* decl = localDeclNode(ctx_, id);
+        return decl && singleUseIterables_.count(decl);
+    }
+
+    // fix #8787 (§29.8 / §29.11, v0.359): when `init` is a direct call to an
+    // iterator method that declares an `owned` parameter and returns an
+    // iterator-format ENUMERABLE head, the method's name; otherwise empty.
+    // §29.8: "an iterable produced by an iterator method that declares an
+    // `owned` or move-only parameter ... is single-consumption". The single-use
+    // ENUMERATOR heads are excluded — there "the call's result is that
+    // enumerator, and nothing further is needed". Not tracked statically here:
+    // a cross-module iterator (no body to classify as an iterator) and the
+    // move-only-parameter arm; the run-time claim in the iterator's
+    // GetEnumerator (`emitIteratorMethod`) guards those.
+    std::string_view singleUseIteratorCallee(const ast::Expr& init) const {
+        auto* ce = dynamic_cast<const ast::CallExpr*>(&init);
+        if (!ce || !ce->callee) return {};
+        auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*ce->callee));
+        if (!ms) return {};
+        bool hasOwnedParam = false;
+        for (Symbol* p : ms->params) {
+            auto* ps = dynamic_cast<ParameterSymbol*>(p);
+            if (ps && ps->modifier == "owned") {
+                hasOwnedParam = true;
+                break;
+            }
+        }
+        if (!hasOwnedParam) return {};
+        // An imported iterator is not tracked statically: its body is not
+        // here, and its own compiled GetEnumerator still raises at run time.
+        if (ctx_.isImported(ms)) return {};
+        // SEAM-ACCESSOR: the method BODY is read (is it an iterator?), which no
+        // symbol carries; an imported method was refused on the line above.
+        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (!md || md->bodyKind != ast::MethodBodyKind::Block ||
+            !md->returnType || !stmtsContainYield(md->stmts))
+            return {};
+        const TypeRef* rt = ctx_.resolvedType(*md->returnType);
+        if (!rt || !common::isIterFormatEnumerableHead(rt->headName()))
+            return {};
+        return md->name;
     }
 
     void visitStmt(const ast::Stmt& s) {
@@ -1305,6 +1420,12 @@ private:
                 declared_.insert(k);
                 if (ld->initializer) {
                     assigned_.insert(k);
+                    // fix #8787 (§29.8, v0.359): a binding of the iterable an
+                    // `owned`-parameter iterator mints carries an enumeration
+                    // right spent at §29.11's consumption points.
+                    std::string_view mname =
+                        singleUseIteratorCallee(*ld->initializer);
+                    if (!mname.empty()) singleUseIterables_[ld] = mname;
                 } else if (ld->type) {
                     // §7.9 (v0.299, #4419): a local of DEFAULTABLE type
                     // (§17.11 "defaultable" glossary entry) declared without an
@@ -1431,6 +1552,22 @@ private:
                 if (declared_.count(k)) {
                     assigned_.insert(k);
                 }
+                // fix #8787 (§29.8): a write to a single-consumption iterable
+                // binding replaces the iterable, so its enumeration right is
+                // fresh. Tracking continues only while the binding provably
+                // holds such an iterable; any other value ends it (the
+                // run-time claim stays the guard from there).
+                if (const ast::Node* d = localDeclNode(ctx_, *id)) {
+                    auto it = singleUseIterables_.find(d);
+                    if (it != singleUseIterables_.end()) {
+                        consumedLazy_.erase(k);
+                        std::string_view mname =
+                            as->value ? singleUseIteratorCallee(*as->value)
+                                      : std::string_view{};
+                        if (mname.empty()) singleUseIterables_.erase(it);
+                        else it->second = mname;
+                    }
+                }
                 // Bare ident that's NOT a declared local — could be a
                 // field-on-this or a typo. Sema slice 3d's silent fall-
                 // through covers the first case; here we don't flag.
@@ -1508,7 +1645,7 @@ private:
             }
             std::vector<DaSet> branchOuts;
             branchOuts.push_back(std::move(assigned_));
-            std::vector<std::unordered_set<std::string_view>> consumedLazyOuts;
+            std::vector<DaSet> consumedLazyOuts;
             consumedLazyOuts.push_back(std::move(consumedLazy_));
             std::vector<std::unordered_set<std::string_view>> fieldOuts;
             fieldOuts.push_back(std::move(assignedFields_));
@@ -1574,7 +1711,7 @@ private:
             // obligation from definite-assignment and out of this fix's scope.
             auto consumedOut = consumedLazyOuts.front();
             for (std::size_t i = 1; i < consumedLazyOuts.size(); ++i) {
-                std::unordered_set<std::string_view> tmp;
+                DaSet tmp;
                 for (auto n : consumedOut) {
                     if (consumedLazyOuts[i].count(n)) tmp.insert(n);
                 }
@@ -1636,9 +1773,11 @@ private:
             if (fs->iterable) {
                 if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         fs->iterable.get())) {
-                    if (isLazyEnumerableExprType(*fs->iterable)) {
+                    if (isLazyEnumerableExprType(*fs->iterable) ||
+                        isSingleUseIterableLocal(*id)) {
                         // §29.11 point 1: enumeration (for-in) consumes the
                         // bound lazy. Use markLazyConsumed for consistency.
+                        // fix #8787: and a §29.8 single-consumption iterable.
                         markLazyConsumed(*id, "for-in enumeration");
                     }
                 }
@@ -1708,7 +1847,7 @@ private:
             // the post-try set; catch arms each start from entry.
             std::vector<DaSet> outs;
             outs.push_back(std::move(assigned_));
-            std::vector<std::unordered_set<std::string_view>> consumedLazyOuts;
+            std::vector<DaSet> consumedLazyOuts;
             consumedLazyOuts.push_back(std::move(consumedLazy_));
             std::vector<std::unordered_set<std::string_view>> fieldOuts;
             fieldOuts.push_back(std::move(assignedFields_));
@@ -1757,7 +1896,7 @@ private:
             // from definite-assignment, out of this fix's scope.
             auto consumedPost = consumedLazyOuts.front();
             for (std::size_t i = 1; i < consumedLazyOuts.size(); ++i) {
-                std::unordered_set<std::string_view> tmp;
+                DaSet tmp;
                 for (auto n : consumedPost) {
                     if (consumedLazyOuts[i].count(n)) tmp.insert(n);
                 }
@@ -1806,7 +1945,7 @@ private:
             // the post-case set is the UNION over live arms (joinUnionLive).
             auto roEntry = readonlyMaybeAssigned_;
             std::vector<DaSet> armOuts;
-            std::vector<std::unordered_set<std::string_view>> armConsumedLazyOuts;
+            std::vector<DaSet> armConsumedLazyOuts;
             std::vector<std::unordered_set<std::string_view>> armFieldOuts;
             std::vector<std::unordered_set<std::string_view>> armRoOuts;
             std::vector<bool> armTerminated;
@@ -1861,7 +2000,7 @@ private:
             if (!armConsumedLazyOuts.empty()) {
                 auto consumedOut = armConsumedLazyOuts.front();
                 for (std::size_t i = 1; i < armConsumedLazyOuts.size(); ++i) {
-                    std::unordered_set<std::string_view> tmp;
+                    DaSet tmp;
                     for (auto n : consumedOut) {
                         if (armConsumedLazyOuts[i].count(n)) tmp.insert(n);
                     }
@@ -2015,7 +2154,10 @@ private:
                         if (const auto* rid =
                                 dynamic_cast<const ast::IdentifierExpr*>(
                                     ma->target.get())) {
-                            if (isLazyEnumerableExprType(*ma->target)) {
+                            // fix #8787: §29.8 "a further deferred
+                            // operator" over a single-consumption iterable.
+                            if (isLazyEnumerableExprType(*ma->target) ||
+                                isSingleUseIterableLocal(*rid)) {
                                 // Check DA assignment (read) first, then
                                 // mark the bound lazy as consumed.
                                 checkRead(*rid);
@@ -2054,6 +2196,29 @@ private:
                             isLazyEnumerableExprType(*ma->target)) {
                             checkRead(*rid);
                             markLazyConsumed(*rid, "terminal operator");
+                            for (const auto& a : ce->args) visitCallArg(a);
+                            return;
+                        }
+                        // fix #8787 (§29.8, v0.359): a single-consumption
+                        // iterable's right is spent by "a terminal operator,
+                        // a `GetEnumerator()` or `GetAsyncEnumerator()` call
+                        // or its owning form".
+                        if (isSingleUseIterableLocal(*rid) &&
+                            (isLinqMember || ma->member == "GetEnumerator" ||
+                             ma->member == "GetAsyncEnumerator" ||
+                             ma->member == "GetOwningEnumerator" ||
+                             ma->member == "GetOwningAsyncEnumerator")) {
+                            checkRead(*rid);
+                            const char* how =
+                                isLinqMember ? "terminal operator"
+                                : ma->member == "GetEnumerator"
+                                    ? "GetEnumerator() call"
+                                : ma->member == "GetAsyncEnumerator"
+                                    ? "GetAsyncEnumerator() call"
+                                : ma->member == "GetOwningEnumerator"
+                                    ? "GetOwningEnumerator() call"
+                                    : "GetOwningAsyncEnumerator() call";
+                            markLazyConsumed(*rid, how);
                             for (const auto& a : ce->args) visitCallArg(a);
                             return;
                         }
@@ -2365,7 +2530,11 @@ private:
         if (a.modifier != "ref") {  // not a ref arg (ref is still a read)
             if (const auto* id =
                     dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
-                if (isLazyEnumerableExprType(*a.value)) {
+                // fix #8787: §29.8's "passing it as an `IEnumerable<T>`/
+                // `IAsyncEnumerable<T>` argument" for a single-consumption
+                // iterable.
+                if (isLazyEnumerableExprType(*a.value) ||
+                    isSingleUseIterableLocal(*id)) {
                     checkRead(*id);  // DA assignment check
                     markLazyConsumed(*id, "IEnumerable<T> argument");
                     return;  // consumed — treated as a read+consume

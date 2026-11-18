@@ -1864,6 +1864,31 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             break;
         }
     }
+    // fix #8787 (§29.8 / §29.11, v0.359): an iterable minted by an iterator
+    // method that declares an `owned` parameter "is single-consumption", and
+    // "the first `GetEnumerator()` ... transfers the frame's `owned` ...
+    // parameters to the enumerator it produces; that enumerator disposes any
+    // such parameter the body has not moved out of when it completes or is
+    // disposed". So for EVERY such iterator at an iterator-format enumerable
+    // head the #2154 claim is armed: the first GetEnumerator moves the
+    // captures to the clone and a second raises InvalidOperationException
+    // (§29.11's run-time guard where the re-enumeration is reachable only at
+    // run time). Before this only the #2154 / #973a shapes armed it, and every
+    // other GetEnumerator memcpy'd the same parameter pointer: a body that
+    // moved the parameter into a `using var` local disposed it in the first
+    // clone and the second clone read the freed object (heap-use-after-free).
+    // The enumerator-direct heads have no clone (the source IS the driven
+    // frame) and are unchanged.
+    bool ownedParamClaim = false;
+    if (common::isSyncIterFormatEnumerableHead(retName)) {
+        for (sema::Symbol* sym : ms->params) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+            if (ps && ps->modifier == "owned") {
+                ownedParamClaim = true;
+                break;
+            }
+        }
+    }
     // Which owned captures does the CLONE take ownership of at GetEnumerator?
     // Identical to the pre-#973a `hasState` test whenever no conditional
     // parameter is present, so the #2154 path is bit-for-bit unchanged.
@@ -1878,11 +1903,15 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // #973a: once the claim is armed, EVERY owned capture the frame
         // disposes must move to the clone — leaving one behind would have the
         // source and the clone dispose the same pointer.
-        return frameConditionalOwnedParams &&
+        // fix #8787: the same holds for the universal §29.8 claim — the
+        // clone's Dispose visits every auto-disposed parameter, so each one
+        // it visits moves to it and the source's slot is nulled.
+        return (frameConditionalOwnedParams || ownedParamClaim) &&
                (ps->iteratorAutoDispose ||
                 ps->iteratorFrameConditionalAutoDispose);
     };
-    bool cloneDisposesOwnedCaptures = frameConditionalOwnedParams;
+    bool cloneDisposesOwnedCaptures =
+        frameConditionalOwnedParams || ownedParamClaim;
     for (sema::Symbol* sym : ms->params) {
         auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
         if (!ps || ps->modifier != "owned") continue;

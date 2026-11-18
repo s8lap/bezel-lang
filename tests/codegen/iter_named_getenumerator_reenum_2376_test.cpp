@@ -266,43 +266,72 @@ BEZEL_TEST(iter_named_getenumerator_reenum_2376,
 // ever raised — a second, independent wrong-value symptom of the same root
 // cause. Cell.n == 0 confirms the owned param is disposed exactly once
 // despite the second call's failure.
+//
+// BEHAVIOUR FLIP (fix #8787, §29.8 v0.359): the iterable is single-consumption
+// and "a second consumption is a compile error where the flow analysis can see
+// it and raises `InvalidOperationException` where it is reachable only at run
+// time"; a `GetEnumerator()` call is one of its consumption points. The two
+// calls on the bound `src` this row used to RUN are visible to the flow
+// analysis, so that program is now rejected, and the run-time guard is driven
+// through an untracked `IEnumerable<int>` parameter (§29.11) with the same
+// assertions. Since #8787 the claim arms for EVERY sync iterator with an
+// `owned` parameter, not only the conditional shape the NOTE below describes.
 BEZEL_TEST(iter_named_getenumerator_reenum_2376,
            named_local_owned_param_second_getenumerator_raises_ioe_spec_29_8) {
-    // NOTE: the claim-and-null mechanism (#973a/#2154) only ARMS for the
-    // narrower CONDITIONALLY-discharged owned-param shape (a body containing
-    // `if cond then using var x := owned c; end;` somewhere, statically,
-    // regardless of `cond`'s runtime value) — unlike the async #2356 twin,
-    // sync's mechanism does NOT claim a SIMPLE owned param the body merely
-    // reads and never conditionally adopts (verified: a first version of this
-    // test using a body with no adoption pattern at all never armed the
-    // claim, so the second call silently returned a THIRD shallow clone
-    // instead of raising — matching iterator_owned_param_conditional_973a_
-    // test.cpp's own scope, which is why this test reuses ITS EXACT iterator
-    // shape (`kCondIter`-equivalent) rather than a plain owned-param
-    // iterator).
-    BEZEL_EXPECT_EQ(runChecked(
+    // NOTE (pre-#8787): the claim-and-null mechanism (#973a/#2154) only ARMED
+    // for the narrower CONDITIONALLY-discharged owned-param shape (a body
+    // containing `if cond then using var x := owned c; end;` somewhere,
+    // statically, regardless of `cond`'s runtime value), which is why this
+    // test reuses iterator_owned_param_conditional_973a_test.cpp's iterator.
+    const std::string iter =
         std::string("module M; ") + kCell +
         "class P "
         "  public static method Use(owned c: Cell, cond: bool): IEnumerable<int> "
         "    if cond then using var x := owned c; end; "
         "    yield return 1; yield return 2; "
-        "  end Use; "
+        "  end Use; ";
+    JitResult rejected = runAot(
+        iter +
         "  public static method Main(): int "
-        "    var a := 0; var caught := 0; "
+        "    var a := 0; "
         "    do "
         "      var src := P.Use(new Cell(), false); "
         "      using var e1 := src.GetEnumerator(); "
         "      if e1.MoveNext() then a := e1.Current; end; "
-        "      try "
-        "        using var e2 := src.GetEnumerator(); "
-        "        var m2 := e2.MoveNext(); "
-        "      catch InvalidOperationException => "
-        "        caught := 1; "
-        "      end; "
+        "      using var e2 := src.GetEnumerator(); "
+        "    end; "
+        "    return a; "
+        "  end Main; end P;");
+    BEZEL_EXPECT_TRUE(!rejected.ran);
+    bool named = false;
+    for (const auto& d : rejected.diagnostics.diagnostics())
+        if (d.message.find("iterable `src` was already consumed") != std::string::npos &&
+            d.message.find("`Use`") != std::string::npos &&
+            d.message.find("GetEnumerator() call") != std::string::npos)
+            named = true;
+    BEZEL_EXPECT_TRUE(named);
+    BEZEL_EXPECT_EQ(runChecked(
+        iter +
+        "  public static method Two(src: IEnumerable<int>): int "
+        "    var a := 0; var caught := 0; "
+        "    using var e1 := src.GetEnumerator(); "
+        "    if e1.MoveNext() then a := e1.Current; end; "
+        "    try "
+        "      using var e2 := src.GetEnumerator(); "
+        "      var m2 := e2.MoveNext(); "
+        "    catch InvalidOperationException => "
+        "      caught := 1; "
+        "    end; "
+        "    return a * 10 + caught; "
+        "  end Two; "
+        "  public static method Main(): int "
+        "    var r := 0; "
+        "    do "
+        "      var src := P.Use(new Cell(), false); "
+        "      r := Two(src); "
         "    end; "
         "    if Cell.n <> 0 then return 100; end; "  // exactly-once, no leak
-        "    if a <> 1 then return 1; end; "
-        "    if caught <> 1 then return 2; end; "
+        "    if r <> 11 then return r; end; "
         "    return 0; "
         "  end Main; end P;"), 0);
 }

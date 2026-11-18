@@ -377,9 +377,18 @@ BEZEL_TEST(async_get_async_enumerator_owned_param_alias_2356,
 // disposed exactly once (via en1's clone) despite the second call's failure
 // — not leaked (the failed claim attempt allocates no clone to abandon) and
 // not double-freed.
+//
+// BEHAVIOUR FLIP (fix #8787, §29.8 v0.359): the iterable is single-consumption
+// and "a second consumption is a compile error where the flow analysis can see
+// it and raises `InvalidOperationException` where it is reachable only at run
+// time"; a `GetAsyncEnumerator()` call is one of its consumption points. The
+// two calls on the bound `src` this row used to RUN are visible to the flow
+// analysis, so that program is now rejected, and the run-time claim is driven
+// through an untracked `IAsyncEnumerable<int>` parameter (§29.11) with the
+// same assertions.
 BEZEL_TEST(async_get_async_enumerator_owned_param_alias_2356,
            owned_param_second_get_call_raises_ioe_disposed_once) {
-    BEZEL_EXPECT_EQ(run(
+    const std::string iter =
         "module M; "
         "class Cell public static n: int := 0; public V: int := 1; "
         "  public constructor() Cell.n := Cell.n + 1; end constructor; "
@@ -389,25 +398,52 @@ BEZEL_TEST(async_get_async_enumerator_owned_param_alias_2356,
         "  public static async method UseCell(owned c: Cell): IAsyncEnumerable<int> "
         "    yield return c.V; "
         "    yield return c.V + 1; "
-        "  end UseCell; "
+        "  end UseCell; ";
+    JitResult rejected = runAot(
+        iter +
         "  public static async method Main(): Task<int> "
+        "    var a := 0; "
+        "    do "
+        "      using var src := P.UseCell(new Cell()); "
+        "      await using var en1 := src.GetAsyncEnumerator(); "
+        "      if await en1.MoveNextAsync() then a := en1.Current; end; "
+        "      await using var en2 := src.GetAsyncEnumerator(); "
+        "    end; "
+        "    return a; "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_TRUE(!rejected.ran);
+    bool named = false;
+    for (const auto& d : rejected.diagnostics.diagnostics())
+        if (d.message.find("iterable `src` was already consumed") != std::string::npos &&
+            d.message.find("`UseCell`") != std::string::npos &&
+            d.message.find("GetAsyncEnumerator() call") != std::string::npos)
+            named = true;
+    BEZEL_EXPECT_TRUE(named);
+    BEZEL_EXPECT_EQ(run(
+        iter +
+        "  public static async method Two(src: IAsyncEnumerable<int>): Task<int> "
         "    var a := 0; var caught := 0; "
+        "    await using var en1 := src.GetAsyncEnumerator(); "
+        "    if await en1.MoveNextAsync() then a := en1.Current; end; "
+        "    try "
+        "      await using var en2 := src.GetAsyncEnumerator(); "
+        "      var m2 := await en2.MoveNextAsync(); "
+        "    catch InvalidOperationException => "
+        "      caught := 1; "
+        "    end; "
+        "    return a * 10 + caught; "
+        "  end Two; "
+        "  public static async method Main(): Task<int> "
+        "    var r := 0; "
         "    do "
         // fix #7762 (§28.3.6 clause 1/4, v0.355): the minted frame is owned
         // at the call site — `using var` discharges it at this scope's end.
         "      using var src := P.UseCell(new Cell()); "
-        "      await using var en1 := src.GetAsyncEnumerator(); "
-        "      if await en1.MoveNextAsync() then a := en1.Current; end; "
-        "      try "
-        "        await using var en2 := src.GetAsyncEnumerator(); "
-        "        var m2 := await en2.MoveNextAsync(); "
-        "      catch InvalidOperationException => "
-        "        caught := 1; "
-        "      end; "
+        "      r := await Two(src); "
         "    end; "
         "    if Cell.n <> 0 then return 100; end; "  // exactly-once, no leak
-        "    if a <> 1 then return 1; end; "
-        "    if caught <> 1 then return 2; end; "
+        "    if r <> 11 then return r; end; "
         "    return 0; "
         "  end Main; "
         "end P;"), 0);

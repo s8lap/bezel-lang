@@ -46,6 +46,7 @@
 // pins EXACTLY-once: 0 means no leak and no extra disposal.
 
 #include <cstddef>
+#include <initializer_list>
 #include <string>
 
 #include "support/aot_support.hpp"
@@ -80,6 +81,21 @@ void expectBalanced(const std::string& src) {
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// True iff `src` is rejected at compile time and one diagnostic contains every
+// needle (a specific diagnostic, not merely "failed").
+bool rejectedWithDiag(const std::string& src,
+                      std::initializer_list<const char*> needles) {
+    JitResult r = runAotChecked(src);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        bool all = true;
+        for (const char* n : needles)
+            if (d.message.find(n) == std::string::npos) all = false;
+        if (all) return true;
+    }
+    return false;
 }
 
 // True iff the full pipeline (including the ownership pass) rejects `src`.
@@ -223,21 +239,51 @@ BEZEL_TEST(iterator_owned_param_conditional_973a,
 // value is still disposed exactly once. (Pre-fix the whole program was rejected;
 // the claim path also needed the missing post-`GetEnumerator` pending check,
 // without which the intended exception was a SIGSEGV.)
+//
+// BEHAVIOUR FLIP (fix #8787, §29.8 v0.359): "a second consumption is a compile
+// error where the flow analysis can see it and raises
+// `InvalidOperationException` where it is reachable only at run time". The
+// two `for`s over the bound `src` this row used to RUN are visible to the flow
+// analysis, so that program is now rejected; the run-time guard is driven
+// through an untracked `IEnumerable<int>` callee (§29.11: "a plain
+// `IEnumerable<T>` parameter is statically untracked"), with the same
+// assertions.
 BEZEL_TEST(iterator_owned_param_conditional_973a,
            sync_second_enumeration_raises_and_disposes_once_spec_29_11) {
+    BEZEL_EXPECT_TRUE(rejectedWithDiag(
+        prog(std::string(kCondIter) +
+             "  public static method Main(): int "
+             "    var seen := 0; var caught := 0; "
+             "    try "
+             "      var src := Use(new Cell(), false); "
+             "      for var v in src do seen := seen + v; end; "
+             "      for var v in src do seen := seen + v; end; "
+             "    catch InvalidOperationException => "
+             "      caught := 1; "
+             "    end; "
+             "    return Cell.n; "
+             "  end Main; "),
+        {"iterable `src` was already consumed", "`Use`", "for-in enumeration"}));
     expectBalanced(prog(
         std::string(kCondIter) +
-        "  public static method Main(): int "
-        "    var seen := 0; var caught := 0; "
+        "  public static method Sum(src: IEnumerable<int>): int "
+        "    var s := 0; "
+        "    for var v in src do s := s + v; end; "
+        "    return s; "
+        "  end Sum; "
+        "  public static method Twice(src: IEnumerable<int>, seen: int): int "
+        "    var t := seen + Sum(src); "
         "    try "
-        "      var src := Use(new Cell(), false); "
-        "      for var v in src do seen := seen + v; end; "
-        "      for var v in src do seen := seen + v; end; "
+        "      t := t + Sum(src); "
         "    catch InvalidOperationException => "
-        "      caught := 1; "
+        "      t := t + 1000; "
         "    end; "
-        "    if seen <> 3 then return 71; end; "
-        "    if caught <> 1 then return 72; end; "
+        "    return t; "
+        "  end Twice; "
+        "  public static method Main(): int "
+        "    var src := Use(new Cell(), false); "
+        "    var seen := Twice(src, 0); "
+        "    if seen <> 1003 then return 71; end; "
         "    return Cell.n; "
         "  end Main; "));
 }
