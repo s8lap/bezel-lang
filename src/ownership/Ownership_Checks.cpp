@@ -28510,6 +28510,13 @@ void MethodOwnership::scopedPreScan(
     for (const auto& s : body)
         if (s) scopedPreScanStmt(*s);
     scopedBlockEndStack_.pop_back();
+    // fix #8785 (fix-forward; §28.3 closure bullet, *Provenance* clause 6,
+    // v0.359): the set-erasing verdicts, in the order the walk met them, now
+    // that every assignment of the body is recorded (`setErasingCheckQueue_`).
+    if (!setErasingCheckQueue_.empty()) setErasingFlowBuild(body);
+    for (const SetErasingCheck& c : setErasingCheckQueue_)
+        reportSetErasingPosition(c);
+    setErasingCheckQueue_.clear();
     // §32.5 (#1719): run after the whole walk so a callback local's lambda /
     // method-reference initializer and the flow-insensitive reassignment set are
     // complete. One pass over the queued extern calls yields one diagnostic per
@@ -28892,18 +28899,64 @@ void MethodOwnership::checkObjectExtensionReceiver(const ast::Expr& callee) {
             (ms && ms->extensionDecl && ms->extensionDecl->targetType)
                 ? ctx_.resolvedType(*ms->extensionDecl->targetType)
                 : nullptr;
+        // Judged after the walk: see `setErasingCheckQueue_`. // per §28.3
         if (head && head->kind == sema::TypeRef::Kind::Primitive &&
-            head->primitive == sema::PrimitiveType::Object &&
-            exprIsFunctionValueWithNonEmptyCaptureSet(*recv)) {
-            report(Severity::Error, recv->span.begin,
-                   std::string("function value carries captured "
-                               "borrow(s) and may not be the receiver of "
-                               "an extension call whose head is `Object` "
-                               "— `Object` announces no source set; use a "
-                               "capture-free function value (§28.3 "
-                               "closure bullet, *Set-erasing positions*, "
-                               "clause 4, v0.359)"));
-        }
+            head->primitive == sema::PrimitiveType::Object)
+            setErasingCheckQueue_.push_back(
+                {SetErasingPosition::ExtensionObjectReceiver, recv});
+    }
+}
+
+// fix #8785 (fix-forward; §28.3 closure bullet, *Provenance* clause 6 and
+// *Set-erasing positions*, v0.359): the verdict of one queued set-erasing
+// position — "At every set-erasing position a function value with a non-empty
+// source set is rejected, and a capture-free one is admitted". Run by
+// `scopedPreScan` after its walk (see `setErasingCheckQueue_`).
+void MethodOwnership::reportSetErasingPosition(const SetErasingCheck& c) {
+    if (!c.value || !exprIsFunctionValueWithNonEmptyCaptureSet(*c.value))
+        return;
+    switch (c.position) {
+    case SetErasingPosition::ExtensionObjectReceiver:
+        report(Severity::Error, c.value->span.begin,
+               std::string("function value carries captured "
+                           "borrow(s) and may not be the receiver of "
+                           "an extension call whose head is `Object` "
+                           "— `Object` announces no source set; use a "
+                           "capture-free function value (§28.3 "
+                           "closure bullet, *Set-erasing positions*, "
+                           "clause 4, v0.359)"));
+        return;
+    case SetErasingPosition::BareTypeParameter:
+        report(Severity::Error, c.value->span.begin,
+               std::string("function value carries "
+                           "captured borrow(s) and may "
+                           "not be passed where the "
+                           "parameter is declared at a bare "
+                           "type parameter (here substituted "
+                           "with a function type) — the "
+                           "parameter's type announces no "
+                           "source set; pass a capture-free "
+                           "function value, declare the "
+                           "parameter at a function type, "
+                           "or declare it `scoped` "
+                           "(§28.3 closure bullet, "
+                           "*Set-erasing positions*, "
+                           "v0.330)"));
+        return;
+    case SetErasingPosition::ObjectParameter:
+        report(Severity::Error, c.value->span.begin,
+               std::string("function value carries "
+                           "captured borrow(s) and may "
+                           "not be passed where the "
+                           "parameter is declared Object — "
+                           "Object announces no source set; "
+                           "pass a capture-free function "
+                           "value, declare the parameter "
+                           "at a function type, or "
+                           "declare it `scoped` (§28.3 "
+                           "closure bullet, *Set-erasing "
+                           "positions*, v0.330)"));
+        return;
     }
 }
 
@@ -29004,38 +29057,17 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
                     isSetErasing = true;  // Object parameter
                 }
                 if (isSetErasing) {
+                    // Judged after the walk: see `setErasingCheckQueue_`.
+                    // // per §28.3
                     if (pt && pt->kind == sema::TypeRef::Kind::Named && !pt->declaration) {
                         // bare type parameter
-                        if (exprIsFunctionValueWithNonEmptyCaptureSet(*a.value))
-                            report(Severity::Error, a.value->span.begin,
-                                   std::string("function value carries "
-                                               "captured borrow(s) and may "
-                                               "not be passed where the "
-                                               "parameter is declared at a bare "
-                                               "type parameter (here substituted "
-                                               "with a function type) — the "
-                                               "parameter's type announces no "
-                                               "source set; pass a capture-free "
-                                               "function value, declare the "
-                                               "parameter at a function type, "
-                                               "or declare it `scoped` "
-                                               "(§28.3 closure bullet, "
-                                               "*Set-erasing positions*, "
-                                               "v0.330)"));
+                        setErasingCheckQueue_.push_back(
+                            {SetErasingPosition::BareTypeParameter,
+                             a.value.get()});
                     } else if (isObject) {
-                        if (exprIsFunctionValueWithNonEmptyCaptureSet(*a.value))
-                            report(Severity::Error, a.value->span.begin,
-                                   std::string("function value carries "
-                                               "captured borrow(s) and may "
-                                               "not be passed where the "
-                                               "parameter is declared Object — "
-                                               "Object announces no source set; "
-                                               "pass a capture-free function "
-                                               "value, declare the parameter "
-                                               "at a function type, or "
-                                               "declare it `scoped` (§28.3 "
-                                               "closure bullet, *Set-erasing "
-                                               "positions*, v0.330)"));
+                        setErasingCheckQueue_.push_back(
+                            {SetErasingPosition::ObjectParameter,
+                             a.value.get()});
                     }
                 }
             }
@@ -29937,6 +29969,22 @@ bool MethodOwnership::exprIsFunctionValueWithNonEmptyCaptureSet(
                 // identifiers, INCLUDING the lambda's own params.  Filter
                 // those out — a lambda param is not a capture of the outer
                 // scope.
+                //
+                // fix #8785 (fix-forward; §28.3 *Provenance* clause 6,
+                // v0.359): "A local or parameter contributes, at each read,
+                // the union of the sets of the forms the flow analysis traces
+                // it to, over every assignment that reaches the read". The
+                // initializer is that union only for a local that is never
+                // an assignment target. This arm reads no later assignment,
+                // so for a REASSIGNED local (`seFlowAssigned_`: an assignment
+                // target or an `out`/`ref` argument anywhere in the body,
+                // lambda bodies and binding atoms included) clause 1's value
+                // exemption does not apply: every capture of the initializer
+                // stays counted, exactly as before #8785
+                // (`var n := 1; var f := lambda() => n; f := lambda() => r.V;`
+                // must not read as capture-free on the initializer alone).
+                const bool reassigned =
+                    !seFlowComplete_ || seFlowAssigned_.count(sym) != 0;
                 std::vector<const ast::IdentifierExpr*> rawCaps;
                 scopedCollectCaptures(*it->second, rawCaps);
                 if (!rawCaps.empty()) {
@@ -29948,7 +29996,7 @@ bool MethodOwnership::exprIsFunctionValueWithNonEmptyCaptureSet(
                     for (const ast::IdentifierExpr* id : rawCaps) {
                         if (const sema::Symbol* s = ctx_.exprSymbol(*id))
                             if (!paramSet.count(s) &&
-                                captureContributesSource(s))
+                                (reassigned || captureContributesSource(s)))
                                 return true;
                     }
                 }
@@ -29975,6 +30023,135 @@ bool MethodOwnership::exprIsFunctionValueWithNonEmptyCaptureSet(
                    : false;
     return false;
 }
+
+// fix #8785 (fix-forward; §28.3 *Provenance* clause 6, v0.359): collect
+// `seFlowAssigned_` — see its declaration. // per §28.3
+void MethodOwnership::setErasingFlowBuild(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    seFlowComplete_ = true;
+    seFlowAssigned_.clear();
+    setErasingFlowStmts(body);
+}
+
+void MethodOwnership::setErasingFlowStmts(
+    const std::vector<std::unique_ptr<ast::Stmt>>& ss) {
+    for (const auto& s : ss)
+        if (s) setErasingFlowStmt(*s);
+}
+
+// The expression walk: every sub-expression through the ONE exhaustive walk
+// (`forEachSyncSubExpr`, which stops at a lambda), plus what that walk leaves
+// to its caller — a lambda's body, a `case` expression's block-form arms.
+void MethodOwnership::setErasingFlowExpr(const ast::Expr* e) {
+    common::forEachSyncSubExpr(e, [&](const ast::Expr& n) {
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&n)) {
+            setErasingFlowExpr(lam->exprBody.get());
+            setErasingFlowStmts(lam->stmts);
+            return;
+        }
+        if (auto* cse = dynamic_cast<const ast::CaseExpr*>(&n)) {
+            for (const ast::CaseArm& arm : cse->arms)
+                setErasingFlowStmts(arm.stmts);
+            return;
+        }
+        // An `out`/`ref` argument overwrites its identifier with a value this
+        // body does not trace.
+        const std::vector<ast::CallArgument>* args = nullptr;
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(&n))
+            args = &ce->args;
+        else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&n))
+            args = &nc->args;
+        else if (auto* ne = dynamic_cast<const ast::NewExpr*>(&n))
+            args = &ne->args;
+        if (!args) return;
+        for (const ast::CallArgument& a : *args) {
+            if (a.modifier.find("out") == std::string_view::npos &&
+                a.modifier != "ref")
+                continue;
+            auto* oid = dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+            if (!oid) continue;
+            if (const sema::Symbol* osym = ctx_.exprSymbol(*oid))
+                seFlowAssigned_.insert(osym);
+        }
+    });
+}
+
+// The statement walk.
+void MethodOwnership::setErasingFlowStmt(const ast::Stmt& s) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s))
+        return setErasingFlowExpr(ld->initializer.get());
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s))
+        return setErasingFlowExpr(lc->value.get());
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        setErasingFlowExpr(as->value.get());
+        setErasingFlowExpr(as->target.get());
+        if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                as->target.get()))
+            if (const sema::Symbol* tsym = ctx_.exprSymbol(*tid))
+                seFlowAssigned_.insert(tsym);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s))
+        return setErasingFlowExpr(rs->value.get());
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s))
+        return setErasingFlowExpr(es->expr.get());
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s))
+        return setErasingFlowExpr(ts->value.get());
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s))
+        return setErasingFlowExpr(ds->value.get());
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s))
+        return setErasingFlowExpr(ys->value.get());
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s))
+        return setErasingFlowExpr(is->target.get());
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        setErasingFlowExpr(ifs->ifBranch.condition.get());
+        setErasingFlowStmts(ifs->ifBranch.body);
+        for (const auto& eb : ifs->elifBranches) {
+            setErasingFlowExpr(eb.condition.get());
+            setErasingFlowStmts(eb.body);
+        }
+        setErasingFlowStmts(ifs->elseBody);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        setErasingFlowExpr(ws->condition.get());
+        setErasingFlowStmts(ws->body);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        setErasingFlowExpr(fs->iterable.get());
+        setErasingFlowExpr(fs->withExpr.get());
+        setErasingFlowStmts(fs->body);
+        return;
+    }
+    if (auto* de = dynamic_cast<const ast::DoEndBlock*>(&s))
+        return setErasingFlowStmts(de->body);
+    if (auto* tr = dynamic_cast<const ast::TryStmt*>(&s)) {
+        setErasingFlowStmts(tr->body);
+        for (const ast::CatchArm& ca : tr->catches) {
+            setErasingFlowExpr(ca.guard.get());
+            if (ca.body) setErasingFlowStmt(*ca.body);
+        }
+        setErasingFlowStmts(tr->finallyBody);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        setErasingFlowExpr(cs->scrutinee.get());
+        for (const ast::CaseArm& arm : cs->arms) {
+            setErasingFlowExpr(arm.guard.get());
+            setErasingFlowExpr(arm.exprBody.get());
+            setErasingFlowStmts(arm.stmts);
+        }
+        return;
+    }
+    if (dynamic_cast<const ast::BreakStmt*>(&s) ||
+        dynamic_cast<const ast::ContinueStmt*>(&s) ||
+        dynamic_cast<const ast::LocalTypeDecl*>(&s))
+        return;
+    // A statement kind this walk does not know: nothing is trusted.
+    seFlowComplete_ = false;
+}
+
 
 void MethodOwnership::scopedCollectCaptures(
     const ast::LambdaExpr& lam,

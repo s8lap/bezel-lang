@@ -7272,6 +7272,46 @@ private:
     // with a non-empty source set may not be passed to a set-erasing
     // parameter.  Determines whether `arg` is a function value with captures.
     bool exprIsFunctionValueWithNonEmptyCaptureSet(const ast::Expr& arg);
+    // fix #8785 (fix-forward; §28.3 closure bullet, *Provenance* clause 6,
+    // v0.359): the set-erasing positions `scopedPreScanExpr` meets — the
+    // receiver of an extension call whose head is `Object`, an argument of a
+    // parameter declared at a bare type parameter, an argument of a parameter
+    // declared `Object` — queued in walk order and judged by `scopedPreScan`
+    // AFTER the walk (`reportSetErasingPosition`), as the §28.14 admissions
+    // are (`scopedAdmissionQueue_`). A local's set is "the union ... over
+    // every assignment that reaches the read", and the walk has not yet
+    // recorded an assignment that follows the read in the text: one that
+    // reaches it around a loop's back edge, or from a lambda body. Judged
+    // inline, such a local read as never reassigned.
+    enum class SetErasingPosition {
+        ExtensionObjectReceiver,
+        BareTypeParameter,
+        ObjectParameter,
+    };
+    struct SetErasingCheck {
+        SetErasingPosition position;
+        const ast::Expr* value;
+    };
+    std::vector<SetErasingCheck> setErasingCheckQueue_;
+    void reportSetErasingPosition(const SetErasingCheck& c);
+    // fix #8785 (fix-forward; §28.3 *Provenance* clause 6, v0.359): the locals
+    // and parameters that are an assignment target, or an `out`/`ref`
+    // argument, ANYWHERE in the body. Collected by `setErasingFlowBuild` —
+    // its own COMPLETE walk of the body (every statement kind, every
+    // expression kind through `forEachSyncSubExpr`, lambda bodies and binding
+    // atoms included), run only for a body that queued a set-erasing
+    // position. `scopedAssignedSyms_` is not that set: the pre-scan does not
+    // descend into a binding atom, so an assignment in a lambda body there
+    // (`(var t := 1; lambda() => do f := … end)`) never reaches it.
+    // `seFlowComplete_` is false when the walk met a statement kind it does
+    // not know; every local then reads as reassigned.
+    std::unordered_set<const sema::Symbol*> seFlowAssigned_;
+    bool seFlowComplete_ = false;
+    void setErasingFlowBuild(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void setErasingFlowStmt(const ast::Stmt& s);
+    void setErasingFlowStmts(const std::vector<std::unique_ptr<ast::Stmt>>& ss);
+    void setErasingFlowExpr(const ast::Expr* e);
     // fix #8785 (§28.3 closure bullet *Provenance* clause 1, v0.359): does this
     // CAPTURED binding contribute a source to the closure's source set?  Only
     // a capture POSITIVELY identified as a value type that holds no borrow

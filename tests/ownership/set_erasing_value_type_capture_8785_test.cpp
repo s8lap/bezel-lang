@@ -328,3 +328,80 @@ BEZEL_TEST(set_erasing_borrow_capture_8785,
         "        F(reg, new BR(r)); "));
     expectSetErasingRejectAtObject(r);
 }
+
+// ---------------------------------------------------------------------------
+// The REASSIGNED local (fix-forward; review r42-rev-s74 of 5ec864693).
+//
+// §28.3 (v0.359), closure bullet, *Provenance*, clause 6:
+//
+//   "A **local or parameter** contributes, at each read, the union of the sets
+//    of the forms the flow analysis traces it to, over every assignment that
+//    reaches the read"
+//
+// The value exemption of clause 1 is a statement about ONE lambda literal.  A
+// local read at a set-erasing position is judged over every assignment that
+// reaches the read, so a local whose INITIALIZER captures only a value and
+// which is then reassigned a borrow-capturing lambda carries that borrow.
+//
+// The two rows below are the suite's two named controls (RUN.md: at most two
+// per suite).  Each is REJECTED on the base tree r30-c1 (base-GREEN) and each
+// is RED under the named wrong fix — the rejected intermediate commit
+// 5ec864693, whose identifier arm exempted the value captures of the local's
+// initializer lambda and looked at nothing else: it ADMITTED both, and under
+// ASan each was a `heap-use-after-free` (review r42-rev-s74, witnesses v01c
+// and v05).  The third witness of that review (v01, a `StringBuilder` in
+// place of `Res`) is the same shape and lives in this lane's
+// `corpus-candidates/`.
+
+namespace {
+
+const char* kAtBareTypeParameter =
+    "may not be passed where the parameter is declared at a bare type parameter";
+
+}  // namespace
+
+// v01c (review r42-rev-s74): the initializer captures the value-type local
+// `n`; the reassignment captures the borrowed parameter `r`; the read at the
+// `Object` argument is reached by the reassignment.  WRONG FIX this catches:
+// 5ec864693's initializer-only value exemption.
+BEZEL_TEST(set_erasing_reassigned_local_8785,
+           v01c_value_initializer_then_borrow_reassignment_at_object_rejected) {
+    auto r = runAot(registryProgram(
+        "",
+        "  public static method Mk(reg: Reg2, r: Res) "
+        "    var n := 1; "
+        "    var f := lambda() => n; "
+        "    f := lambda() => r.V; "
+        "    reg.Keep(f); "
+        "  end Mk; ",
+        "        Mk(reg, r); "));
+    expectSetErasingRejectAtObject(r);
+}
+
+// v05 (review r42-rev-s74): the same reassigned local at the OTHER argument
+// position — a bare type parameter (`Keep<Object>.Put(a: T)`).  WRONG FIX
+// this catches: 5ec864693's initializer-only value exemption (the predicate
+// is shared by every set-erasing position, so a guard added at the `Object`
+// argument alone would leave this one admitted).
+BEZEL_TEST(set_erasing_reassigned_local_8785,
+           v05_value_initializer_then_borrow_reassignment_at_bare_type_parameter_rejected) {
+    auto r = runAot(registryProgram(
+        "public class Keep<T> "
+        "  private _v: T? := null; "
+        "  public constructor() end constructor; "
+        "  public method Put(a: T) _v := a; end Put; "
+        "end Keep; ",
+        "  public static method Mk(r: Res) "
+        "    var n := 1; "
+        "    var k := new Keep<Object>(); "
+        "    var f := lambda() => n; "
+        "    f := lambda() => r.V; "
+        "    k.Put(f); "
+        "  end Mk; ",
+        "        Mk(r); "
+        "        reg.Keep(lambda() => 1); "));
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, kCarriesBorrow));
+    BEZEL_EXPECT_TRUE(
+        bezel::test::diagnosticMessageContains(r, kAtBareTypeParameter));
+}
