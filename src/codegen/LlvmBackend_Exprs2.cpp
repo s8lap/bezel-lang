@@ -4055,6 +4055,11 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         auto savedSharedCellOwner = sharedCellEnvdtorFreeOwner_;
         auto savedBoxCaptureLocals = boxCaptureLocals_;
         auto savedSingleCaptureLocals = singleCaptureLocals_;
+        // fix #8840: emitAsyncLambda's collectBoxCaptureLocals re-scan
+        // recomputes multiCaptureLocals_ too (and merges this scope's copy
+        // in), so it travels with singleCaptureLocals_ (CaptureReclaimSetScope
+        // carries it for the sync venue).
+        auto savedMultiCaptureLocals = multiCaptureLocals_;
         auto savedAssignedCaptureVars = assignedCaptureVars_;  // fix #2706
         auto savedReturnedCaptureVars = returnedCaptureVars_;  // fix #4198
         llvm::Function* savedBoxCaptureLocalsFn = boxCaptureLocalsFn_;
@@ -4140,6 +4145,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         sharedCellEnvdtorFreeOwner_ = std::move(savedSharedCellOwner);  // #3426
         boxCaptureLocals_ = std::move(savedBoxCaptureLocals);
         singleCaptureLocals_ = std::move(savedSingleCaptureLocals);
+        multiCaptureLocals_ = std::move(savedMultiCaptureLocals);  // fix #8840
         assignedCaptureVars_ = std::move(savedAssignedCaptureVars);  // fix #2706
         returnedCaptureVars_ = std::move(savedReturnedCaptureVars);  // fix #4198
         boxCaptureLocalsFn_ = savedBoxCaptureLocalsFn;

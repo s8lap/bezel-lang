@@ -2558,6 +2558,27 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         // #1416 / #1418: likewise compute the CAPTURE-CELL free eligibility so a
         // frame-local captured by a nested lambda inside this async lambda's body
         // has its cell freed at scope end (mirrors emitAsyncMethod above).
+        //
+        // fix #8840 (§27.5 / §28.9, v0.359): snapshot the ANCESTOR scope's
+        // multiCaptureLocals_ (#4240), assignedCaptureVars_ (#8811) and
+        // returnedCaptureVars_ (#4226) before THIS async lambda's own re-scan
+        // clears them, and merge them back after it (below), exactly as sync
+        // lowerLambda does. This venue had none of the three merges, so a cell
+        // the enclosing function shares between this async lambda's env and a
+        // nested sync lambda's env looked single-captured from the narrower
+        // re-scan of `lam.stmts` alone. mutatedSharedCaptureCell then answered
+        // false for the nested capture of a WRITTEN `string` cell: a retain on
+        // the value present at capture and an envdtor release of the cell's
+        // last value, the frame's only reference:
+        //     var f2 := async lambda() => do await Task.Delay(0);
+        //         var g := lambda() => s.Length; s := s + "c"; return g(); end;
+        //     var r := await f2(); return r + s.Length;  // `s` freed by lam$1's envdtor
+        const std::unordered_set<const void*> ancestorMultiCaptureLocals8840 =
+            multiCaptureLocals_;
+        const std::unordered_set<const void*> ancestorAssignedCaptureVars8840 =
+            assignedCaptureVars_;
+        const std::unordered_set<const void*> ancestorReturnedCaptureVars8840 =
+            returnedCaptureVars_;
         boxCaptureLocals_.clear();
         singleCaptureLocals_.clear();
         assignedCaptureVars_.clear();  // fix #2706
@@ -2602,6 +2623,26 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             // load-bearing only together with the mint below.
             closureLocalCandidates_.clear();
         }
+        // fix #8840 (§27.5 / §28.9, v0.359): merge the ancestor's capture
+        // facts back in (see the snapshots above), for both branches: an
+        // expression body never re-scans, so its sets are empty after the
+        // clears. Each merge mirrors its sync lowerLambda twin. #4240: a key
+        // the ancestor proved shared by 2+ envs joins multiCaptureLocals_ and
+        // LEAVES singleCaptureLocals_, which only makes the sole-holder gates
+        // more conservative. #8811 / #4226: "written" and "returned by name"
+        // somewhere in the enclosing chain are membership facts, so a union is
+        // sound. Every merge only adds a key naming an ancestor's cell, which
+        // makes mutatedSharedCaptureCell suppress a nested env's retain AND
+        // release together: at worst a leak of the cell's final value
+        // (#2718), never an over-release.
+        for (const void* k : ancestorMultiCaptureLocals8840) {
+            multiCaptureLocals_.insert(k);
+            singleCaptureLocals_.erase(k);
+        }
+        for (const void* k : ancestorAssignedCaptureVars8840)
+            assignedCaptureVars_.insert(k);
+        for (const void* k : ancestorReturnedCaptureVars8840)
+            returnedCaptureVars_.insert(k);
         closureReleaseEligibleFn_ = resumeFn;
         // fix #2132 / #2142 / #2143 / #1871 / §28.9 / §28.11: re-establish the
         // borrowing-`Array<T>` / `Set<T>` / `Dictionary<K,V>` literal /
