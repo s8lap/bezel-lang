@@ -34,6 +34,18 @@
 // LastCellEntry::unwindUnsafe / Emitter::unwindUnsafeCellFree_ were added to
 // suppress the free specifically on unwind, leaving the ordinary
 // conservative leak there instead (never a UAF).
+//
+// fix #8463 (§27.5 / §28.9 / §28.14, v0.359): that conservative LEAK is gone.
+// The capture cell of a local captured by a TaskScope.Spawn child is now
+// reclaimed by COUNTING — the env retains it (`bz_cell_retain`) and drops that
+// reference in its envdtor, so the frame's scope-end RELEASE cannot outrun a
+// still-running child (a counted reader keeps the cell alive by construction)
+// and the cell is freed by whoever lets go LAST. So the unwind edge is now
+// BOTH leak-free AND use-after-free-free: the row below, which used to pin
+// the conservative leak, is flipped to expect a clean run (see its own
+// comment). The TaskScope's non-blocking drain itself is unchanged — it is
+// documented behaviour, pinned by
+// `taskscope_behavior_610.exception_edge_drain_is_nonblocking_zombie_1422`.
 
 #include <cstdio>
 #include <cstdlib>
@@ -88,8 +100,13 @@ void expectAsanClean(const std::string& source, int expectedExitCode) {
 // overrides the process exit code, this is how a shape that is EXPECTED to
 // leak (the unwind-edge / loop-capture conservative fallbacks below) is
 // checked for memory SAFETY without the leak itself masking a real bug.
-void expectAsanSafeIgnoringLeaks(const std::string& source,
-                                 int expectedExitCode) {
+// fix #8463 (§27.5 / §28.9 / §28.14, v0.359): no row in this file needs the
+// leak-blind posture any more (the capture cell is reclaimed on the unwind
+// edge too, so no expected leak remains to be masked by LSan's exit-code
+// override) — kept, marked [[maybe_unused]], for a future row that must
+// assert memory-safety WITHOUT the leak oracle.
+[[maybe_unused]] void expectAsanSafeIgnoringLeaks(const std::string& source,
+                                                  int expectedExitCode) {
     int a = runUnderAsanWithOptions(source, expectedExitCode,
                                     "detect_leaks=0:exitcode=99");
     if (a == -1) return;  // toolchain unavailable: skip
@@ -112,7 +129,15 @@ void expectAsanSafeIgnoringLeaks(const std::string& source,
 // expected value collapses the helper to two outcomes (crash or genuine
 // sanitizer report vs. a correct clean run), so `1` here is reachable ONLY
 // via an actual sanitizer/crash finding.
-void expectAsanLeakDetected(const std::string& source, int expectedExitCode) {
+//
+// fix #8463 (§27.5 / §28.9 / §28.14, v0.359): NO row in this file expects a
+// leak any more — the capture cell is reclaimed on the unwind edge too (by
+// counting), so the conservative leak the unwind row used to pin is gone. The
+// helper is kept (marked [[maybe_unused]]) because it is the only way this
+// file can assert the OPPOSITE — that a shape really does leak — which is
+// what a future residual-leak row would need.
+[[maybe_unused]] void expectAsanLeakDetected(const std::string& source,
+                                             int expectedExitCode) {
     int a = runUnderAsanWithOptions(source, expectedExitCode,
                                     "detect_leaks=1:exitcode=99");
     if (a == -1) return;  // toolchain unavailable: skip
@@ -254,13 +279,24 @@ BEZEL_TEST(taskscope_asan_2334, early_return_after_join_no_leak) {
 // THE UNWIND EDGE (the case the adversarial probe caught a real UAF on
 // during development of this fix): the scope disposes via DisposeAsync's
 // documented (#1422) NON-BLOCKING zombie drain, never reaching an explicit
-// Join at runtime — quiescence does not hold on this edge, so the fix must
-// NOT free the cell here. Checked in two parts: (1) memory-SAFE (no UAF/
-// double-free) with leak detection off, since the expected leak would
-// otherwise mask a real bug behind LSan's own exit-code override (CLAUDE.md);
-// (2) the conservative leak genuinely IS still present (skipCellFreeOnUnwind
-// is actually armed, not vacuously true because nothing needed it).
-BEZEL_TEST(taskscope_asan_2334, unwind_edge_conservative_leak_not_uaf) {
+// Join at runtime — the child is STILL RUNNING when the frame's scope end
+// runs, so the capture cell must NOT be freed there.
+//
+// fix #8463 (§27.5 / §28.9 / §28.14, v0.359): the cell is no longer freed
+// there, but it is no longer LEAKED there either — it is reclaimed by
+// COUNTING (the env retains the cell; the frame's scope-end RELEASE cannot
+// outrun a counted reader; the cell is freed by whoever lets go last). So
+// this row's expectation is FLIPPED: it used to assert that the conservative
+// leak was present (`expectAsanLeakDetected`), and it now asserts the fully
+// clean run — no leak AND no use-after-free — which is the property the
+// counting reclaim buys. The row is renamed accordingly: the old name
+// (`unwind_edge_conservative_leak_not_uaf`) recorded the conservative-leak
+// contract that #8463 removes.
+//
+// The memory-SAFETY half is unchanged in substance: the child is still
+// running when the frame's scope end runs, so a FREE there would be the
+// #2334 use-after-free — and this row still proves it does not happen.
+BEZEL_TEST(taskscope_asan_2334, unwind_edge_cell_reclaimed_no_uaf) {
     const std::string source =
         std::string("module M; import System.Threading; ") + kTrackedClass +
         "class Prog "
@@ -287,10 +323,10 @@ BEZEL_TEST(taskscope_asan_2334, unwind_edge_conservative_leak_not_uaf) {
         "  end Main; "
         "end Prog;";
     // `a`'s destructor still runs exactly once (the object itself is
-    // disposed normally by the `using var` unwind path; only the 8-byte
-    // CAPTURE-CELL free is what this fix conservatively skips on unwind).
-    expectAsanSafeIgnoringLeaks(source, 1);
-    expectAsanLeakDetected(source, 1);
+    // disposed normally by the `using var` unwind path), and the 8-byte
+    // CAPTURE CELL is reclaimed as well — late, by the child's envdtor,
+    // once the child is done reading it (fix #8463).
+    expectAsanClean(source, 1);
 }
 
 // Control shape / #694 loop-guard interaction: `t` is declared BEFORE

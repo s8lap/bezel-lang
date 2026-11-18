@@ -3301,12 +3301,84 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                     !(singleCaptureLocals_.count(dkey) &&
                       definitelyEscapingLambdas_.count(
                           static_cast<const void*>(&lam)));
+            // fix #8463 (§27.5 / §28.9 / §28.14, v0.359): the SECOND route —
+            // the capture cell of a local captured by a `TaskScope.Spawn` child.
+            //
+            // #2334 classifies that capture free-eligible at scope end and tags
+            // it `unwindUnsafeCellFree_`: the TaskScope's EXCEPTION-edge
+            // disposal is a NON-BLOCKING zombie drain (`bz_task_scope_dispose_
+            // unwind`, pinned by `taskscope_behavior_610,
+            // exception_edge_drain_is_nonblocking_zombie_1422`), so a
+            // still-running child may read the cell and the scope-end FREE
+            // must not run on the unwind edge. `Disposal::skipCellFreeOnUnwind`
+            // therefore SKIPS that free — which leaves the cell LEAKED on that
+            // edge: measured on the base, #8463's own repro reports
+            // "400 byte(s) leaked in 100 allocation(s)" over 100 calls, one
+            // 4-byte `int` cell per call.
+            //
+            // COUNTING is the reclaim this shape needs. The env that holds the
+            // cell announces itself with `bz_cell_retain` and drops that
+            // reference in its envdtor, so the frame's scope-end RELEASE
+            // cannot outrun a child that is still reading the cell — a counted
+            // reader keeps the cell alive by construction — and the cell is
+            // freed by whoever lets go LAST (the frame's release or the env's,
+            // whichever is later). No leak on either edge; no use-after-free
+            // on the drain edge. The #4509 `cellRelease` arm's own note says
+            // exactly this: "There is no `skipCellFreeOnUnwind` analogue here
+            // — that flag exists because a FREE on the unwind edge could outrun
+            // a #1422 zombie drain still reading the cell; a release cannot,
+            // since a reader that still holds a counted reference keeps the
+            // cell alive by construction."
+            //
+            // THE GATES are #4509's, with the two that encode the OLD route's
+            // premise replaced. This cell IS free-eligible — that is exactly
+            // the leak: the scope-end free is its only reclaim, and it is
+            // skipped on the unwind edge. And it is NOT captured by an
+            // ESCAPING lambda — the `TaskScope.Spawn` capture is classified
+            // non-escaping (that classification is what makes the scope-end
+            // free the only reclaim it had), so the old route's
+            // `declsCapturedByEscaping_` conjunct cannot hold here. The two
+            // routes are therefore mutually exclusive: the old one requires
+            // `!cellFreeEligible_`, this one requires `cellFreeEligible_`.
+            if (!armed) {
+                // A cell that holds a struct BY VALUE is declined: the
+                // DictionaryEntry<string,V> capture's Key release reads
+                // THROUGH the cell inside the scope-end free's own emission,
+                // and that emission is skipped for a counted cell — so arming
+                // here would leak the Key. (The inline-array cell is declined
+                // by `isInlineOwnedArray` above for the same class of reason.)
+                bool structValuedCell = false;
+                if (auto cvIt = cellVars_.find(newSlot);
+                    cvIt != cellVars_.end())
+                    structValuedCell = cvIt->second->isStructTy();
+                armed = !structValuedCell &&
+                        unwindUnsafeCellFree_.count(dkey) != 0 &&
+                        cellFreeEligible_.count(dkey) != 0 &&
+                        !isForVar && !isInlineOwnedArray &&
+                        !contentsAlsoManaged &&
+                        !ce.freeCellInEnvdtor &&
+                        currentFn_ == cellFreeEligibleFn_ &&
+                        !sharedCellEnvdtorFreeOwner_.count(dkey) &&
+                        !(singleCaptureLocals_.count(dkey) &&
+                          definitelyEscapingLambdas_.count(
+                              static_cast<const void*>(&lam)));
+            }
             if (!armed) cellRefcountDeclined_.insert(dkey);
         }
         if (armed) {
             // (1) — in every body, declaring or not.
             ce.retainCellInEnv = true;
             refcountedCellDecls_.insert(dkey);
+            // fix #8463 (§27.5 / §28.9, v0.359): mark the CELL HOLDER, so
+            // `emitDisposals` SKIPS the scope-end free for this cell: its
+            // reclaim is the counted RELEASE (the `Disposal::cellRelease`
+            // entry below), and a second reclaim — the free — would be a
+            // double free. Recorded only for a cell that is free-eligible,
+            // i.e. one a scope-end free could be registered for at all; the
+            // old route's cells have no such free (it requires
+            // `!cellFreeEligible_`) and are left untouched.
+            if (cellFreeEligible_.count(dkey))
+                refcountedCellSlots_.insert(newSlot);
             if (inDeclaringFrame) {
                 // (2) — the frame's release goes in the scope that DECLARED the
                 // local (`declScopeDepth_` records disposeStack_.size() at the

@@ -2132,6 +2132,41 @@ private:
     // early `continue`, so every captured local reaches the decision.
     std::unordered_set<const void*> refcountedCellDecls_;
     std::unordered_set<const void*> cellRefcountDeclined_;
+    // fix #8463 (§27.5 / §28.9 / §28.14, v0.359): the CELL HOLDERS whose
+    // capture cell is RECLAIMED BY COUNTING rather than by a scope-end free.
+    //
+    // A cell in this set is one whose frame-side reclaim is a `bz_cell_release`
+    // (the #4509 `Disposal::cellRelease` SECOND-PASS entry) instead of the
+    // `free()` the scope-end `boxedCellFree` / `boxedCellFreeDeferred` entries
+    // emit: every env that stores the cell pointer announces itself with
+    // `bz_cell_retain` and drops that reference in its envdtor, so the cell is
+    // freed by whoever lets go LAST.
+    //
+    // WHY THE SET IS KEYED BY THE HOLDER (the cell's alloca) and NOT BY THE
+    // DECL: the scope-end free entries are keyed by the holder too, and the
+    // two must agree about WHICH cells they speak about. Keying by the decl
+    // would need a decl->holder map the consumers do not have.
+    //
+    // WHY IT EXISTS AT ALL: #2334 skips the scope-end cell FREE on the unwind
+    // edge for a cell captured by a `TaskScope.Spawn` child, because the
+    // TaskScope's exception-edge disposal is a NON-BLOCKING zombie drain
+    // (`bz_task_scope_dispose_unwind`, pinned by `taskscope_behavior_610,
+    // exception_edge_drain_is_nonblocking_zombie_1422`) — a still-running
+    // child may read the cell, so freeing it there would be a use-after-free.
+    // The skip leaves the cell LEAKED on that edge (#8463: 400 B in 100
+    // allocations over 100 calls, measured on the base). A RELEASE cannot
+    // outrun the drain: a reader that still holds a counted reference keeps the
+    // cell alive by construction (the #4509 `cellRelease` arm's own note says
+    // exactly this). So for those cells the frame-side reclaim is a release,
+    // not a free, and the scope-end free entries must NOT also free them.
+    //
+    // Populated by the capture site when it arms the counting protocol for a
+    // cell (LlvmBackend_Exprs2.cpp's `lowerLambda` capture loop); consulted by
+    // `emitDisposals` (LlvmBackend_Disposal.cpp) at the two scope-end free
+    // sites. NOT saved/restored by `CaptureReclaimSetScope`: like
+    // `refcountedCellDecls_`, it is a property of the CELL, not of the body
+    // being analysed, and the holder alloca it names belongs to one body.
+    std::unordered_set<llvm::AllocaInst*> refcountedCellSlots_;
     // CG6: emitted LLVM function for each static method symbol.
     // fix #3550 (§23.3 / §23.4 / §30.5 / §28.4, v0.286): MapVector, NOT
     // unordered_map. The NestedBodyScope comment (LlvmBackend_Assign.cpp ~4665)

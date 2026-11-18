@@ -11071,6 +11071,20 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // an entry — the cell leaks there instead of a use-after-free.
         if (it->boxedCellFree) {
             if (isUnwind && it->skipCellFreeOnUnwind) continue;
+            // fix #8463 (§27.5 / §28.9 / §28.14, v0.359): a COUNTED cell
+            // (`refcountedCellSlots_`) is not freed here — it is RELEASED by
+            // the `Disposal::cellRelease` SECOND-PASS entry below, and the
+            // envs that still hold it keep it alive until they let go. A free
+            // here would be a DOUBLE free (the release already accounts for
+            // this frame's reference) and, on the unwind edge, would also
+            // outrun a `TaskScope.Spawn` child still reading the cell.
+            //
+            // WHY THE RELEASE IS THE RIGHT RECLAIM, not a leak traded for a
+            // use-after-free: the cell's own refcount decides when the LAST
+            // holder lets go, so the cell survives exactly as long as some
+            // reader can still reach it — which is the property #2334's
+            // `skipCellFreeOnUnwind` was approximating with a leak.
+            if (refcountedCellSlots_.count(it->slot)) continue;
             // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): if this
             // boxedCellFree entry also carries dictEntryKeyReleaseDeferred
             // (set in consumeLastLambdaCapturedCells when the captured local
@@ -13239,6 +13253,13 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
     for (const auto& d : scope) {
         if (!d.boxedCellFreeDeferred) continue;
         if (isUnwind && d.skipCellFreeOnUnwind) continue;
+        // fix #8463 (§27.5 / §28.9 / §28.14, v0.359): a COUNTED cell
+        // (`refcountedCellSlots_`) is RELEASED here by the `cellRelease` arm
+        // below, not freed — the same double-free argument as the FIRST PASS's
+        // `boxedCellFree` arm, and the same reason the release is sound on the
+        // unwind edge (a reader that still holds a counted reference keeps the
+        // cell alive).
+        if (refcountedCellSlots_.count(d.slot)) continue;
         llvm::Value* cell =
             builder_.CreateLoad(ptrTy(), d.slot, "cell.deferred.ptr");
         // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): if this deferred
