@@ -213,6 +213,11 @@ BEZEL_TEST(move_nullable_field_take_7849,
 // the field holding `null`, so the second take yields `null` — there is no
 // ownership left to transfer and no double-own. The retired "already moved-from"
 // report must not fire.
+//
+// #7435 (§28.2, v0.357): the null test of `b` is read BEFORE the disposals.
+// The row used to end `a?.Dispose(); b?.Dispose(); return b = null;`, a read
+// of `b` its own explicit disposal dominates -- §28.2's use-after-dispose
+// compile error, which has nothing to do with the second take this row pins.
 BEZEL_TEST(move_nullable_field_take_7849,
            second_bare_take_of_a_nullable_field_is_accepted_spec_28_8_1) {
     auto r = parseAndCheckOwnership(
@@ -222,9 +227,10 @@ BEZEL_TEST(move_nullable_field_take_7849,
         "  public method Twice(): bool "
         "    var a := move _c; "
         "    var b := move _c; "
+        "    var secondIsNull := b = null; "
         "    a?.Dispose(); "
         "    b?.Dispose(); "
-        "    return b = null; "
+        "    return secondIsNull; "
         "  end Twice; "
         "end Holder; "
         "class C public static method Main(): int return 0; end Main; end C;");

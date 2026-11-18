@@ -93,12 +93,13 @@ std::string wrapOwning(const std::string& body) {
         body + " end Main; end C;";
 }
 
-// True iff some WARNING diagnostic names `name` after a dominating Dispose
-// (the §28.2 use-after-dispose message text). Scans Warning-severity directly
-// because `hasErrorMessage` deliberately filters warnings.
-bool hasDisposeWarningFor(const OwnershipResult& r, const std::string& name) {
+// True iff some ERROR diagnostic names `name` after a dominating Dispose
+// (the §28.2 use-after-dispose message text). #7435 (§28.2, v0.357): a use
+// the explicit disposal dominates is a compile ERROR; it was the WARNING of
+// the earlier revisions when these rows were written.
+bool hasDisposeErrorFor(const OwnershipResult& r, const std::string& name) {
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != bezel::Severity::Warning) continue;
+        if (d.severity != bezel::Severity::Error) continue;
         if (d.message.find("after a dominating explicit Dispose()") ==
                 std::string::npos) continue;
         if (d.message.find("`" + name + "`") == std::string::npos) continue;
@@ -147,11 +148,12 @@ BEZEL_TEST(check_read_index_expr_target_4065,
         "arr.Dispose(); "
         "var x: int := arr[0]!.V; "
         "return x;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors() ||
-                      hasDisposeWarningFor(r, "arr"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     // The diagnostic must name the receiver, not just the slot — this is what
     // the gate was failing to consult.
-    BEZEL_EXPECT_TRUE(hasDisposeWarningFor(r, "arr"));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(hasDisposeErrorFor(r, "arr"));
 }
 
 // §28.2 (#4065): the issue's own second example — `Reader.Peek(arr[0])` off a
@@ -167,7 +169,9 @@ BEZEL_TEST(check_read_index_expr_target_4065,
         "using var arr: OwningArray<Cell> := [new Cell(1)]; "
         "arr.Dispose(); "
         "return Reader.Peek(arr[0]!);"));
-    BEZEL_EXPECT_TRUE(hasDisposeWarningFor(r, "arr"));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(hasDisposeErrorFor(r, "arr"));
 }
 
 // §28.3 K1.3 (#4065): an UNREADABLE local (one whose whole value has been
@@ -231,7 +235,9 @@ BEZEL_TEST(check_read_index_expr_target_4065,
         "arr.Dispose(); "
         "arr[0] := new Cell(2); "
         "return 0;"));
-    BEZEL_EXPECT_TRUE(hasDisposeWarningFor(r, "arr"));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(hasDisposeErrorFor(r, "arr"));
 }
 
 // §28.3 K1.3 (#4065): the WRITE-side moved-from twin — `arr[0] := …` after

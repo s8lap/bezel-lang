@@ -400,6 +400,11 @@ const char* kCoalesceConformingStore =
 // CHOICE the fix had to make: the boundary check is emitted AFTER `lvalueAddr`,
 // so §28.2's disposed guard precedes it and DisposedAccessException wins,
 // exactly as on #4646's `:=` arm and #4682's compound one.
+// Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+// a compile error, so the checked-mode backstop is observed through an
+// alias whose source has a CONDITIONAL kill ("A holder whose source was
+// disposed on only some paths to the use ... is not rejected: a use through
+// it raises `DisposedAccessException` in checked disposal mode").
 const char* kDisposedCoalesce =
     "module S; class CD "
     "  public property P: int? := null; "
@@ -408,18 +413,20 @@ const char* kDisposedCoalesce =
     "  destructor P := null; end destructor; "
     "end CD; "
     "class MainSD "
-    "  public static method Main(): int "
+    "  public static method Probe(kill: bool): int "
     "    var r: int := 0; "
     "    var c := new CD(); "
-    "    c.Dispose(); "
+    "    var view := c; "
+    "    if kill then c.Dispose(); end; "
     "    try "
-    "      c.P ??= 7; "
+    "      view.P ??= 7; "
     "      r := 42; "
     "    catch DisposedAccessException => r := 55; "
     "    catch ContractViolationException => r := 99; "
     "    end; "
     "    return r; "
-    "  end Main; "
+    "  end Probe; "
+    "  public static method Main(): int return Probe(true); end Main; "
     "end MainSD;";
 
 }  // namespace

@@ -58,20 +58,27 @@ int runDefault(const std::string& program) {
 // ── §28.2 v0.135: stored-field READ on disposed instance ─────────────────
 
 BEZEL_TEST(codegen_checked_disposal_621, spec_28_2_field_read_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.135: "a field access through the reference" on a disposed
     // instance raises DisposedAccessException in checked mode.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
         "  public V: int := 42; "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var obj := new C(); "
-        "    obj.Dispose(); "
+        "    var view := obj; "
+        "    if kill then obj.Dispose(); end; "
         "    try "
-        "      var x := obj.V; "
+        "      var x := view.V; "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 
@@ -79,20 +86,27 @@ BEZEL_TEST(codegen_checked_disposal_621, spec_28_2_field_read_raises) {
 // ── §28.2 v0.135: stored-field WRITE on disposed instance ────────────────
 
 BEZEL_TEST(codegen_checked_disposal_621, spec_28_2_field_write_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.135: writing to a field of a disposed instance raises
     // DisposedAccessException in checked mode.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
         "  public V: int := 0; "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var obj := new C(); "
-        "    obj.Dispose(); "
+        "    var view := obj; "
+        "    if kill then obj.Dispose(); end; "
         "    try "
-        "      obj.V := 99; "
+        "      view.V := 99; "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 
@@ -152,20 +166,27 @@ BEZEL_TEST(codegen_checked_disposal_621, spec_28_2_this_field_access_no_double_g
 // ── §28.2: DisposedAccessException from field read catchable as base ─────
 
 BEZEL_TEST(codegen_checked_disposal_621, spec_31_4_field_raise_caught_by_base) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §31.4 v0.135: DisposedAccessException isa InvalidOperationException.
     // A catch arm for the base type must catch the field-access guard raise.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
         "  public V: int := 0; "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var obj := new C(); "
-        "    obj.Dispose(); "
+        "    var view := obj; "
+        "    if kill then obj.Dispose(); end; "
         "    try "
-        "      var x := obj.V; "
+        "      var x := view.V; "
         "      return 0; "
         "    catch var e: InvalidOperationException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 
@@ -201,21 +222,28 @@ BEZEL_TEST(codegen_checked_disposal_621, spec_28_2_correct_field_prog_default) {
 // ── §28.2 v0.135: built-in Array<int> indexer GET on disposed array ───────
 
 BEZEL_TEST(codegen_checked_disposal_621, spec_28_2_array_indexer_get_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.135: "a property or indexer accessor invocation" on a disposed
     // instance raises DisposedAccessException. The built-in Array<T> indexer
     // is an indexer accessor; accessing it after Dispose() must raise.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var arr := new Array<int>(); "
         "    arr.Add(10); "
-        "    arr.Dispose(); "
+        "    var view := arr; "
+        "    if kill then arr.Dispose(); end; "
         "    try "
-        "      var x := arr[0]; "
+        "      var x := view[0]; "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 
@@ -223,20 +251,27 @@ BEZEL_TEST(codegen_checked_disposal_621, spec_28_2_array_indexer_get_raises) {
 // ── §28.2 v0.135: built-in Array<int> indexer SET on disposed array ───────
 
 BEZEL_TEST(codegen_checked_disposal_621, spec_28_2_array_indexer_set_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.135: the indexer setter on a disposed Array<T> likewise raises
     // DisposedAccessException in checked mode.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var arr := new Array<int>(); "
         "    arr.Add(0); "
-        "    arr.Dispose(); "
+        "    var view := arr; "
+        "    if kill then arr.Dispose(); end; "
         "    try "
-        "      arr[0] := 5; "
+        "      view[0] := 5; "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 

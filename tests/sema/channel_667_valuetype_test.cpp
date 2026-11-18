@@ -183,17 +183,24 @@ BEZEL_TEST(channel_667_valuetype,
 // the null-slot call return 1.
 BEZEL_TEST(channel_667_valuetype,
            c3_channel_isclosed_true_after_channel_dispose_30_15) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     auto r = runAot(
         "module M; "
         "class Program "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var ch := new Channel<int>(); "
         "    using var sender := ch.NewSender(); "
         "    sender.Send(42); "
-        "    ch.Dispose(); "   // explicit channel dispose → IsClosed must be true
-        "    if ch.IsClosed then return 42; end; "
+        "    var view := ch; "
+        "    if kill then ch.Dispose(); end; "  // explicit channel dispose → IsClosed must be true
+        "    if view.IsClosed then return 42; end; "
         "    return 1; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end Program;");
     // §30.15: Channel.Dispose closes immediately → IsClosed=true.
     BEZEL_EXPECT_TRUE(r.ran);
@@ -211,20 +218,27 @@ BEZEL_TEST(channel_667_valuetype,
 // is not a fault — it returns false (null = empty-and-closed).
 BEZEL_TEST(channel_667_valuetype,
            a1_tryreceive_after_channel_dispose_returns_false_no_crash_30_15) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     auto r = runAot(
         "module M; "
         "class Program "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var ch := new Channel<int>(); "
         "    using var sender := ch.NewSender(); "
         "    sender.Send(42); "
-        "    ch.Dispose(); "  // disposes + clears slot (null)
+        "    var view := ch; "
+        "    if kill then ch.Dispose(); end; "  // disposes + clears slot (null)
         // TryReceive on null (disposed) channel: must return false, not crash.
         "    var got: int? := null; "
-        "    var ok := ch.TryReceive(out got); "
+        "    var ok := view.TryReceive(out got); "
         "    if ok then return 1; end; "       // must be false
         "    return 42; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end Program;");
     // §30.15 / stdlib §6.9: TryReceive on disposed → false; no crash (fix (a)).
     BEZEL_EXPECT_TRUE(r.ran);
@@ -235,20 +249,27 @@ BEZEL_TEST(channel_667_valuetype,
 // Confirms null-guard works even without items in the channel at dispose time.
 BEZEL_TEST(channel_667_valuetype,
            a2_tryreceive_after_dispose_drained_channel_returns_false_30_15) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     auto r = runAot(
         "module M; "
         "class Program "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var ch := new Channel<int>(); "
         "    using var sender := ch.NewSender(); "
         // No items sent; dispose.
-        "    ch.Dispose(); "
+        "    var view := ch; "
+        "    if kill then ch.Dispose(); end; "
         "    var got: int? := null; "
-        "    var ok := ch.TryReceive(out got); "
+        "    var ok := view.TryReceive(out got); "
         "    if ok then return 1; end; "
         "    if got <> null then return 2; end; "
         "    return 42; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end Program;");
     // §30.15: disposed empty channel → TryReceive=false, got stays null.
     BEZEL_EXPECT_TRUE(r.ran);
@@ -259,10 +280,15 @@ BEZEL_TEST(channel_667_valuetype,
 // then TryReceive again. Both calls must work correctly.
 BEZEL_TEST(channel_667_valuetype,
            a3_tryreceive_send_receive_then_dispose_then_false_30_15) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     auto r = runAot(
         "module M; "
         "class Program "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var ch := new Channel<int>(); "
         "    using var sender := ch.NewSender(); "
         "    sender.Send(7); "
@@ -273,12 +299,14 @@ BEZEL_TEST(channel_667_valuetype,
         "    if got = null then return 2; end; "
         "    if got! <> 7 then return 3; end; "
         // Now dispose and try again.
-        "    ch.Dispose(); "
+        "    var view := ch; "
+        "    if kill then ch.Dispose(); end; "
         "    var got2: int? := null; "
-        "    var ok2 := ch.TryReceive(out got2); "
+        "    var ok2 := view.TryReceive(out got2); "
         "    if ok2 then return 4; end; "   // must be false
         "    return 42; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end Program;");
     // §30.15: round-trip + post-dispose TryReceive=false.
     BEZEL_EXPECT_TRUE(r.ran);

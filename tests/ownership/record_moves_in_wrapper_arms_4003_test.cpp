@@ -190,9 +190,15 @@ constexpr char kDisposedMoveWarn[] =
 // severity change, not a relaxation of the program's static analysis
 // (the conditional-kill `maybeConsumed` arm still errors).  Returns true
 // iff the diagnostic matches; used by every NEGATIVE row below.
-inline bool hasMoveAfterDisposeWarning(const OwnershipResult& r) {
+//
+// #7435 (§28.2, v0.357): the verdict is an ERROR again -- "under a
+// *dominating* kill every use in the list above is this error -- a
+// **consume** exactly as a read is, `move x` and an `owned` argument position
+// included". The consume-side wording's leading text is unchanged; the
+// helper scans Error-severity.
+inline bool hasMoveAfterDisposeError(const OwnershipResult& r) {
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.severity == bezel::Severity::Warning &&
+        if (d.severity == bezel::Severity::Error &&
             d.message.find(kDisposedMoveWarn) != std::string::npos)
             return true;
     return false;
@@ -230,7 +236,7 @@ std::string program(const std::string& classesAndMain) {
 // the shared predicate defined above.
 // =============================================================================
 BEZEL_TEST(record_moves_in_wrapper_arms_4003,
-           direct_new_ctor_move_of_disposed_local_warns_28_2_4450_control) {
+           direct_new_ctor_move_of_disposed_local_is_error_28_2_4450_control) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -239,8 +245,10 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
         "    return h.v; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeError(r));
 }
 
 // =============================================================================
@@ -253,7 +261,7 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
 // rename to `_warns_28_2_4450`.
 // =============================================================================
 BEZEL_TEST(record_moves_in_wrapper_arms_4003,
-           member_access_wrapping_new_ctor_move_of_disposed_local_warns_28_2_4450) {
+           member_access_wrapping_new_ctor_move_of_disposed_local_is_error_28_2_4450) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -262,8 +270,10 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
         "    return y; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeError(r));
 }
 
 // The same case through the STRONG AOT oracle (real `bezelc` + link + exec):
@@ -276,7 +286,7 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
 // analogue so every #4003 wrapper kind has its own checked-mode row.
 BEZEL_TEST(
     record_moves_in_wrapper_arms_4003,
-    aot_member_access_wrapping_new_ctor_move_of_disposed_local_raises_in_checked_mode_4450) {
+    aot_member_access_wrapping_new_ctor_move_of_disposed_local_rejected_at_compile_time_4450) {
     JitResult r = runAotCheckedDisposal(program(
         "class C "
         "  public static method Main(): int "
@@ -288,8 +298,12 @@ BEZEL_TEST(
         "    end; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 1);
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(
+        bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "§28.2's use-after-dispose compile error"));
 }
 
 // =============================================================================
@@ -299,7 +313,7 @@ BEZEL_TEST(
 // under ASan (measured).  Post-ruling the verdict is §28.2 WARNING.
 // =============================================================================
 BEZEL_TEST(record_moves_in_wrapper_arms_4003,
-           index_expr_wrapping_new_ctor_move_of_disposed_local_warns_28_2_4450) {
+           index_expr_wrapping_new_ctor_move_of_disposed_local_is_error_28_2_4450) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "class Res "
@@ -321,8 +335,10 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
         "    return y; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeError(r));
 }
 
 // =============================================================================
@@ -335,7 +351,7 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
 // under ASan (measured).  Post-ruling the verdict is §28.2 WARNING.
 // =============================================================================
 BEZEL_TEST(record_moves_in_wrapper_arms_4003,
-           postfix_bang_wrapping_new_ctor_move_of_disposed_local_warns_28_2_4450) {
+           postfix_bang_wrapping_new_ctor_move_of_disposed_local_is_error_28_2_4450) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -344,8 +360,10 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
         "    return y; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeError(r));
 }
 
 // =============================================================================
@@ -355,7 +373,7 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
 // under ASan (measured).  Post-ruling the verdict is §28.2 WARNING.
 // =============================================================================
 BEZEL_TEST(record_moves_in_wrapper_arms_4003,
-           null_cond_member_wrapping_factory_move_of_disposed_local_warns_28_2_4450) {
+           null_cond_member_wrapping_factory_move_of_disposed_local_is_error_28_2_4450) {
     auto r = parseAndCheckOwnership(program(
         "class Factory "
         "  public static method Make(owned r: Res): owned Holder? "
@@ -369,8 +387,10 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
         "    return y ?? -1; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeError(r));
 }
 
 // =============================================================================
@@ -381,7 +401,7 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
 // under ASan (measured).  Post-ruling the verdict is §28.2 WARNING.
 // =============================================================================
 BEZEL_TEST(record_moves_in_wrapper_arms_4003,
-           null_cond_call_wrapping_lambda_move_of_disposed_local_warns_28_2_4450) {
+           null_cond_call_wrapping_lambda_move_of_disposed_local_is_error_28_2_4450) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "class Res "
@@ -398,8 +418,10 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
         "    return y ?? -1; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeError(r));
 }
 
 // =============================================================================
@@ -409,7 +431,7 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
 // under ASan (measured).  Post-ruling the verdict is §28.2 WARNING.
 // =============================================================================
 BEZEL_TEST(record_moves_in_wrapper_arms_4003,
-           type_test_wrapping_new_ctor_move_of_disposed_local_warns_28_2_4028_4450) {
+           type_test_wrapping_new_ctor_move_of_disposed_local_is_error_28_2_4028_4450) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -418,8 +440,10 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
         "    return (if y then 1 else 0); "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeError(r));
 }
 
 // The AOT oracle's half for the row above.  Program now COMPILES (with a
@@ -428,7 +452,7 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
 // consume positions.
 BEZEL_TEST(
     record_moves_in_wrapper_arms_4003,
-    aot_type_test_wrapping_new_ctor_move_of_disposed_local_raises_in_checked_mode_4028_4450) {
+    aot_type_test_wrapping_new_ctor_move_of_disposed_local_rejected_at_compile_time_4028_4450) {
     JitResult r = runAotCheckedDisposal(program(
         "class C "
         "  public static method Main(): int "
@@ -440,8 +464,12 @@ BEZEL_TEST(
         "    end; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 1);
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(
+        bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "§28.2's use-after-dispose compile error"));
 }
 
 // =============================================================================
@@ -452,7 +480,7 @@ BEZEL_TEST(
 // =============================================================================
 BEZEL_TEST(
     record_moves_in_wrapper_arms_4003,
-    interpolated_string_wrapping_new_ctor_move_of_disposed_local_warns_28_2_4028_4450) {
+    interpolated_string_wrapping_new_ctor_move_of_disposed_local_is_error_28_2_4028_4450) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -461,13 +489,15 @@ BEZEL_TEST(
         "    return s.Length; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeError(r));
 }
 
 BEZEL_TEST(
     record_moves_in_wrapper_arms_4003,
-    aot_interpolated_string_wrapping_new_ctor_move_of_disposed_local_raises_in_checked_mode_4028_4450) {
+    aot_interpolated_string_wrapping_new_ctor_move_of_disposed_local_rejected_at_compile_time_4028_4450) {
     JitResult r = runAotCheckedDisposal(program(
         "class C "
         "  public static method Main(): int "
@@ -479,8 +509,12 @@ BEZEL_TEST(
         "    end; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 1);
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(
+        bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "§28.2's use-after-dispose compile error"));
 }
 
 // =============================================================================

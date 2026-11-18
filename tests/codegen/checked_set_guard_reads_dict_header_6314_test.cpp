@@ -311,19 +311,27 @@ public class Program
 end Program;
 )BZL";
 
+// Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is a
+// compile error (and a read of `x` itself after a CONDITIONAL kill is §28.3's
+// conditional-discharge join error), so the member access is made through the
+// alias `view`, whose source has a conditional kill ("A holder whose source
+// was disposed on only some paths to the use ... is not rejected: a use
+// through it raises `DisposedAccessException` in checked disposal mode").
 std::string afterDispose(const std::string& use) {
-    return "module M; class C public static method Main(): int "
+    return "module M; class C public static method Probe(kill: bool): int "
            "  var i := 0; "
            "  while i < 100 do "
            "    try "
-           "      using var x: Set<int> := [1, 2]; x.Dispose(); " + use +
+           "      using var x: Set<int> := [1, 2]; var view := x; "
+           "      if kill then x.Dispose(); end; " + use +
            "      Console.WriteLine(\"no-raise\"); "
            "    catch "
            "      DisposedAccessException => Console.WriteLine(\"DAE\"), "
            "    end try; "
            "    i := i + 1; "
            "  end; "
-           "  return 0; end Main; end C;";
+           "  return 0; end Probe; "
+           "  public static method Main(): int return Probe(true); end Main; end C;";
 }
 
 // A borrow of a live local set stored in a holder; the local is then disposed
@@ -496,10 +504,10 @@ BEZEL_TEST(codegen_checked_set_guard_reads_dict_header_6314, control_stale_borro
 // table and nulls the slot — the member call then runs on a null table and
 // nothing raises (measured: `no-raise`).
 BEZEL_TEST(codegen_checked_set_guard_reads_dict_header_6314, control_set_member_after_explicit_dispose_raises_100x_28_2) {
-    BEZEL_EXPECT_EQ(outChecked(afterDispose("if x.Contains(1) then Console.WriteLine(1); end; ")),
+    BEZEL_EXPECT_EQ(outChecked(afterDispose("if view.Contains(1) then Console.WriteLine(1); end; ")),
                     times("DAE\n", 100));
-    BEZEL_EXPECT_EQ(outChecked(afterDispose("x.Add(3); ")), times("DAE\n", 100));
-    BEZEL_EXPECT_EQ(outChecked(afterDispose("Console.WriteLine(x.Count); ")),
+    BEZEL_EXPECT_EQ(outChecked(afterDispose("view.Add(3); ")), times("DAE\n", 100));
+    BEZEL_EXPECT_EQ(outChecked(afterDispose("Console.WriteLine(view.Count); ")),
                     times("DAE\n", 100));
 }
 

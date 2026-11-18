@@ -68,8 +68,12 @@ bool rejectsDisposedBeforeInvoke(const bezel::test::OwnershipResult& r,
     const std::string needle =
         std::string("closure captures `") + name +
         "` which was disposed before this invocation";
+    // #7435 (§28.2, v0.357): "A closure that captures the variable itself
+    // ... reads the variable when it is invoked (§27.5): its invocation after
+    // the kill is a use of the variable under the first sentence" -- a compile
+    // ERROR; it was a Warning while the rule was the earlier revisions'.
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != Severity::Warning) continue;
+        if (d.severity != Severity::Error) continue;
         if (d.message.find(needle) != std::string::npos) return true;
     }
     return false;

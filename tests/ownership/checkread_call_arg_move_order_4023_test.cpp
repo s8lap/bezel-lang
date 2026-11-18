@@ -89,6 +89,7 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"         // runAotCheckedDisposal — the strong AOT oracle (§28.2 backstop)
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
@@ -104,20 +105,10 @@ namespace {
 constexpr char kUseAfterDisposeWarningFragment[] =
     "after a dominating explicit Dispose() call";
 
-// `hasErrorMessage` (ownership_support.hpp) deliberately scans ERROR-severity
-// diagnostics only (its own header comment: "auto-drop warnings ... and
-// use-after-dispose warnings (§28.2) are filtered out"). The §28.2
-// use-after-dispose diagnostic this file's accept-side sweep needs to
-// confirm STILL fires is a WARNING (see `checkRead`'s `IdentifierExpr` arm),
-// so scan Warning-severity diagnostics directly, mirroring
-// `hasAutoDropWarning`'s own shape for the sibling warning family.
-bool hasWarningMessage(const OwnershipResult& r, std::string_view needle) {
-    for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != bezel::Severity::Warning) continue;
-        if (d.message.find(needle) != std::string::npos) return true;
-    }
-    return false;
-}
+// #7435 (§28.2, v0.357): the §28.2 use-after-dispose diagnostic under a
+// DOMINATING kill is a compile ERROR, so the rows below read it through
+// `hasErrorMessage` (ownership_support.hpp); the Warning-severity scanner
+// this file carried while the rule was the v0.303 warning is gone with it.
 
 // v0.303 / #4450 (the #3975 option-1 ruling): under a DOMINATING
 // `Dispose()`, every use of the source local — read, borrow, AND consume —
@@ -131,9 +122,14 @@ bool hasWarningMessage(const OwnershipResult& r, std::string_view needle) {
 // conditional-kill arms).
 //
 // per §28.2, §28.3 K1.3/K7, v0.303, #3975 (option 1), #4450
-inline bool hasUseAfterDisposeWarning(const OwnershipResult& r) {
+//
+// #7435 (§28.2, v0.357): the severity of that one verdict is now ERROR --
+// "under a *dominating* kill every use in the list above is this error -- a
+// **consume** exactly as a read is". The two wordings are unchanged in
+// their leading text; the helper scans Error-severity.
+inline bool hasUseAfterDisposeError(const OwnershipResult& r) {
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != bezel::Severity::Warning) continue;
+        if (d.severity != bezel::Severity::Error) continue;
         if (d.message.find("use of `x` after a dominating explicit "
                            "Dispose() call") != std::string::npos) return true;
         if (d.message.find("move from a local `x` already disposed at "
@@ -192,7 +188,7 @@ std::string program(const std::string& classesAndMain) {
 // GONE.
 // =============================================================================
 BEZEL_TEST(checkread_call_arg_move_order_4023,
-           direct_new_ctor_move_of_disposed_local_warns_28_2_4450_control) {
+           direct_new_ctor_move_of_disposed_local_is_error_28_2_4450_control) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -201,8 +197,10 @@ BEZEL_TEST(checkread_call_arg_move_order_4023,
         "    return h.v; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeError(r));
     BEZEL_EXPECT_FALSE(hasCannotMoveFromDisposedError(r));
 }
 
@@ -221,7 +219,7 @@ BEZEL_TEST(checkread_call_arg_move_order_4023,
 // `DisposedAccessException`, observed in the backstop row below.
 // =============================================================================
 BEZEL_TEST(checkread_call_arg_move_order_4023,
-           bare_call_move_of_disposed_local_warns_28_2_4450) {
+           bare_call_move_of_disposed_local_is_error_28_2_4450) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -230,8 +228,10 @@ BEZEL_TEST(checkread_call_arg_move_order_4023,
         "    return y!.v; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeError(r));
     BEZEL_EXPECT_FALSE(hasCannotMoveFromDisposedError(r));
 }
 
@@ -243,7 +243,7 @@ BEZEL_TEST(checkread_call_arg_move_order_4023,
 // "warns, then crashes at runtime" is the §28.2 verdict; this row pins it
 // so "warns, runs to completion" is not a hole in the contract.
 BEZEL_TEST(checkread_call_arg_move_order_4023,
-           aot_bare_call_move_of_disposed_local_warns_28_2_4450_checked_backstop) {
+           aot_bare_call_move_of_disposed_local_is_error_28_2_4450_compile_rejection) {
     JitResult jr = runAotCheckedDisposal(program(
         "class C "
         "  public static method Main(): int "
@@ -255,8 +255,12 @@ BEZEL_TEST(checkread_call_arg_move_order_4023,
         "    end; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(jr.ran);
-    BEZEL_EXPECT_EQ(jr.exitCode, 1);
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(
+        bezel::test::failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        jr, "§28.2's use-after-dispose compile error"));
 }
 
 // =============================================================================
@@ -306,7 +310,7 @@ BEZEL_TEST(checkread_call_arg_move_order_4023,
 // a top-level `move`/`await` is skipped) and did not silently widen to
 // swallow the ordinary read-check path for every argument.
 BEZEL_TEST(checkread_call_arg_move_order_4023,
-           accept_bare_call_plain_read_of_disposed_local_still_warns) {
+           accept_bare_call_plain_read_of_disposed_local_is_error) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "class Res "
@@ -324,8 +328,10 @@ BEZEL_TEST(checkread_call_arg_move_order_4023,
         "    return y; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasWarningMessage(r, kUseAfterDisposeWarningFragment));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kUseAfterDisposeWarningFragment));
 }
 
 // A `move` argument to a bare call reached through a straight-line loop

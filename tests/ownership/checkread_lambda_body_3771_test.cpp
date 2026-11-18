@@ -97,14 +97,6 @@ bool rejectsDisposeCapture(const OwnershipResult& r, const char* name) {
     return false;
 }
 
-bool hasWarningMessage(const OwnershipResult& r, std::string_view needle) {
-    for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != Severity::Warning) continue;
-        if (d.message.find(needle) != std::string::npos) return true;
-    }
-    return false;
-}
-
 } // namespace
 
 // --- Row 1: maybe-consumed capture (cross-branch Owned ⊓ MovedFrom) -------
@@ -235,7 +227,9 @@ BEZEL_TEST(checkread_lambda_body_3771, direct_dispose_still_emits_28_2) {
         "  p.Dispose(); "
         "  _ := p.V(); "
         "end Run; "));
-    BEZEL_EXPECT_TRUE(hasWarningMessage(
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
         r, std::string("use of `p` after a dominating explicit Dispose() "
                        "call")));
 }

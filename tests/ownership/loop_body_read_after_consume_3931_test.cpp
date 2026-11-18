@@ -195,14 +195,16 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
 }
 
 BEZEL_TEST(loop_body_read_after_consume_3931,
-           straight_line_read_after_dispose_warns_28_2_control) {
+           straight_line_read_after_dispose_is_error_28_2_control) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); "
         "x.Dispose(); "
         "Sink.Peek(x); "
         "return 0;"));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(r, bezel::Severity::Warning, kUseAfterDispose));
+        diagWithSeverity(r, bezel::Severity::Error, kUseAfterDispose));
 }
 
 // ============================================================================
@@ -420,7 +422,7 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
 // FAILS WITHOUT THE FIX: zero diagnostics at all; the program SEGVs.
 // ============================================================================
 BEZEL_TEST(loop_body_read_after_consume_3931,
-           while_body_read_after_dispose_warns_28_2) {
+           while_body_read_after_dispose_is_error_28_2) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); "
         "x.Dispose(); "
@@ -430,15 +432,17 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
         "  i := i + 1; "
         "end; "
         "return 0;"));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(r, bezel::Severity::Warning, kUseAfterDispose));
-    BEZEL_EXPECT_FALSE(
         diagWithSeverity(r, bezel::Severity::Error, kUseAfterDispose));
+    BEZEL_EXPECT_FALSE(
+        diagWithSeverity(r, bezel::Severity::Warning, kUseAfterDispose));
     BEZEL_EXPECT_TRUE(diagHasRealLocation(r, kUseAfterDispose));
 }
 
 BEZEL_TEST(loop_body_read_after_consume_3931,
-           for_range_body_read_after_dispose_warns_28_2) {
+           for_range_body_read_after_dispose_is_error_28_2) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); "
         "x.Dispose(); "
@@ -446,12 +450,14 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
         "  Sink.Peek(x); "
         "end; "
         "return 0;"));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(r, bezel::Severity::Warning, kUseAfterDispose));
+        diagWithSeverity(r, bezel::Severity::Error, kUseAfterDispose));
 }
 
 BEZEL_TEST(loop_body_read_after_consume_3931,
-           while_body_member_read_after_dispose_warns_28_2) {
+           while_body_member_read_after_dispose_is_error_28_2) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); "
         "x.Dispose(); "
@@ -461,8 +467,10 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
         "  i := i + y; "
         "end; "
         "return 0;"));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(r, bezel::Severity::Warning, kUseAfterDispose));
+        diagWithSeverity(r, bezel::Severity::Error, kUseAfterDispose));
 }
 
 // ============================================================================
@@ -563,7 +571,7 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
 // `kUseAfterDispose` produced by `checkRead`.  Both rows of this
 // loop-vs-straight-line twin therefore pin the consume-side wording.
 BEZEL_TEST(loop_body_read_after_consume_3931,
-           while_body_move_after_dispose_warns_28_2_like_straight_line) {
+           while_body_move_after_dispose_is_error_28_2_like_straight_line) {
     const char* kBody =
         "x.Dispose(); "
         "var t := 0; "
@@ -579,11 +587,13 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
     // post-ruling consume-side wording (produced by `markMovedByName`'s
     // demoted Disposed arm, the sole authority once #4023's skip has
     // taken `checkRead` out of the picture for this argument position).
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(loop, bezel::Severity::Warning, kMoveAfterDisposeWarn));
+        diagWithSeverity(loop, bezel::Severity::Error, kMoveAfterDisposeWarn));
     BEZEL_EXPECT_TRUE(diagHasRealLocation(loop, kMoveAfterDisposeWarn));
     // ...and it is a WARNING, not an error: §28.2's dominating-kill regime.
-    BEZEL_EXPECT_FALSE(loop.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(loop.diagnostics.hasErrors());
     // The OLD §28.3 ERROR text must NOT fire — the ruling moved the
     // verdict off §28.3's consume-table for the dominating kill.
     BEZEL_EXPECT_FALSE(
@@ -597,8 +607,8 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
         "t := t + Sink.Take(move x); "
         "return t;"));
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(sl, bezel::Severity::Warning, kMoveAfterDisposeWarn));
-    BEZEL_EXPECT_FALSE(sl.diagnostics.hasErrors());
+        diagWithSeverity(sl, bezel::Severity::Error, kMoveAfterDisposeWarn));
+    BEZEL_EXPECT_TRUE(sl.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(
         diagWithSeverity(sl, bezel::Severity::Error, kCannotMoveDisposed));
 }
@@ -691,7 +701,7 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
 // hole.  (Measured on the batch tip: unchecked mode segfaults — §28.2's
 // "undefined behavior" — and checked mode exits 1 through the arm.)
 BEZEL_TEST(loop_body_read_after_consume_3931,
-           while_body_move_after_dispose_raises_in_checked_mode_28_2) {
+           while_body_move_after_dispose_rejected_at_compile_time_28_2) {
     JitResult jr = runAotCheckedDisposal(wrap(
         "var x := new Res(1); "
         "x.Dispose(); "
@@ -705,8 +715,12 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
         "  return 0; "
         "catch DisposedAccessException => return 1; "
         "end; "));
-    BEZEL_EXPECT_TRUE(jr.ran);
-    BEZEL_EXPECT_EQ(jr.exitCode, 1);
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(
+        bezel::test::failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        jr, "§28.2's use-after-dispose compile error"));
 }
 
 // ============================================================================
@@ -727,7 +741,7 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
 // this row reach the verdict at all (#3949 deliberately skips checkRead).
 // ============================================================================
 BEZEL_TEST(loop_body_read_after_consume_3931,
-           while_body_top_level_move_after_dispose_warns_28_2_4450) {
+           while_body_top_level_move_after_dispose_is_error_28_2_4450) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); "
         "var y := new Res(2); "
@@ -739,9 +753,11 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
         "end; "
         "return y.tag;"));
     // §28.2 WARNING at a real location — the dominating-kill verdict.
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(r, bezel::Severity::Warning, kMoveAfterDisposeWarn));
+        diagWithSeverity(r, bezel::Severity::Error, kMoveAfterDisposeWarn));
     BEZEL_EXPECT_TRUE(diagHasRealLocation(r, kMoveAfterDisposeWarn));
     // The §28.3 ERROR text must NOT fire — the ruling is the WHOLE POINT.
     BEZEL_EXPECT_FALSE(
@@ -752,16 +768,18 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
 // CONSISTENCY is the #3931 invariant these rows have always owned; pinning
 // the equality here is what survives any future ruling flip.
 BEZEL_TEST(loop_body_read_after_consume_3931,
-           straight_line_top_level_move_after_dispose_warns_28_2_4450_control) {
+           straight_line_top_level_move_after_dispose_is_error_28_2_4450_control) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); "
         "var y := new Res(2); "
         "x.Dispose(); "
         "y := move x; "
         "return y.tag;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(r, bezel::Severity::Warning, kMoveAfterDisposeWarn));
+        diagWithSeverity(r, bezel::Severity::Error, kMoveAfterDisposeWarn));
 }
 
 // The AOT oracle's half of the row above.  The program now COMPILES (with a
@@ -786,7 +804,7 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
 // so the runtime exception fires and the catch arm observes it; the
 // static-analysis verdict (the §28.2 warning) is unchanged.
 BEZEL_TEST(loop_body_read_after_consume_3931,
-           while_body_top_level_move_after_dispose_raises_in_checked_mode_28_2_4450) {
+           while_body_top_level_move_after_dispose_rejected_at_compile_time_28_2_4450) {
     JitResult jr = runAotCheckedDisposal(wrap(
         "var x := new Res(1); "
         "var y := new Res(2); "
@@ -801,8 +819,12 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
         "  return 0; "
         "catch DisposedAccessException => return 1; "
         "end; "));
-    BEZEL_EXPECT_TRUE(jr.ran);
-    BEZEL_EXPECT_EQ(jr.exitCode, 1);
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(
+        bezel::test::failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        jr, "§28.2's use-after-dispose compile error"));
 }
 
 // ============================================================================

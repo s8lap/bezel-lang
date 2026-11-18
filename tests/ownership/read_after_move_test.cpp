@@ -21,11 +21,24 @@ std::string wrap(const std::string& body, const std::string& sig = "M()") {
         "end C;";
 }
 
-// True iff any diagnostic mentions the §28.2 use-after-dispose warning.
-bool hasUseAfterDisposeWarning(const bezel::test::OwnershipResult& r) {
+// True iff any diagnostic mentions the §28.2 use-after-dispose wording, at
+// any severity.
+bool hasUseAfterDisposeDiag(const bezel::test::OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("after a dominating explicit Dispose") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True iff `r` carries the repeated-disposal warning for `x` (§28.2, v0.357:
+// "a second `Dispose()` ..., or a second discard, of the same binding ...
+// draws a compile-time warning").
+bool hasRepeatedDisposalWarning(const bezel::test::OwnershipResult& r) {
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.severity == bezel::Severity::Warning &&
-            d.message.find("after a dominating explicit Dispose") != std::string::npos) {
+            d.message.find("local `x` is disposed again here") != std::string::npos) {
             return true;
         }
     }
@@ -37,11 +50,15 @@ bool hasUseAfterDisposeWarning(const bezel::test::OwnershipResult& r) {
 // §28.2 v0.131: use of a local after a dominating explicit Dispose() is a
 // compile-time WARNING (should-level, not an error).  A plain discard read
 // `_ := x` after `x.Dispose()` is a use of x and must warn.
-BEZEL_TEST(own_read, read_of_disposed_local_warns_spec_28_2) {
+BEZEL_TEST(own_read, discard_of_disposed_local_is_repeated_disposal_warning_spec_28_2) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T(); x.Dispose(); _ := x;"));
-    // §28.2: should warn (not error) for use after dominating explicit Dispose.
-    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a discard of the binding is a disposal of it
+    // (§17.13), so `_ := x;` after `x.Dispose();` is the exempt REPEATED
+    // disposal -- a warning -- and not the use-after-dispose compile error a
+    // read draws (pinned by use_after_dominating_dispose_is_error_7435).
+    BEZEL_EXPECT_TRUE(hasRepeatedDisposalWarning(r));
+    BEZEL_EXPECT_FALSE(hasUseAfterDisposeDiag(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

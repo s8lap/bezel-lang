@@ -1,15 +1,15 @@
 //! case: s28_2_0013
 //! doc: spec
 //! section: 28.2
-//! title: a closure that captures a disposed local warns at the call that reads it
-//! rule: "The compiler additionally must emit a compile-time warning when a local
-//!   variable is used (read, borrowed from, or consumed) after an explicit
-//!   `Dispose()`" (§28.2, v0.340). The closure captures a borrow of `d`, and the
-//!   capture is read at invoke time — the call after the explicit `Dispose()`
-//!   reads a disposed value, so the warning is required.
-//! cites: 28.2, 28.9
-//! expect: warn
-//! diagnostic: disposed
+//! title: invoking a closure over a variable after its dominating disposal is a compile error
+//! rule: "A closure that captures the variable itself, rather than a holder of its
+//!   value, reads the variable when it is invoked (§27.5): its invocation after the
+//!   kill is a use of the variable under the first sentence" (§28.2, v0.357) — and
+//!   the first sentence makes a use the explicit disposal dominates a compile
+//!   error.
+//! cites: 28.2, 27.5
+//! expect: reject
+//! diagnostic: use-after-dispose
 module Conf;
 
 import System;

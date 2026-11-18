@@ -76,21 +76,28 @@ const char* kCounterClass =
 // ── §28.2 / §28.13: Shared.Get() after Dispose raises ───────────────────────
 
 BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_shared_get_after_dispose_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.135 / §28.13: Get() on a disposed Shared<T> handle must raise
     // DisposedAccessException in checked mode. This exercises the inline-lowering
     // guard path (not the emitFunctionBody method-entry guard).
     std::string src = std::string(kCounterClass) +
         "class C "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    var obj := new Inner(); "
         "    using var h := new Shared<Inner>(move obj); "
-        "    h.Dispose(); "
+        "    var view := h; "
+        "    if kill then h.Dispose(); end; "
         "    try "
-        "      var b := h.Get(); "
+        "      var b := view.Get(); "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;";
     BEZEL_EXPECT_EQ(runChecked(src), 1);
 }
@@ -99,20 +106,27 @@ BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_shared_get_after_dispose_rais
 // ── §28.2 / §28.13: Shared.Clone() after Dispose raises ─────────────────────
 
 BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_shared_clone_after_dispose_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.135 / §28.13: Clone() on a disposed Shared<T> handle must raise
     // DisposedAccessException in checked mode.
     std::string src = std::string(kCounterClass) +
         "class C "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    var obj := new Inner(); "
         "    using var h := new Shared<Inner>(move obj); "
-        "    h.Dispose(); "
+        "    var view := h; "
+        "    if kill then h.Dispose(); end; "
         "    try "
-        "      using var h2 := h.Clone(); "
+        "      using var h2 := view.Clone(); "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;";
     BEZEL_EXPECT_EQ(runChecked(src), 1);
 }
@@ -121,20 +135,27 @@ BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_shared_clone_after_dispose_ra
 // ── §28.2 / §28.13: Shared.Downgrade() after Dispose raises ─────────────────
 
 BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_shared_downgrade_after_dispose_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.135 / §28.13: Downgrade() on a disposed Shared<T> handle must
     // raise DisposedAccessException in checked mode.
     std::string src = std::string(kCounterClass) +
         "class C "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    var obj := new Inner(); "
         "    using var h := new Shared<Inner>(move obj); "
-        "    h.Dispose(); "
+        "    var view := h; "
+        "    if kill then h.Dispose(); end; "
         "    try "
-        "      using var w := h.Downgrade(); "
+        "      using var w := view.Downgrade(); "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;";
     BEZEL_EXPECT_EQ(runChecked(src), 1);
 }
@@ -162,20 +183,27 @@ BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_shared_get_live_ok) {
 // ── §28.2 / §4.4: Array.Add() after Dispose raises ──────────────────────────
 
 BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_array_add_after_dispose_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.135 / §4.4: Add() on a disposed Array<int> must raise
     // DisposedAccessException in checked mode. This covers the inline-lowered
     // array method path (not the indexer path, which was already guarded #621).
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var arr := new Array<int>(); "
-        "    arr.Dispose(); "
+        "    var view := arr; "
+        "    if kill then arr.Dispose(); end; "
         "    try "
-        "      arr.Add(5); "
+        "      view.Add(5); "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 
@@ -183,20 +211,27 @@ BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_array_add_after_dispose_raise
 // ── §28.2 / §4.4: Array.Remove() after Dispose raises ───────────────────────
 
 BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_array_remove_after_dispose_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.135 / §4.4: Remove() on a disposed Array<int> must raise
     // DisposedAccessException in checked mode.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var arr := new Array<int>(); "
         "    arr.Add(1); "
-        "    arr.Dispose(); "
+        "    var view := arr; "
+        "    if kill then arr.Dispose(); end; "
         "    try "
-        "      arr.Remove(1); "
+        "      view.Remove(1); "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 
@@ -204,20 +239,27 @@ BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_array_remove_after_dispose_ra
 // ── §28.2 / §4.4: Array.Count after Dispose raises ──────────────────────────
 
 BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_array_count_after_dispose_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.135 / §4.4: Count on a disposed Array<int> must raise
     // DisposedAccessException in checked mode.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var arr := new Array<int>(); "
         "    arr.Add(1); arr.Add(2); "
-        "    arr.Dispose(); "
+        "    var view := arr; "
+        "    if kill then arr.Dispose(); end; "
         "    try "
-        "      var n := arr.Count; "
+        "      var n := view.Count; "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 
@@ -225,20 +267,27 @@ BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_array_count_after_dispose_rai
 // ── §28.2 / §4.4: Array.Contains() after Dispose raises ─────────────────────
 
 BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_array_contains_after_dispose_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.135 / §4.4: Contains() on a disposed Array<int> must raise
     // DisposedAccessException in checked mode.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var arr := new Array<int>(); "
         "    arr.Add(3); "
-        "    arr.Dispose(); "
+        "    var view := arr; "
+        "    if kill then arr.Dispose(); end; "
         "    try "
-        "      var found := arr.Contains(3); "
+        "      var found := view.Contains(3); "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 
@@ -263,20 +312,27 @@ BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_array_add_live_ok) {
 // ── §28.2 / §4.8: Dictionary.Add() after Dispose raises ─────────────────────
 
 BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_dict_add_after_dispose_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.135 / §4.8: Add() on a disposed Dictionary<string,int> must raise
     // DisposedAccessException in checked mode. This covers the inline-lowered
     // dict method path.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var d := new Dictionary<string,int>(); "
-        "    d.Dispose(); "
+        "    var view := d; "
+        "    if kill then d.Dispose(); end; "
         "    try "
-        "      d.Add(\"k\", 1); "
+        "      view.Add(\"k\", 1); "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 
@@ -284,20 +340,27 @@ BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_dict_add_after_dispose_raises
 // ── §28.2 / §4.8: Dictionary.ContainsKey() after Dispose raises ─────────────
 
 BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_dict_containskey_after_dispose_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.135 / §4.8: ContainsKey() on a disposed Dictionary<string,int>
     // must raise DisposedAccessException in checked mode.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var d := new Dictionary<string,int>(); "
         "    d.Add(\"k\", 1); "
-        "    d.Dispose(); "
+        "    var view := d; "
+        "    if kill then d.Dispose(); end; "
         "    try "
-        "      var found := d.ContainsKey(\"k\"); "
+        "      var found := view.ContainsKey(\"k\"); "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 
@@ -305,20 +368,27 @@ BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_dict_containskey_after_dispos
 // ── §28.2 / §4.8: Dictionary.Remove() after Dispose raises ──────────────────
 
 BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_dict_remove_after_dispose_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.135 / §4.8: Remove() on a disposed Dictionary<string,int>
     // must raise DisposedAccessException in checked mode.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var d := new Dictionary<string,int>(); "
         "    d.Add(\"k\", 1); "
-        "    d.Dispose(); "
+        "    var view := d; "
+        "    if kill then d.Dispose(); end; "
         "    try "
-        "      var removed := d.Remove(\"k\"); "
+        "      var removed := view.Remove(\"k\"); "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 
@@ -326,20 +396,27 @@ BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_dict_remove_after_dispose_rai
 // ── §28.2 / §4.8: Dictionary.Count after Dispose raises ─────────────────────
 
 BEZEL_TEST(codegen_checked_disposal_627, spec_28_2_dict_count_after_dispose_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.135 / §4.8: Count on a disposed Dictionary<string,int>
     // must raise DisposedAccessException in checked mode.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var d := new Dictionary<string,int>(); "
         "    d.Add(\"x\", 10); "
-        "    d.Dispose(); "
+        "    var view := d; "
+        "    if kill then d.Dispose(); end; "
         "    try "
-        "      var n := d.Count; "
+        "      var n := view.Count; "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 

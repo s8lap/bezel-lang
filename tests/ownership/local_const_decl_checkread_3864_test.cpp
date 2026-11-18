@@ -202,16 +202,18 @@ BEZEL_TEST(local_const_decl_checkread_3864,
 // FAILS WITHOUT THE FIX: zero diagnostics at all.
 // =============================================================================
 BEZEL_TEST(local_const_decl_checkread_3864,
-           const_initializer_reads_disposed_local_warns_28_2) {
+           const_initializer_reads_disposed_local_is_error_28_2) {
     auto r = parseAndCheckOwnership(disposeProg("const y := x;"));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
     BEZEL_EXPECT_TRUE(diagContainsWithSeverity(
-        r, bezel::Severity::Warning,
+        r, bezel::Severity::Error,
         "use of `x` after a dominating explicit Dispose() call"));
     // A use-after-dispose is a WARNING, not an error (§28.2's existing
     // policy) — the const spelling must match the var spelling exactly, not
     // over-reject by promoting it to an error.
     BEZEL_EXPECT_FALSE(diagContainsWithSeverity(
-        r, bezel::Severity::Error,
+        r, bezel::Severity::Warning,
         "use of `x` after a dominating explicit Dispose() call"));
 }
 
@@ -219,10 +221,12 @@ BEZEL_TEST(local_const_decl_checkread_3864,
 // CONTROL — the var twin's existing warning, unchanged by this fix.
 // =============================================================================
 BEZEL_TEST(local_const_decl_checkread_3864,
-           var_initializer_reads_disposed_local_warns_28_2_control) {
+           var_initializer_reads_disposed_local_is_error_28_2_control) {
     auto r = parseAndCheckOwnership(disposeProg("var y := x;"));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
     BEZEL_EXPECT_TRUE(diagContainsWithSeverity(
-        r, bezel::Severity::Warning,
+        r, bezel::Severity::Error,
         "use of `x` after a dominating explicit Dispose() call"));
 }
 
@@ -293,7 +297,7 @@ BEZEL_TEST(local_const_decl_checkread_3864,
 //       §21.1 text.
 // =============================================================================
 BEZEL_TEST(local_const_decl_checkread_3864,
-           const_top_level_move_of_disposed_local_emits_28_2_consume_warning_4450) {
+           const_top_level_move_of_disposed_local_is_28_2_consume_error_4450) {
     auto r = parseAndCheckOwnership(disposeThenMoveProg("const y := move x;"));
     // §21.1 still rejects the `const` shape outright — that error is the
     // load-bearing reason this program still fails to compile.
@@ -305,8 +309,10 @@ BEZEL_TEST(local_const_decl_checkread_3864,
     // the disposed state ("already disposed at this point"), and the §28.2
     // citation are all present, so a future reader sees the ruling's
     // severity, the verb, and the regime change at a glance.
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
     BEZEL_EXPECT_TRUE(diagContainsWithSeverity(
-        r, bezel::Severity::Warning,
+        r, bezel::Severity::Error,
         "move from a local `x` already disposed at this point (§28.2)"));
     // The §28.3 ERROR text must NOT fire — the ruling is the WHOLE POINT.
     BEZEL_EXPECT_FALSE(diagContainsWithSeverity(
@@ -323,11 +329,13 @@ BEZEL_TEST(local_const_decl_checkread_3864,
 // emit if `isTopLevelConsumingForm` had not skipped the read-check.
 // =============================================================================
 BEZEL_TEST(local_const_decl_checkread_3864,
-           var_top_level_move_of_disposed_local_emits_28_2_consume_warning_4450_control) {
+           var_top_level_move_of_disposed_local_is_28_2_consume_error_4450_control) {
     auto r = parseAndCheckOwnership(disposeThenMoveProg("var y := move x;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(diagContainsWithSeverity(
-        r, bezel::Severity::Warning,
+        r, bezel::Severity::Error,
         "move from a local `x` already disposed at this point (§28.2)"));
     // Preemption invariant: the read-side §28.2 wording must NOT also fire
     // — `isTopLevelConsumingForm` is what gives `markMovedByName` the

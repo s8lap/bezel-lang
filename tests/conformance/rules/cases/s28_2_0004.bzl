@@ -1,11 +1,14 @@
 //! case: s28_2_0004
 //! doc: spec
 //! section: 28.2
-//! title: a straight-line read after a discard raises the same mandatory warning
-//! rule: The compiler must emit a warning when a local variable is used after a discard
-//!   of the binding that dominates the use site on every path.
-//! expect: warn
-//! diagnostic: used
+//! title: a straight-line read after a discard of the binding is the same compile error
+//! rule: "A use of a local variable ... after an explicit `Dispose()` or direct
+//!   `DisposeAsync()` call — or a discard of the binding (§17.13) — on the same
+//!   variable that dominates the use site on every path is a **compile error**"
+//!   (§28.2, v0.357).
+//! cites: 28.2, 17.13
+//! expect: reject
+//! diagnostic: use-after-dispose
 module Conf;
 
 public class Widget

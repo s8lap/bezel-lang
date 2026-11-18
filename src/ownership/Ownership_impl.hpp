@@ -3100,9 +3100,19 @@ private:
     void collectLambdaIdentifiers(
         const ast::LambdaExpr& lam,
         std::vector<const ast::IdentifierExpr*>& out) const;
+    // `invokeLoc` is the invocation being checked (a note under the §28.2
+    // error names it; a default location names none).
     void checkTransitiveCapturesDisposed(
         const ast::LambdaExpr& lam,
-        std::set<const ast::LambdaExpr*>& visited);
+        std::set<const ast::LambdaExpr*>& visited,
+        SourceLocation invokeLoc = {});
+    // §28.2 (v0.357), #7435: the lambda literal a function-typed local names
+    // when it is invoked — its own initializer (`scopedLambdaLocalInit_`), or
+    // the literal a chain of plain copies (`var g := h;`, `const g := h;`)
+    // leads to — or null. Every local on the chain must be one that is never
+    // an assignment target (`scopedAssignedSyms_`), so the literal read off
+    // the declarations is the closure the local holds at every invocation.
+    const ast::LambdaExpr* lambdaLiteralOfFunctionLocal(sema::Symbol* sym) const;
     // fix #7025 (follow-up, §28.2, v0.340): the METHOD-GROUP twin of
     // checkTransitiveCapturesDisposed. A method-group reference over a class's
     // own compiler-generated `Dispose` CAPTURES its receiver (§27.6: "the

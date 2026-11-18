@@ -36,8 +36,8 @@
 // THE ROWS BELOW.
 //
 //   * the INLINE-ARGUMENT spelling, the group formed AFTER the dispose — the
-//     shape that SEGV'd; the program must run and print what the base
-//     printed;
+//     shape that SEGV'd. Since #7435 (§28.2, v0.357) the read of `d` that
+//     forms the group is a compile error, so the row pins the rejection;
 //   * the CONTROL: the same spelling with the group formed BEFORE the
 //     dispose — it already worked, and it must keep working;
 //   * the CONTROL: the explicit dispose with NO group at all — the fix must
@@ -49,6 +49,7 @@
 
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
+#include "support/aot_result_asserts.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAotChecked;
@@ -72,14 +73,18 @@ constexpr char kDAndTake[] =
 // The INLINE-ARGUMENT spelling: the receiver is explicitly disposed, and the
 // method group is formed afterwards, as a call argument.
 //
-// §28.2: the receiver's block stays live until the holder's release point,
-// so the group captures a live block and its invocation is the already-set
-// dispose flag's no-op ("a repeated call is the no-op").
-//
-// PRE-FIX: AddressSanitizer "SEGV on unknown address 0x000000000000" in
-// `disposethunk$Dispose` — the capture was the nulled slot.
+// §28.2 (v0.357), #7435: forming the group reads the receiver ("a use of a
+// local variable — a read, a borrow taken from it, a member access, …"), and
+// the explicit disposal dominates that read, so the program is a COMPILE
+// ERROR — the exemption covers "a second `Dispose()` … call", not a reference
+// to the member. Until #7435 this row ran the program (the compiler only
+// warned) and pinned that the capture was not the nulled slot (PRE-#7025:
+// AddressSanitizer "SEGV on unknown address 0x000000000000" in
+// `disposethunk$Dispose`). The shape has no run-time re-cut — a conditional
+// kill leaves `d` maybe-consumed (§28.3) — so the row pins the rejection; the
+// group formed BEFORE the dispose is the row below.
 BEZEL_TEST(method_group_arg_receiver_7025,
-           spec_27_6_inline_argument_group_formed_after_the_dispose_does_not_crash) {
+           spec_28_2_inline_argument_group_formed_after_the_dispose_is_rejected) {
     auto r = runAotChecked(
         std::string(kDAndTake) +
         "  var d := new D(); "
@@ -88,12 +93,12 @@ BEZEL_TEST(method_group_arg_receiver_7025,
         "  Console.WriteLine(\"after\"); "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    // The destructor runs EXACTLY once: the explicit `Dispose()` performs the
-    // logical disposal (running the cleanup), and the group's later
-    // invocation is the already-set flag's no-op (§28.2).
-    BEZEL_EXPECT_EQ(r.stdoutText, "disposed\nafter\n");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "use of `d` after a dominating explicit Dispose() call"));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "§28.2's use-after-dispose compile error"));
 }
 
 // The CONTROL: the same inline-argument spelling with the group formed

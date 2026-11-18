@@ -353,15 +353,18 @@ BEZEL_TEST(ownership_pin_use_after_dominating_dispose_7893,
     BEZEL_EXPECT_TRUE(hasError(r, kHolderUse));
 }
 
-// CONTROL: the DIRECT shape keeps its own diagnostic AND its own severity --
-// the §28.2 v0.131 WARNING ruling is unchanged by this fix.
+// The DIRECT shape keeps its own diagnostic; its severity is §28.2's compile
+// ERROR (v0.357), no longer the v0.131 WARNING this row pinned as unchanged
+// by the pin fix.
 BEZEL_TEST(ownership_pin_use_after_dominating_dispose_7893,
-           direct_use_after_dispose_keeps_its_warning_spec_28_2) {
+           direct_use_after_dispose_is_error_spec_28_2) {
     OwnershipResult r = parseAndCheckOwnership(prog(
         "    var a := new R(1);\n"
         "    a.Dispose();\n"
         "    var s := a.Use();\n"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasWarning(r, kDirectWarning));
-    BEZEL_EXPECT_FALSE(hasError(r, kDirectWarning));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasError(r, kDirectWarning));
+    BEZEL_EXPECT_FALSE(hasWarning(r, kDirectWarning));
 }

@@ -39,8 +39,13 @@
 // method group it returns — is DISCARDED by the statement that calls it, and
 // a discarded function value is not released by the compiler (a pre-existing
 // gap, shared with the ordinary §27.6 reference — measured: the same 72
-// bytes, the same allocation site, for `lambda() => d.Ping`). The row that
-// pins the §28.2 use-after-dispose warning is in tests/ownership/.
+// bytes, the same allocation site, for `lambda() => d.Ping`).
+//
+// #7435 (§28.2, v0.357): the first row used to invoke the lambda AFTER
+// `d.Dispose()`; that invocation is a use the explicit disposal dominates and
+// is now a compile error (pinned in tests/ownership/). The row keeps its
+// subject — the lambda body's type — with the invocation moved BEFORE the
+// disposal; the pre-fix failure (the IR verifier) does not depend on the order.
 
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
@@ -59,8 +64,8 @@ constexpr char kClassDisposeLambda[] =
     "class C public static method Main(): int "
     "  var d := new D(); "
     "  var f := lambda() => d.Dispose; "
-    "  d.Dispose(); "
     "  f(); "
+    "  d.Dispose(); "
     "  Console.WriteLine(\"after\"); "
     "  return 0; "
     "end Main; end C;";
@@ -93,9 +98,9 @@ BEZEL_TEST(method_group_lambda_dispose_ref_7025,
     // failure mode, with the verifier's message in `r.diagnostics`.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    // The explicit `Dispose()` runs the destructor once ("disposed"); the
-    // lambda's invocation FORMS the method group (and returns it) without
-    // calling it, so nothing else prints.
+    // The lambda's invocation FORMS the method group (and returns it) without
+    // calling it, so it prints nothing; the explicit `Dispose()` after it runs
+    // the destructor once ("disposed").
     BEZEL_EXPECT_EQ(r.stdoutText, "disposed\nafter\n");
 }
 

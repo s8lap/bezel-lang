@@ -144,7 +144,7 @@ std::string program(const std::string& classesAndMain) {
 // invariant this row was originally written to prove.
 // =============================================================================
 BEZEL_TEST(record_moves_in_collection_literal_4024,
-           direct_move_of_disposed_local_warns_28_2_4450_control) {
+           direct_move_of_disposed_local_is_error_28_2_4450_control) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -153,15 +153,17 @@ BEZEL_TEST(record_moves_in_collection_literal_4024,
         "    return y.tag; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    bool hasWarn = false;
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool hasConsumeError = false;
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity == bezel::Severity::Warning &&
+        if (d.severity == bezel::Severity::Error &&
             d.message.find(kDisposedMoveWarn) != std::string::npos) {
-            hasWarn = true; break;
+            hasConsumeError = true; break;
         }
     }
-    BEZEL_EXPECT_TRUE(hasWarn);
+    BEZEL_EXPECT_TRUE(hasConsumeError);
 }
 
 // =============================================================================
@@ -178,7 +180,7 @@ BEZEL_TEST(record_moves_in_collection_literal_4024,
 // it through the SAME code path (`markMovedByName`'s Disposed arm).
 // =============================================================================
 BEZEL_TEST(record_moves_in_collection_literal_4024,
-           collection_literal_element_move_of_disposed_local_warns_28_2_4450) {
+           collection_literal_element_move_of_disposed_local_is_error_28_2_4450) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -187,15 +189,17 @@ BEZEL_TEST(record_moves_in_collection_literal_4024,
         "    return arr[0].tag; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    bool hasWarn = false;
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool hasConsumeError = false;
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity == bezel::Severity::Warning &&
+        if (d.severity == bezel::Severity::Error &&
             d.message.find(kDisposedMoveWarn) != std::string::npos) {
-            hasWarn = true; break;
+            hasConsumeError = true; break;
         }
     }
-    BEZEL_EXPECT_TRUE(hasWarn);
+    BEZEL_EXPECT_TRUE(hasConsumeError);
 }
 
 // The same case through the STRONG AOT oracle (real `bezelc` + link + exec):
@@ -217,7 +221,7 @@ BEZEL_TEST(record_moves_in_collection_literal_4024,
 // static-analysis verdict (the §28.2 warning) is unchanged.
 BEZEL_TEST(
     record_moves_in_collection_literal_4024,
-    aot_collection_literal_element_move_of_disposed_local_raises_in_checked_mode_4450) {
+    aot_collection_literal_element_move_of_disposed_local_rejected_at_compile_time_4450) {
     JitResult r = runAotCheckedDisposal(program(
         "class C "
         "  public static method Main(): int "
@@ -230,8 +234,12 @@ BEZEL_TEST(
         "    end; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 1);
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(
+        bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "§28.2's use-after-dispose compile error"));
 }
 
 // A second, independently-shaped repro: an already-MOVED-FROM (not merely

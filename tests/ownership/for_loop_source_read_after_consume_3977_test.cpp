@@ -227,7 +227,7 @@ BEZEL_TEST(for_loop_source_read_after_consume_3977,
 // in the `with` clause; post-fix: the §28.2 warning, at the with-clause's
 // own location.
 BEZEL_TEST(for_loop_source_read_after_consume_3977,
-           await_for_with_clause_read_after_dispose_warns_28_2) {
+           await_for_with_clause_read_after_dispose_is_error_28_2) {
     OwnershipResult r = parseAndCheckOwnership(
         "module M; "
         "class C "
@@ -245,13 +245,15 @@ BEZEL_TEST(for_loop_source_read_after_consume_3977,
         "    return sum; "
         "  end Main; "
         "end C;");
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
     BEZEL_EXPECT_TRUE(diagWithSeverity(
-        r, bezel::Severity::Warning,
+        r, bezel::Severity::Error,
         "use of `cts` after a dominating explicit Dispose() call"));
 }
 
 BEZEL_TEST(for_loop_source_read_after_consume_3977,
-           for_source_read_after_dispose_warns_28_2) {
+           for_source_read_after_dispose_is_error_28_2) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); "
         "var t := 0; "
@@ -259,8 +261,10 @@ BEZEL_TEST(for_loop_source_read_after_consume_3977,
         "var n := 0; "
         "for var i in x.tag..3 do n := n + 1; end; "
         "return t + n;"));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
     BEZEL_EXPECT_TRUE(diagWithSeverity(
-        r, bezel::Severity::Warning,
+        r, bezel::Severity::Error,
         "use of `x` after a dominating explicit Dispose() call"));
 }
 

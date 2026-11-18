@@ -63,7 +63,7 @@ namespace {
 constexpr const char* kHolderUse =
     "after a dominating explicit Dispose() of";
 
-// The §28.2 direct-shape diagnostic -- its severity is NOT moved by this fix.
+// The §28.2 direct-shape diagnostic (an ERROR since the rest of #7435 landed).
 constexpr const char* kDirectWarning =
     "use of `c` after a dominating explicit Dispose() call";
 
@@ -481,18 +481,21 @@ BEZEL_TEST(ownership_alias_use_after_dominating_dispose_7435,
     BEZEL_EXPECT_FALSE(hasError(r, kHolderUse));
 }
 
-// CONTROL: the DIRECT shape keeps its own diagnostic and its own severity --
-// this fix is the holder sentence only (the same-variable promotion is the
-// rest of #7435).
+// The DIRECT shape keeps its own diagnostic. Its SEVERITY is the rest of
+// #7435 (§28.2, v0.357): "A use of a local variable ... after an explicit
+// `Dispose()` ... that dominates the use site on every path is a **compile
+// error**" -- the same-variable promotion, which this row pinned as still
+// outstanding (a Warning) when only the holder sentence was implemented.
 BEZEL_TEST(ownership_alias_use_after_dominating_dispose_7435,
-           direct_shape_severity_unchanged_spec_28_2) {
+           direct_shape_is_error_spec_28_2) {
     OwnershipResult r = parseAndCheckOwnership(prog(
         "    var c := new Customer(\"ann\");\n"
         "    c.Dispose();\n"
         "    var n := c.Hello();\n"));
     BEZEL_EXPECT_FALSE(hasError(r, kHolderUse));
-    BEZEL_EXPECT_TRUE(hasWarning(r, kDirectWarning));
-    BEZEL_EXPECT_FALSE(hasError(r, kDirectWarning));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasError(r, kDirectWarning));
+    BEZEL_EXPECT_FALSE(hasWarning(r, kDirectWarning));
 }
 
 // ──────────────────────────── try / catch / finally ─────────────────────────

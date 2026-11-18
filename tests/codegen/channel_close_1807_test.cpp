@@ -290,18 +290,26 @@ BEZEL_TEST(channel_close_1807,
         std::string(
             "module M; import System.Threading; "
         ) + kItem +
+        // Re-cut by #7435 (§28.2, v0.357): a read the explicit disposal
+        // DOMINATES is a compile error, so `IsClosed` is read through an alias
+        // whose source has a CONDITIONAL kill ("A holder whose source was
+        // disposed on only some paths to the use ... is not rejected").
         "class C "
-        "  public static async method Main(): Task<int> "
+        "  public static method Probe(kill: bool): int "
         "    var ch := new Channel<Item>(); "
+        "    var view := ch; "
         "    var tx := ch.NewSender(); "
         "    tx.Send(new Item(1)); "
         "    tx.Send(new Item(2)); "
-        "    ch.Dispose(); "        // disposes BOTH buffered items (reverse order)
+        "    if kill then ch.Dispose(); end; "  // disposes BOTH buffered items (reverse order)
         "    if Item._n <> 0 then return 10; end; "
         "    if Item.disposed <> 2 then return 20; end; "
-        "    if not ch.IsClosed then return 30; end; "   // dispose closes it
+        "    if not view.IsClosed then return 30; end; "   // dispose closes it
         "    tx.Dispose(); "
         "    return 42; "
+        "  end Probe; "
+        "  public static async method Main(): Task<int> "
+        "    return Probe(true); "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.ran);

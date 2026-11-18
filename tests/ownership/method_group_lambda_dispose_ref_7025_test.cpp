@@ -29,11 +29,20 @@ namespace {
 constexpr char kClosureDisposedWarn[] =
     "closure captures `d` which was disposed before this invocation";
 
-bool hasWarning(const bezel::test::OwnershipResult& r, const char* needle) {
+// #7435 (§28.2, v0.357): the invocation of a closure over a variable after
+// the variable's dominating explicit disposal is a compile ERROR.
+bool hasError(const bezel::test::OwnershipResult& r, const char* needle) {
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.severity == bezel::Severity::Warning &&
+        if (d.severity == bezel::Severity::Error &&
             d.message.find(needle) != std::string::npos)
             return true;
+    return false;
+}
+
+// The wording at ANY severity -- for the row that must not draw it at all.
+bool hasDiag(const bezel::test::OwnershipResult& r, const char* needle) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(needle) != std::string::npos) return true;
     return false;
 }
 
@@ -44,7 +53,7 @@ bool hasWarning(const bezel::test::OwnershipResult& r, const char* needle) {
 // §28.2's regime for this shape is a WARNING (the program is legal), and the
 // warning must survive the compile-forward.
 BEZEL_TEST(method_group_lambda_dispose_ref_7025,
-           closure_capture_of_a_disposed_receiver_warns_28_2) {
+           closure_capture_of_a_disposed_receiver_is_error_28_2) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "class D "
@@ -58,8 +67,10 @@ BEZEL_TEST(method_group_lambda_dispose_ref_7025,
         "  f(); "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(hasWarning(r, kClosureDisposedWarn));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(hasError(r, kClosureDisposedWarn));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // The CONTROL: the same closure WITHOUT the intervening dispose — the
@@ -79,5 +90,5 @@ BEZEL_TEST(method_group_lambda_dispose_ref_7025,
         "  f(); "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(hasWarning(r, kClosureDisposedWarn));
+    BEZEL_EXPECT_FALSE(hasDiag(r, kClosureDisposedWarn));
 }

@@ -153,8 +153,15 @@ BEZEL_TEST(closure_capture_disposed_indirect_escape,
 // `mk_call_discarded_not_returned_accepted_28_9` boundary for the sibling
 // direct-lambda-literal check. Must stay accepted: the closure's one
 // invocation happens synchronously, in this frame, before `Mk` returns.
+//
+// #7435 (§28.2, v0.357): the §28.9 ESCAPE check still does not fire here --
+// that is what this row was written to pin -- but the program is no longer
+// accepted: "A closure that captures the variable itself ... reads the
+// variable when it is invoked (§27.5): its invocation after the kill is a use
+// of the variable under the first sentence", and `r.Dispose();` dominates
+// `f()`. The row now pins that the rejection is §28.2's, not §28.9's.
 BEZEL_TEST(closure_capture_disposed_indirect_escape,
-           holder_disposed_then_call_result_returned_accepted) {
+           holder_disposed_then_call_result_returned_is_28_2_use_not_28_9_escape) {
     auto r = parseAndCheckOwnership(wrap(
         "public static method Mk(): int "
         "  using var r := new R(); "
@@ -162,7 +169,11 @@ BEZEL_TEST(closure_capture_disposed_indirect_escape,
         "  r.Dispose(); "
         "  return f(); "
         "end Mk;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "closure captures `r` which was disposed before this invocation"));
+    BEZEL_EXPECT_FALSE(hasErrorMessage(
+        r, "whose source is disposed at scope end"));
 }
 
 // NEGATIVE (§28.9, #4156 accept-side sweep): the returned closure captures a

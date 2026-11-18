@@ -54,21 +54,28 @@ int runDefault(const std::string& program) {
 // ── §28.2 / §31.4 v0.134: instance method call on disposed instance ──────
 
 BEZEL_TEST(codegen_checked_disposal_601, spec_28_2_method_call_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.134: calling an instance method on a disposed instance in
     // checked mode raises DisposedAccessException.  The try arm catches it
     // and returns 1 to signal the raise happened.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
         "  public method GetValue(): int return 42; end GetValue; "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var obj := new C(); "
-        "    obj.Dispose(); "
+        "    var view := obj; "
+        "    if kill then obj.Dispose(); end; "
         "    try "
-        "      var v := obj.GetValue(); "
+        "      var v := view.GetValue(); "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 
@@ -76,20 +83,27 @@ BEZEL_TEST(codegen_checked_disposal_601, spec_28_2_method_call_raises) {
 // ── §28.2 / §31.4 v0.134: property accessor on disposed instance ─────────
 
 BEZEL_TEST(codegen_checked_disposal_601, spec_28_2_property_read_raises) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §28.2 v0.134: reading a property on a disposed instance raises
     // DisposedAccessException in checked mode.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
         "  public property Value: int => 7; "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var obj := new C(); "
-        "    obj.Dispose(); "
+        "    var view := obj; "
+        "    if kill then obj.Dispose(); end; "
         "    try "
-        "      var v := obj.Value; "
+        "      var v := view.Value; "
         "      return 0; "
         "    catch DisposedAccessException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 
@@ -120,21 +134,28 @@ BEZEL_TEST(codegen_checked_disposal_601, spec_28_2_second_dispose_noop_checked) 
 // ── §31.4: DisposedAccessException is-a InvalidOperationException ─────────
 
 BEZEL_TEST(codegen_checked_disposal_601, spec_31_4_hierarchy_caught_by_base) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error, so the checked-mode backstop is observed through an
+    // alias whose source has a CONDITIONAL kill ("A holder whose source was
+    // disposed on only some paths to the use ... is not rejected: a use through
+    // it raises `DisposedAccessException` in checked disposal mode").
     // §31.4 v0.134: DisposedAccessException is under InvalidOperationException
     // in the hierarchy. A `catch var e: InvalidOperationException` arm must
     // catch a DisposedAccessException.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
         "  public method GetValue(): int return 99; end GetValue; "
-        "  public static method Main(): int "
+        "  public static method Probe(kill: bool): int "
         "    using var obj := new C(); "
-        "    obj.Dispose(); "
+        "    var view := obj; "
+        "    if kill then obj.Dispose(); end; "
         "    try "
-        "      var v := obj.GetValue(); "
+        "      var v := view.GetValue(); "
         "      return 0; "
         "    catch var e: InvalidOperationException => return 1; "
         "    end; "
-        "  end Main; "
+        "  end Probe; "
+        "  public static method Main(): int return Probe(true); end Main; "
         "end C;"), 1);
 }
 

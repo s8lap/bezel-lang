@@ -475,35 +475,47 @@ BEZEL_TEST(codegen_checked_dispose_release_once_6314, linked_list_disposed_twice
 // coin toss about a different defect.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(codegen_checked_dispose_release_once_6314, control_array_keeps_checked_backstop_28_2) {
+    // Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+    // a compile error (and a read of `x` itself after a CONDITIONAL kill is
+    // §28.3's conditional-discharge join error), so the checked-mode backstop
+    // is observed through an alias whose source has a conditional kill ("A
+    // holder whose source was disposed on only some paths to the use ... is
+    // not rejected: a use through it raises `DisposedAccessException` in
+    // checked disposal mode").
     const std::string src =
         "module M; "
-        "class C public static method Main(): int "
+        "class C public static method Probe(kill: bool): int "
         "  try "
         "    using var x := new Array<int>(2); "
-        "    x.Dispose(); "
-        "    Console.WriteLine(x.Count); "
+        "    var view := x; "
+        "    if kill then x.Dispose(); end; "
+        "    Console.WriteLine(view.Count); "
         "    Console.WriteLine(\"no-raise\"); "
         "  catch "
         "    DisposedAccessException => Console.WriteLine(\"DAE\"), "
         "  end try; "
         "  return 0; "
-        "end Main; end C;";
+        "end Probe; "
+        "public static method Main(): int return Probe(true); end Main; end C;";
     BEZEL_EXPECT_EQ(outChecked(src), "DAE\n");
 }
 
 BEZEL_TEST(codegen_checked_dispose_release_once_6314, control_dictionary_keeps_checked_backstop_28_2) {
+    // Re-cut by #7435 (§28.2, v0.357), as the array control above.
     const std::string src =
         "module M; "
-        "class C public static method Main(): int "
+        "class C public static method Probe(kill: bool): int "
         "  try "
         "    using var x := new Dictionary<string, int>(); "
-        "    x.Dispose(); "
-        "    x.Add(\"a\", 1); "
+        "    var view := x; "
+        "    if kill then x.Dispose(); end; "
+        "    view.Add(\"a\", 1); "
         "    Console.WriteLine(\"no-raise\"); "
         "  catch "
         "    DisposedAccessException => Console.WriteLine(\"DAE\"), "
         "  end try; "
         "  return 0; "
-        "end Main; end C;";
+        "end Probe; "
+        "public static method Main(): int return Probe(true); end Main; end C;";
     BEZEL_EXPECT_EQ(outChecked(src), "DAE\n");
 }

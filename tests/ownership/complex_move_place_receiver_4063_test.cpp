@@ -118,9 +118,12 @@ bool hasWarningMessage(const OwnershipResult& r, std::string_view needle) {
 // checkread_call_arg_move_order_4023_test.cpp.
 //
 // per §28.2, §28.3 K1.3/K7, v0.303, #3975 (option 1), #4450
-inline bool hasUseAfterDisposeWarning(const OwnershipResult& r) {
+//
+// #7435 (§28.2, v0.357): that one verdict's severity is now ERROR ("a
+// **consume** exactly as a read is"); the helper scans Error-severity.
+inline bool hasUseAfterDisposeError(const OwnershipResult& r) {
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != bezel::Severity::Warning) continue;
+        if (d.severity != bezel::Severity::Error) continue;
         if (d.message.find("use of `b` after a dominating explicit "
                            "Dispose() call") != std::string::npos) return true;
         if (d.message.find("move from a local `x` already disposed at "
@@ -187,7 +190,7 @@ std::string program(const std::string& classesAndMain) {
 // rows below it, which genuinely go from SILENT to WARNS only with the fix.
 // =============================================================================
 BEZEL_TEST(complex_move_place_receiver_4063,
-           bare_call_move_complex_place_disposed_receiver_warns) {
+           bare_call_move_complex_place_disposed_receiver_is_error) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -197,8 +200,10 @@ BEZEL_TEST(complex_move_place_receiver_4063,
         "    return y!.v; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasWarningMessage(r, kUseAfterDisposeFragment));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kUseAfterDisposeFragment));
 }
 
 // =============================================================================
@@ -207,7 +212,7 @@ BEZEL_TEST(complex_move_place_receiver_4063,
 // all): SILENT there too — never a regression, always broken.
 // =============================================================================
 BEZEL_TEST(complex_move_place_receiver_4063,
-           newexpr_ctor_arg_move_complex_place_disposed_receiver_warns) {
+           newexpr_ctor_arg_move_complex_place_disposed_receiver_is_error) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -217,15 +222,17 @@ BEZEL_TEST(complex_move_place_receiver_4063,
         "    return h.v; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasWarningMessage(r, kUseAfterDisposeFragment));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kUseAfterDisposeFragment));
 }
 
 // =============================================================================
 // NEGATIVE (2b) — pre-existing sibling gap, marker-free if-expression arm.
 // =============================================================================
 BEZEL_TEST(complex_move_place_receiver_4063,
-           ifexpr_marker_free_arm_move_complex_place_disposed_receiver_warns) {
+           ifexpr_marker_free_arm_move_complex_place_disposed_receiver_is_error) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -237,8 +244,10 @@ BEZEL_TEST(complex_move_place_receiver_4063,
         "    return h.v; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasWarningMessage(r, kUseAfterDisposeFragment));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kUseAfterDisposeFragment));
 }
 
 // =============================================================================
@@ -246,7 +255,7 @@ BEZEL_TEST(complex_move_place_receiver_4063,
 // `CollectionLiteralExpr` arm (#4024).
 // =============================================================================
 BEZEL_TEST(complex_move_place_receiver_4063,
-           collection_literal_move_complex_place_disposed_receiver_warns) {
+           collection_literal_move_complex_place_disposed_receiver_is_error) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -256,8 +265,10 @@ BEZEL_TEST(complex_move_place_receiver_4063,
         "    return arr[0].tag; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasWarningMessage(r, kUseAfterDisposeFragment));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kUseAfterDisposeFragment));
 }
 
 // =============================================================================
@@ -316,7 +327,7 @@ BEZEL_TEST(complex_move_place_receiver_4063,
 // fallthrough for the complex-place case.
 // =============================================================================
 BEZEL_TEST(complex_move_place_receiver_4063,
-           control_plain_read_complex_place_disposed_receiver_still_warns) {
+           control_plain_read_complex_place_disposed_receiver_is_error) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "class Res "
@@ -340,8 +351,10 @@ BEZEL_TEST(complex_move_place_receiver_4063,
         "    return y; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasWarningMessage(r, kUseAfterDisposeFragment));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kUseAfterDisposeFragment));
 }
 
 // =============================================================================
@@ -358,7 +371,7 @@ BEZEL_TEST(complex_move_place_receiver_4063,
 // per §28.2, §28.3 K1.3/K7, v0.303, #4023, #4450
 // =============================================================================
 BEZEL_TEST(complex_move_place_receiver_4063,
-           control_bare_identifier_move_of_disposed_local_warns_28_2_4450) {
+           control_bare_identifier_move_of_disposed_local_is_error_28_2_4450) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -367,8 +380,10 @@ BEZEL_TEST(complex_move_place_receiver_4063,
         "    return y!.v; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeError(r));
     // OLD §28.3 ERROR text must NOT have re-appeared (negative guard
     // against any over-relaxation of the conditional-kill arms, which
     // the demotion did NOT touch).

@@ -59,11 +59,39 @@ std::string wrapBranch(const std::string& body) {
         "end C;";
 }
 
-// True iff any diagnostic in `r` is the §28.2 use-after-dispose warning.
-bool hasUseAfterDisposeWarning(const bezel::test::OwnershipResult& r) {
+// True iff any diagnostic in `r` is the §28.2 use-after-dispose ERROR.
+// #7435 (§28.2, v0.357): "A use of a local variable ... after an explicit
+// `Dispose()` ... that dominates the use site on every path is a **compile
+// error**" -- the rule these rows pinned as the v0.131 WARNING.
+bool hasUseAfterDisposeError(const bezel::test::OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("after a dominating explicit Dispose") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The same wording at ANY severity -- for the rows that must not draw it.
+bool hasUseAfterDisposeDiag(const bezel::test::OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("after a dominating explicit Dispose") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// §28.2 (v0.357): "One use is exempt: a second `Dispose()` or
+// `DisposeAsync()`, or a second discard, of the same binding is the runtime
+// no-op the carve-out above defines and draws a compile-time warning". A
+// discard of the binding is a disposal of it (§17.13), so `_ := x;` after
+// `x.Dispose();` is the repeated explicit disposal, not a read (#7435).
+bool hasRepeatedDisposalWarning(const bezel::test::OwnershipResult& r) {
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.severity == bezel::Severity::Warning &&
-            d.message.find("after a dominating explicit Dispose") != std::string::npos) {
+            d.message.find("local `x` is disposed again here") != std::string::npos) {
             return true;
         }
     }
@@ -78,12 +106,16 @@ bool hasUseAfterDisposeWarning(const bezel::test::OwnershipResult& r) {
 
 // §28.2 v0.131: explicit Dispose() immediately before a read on the same
 // straight-line path dominates the use → WARN.
-BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_straight_line_warns) {
+BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_straight_line_discard_is_repeated_disposal_warning) {
     // var x := new T(); x.Dispose(); _ := x;
     // The Dispose() at the single predecessor block dominates the read.
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T(); x.Dispose(); _ := x;"));
-    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): the discard of an already explicitly disposed
+    // binding is the exempt REPEATED DISPOSAL -- a warning, never the
+    // use-after-dispose error (the method-call row below is the read).
+    BEZEL_EXPECT_TRUE(hasRepeatedDisposalWarning(r));
+    BEZEL_EXPECT_FALSE(hasUseAfterDisposeDiag(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -94,11 +126,13 @@ BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_straight_line_warns) {
 
 // §28.2 v0.131: calling an instance method on x after disposing it is a
 // use-after-dispose; the receiver x is read as part of the call site.
-BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_method_call_warns) {
+BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_method_call_is_error) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T(); x.Dispose(); _ := x.ToString();"));
-    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 
@@ -130,7 +164,7 @@ BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_one_branch_conditional_kill
         "if cond then x.Dispose(); end; "
         "x.Dispose();"));
     // Not the domination warning: the then-branch Dispose does not dominate.
-    BEZEL_EXPECT_FALSE(hasUseAfterDisposeWarning(r));
+    BEZEL_EXPECT_FALSE(hasUseAfterDisposeDiag(r));
     // But the conditional kill makes the post-join use a hard error.
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
@@ -142,12 +176,15 @@ BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_one_branch_conditional_kill
 // the state at the join is Disposed (Disposed ⊓ Disposed = Disposed per
 // §28.3 branch join), so every path into the post-if use site passed through
 // a Dispose() — the Dispose dominates, and we warn.
-BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_both_branches_warns) {
+BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_both_branches_discard_is_repeated_disposal_warning) {
     auto r = parseAndCheckOwnership(wrapBranch(
         "var x := new T(); "
         "if cond then x.Dispose(); else x.Dispose(); end; "
-        "_ := x;"));  // x is Disposed on every path to here → warn
-    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+        "_ := x;"));  // x is Disposed on every path to here
+    // #7435 (§28.2, v0.357): the kill on both arms dominates, and the discard
+    // after it is the exempt repeated disposal -- a warning, no error.
+    BEZEL_EXPECT_TRUE(hasRepeatedDisposalWarning(r));
+    BEZEL_EXPECT_FALSE(hasUseAfterDisposeDiag(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -160,7 +197,7 @@ BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_both_branches_warns) {
 BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_use_before_dispose_clean) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T(); _ := x.ToString(); x.Dispose();"));
-    BEZEL_EXPECT_FALSE(hasUseAfterDisposeWarning(r));
+    BEZEL_EXPECT_FALSE(hasUseAfterDisposeDiag(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -177,7 +214,7 @@ BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_use_before_dispose_clean) {
 BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_reassign_after_dispose_no_warn) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T(); x.Dispose(); x := new T(); _ := x.ToString(); x.Dispose();"));
-    BEZEL_EXPECT_FALSE(hasUseAfterDisposeWarning(r));
+    BEZEL_EXPECT_FALSE(hasUseAfterDisposeDiag(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -194,7 +231,7 @@ BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_reassign_after_dispose_no_w
 BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_using_var_implicit_no_warn) {
     auto r = parseAndCheckOwnership(wrap(
         "using var x := new T(); _ := x.ToString();"));
-    BEZEL_EXPECT_FALSE(hasUseAfterDisposeWarning(r));
+    BEZEL_EXPECT_FALSE(hasUseAfterDisposeDiag(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -220,7 +257,7 @@ BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_dispose_in_loop_no_warn_pos
         "  x := new T(); "        // reinitialise; Owned again
         "end; "
         "x.Dispose();"));         // final discharge (safe on all paths)
-    BEZEL_EXPECT_FALSE(hasUseAfterDisposeWarning(r));
+    BEZEL_EXPECT_FALSE(hasUseAfterDisposeDiag(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -231,7 +268,7 @@ BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_dispose_in_loop_no_warn_pos
 // used in the same straight-line body segment, the Dispose() dominates the
 // in-body use.  The warning fires inside the loop body (same as the
 // straight-line case 1).
-BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_dispose_then_use_in_loop_body_warns) {
+BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_dispose_then_use_in_loop_body_is_error) {
     // Dispose x inside the loop, then read it in the same iteration. The
     // Dispose() on the straight-line path inside the body dominates the read.
     auto r = parseAndCheckOwnership(wrapBranch(
@@ -240,8 +277,10 @@ BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_dispose_then_use_in_loop_bo
         "  x.Dispose(); "
         "  _ := x.ToString(); "   // use after dispose inside the same iteration
         "end;"));
-    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 

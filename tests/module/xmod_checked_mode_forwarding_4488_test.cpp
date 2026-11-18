@@ -201,19 +201,26 @@ const char* kCdLib4488 =
     "  public method GetValue(): int return 42; end GetValue; "
     "end CdRes4488; ";
 
+// Re-cut by #7435 (§28.2, v0.357): a use the explicit disposal DOMINATES is
+// a compile error, so the checked-mode backstop is observed through an
+// alias whose source has a CONDITIONAL kill ("A holder whose source was
+// disposed on only some paths to the use ... is not rejected: a use through
+// it raises `DisposedAccessException` in checked disposal mode").
 const char* kCdAppUseAfterDispose4488 =
     "module CdApp4488; "
     "import CdLib4488; "
     "class CdMain4488 "
-    "  public static method Main(): int "
+    "  public static method Probe(kill: bool): int "
     "    using var obj := new CdRes4488(); "
-    "    obj.Dispose(); "
+    "    var view := obj; "
+    "    if kill then obj.Dispose(); end; "
     "    try "
-    "      var v := obj.GetValue(); "
+    "      var v := view.GetValue(); "
     "      return 0; "
     "    catch DisposedAccessException => return 1; "
     "    end; "
-    "  end Main; "
+    "  end Probe; "
+    "  public static method Main(): int return Probe(true); end Main; "
     "end CdMain4488; ";
 
 // The CORRECT program (never uses a disposed instance) over the same library.

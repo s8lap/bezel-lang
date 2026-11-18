@@ -121,8 +121,18 @@ BEZEL_TEST(return_mk_indirection_captured_disposed_escape,
 // NEGATIVE (§28.9, accept-side sweep): `mk()` is called but its RESULT is
 // DISCARDED (not returned). The inner lambda is consumed by the call and
 // never escapes. Must stay accepted.
+//
+// #7435 (§28.2, v0.357): nothing ESCAPES, so the §28.9 check stays silent --
+// that is what this row was written to pin -- but the program is no longer
+// accepted. `mk` captures `entry` itself (it must, to hand it to the closure
+// it builds), and "A closure that captures the variable itself ... reads the
+// variable when it is invoked (§27.5): its invocation after the kill is a use
+// of the variable under the first sentence". `entry.Dispose();` dominates
+// `mk()`, so the call is §28.2's use-after-dispose compile error. The spec
+// sentence is categorical -- it does not ask what the invoked body does with
+// the capture -- and the commit body records that reading (I5).
 BEZEL_TEST(return_mk_indirection_captured_disposed_escape,
-           mk_call_result_discarded_no_escape_accepted) {
+           mk_call_result_discarded_no_escape_is_28_2_use) {
     auto r = parseAndCheckOwnership(wrap(
         "public static method Mk(): int "
         "  using var entry := new Widget(9); "
@@ -131,7 +141,12 @@ BEZEL_TEST(return_mk_indirection_captured_disposed_escape,
         "  var _unused := mk(); "
         "  return 0; "
         "end Mk;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "closure captures `entry` which was disposed before this "
+           "invocation"));
+    BEZEL_EXPECT_FALSE(hasErrorMessage(
+        r, "whose source is disposed at scope end"));
 }
 
 // NEGATIVE (parity with #4156 accept-side): the inner lambda is invoked

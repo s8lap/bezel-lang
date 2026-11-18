@@ -395,11 +395,13 @@ BEZEL_TEST(compound_assignment_read_after_consume_3969,
 // ============================================================================
 
 BEZEL_TEST(compound_assignment_read_after_consume_3969,
-           compound_rhs_read_after_dispose_warns_28_2) {
+           compound_rhs_read_after_dispose_is_error_28_2) {
     OwnershipResult r = parseAndCheckOwnership(
         wrap(std::string(kDisposed) + "t += x.tag; return t;"));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(r, bezel::Severity::Warning, kUseAfterDispose));
+        diagWithSeverity(r, bezel::Severity::Error, kUseAfterDispose));
     BEZEL_EXPECT_TRUE(diagHasRealLocation(r, kUseAfterDispose));
     BEZEL_EXPECT_EQ(diagCount(r, kUseAfterDispose), 1);
     // A warning, never an error — §28.2's straight-line use-after-dispose
@@ -408,11 +410,13 @@ BEZEL_TEST(compound_assignment_read_after_consume_3969,
 }
 
 BEZEL_TEST(compound_assignment_read_after_consume_3969,
-           increment_target_read_after_dispose_warns_28_2) {
+           increment_target_read_after_dispose_is_error_28_2) {
     OwnershipResult r = parseAndCheckOwnership(
         wrap(std::string(kDisposed) + "x.tag++; return t;"));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(r, bezel::Severity::Warning, kUseAfterDispose));
+        diagWithSeverity(r, bezel::Severity::Error, kUseAfterDispose));
     BEZEL_EXPECT_EQ(diagCount(r, kUseAfterDispose), 1);
 }
 

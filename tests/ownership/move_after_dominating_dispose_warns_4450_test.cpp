@@ -134,9 +134,17 @@ std::string wrap(const std::string& body) {
 // True iff `r` carries a §28.2 use-after-dispose WARNING for `x` (any
 // wording — both the read-side `checkRead` text and the consume-side
 // `markMovedByName` text fall under §28.2's regime).
-inline bool hasUseAfterDisposeWarning(const OwnershipResult& r) {
+//
+// #7435 (§28.2, v0.357): the verdict's SEVERITY is now ERROR -- "under a
+// *dominating* kill every use in the list above is this error -- a
+// **consume** exactly as a read is, `move x` and an `owned` argument position
+// included". `sev` selects the severity scanned: the positive rows pin
+// `Severity::Error`; the conditional-kill rows, which must not draw this
+// diagnostic at all, scan every severity (`hasUseAfterDisposeDiag`).
+inline bool hasUseAfterDisposeAt(const OwnershipResult& r,
+                                 const bezel::Severity* sev) {
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != bezel::Severity::Warning) continue;
+        if (sev && d.severity != *sev) continue;
         // The checkRead-side wording: "use of `x` after a dominating
         // explicit Dispose() call" — fires for rows 1-3, where `checkRead`
         // reaches `x` before `markMovedByName` and cascade-suppresses the
@@ -154,6 +162,14 @@ inline bool hasUseAfterDisposeWarning(const OwnershipResult& r) {
             return true;
     }
     return false;
+}
+
+inline bool hasUseAfterDisposeError(const OwnershipResult& r) {
+    const bezel::Severity sev = bezel::Severity::Error;
+    return hasUseAfterDisposeAt(r, &sev);
+}
+inline bool hasUseAfterDisposeDiag(const OwnershipResult& r) {
+    return hasUseAfterDisposeAt(r, nullptr);
 }
 
 // True iff `r` carries a §28.3 consume-table ERROR for a moved-from
@@ -220,15 +236,17 @@ inline bool hasCannotMoveFromDisposedError(const OwnershipResult& r) {
 // breaks one but not the other fails this row.
 // ============================================================================
 BEZEL_TEST(move_after_dominating_dispose_warns_4450,
-           straight_line_assignment_rhs_move_after_dispose_warns_28_2_row_1) {
+           straight_line_assignment_rhs_move_after_dispose_is_error_28_2_row_1) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); "
         "x.Dispose(); "
         "var t := 0; "
         "t := t + Sink.Take(move x); "
         "return t;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeError(r));
     // The pre-ruling §28.3 ERROR must NOT have re-appeared — the cascade
     // path stays in place, and the post-ruling verdict for this row is
     // WARNING (not ERROR).
@@ -239,14 +257,16 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
 // TABLE ROW 2 — `var t := Sink.Take(move x);` (LocalDecl initializer)
 // ============================================================================
 BEZEL_TEST(move_after_dominating_dispose_warns_4450,
-           straight_line_localdecl_init_move_after_dispose_warns_28_2_row_2) {
+           straight_line_localdecl_init_move_after_dispose_is_error_28_2_row_2) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); "
         "x.Dispose(); "
         "var t := Sink.Take(move x); "
         "return t;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeError(r));
     BEZEL_EXPECT_FALSE(hasCannotMoveFromDisposedError(r));
 }
 
@@ -257,7 +277,7 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
 // ruling flip.
 // ============================================================================
 BEZEL_TEST(move_after_dominating_dispose_warns_4450,
-           while_body_assignment_rhs_move_after_dispose_warns_28_2_row_3) {
+           while_body_assignment_rhs_move_after_dispose_is_error_28_2_row_3) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); "
         "x.Dispose(); "
@@ -268,8 +288,10 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
         "  i := i + 1; "
         "end; "
         "return t;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeError(r));
     BEZEL_EXPECT_FALSE(hasCannotMoveFromDisposedError(r));
 }
 
@@ -284,14 +306,16 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
 // #4450 the verdict is WARNING.
 // ============================================================================
 BEZEL_TEST(move_after_dominating_dispose_warns_4450,
-           straight_line_bare_statement_move_after_dispose_warns_28_2_row_4) {
+           straight_line_bare_statement_move_after_dispose_is_error_28_2_row_4) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); "
         "x.Dispose(); "
         "Sink.Take(move x); "
         "return 0;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeError(r));
     // The OLD §28.3 ERROR text must NOT fire — the verdict MOVED.
     BEZEL_EXPECT_FALSE(hasCannotMoveFromDisposedError(r));
 }
@@ -307,15 +331,17 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
 // local" ERROR.
 // ============================================================================
 BEZEL_TEST(move_after_dominating_dispose_warns_4450,
-           straight_line_top_level_move_after_dispose_warns_28_2_row_5) {
+           straight_line_top_level_move_after_dispose_is_error_28_2_row_5) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); "
         "var y := new Res(2); "
         "x.Dispose(); "
         "y := move x; "
         "return y.tag;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeError(r));
     BEZEL_EXPECT_FALSE(hasCannotMoveFromDisposedError(r));
 }
 
@@ -324,7 +350,7 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
 // and the loop/straight-line CONSISTENCY row for the consume side.
 // ============================================================================
 BEZEL_TEST(move_after_dominating_dispose_warns_4450,
-           while_body_top_level_move_after_dispose_warns_28_2_row_6) {
+           while_body_top_level_move_after_dispose_is_error_28_2_row_6) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); "
         "var y := new Res(2); "
@@ -335,8 +361,10 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
         "  i := i + 1; "
         "end; "
         "return y.tag;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeError(r));
     BEZEL_EXPECT_FALSE(hasCannotMoveFromDisposedError(r));
 }
 
@@ -366,7 +394,7 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
 // the program's own head (rows 5-6's natural form, by design).
 // ============================================================================
 BEZEL_TEST(move_after_dominating_dispose_warns_4450,
-           checked_mode_backstop_for_row_2_localdecl_init) {
+           compile_rejection_for_row_2_localdecl_init) {
     JitResult jr = runAotCheckedDisposal(wrap(
         "var x := new Res(1); "
         "x.Dispose(); "
@@ -375,12 +403,16 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
         "  return 0; "
         "catch DisposedAccessException => return 1; "
         "end; "));
-    BEZEL_EXPECT_TRUE(jr.ran);
-    BEZEL_EXPECT_EQ(jr.exitCode, 1);
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(
+        bezel::test::failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        jr, "§28.2's use-after-dispose compile error"));
 }
 
 BEZEL_TEST(move_after_dominating_dispose_warns_4450,
-           checked_mode_backstop_for_row_4_bare_statement) {
+           compile_rejection_for_row_4_bare_statement) {
     // `Sink.Take(move x)`'s body reads `r.tag` — the member access through
     // the moved-from-and-already-disposed reference — so the exception
     // fires inside `Take` and the catch arm observes it.
@@ -392,12 +424,16 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
         "  return 0; "
         "catch DisposedAccessException => return 1; "
         "end; "));
-    BEZEL_EXPECT_TRUE(jr.ran);
-    BEZEL_EXPECT_EQ(jr.exitCode, 1);
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(
+        bezel::test::failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        jr, "§28.2's use-after-dispose compile error"));
 }
 
 BEZEL_TEST(move_after_dominating_dispose_warns_4450,
-           checked_mode_backstop_for_row_5_top_level_move_with_field_access) {
+           compile_rejection_for_row_5_top_level_move_with_field_access) {
     // Row 5's natural form (`y := move x; return 0;`) does NOT reach the
     // backstop — the move is a reference transfer, no member access.  To
     // pin the backstop claim for this row, use the SHAPE that DOES include
@@ -414,8 +450,12 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
         "  return 0; "
         "catch DisposedAccessException => return 1; "
         "end; "));
-    BEZEL_EXPECT_TRUE(jr.ran);
-    BEZEL_EXPECT_EQ(jr.exitCode, 1);
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(
+        bezel::test::failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        jr, "§28.2's use-after-dispose compile error"));
 }
 
 // ============================================================================
@@ -453,7 +493,7 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
     BEZEL_EXPECT_TRUE(hasMaybeConsumedError(r));
     // The §28.2 consume-side WARNING must NOT fire — the conditional-kill
     // is still an ERROR (the ruling is the DOMINATING kill only).
-    BEZEL_EXPECT_FALSE(hasUseAfterDisposeWarning(r));
+    BEZEL_EXPECT_FALSE(hasUseAfterDisposeDiag(r));
 }
 
 BEZEL_TEST(move_after_dominating_dispose_warns_4450,
@@ -469,7 +509,7 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
         "return 0;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasMaybeConsumedError(r));
-    BEZEL_EXPECT_FALSE(hasUseAfterDisposeWarning(r));
+    BEZEL_EXPECT_FALSE(hasUseAfterDisposeDiag(r));
 }
 
 // ============================================================================

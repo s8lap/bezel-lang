@@ -48,6 +48,7 @@
 
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
+#include "support/aot_result_asserts.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
@@ -479,16 +480,17 @@ BEZEL_TEST(class_dispose_method_group_7025,
     BEZEL_EXPECT_EQ(r.stdoutText, "disposed\nafter\n0\n");
 }
 
-// THE GROUP FORMED AFTER THE DISPOSAL. §28.2's use-after-dispose regime
-// covers this program — the receiver is disposed before the group captures it
-// — so the COMPILER warns (the row is in tests/ownership/, where the
-// diagnostic is pinned). The RUNTIME obligation is that the capture must not
-// be a null pointer: the pre-fix build nulled the receiver's slot at the
-// dispose, the group captured null, and the invocation was a SIGSEGV
-// (measured on the fix-forward). The group's invocation is the already-set
-// dispose flag's no-op (§28.2: "a repeated call is the no-op").
+// THE GROUP FORMED AFTER THE DISPOSAL. §28.2 (v0.357), #7435: forming the
+// group reads the receiver ("a use of a local variable — a read, a borrow
+// taken from it, a member access, …"), and the explicit disposal dominates
+// that read, so the program is a COMPILE ERROR — the exemption covers "a
+// second `Dispose()` … call", not a reference to the member. Until #7435 this
+// row ran the program (the compiler only warned) and pinned that the captured
+// receiver was not a null pointer; the shape has no run-time re-cut — a
+// conditional kill leaves `d` maybe-consumed (§28.3) and `Dispose` through an
+// alias is §28.6's error — so the row pins the rejection.
 BEZEL_TEST(class_dispose_method_group_7025,
-           spec_28_2_group_formed_after_the_dispose_does_not_crash) {
+           spec_28_2_group_formed_after_the_dispose_is_rejected) {
     auto r = runAotChecked(
         "module M; "
         "class D "
@@ -503,9 +505,12 @@ BEZEL_TEST(class_dispose_method_group_7025,
         "  Console.WriteLine(\"after\"); "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, "disposed\nafter\n");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "use of `d` after a dominating explicit Dispose() call"));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "§28.2's use-after-dispose compile error"));
 }
 
 // ---------------------------------------------------------------------------

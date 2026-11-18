@@ -119,13 +119,17 @@ BEZEL_TEST(try_convention_1336, owning_array_trypopfirst_true_bang) {
 // §4.5 / §22.3 (#1336): empty array — FALSE path leaves the inline `out owned
 // var` recipient `null`; the null-guarded `?.Dispose()` is a safe no-op.
 BEZEL_TEST(try_convention_1336, owning_array_trypopfirst_false_is_null) {
+    // Re-cut by #7435 (§28.2, v0.357; K3.9 names `x?.Dispose()` an explicit
+    // disposal): a read of `item` the disposal DOMINATES is a compile error,
+    // so the null test is taken BEFORE the kill. Same observation: 7.
     BEZEL_EXPECT_EQ(run(
         "module M; class Box public Val: int := 0; end Box; "
         "class C public static method Main(): int "
         "  do using var a := new OwningArray<Box>(); "
         "    var ok := a.TryPopFirst(out var item); "
+        "    var isNull := item = null; "
         "    item?.Dispose(); "
-        "    if item = null then return 7; end; return 3; end; return 0; "
+        "    if isNull then return 7; end; return 3; end; return 0; "
         "end Main; end C;"), 7);
 }
 

@@ -4988,7 +4988,35 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                     }
                 }
             }
-            handleDischarge(*ds->value);
+            // §28.2 (v0.357), #7435: "One use is exempt: a second `Dispose()`
+            // or `DisposeAsync()`, or a second discard, of the same binding is
+            // the runtime no-op the carve-out above defines and draws a
+            // compile-time warning". A discard of a binding an explicit
+            // disposal already reaches on every path is that repeated
+            // disposal, not a READ of the binding: it is reported with the
+            // *disposed again* warning `markDisposedByName` gives a second
+            // `Dispose()`, and the operand is not walked as a read (which
+            // would be §28.2's use-after-dispose error). The state stays
+            // Disposed, as it does after a second `Dispose()`.
+            bool repeatedDiscard = false;
+            if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+                    ds->value.get())) {
+                if (rid->name != "this" && rid->name != "base") {
+                    auto* rst = lookupStateFor(*rid);
+                    if (rst && rst->state == OwnershipState::Disposed &&
+                        rst->explicitlyDisposed && !rst->awaitSpent) {
+                        report(
+                            Severity::Warning, rid->span.begin,
+                            std::string("local `") + std::string(rid->name) +
+                                "` is disposed again here — the discard of an "
+                                "already explicitly disposed binding is a "
+                                "no-op (disposal is idempotent, §28.2); the "
+                                "redundant discard usually indicates a bug");
+                        repeatedDiscard = true;
+                    }
+                }
+            }
+            if (!repeatedDiscard) handleDischarge(*ds->value);
             // §17.13 / §28.3 v0.184 (#1651): `_ := x;` where `x` is a named
             // owned binding — a plain owned LOCAL (a `var`/`using var`
             // LocalDecl, the `out owned var` inline form, #1387, or an
@@ -11046,6 +11074,23 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
         // live index never triggers it — no over-rejection. // per §15.3 (#1932)
         for (const auto& idx : ix->indices)
             if (idx.value) checkRead(*idx.value, /*selfTarget=*/false);
+    }
+    // §28.2 (v0.357), #7435: a MEMBER STORE `x.f := …` is a use of `x` — "A
+    // use of a local variable — a read, a borrow taken from it, a member
+    // access, an argument position, a consume". The store reaches the member
+    // through the receiver, so the receiver chain is a READ position exactly
+    // as the indexer-set receiver above is (#4065) and as the compound form's
+    // target is (§6.6, #3969); only the plain `:=` member store never asked.
+    // MEASURED on the parent: `h.Dispose(); h.Tag := 3;` and the same store
+    // after `_ := h;` or through an alias of `h` compiled with no diagnostic
+    // and wrote through a disposed receiver (DisposedAccessException checked,
+    // an ASan-reported write unchecked). `checkRead` reports only for a local
+    // already in an error state, so a store through a live receiver is
+    // untouched. The final member itself is not read: `ma->target` only.
+    // // per §28.2
+    if (const auto* tma =
+            dynamic_cast<const ast::MemberAccessExpr*>(as.target.get())) {
+        if (tma->target) checkRead(*tma->target, /*selfTarget=*/false);
     }
     // §28.14 (v0.175): a captured source frozen by a scoped-callback admission
     // may not be REASSIGNED until the bounding scope exits.

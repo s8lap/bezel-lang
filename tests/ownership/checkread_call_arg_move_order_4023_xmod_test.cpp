@@ -202,12 +202,20 @@ using bezel::ownership::kOldDisposedMoveError;
 // conditional-kill arms, which the demotion did NOT touch).
 // =============================================================================
 BEZEL_TEST(checkread_call_arg_move_order_4023_xmod,
-           imported_callee_bare_call_move_of_disposed_local_warns_28_2_4450) {
+           imported_callee_bare_call_move_of_disposed_local_is_error_28_2_4450) {
     std::string stderrText;
     bool compiled = compileImportedApp4023X(&stderrText);
-    BEZEL_EXPECT_TRUE(compiled);  // warnings don't fail the build
+    // #7435 (§28.2, v0.357): the consume a dominating explicit disposal
+    // reaches is a compile ERROR again -- "a **consume** exactly as a read
+    // is, `move x` and an `owned` argument position included" -- so the
+    // cross-module app is REJECTED, with §28.2's consume-side wording (the
+    // v0.303 warning, #4450, is the retired verdict).
+    BEZEL_EXPECT_FALSE(compiled);
     BEZEL_EXPECT_TRUE(stderrText.find(kConsumeSideUseAfterDisposeWarning) !=
                       std::string::npos);
+    BEZEL_EXPECT_TRUE(
+        stderrText.find("§28.2's use-after-dispose compile error") !=
+        std::string::npos);
     // Negative guard: OLD §28.3 ERROR text must NOT have re-appeared.
     BEZEL_EXPECT_TRUE(stderrText.find(kOldDisposedMoveError) ==
                       std::string::npos);

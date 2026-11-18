@@ -129,16 +129,22 @@ BEZEL_TEST(using_var_pin_move_out_7405,
     BEZEL_EXPECT_TRUE(hasErrorMessage(r, kA5));
 }
 
-// Over-reject mirror: the move-out of a PLAIN owned local after its explicit
-// `Dispose()` is §28.2's dominating-kill WARNING, not an error (the binding is
-// not a `using var`; v0.303, pinned by move_after_dominating_dispose_warns_4450).
+// The move-out of a PLAIN owned local after its explicit `Dispose()` is not
+// the A5 `using var` error (the binding is not a `using var`) -- it is §28.2's
+// own use-after-dispose compile error: "under a *dominating* kill every use
+// in the list above is this error -- a **consume** exactly as a read is,
+// `move x` and an `owned` argument position included" (#7435, §28.2, v0.357;
+// the v0.303 warning this row pinned is the retired verdict).
 BEZEL_TEST(using_var_pin_move_out_7405,
-           move_of_disposed_plain_local_stays_a_warning_spec_28_2) {
+           move_of_disposed_plain_local_is_error_spec_28_2) {
     auto r = parseAndCheckOwnership(probe(R"(
     var a := new R(2, new Q(1));
     a.Dispose();
     R.Take(move a);)"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "move from a local `a` already disposed at this point (§28.2)"));
+    BEZEL_EXPECT_FALSE(hasErrorMessage(r, kA5));
 }
 
 // Over-reject mirror: an explicit `Dispose()` of a `using var` is itself

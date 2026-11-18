@@ -1,12 +1,13 @@
 //! case: s28_2_0003
 //! doc: spec
 //! section: 28.2
-//! title: a straight-line read after an explicit Dispose raises the use-after-dispose warning
-//! rule: The compiler must emit a warning when a local variable is used after an
-//!   explicit `Dispose()` call on the same variable that dominates the use site on
-//!   every path.
-//! expect: warn
-//! diagnostic: used
+//! title: a straight-line read after an explicit Dispose is a compile error
+//! rule: "A use of a local variable — a read, a borrow taken from it, a member access,
+//!   an argument position, a consume — after an explicit `Dispose()` or direct
+//!   `DisposeAsync()` call ... on the same variable that dominates the use site on
+//!   every path is a **compile error**" (§28.2, v0.357).
+//! expect: reject
+//! diagnostic: use-after-dispose
 module Conf;
 
 public class Widget

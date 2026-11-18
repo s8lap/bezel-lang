@@ -178,9 +178,15 @@ constexpr char kMoveAfterDisposeWarn[] =
 // path reaching the consume (the "dominating kill" of §28.2, v0.303) emits
 // a single §28.2 WARNING — the consume-side wording above — and nothing
 // else.
-inline bool hasMoveAfterDisposeWarning(const OwnershipResult& r) {
+//
+// #7435 (§28.2, v0.357): the verdict is an ERROR again -- "under a
+// *dominating* kill every use in the list above is this error -- a
+// **consume** exactly as a read is, `move x` and an `owned` argument position
+// included". The consume-side wording's leading text is unchanged; the
+// helper scans Error-severity.
+inline bool hasMoveAfterDisposeError(const OwnershipResult& r) {
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.severity == bezel::Severity::Warning &&
+        if (d.severity == bezel::Severity::Error &&
             d.message.find(kMoveAfterDisposeWarn) != std::string::npos)
             return true;
     return false;
@@ -210,12 +216,14 @@ JitResult runAotAsan(const std::string& source) {
 // Post-ruling (#4450, v0.303): the verdict is the §28.2 consume-side
 // WARNING, NOT the pre-ruling §28.3 ERROR the row originally pinned.
 BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
-           control_direct_move_of_disposed_local_warns_28_2_4450) {
+           control_direct_move_of_disposed_local_is_error_28_2_4450) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); x.Dispose(); "
         "using var h := new Holder(move x); return h.v;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeError(r));
 }
 
 // The bare-STATEMENT throw was always correctly discharged — #3989's issue
@@ -254,26 +262,30 @@ BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
 // ============================================================================
 
 BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
-           if_expr_move_of_disposed_local_warns_28_2_4450) {
+           if_expr_move_of_disposed_local_is_error_28_2_4450) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); x.Dispose(); var flag := true; "
         "using var h := (if flag then new Holder(move x) "
         "                        else new Holder(new Res(0))); "
         "return h.v;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeError(r));
 }
 
 BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
-           case_expr_move_of_disposed_local_warns_28_2_4450) {
+           case_expr_move_of_disposed_local_is_error_28_2_4450) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); x.Dispose(); var n := 1; "
         "using var h := (case n of "
         "  1 => new Holder(move x), "
         "  _ => new Holder(new Res(0))); "
         "return h.v;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeError(r));
 }
 
 
@@ -287,15 +299,17 @@ BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
 // otherwise make this row accidentally exercise a DIFFERENT unfixed defect
 // instead of the guard-walk this fix actually adds.
 BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
-           case_expr_guard_move_of_disposed_local_warns_28_2_4450) {
+           case_expr_guard_move_of_disposed_local_is_error_28_2_4450) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); x.Dispose(); var n := 1; "
         "var y := (case n of "
         "  var m when new Holder(move x) <> null => m, "
         "  _ => 0); "
         "return y;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeError(r));
 }
 
 // ============================================================================

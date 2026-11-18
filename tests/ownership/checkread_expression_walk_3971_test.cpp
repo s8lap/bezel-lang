@@ -378,34 +378,40 @@ BEZEL_TEST(checkread_expression_walk_3971,
 // ============================================================================
 
 BEZEL_TEST(checkread_expression_walk_3971,
-           new_ctor_argument_read_after_dispose_warns_28_2) {
+           new_ctor_argument_read_after_dispose_is_error_28_2) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         std::string(kDisposed) +
         "using var q := new Res(x.tag); return t + q.tag;"));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(r, bezel::Severity::Warning, kUseAfterDispose));
+        diagWithSeverity(r, bezel::Severity::Error, kUseAfterDispose));
     BEZEL_EXPECT_TRUE(diagHasRealLocation(r, kUseAfterDispose));
     BEZEL_EXPECT_EQ(diagCount(r, kUseAfterDispose), 1);
 }
 
 BEZEL_TEST(checkread_expression_walk_3971,
-           conditional_arm_read_after_dispose_warns_28_2) {
+           conditional_arm_read_after_dispose_is_error_28_2) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         std::string(kDisposed) +
         "var c := true; var u := (if c then x.tag else 0); return t + u;"));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(r, bezel::Severity::Warning, kUseAfterDispose));
+        diagWithSeverity(r, bezel::Severity::Error, kUseAfterDispose));
     BEZEL_EXPECT_TRUE(diagHasRealLocation(r, kUseAfterDispose));
     BEZEL_EXPECT_EQ(diagCount(r, kUseAfterDispose), 1);
 }
 
 BEZEL_TEST(checkread_expression_walk_3971,
-           interpolated_string_hole_read_after_dispose_warns_28_2) {
+           interpolated_string_hole_read_after_dispose_is_error_28_2) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         std::string(kDisposed) +
         "var s := $\"{x.tag}\"; return t + s.Length;"));
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(r, bezel::Severity::Warning, kUseAfterDispose));
+        diagWithSeverity(r, bezel::Severity::Error, kUseAfterDispose));
     BEZEL_EXPECT_TRUE(diagHasRealLocation(r, kUseAfterDispose));
     BEZEL_EXPECT_EQ(diagCount(r, kUseAfterDispose), 1);
 }
@@ -527,16 +533,18 @@ BEZEL_TEST(checkread_expression_walk_3971,
 // ============================================================================
 
 BEZEL_TEST(checkread_expression_walk_3971,
-           guard_new_move_argument_after_dispose_warns_28_2_4450) {
+           guard_new_move_argument_after_dispose_is_error_28_2_4450) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         std::string(kDisposed) +
         "using var h := new Holder(move x); return t + h.v;"));
     // §28.2 WARNING (not §28.3 error) under the v0.303 ruling — the consume
     // side wording, distinct from the read side, with the `x` name and the
     // §28.2 citation all present.
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(diagWithSeverity(
-        r, bezel::Severity::Warning,
+        r, bezel::Severity::Error,
         "move from a local `x` already disposed at this point (§28.2)"));
     // `checkRead` must NOT also fire on `move x` (no double warning) — this
     // is the preemption invariant #3971's GUARD originally owned.
@@ -544,13 +552,15 @@ BEZEL_TEST(checkread_expression_walk_3971,
 }
 
 BEZEL_TEST(checkread_expression_walk_3971,
-           guard_new_bare_owned_argument_after_dispose_warns_28_2_4450) {
+           guard_new_bare_owned_argument_after_dispose_is_error_28_2_4450) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         std::string(kDisposed) +
         "using var h := new Holder(x); return t + h.v;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // #7435 (§28.2, v0.357): a use the explicit disposal dominates is a
+    // compile ERROR -- the v0.303 warning (#4450) is the retired verdict.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(diagWithSeverity(
-        r, bezel::Severity::Warning,
+        r, bezel::Severity::Error,
         "move from a local `x` already disposed at this point (§28.2)"));
     BEZEL_EXPECT_EQ(diagCount(r, kUseAfterDispose), 0);
 }

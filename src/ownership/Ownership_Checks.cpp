@@ -2608,7 +2608,14 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             }
         }
         bool skipCalleeReadForDispose = false;
-        if (disposeTarget && disposeMember == "Dispose") {
+        // §28.2 (v0.357), #7435: the exemption names BOTH spellings — "a second
+        // `Dispose()` or `DisposeAsync()` ... of the same binding" draws the
+        // repeated-disposal warning, never the use-after-dispose error. With
+        // `Dispose` alone here, `await a.DisposeAsync(); await a.DisposeAsync();`
+        // had its second receiver read first and reported as a USE.
+        // // per §28.2
+        if (disposeTarget &&
+            (disposeMember == "Dispose" || disposeMember == "DisposeAsync")) {
             if (auto* tid =
                     dynamic_cast<const ast::IdentifierExpr*>(disposeTarget)) {
                 // Only skip read-check if the local is already Disposed
@@ -3241,7 +3248,38 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         // handleDischarge explicitly so the ownership check fires. // per §28.6
         if (un->op == "await" && un->operand) {
             handleDischarge(*un->operand);
-            if (un->operand) checkRead(*un->operand, /*selfTarget=*/false);
+            // §28.2 (v0.357), #7435: `await x.DisposeAsync()` IS the explicit
+            // disposal of `x` — "an explicit `Dispose()` or direct
+            // `DisposeAsync()` call". The walk above has just recorded that
+            // kill (and given a repeated one its *disposed again* warning), so
+            // reading the same operand afterwards would report the disposal
+            // call's own receiver as a use AFTER the disposal: MEASURED on the
+            // parent, a lone `await a.DisposeAsync();` drew "use of `a` after
+            // a dominating explicit Dispose() call" at the call itself — a
+            // false warning, and a false compile error once the use is the
+            // error §28.2 states. A disposal call on a named local has no
+            // other operand to read. // per §28.2, §28.12
+            bool explicitDisposalOfLocal = false;
+            if (auto* dc = dynamic_cast<const ast::CallExpr*>(
+                    un->operand.get())) {
+                const ast::Expr* recv = nullptr;
+                if (auto* dma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        dc->callee.get())) {
+                    if (dma->member == "Dispose" ||
+                        dma->member == "DisposeAsync")
+                        recv = lookThroughForceUnwrap(dma->target.get());
+                } else if (auto* dnm =
+                               dynamic_cast<const ast::NullCondMemberExpr*>(
+                                   dc->callee.get())) {
+                    if (dnm->member == "Dispose" ||
+                        dnm->member == "DisposeAsync")
+                        recv = dnm->target.get();
+                }
+                explicitDisposalOfLocal =
+                    recv && dynamic_cast<const ast::IdentifierExpr*>(recv);
+            }
+            if (!explicitDisposalOfLocal)
+                checkRead(*un->operand, /*selfTarget=*/false);
             return;
         }
         // Other unary ops — sub-expression is a regular read.
@@ -3569,9 +3607,9 @@ static bool isOwnedRelevantLocal(sema::Symbol* sym) {
 // `DisposedAccessException` in checked disposal mode".
 //
 // So the severity is the SPEC'S OWN: a compile error. The DIRECT shape
-// (`a.Dispose(); a.Use();`) keeps its own diagnostic and its own severity —
-// `checkRead`'s `state == Disposed` arm, a WARNING (the §28.2 v0.131 ruling,
-// unchanged here); this check is the MISSING static rejection for the HOLDER
+// (`a.Dispose(); a.Use();`) keeps its own diagnostic — `checkRead`'s
+// `state == Disposed` arm, the same compile error under §28.2's first
+// sentence (#7435); this check is the static rejection for the HOLDER
 // shape, with its own diagnostic.
 //
 // THE HOLDER — ONE POSITIVE RECOGNITION: a `using var` BORROW-PIN —
@@ -4290,20 +4328,42 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
             }
             if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         } else if (st->state == OwnershipState::Disposed) {
-            // §28.2 v0.131: emit a compile-time warning (not an error) when a
-            // local is used after an explicit Dispose() that dominates the use
-            // site on every path — the statically-decidable subset of
-            // use-after-dispose.  "Should" in the spec maps to Warning severity
-            // (the runtime checked mode, §28.2 checked mode, handles the error
-            // path).  If we have the dispose-site location, emit a Note pointing
-            // at it so the programmer can see both sites in a single diagnostic
-            // sequence.
+            // §28.2 (v0.357), #7435: "A use of a local variable — a read, a
+            // borrow taken from it, a member access, an argument position, a
+            // consume — after an explicit `Dispose()` or direct
+            // `DisposeAsync()` call … — or a discard of the binding … — on
+            // the same variable that dominates the use site on every path is
+            // a **compile error**". The state is Disposed only where the kill
+            // reaches this read on every path (a kill on some paths joins to
+            // `disposedOnSomePath`, §28.3's error above), so this arm IS the
+            // dominated use. The one exempt use, the repeated disposal, never
+            // gets here: a second `Dispose()` is `markDisposedByName`'s
+            // warning and a second discard is the discard statement's own
+            // (`visitStmt`, which does not walk its operand as a read).
+            //
+            // An await-spent task (`awaitSpent`, §30.5 Pattern B) is Disposed
+            // without an explicit disposal; its read keeps the warning this
+            // arm gave before v0.346 (the §28.2 error is stated of the three
+            // explicit kills only). If we have the dispose-site location,
+            // emit a Note pointing at it so the programmer can see both
+            // sites in a single diagnostic sequence. // per §28.2
+            const bool dominatedUse = st->explicitlyDisposed && !st->awaitSpent;
             report(
-                Severity::Warning, id->span.begin,
-                std::string("use of `") + std::string(id->name) +
-                "` after a dominating explicit Dispose() call — "
-                "use-after-dispose is undefined behaviour in unchecked mode "
-                "and raises DisposedAccessException in checked mode (§28.2)");
+                dominatedUse ? Severity::Error : Severity::Warning,
+                id->span.begin,
+                dominatedUse
+                    ? std::string("use of `") + std::string(id->name) +
+                      "` after a dominating explicit Dispose() call — the "
+                      "disposal reaches this use on every path, so the use "
+                      "reads a disposed value: a use the explicit disposal "
+                      "dominates is §28.2's use-after-dispose compile error "
+                      "(§28.2 — move the disposal after the last use of `" +
+                      std::string(id->name) + "`, or reassign it first)"
+                    : std::string("use of `") + std::string(id->name) +
+                      "` after a dominating explicit Dispose() call — "
+                      "use-after-dispose is undefined behaviour in unchecked "
+                      "mode and raises DisposedAccessException in checked "
+                      "mode (§28.2)");
             if (st->explicitlyDisposed && st->explicitDisposeLoc.line != 0) {
                 report(
                     Severity::Note, st->explicitDisposeLoc,
@@ -5630,9 +5690,21 @@ void MethodOwnership::collectLambdaIdentifiers(
 // fix #4399: recursively check whether any capture in the closure chain
 // (including transitive captures of nested closures) is in Disposed state.
 // The `visited` set prevents infinite loops on pathological code.
+//
+// §28.2 (v0.357), #7435: "A closure that captures the variable itself, rather
+// than a holder of its value, reads the variable when it is invoked (§27.5):
+// its invocation after the kill is a use of the variable under the first
+// sentence, and a reassignment between the kill and the invocation lifts it as
+// it lifts any other read of the variable." So the invocation is the compile
+// error `checkRead`'s Disposed arm reports for a direct read — the capture is
+// in Disposed state HERE, at the invocation, only where the kill reaches the
+// invocation on every path and no store into the variable followed it. The
+// error is reported at the capture (the read the invocation performs), with
+// the invocation and the disposing site as notes.
 void MethodOwnership::checkTransitiveCapturesDisposed(
     const ast::LambdaExpr& lam,
-    std::set<const ast::LambdaExpr*>& visited) {
+    std::set<const ast::LambdaExpr*>& visited,
+    SourceLocation invokeLoc) {
     if (!visited.insert(&lam).second) return;  // already visited
 
     std::vector<const ast::IdentifierExpr*> caps;
@@ -5644,23 +5716,70 @@ void MethodOwnership::checkTransitiveCapturesDisposed(
         if (it == states_.end()) continue;
         const LocalOwnership& st = it->second;
         if (st.state == OwnershipState::Disposed) {
-            report(
-                Severity::Warning,
+            // An await-spent task (§30.5 Pattern B) is Disposed without an
+            // explicit disposal; it keeps the pre-v0.346 warning, as in
+            // `checkRead`.
+            const bool dominatedUse = st.explicitlyDisposed && !st.awaitSpent;
+            reportOnce(
+                dominatedUse ? Severity::Error : Severity::Warning,
                 id->span.begin,
                 std::string("closure captures `") + std::string(id->name) +
                     "` which was disposed before this invocation — a closure's "
                     "captured borrow is read at invoke time, and this call "
-                    "reads a disposed value (§28.2 use-after-dispose)");
+                    "reads a disposed value (§28.2 use-after-dispose" +
+                    (dominatedUse
+                         ? std::string(": the invocation of a closure over a "
+                                       "variable is a use of that variable, "
+                                       "and a use the explicit disposal "
+                                       "dominates is a compile error — invoke "
+                                       "the closure before the disposal, or "
+                                       "reassign `") +
+                               std::string(id->name) + "` first)"
+                         : std::string(")")));
+            if (dominatedUse) {
+                if (invokeLoc.line != 0)
+                    reportOnce(Severity::Note, invokeLoc,
+                               "the closure is invoked here");
+                if (st.explicitDisposeLoc.line != 0)
+                    reportOnce(Severity::Note, st.explicitDisposeLoc,
+                           std::string("explicit Dispose() of `") +
+                               std::string(id->name) + "` was here");
+            }
         }
         // Recurse: if this capture is itself a function-typed local holding
         // a closure, check ITS captures transitively.
-        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(capSym)) {
-            auto lit = scopedLambdaLocalInit_.find(ls);
-            if (lit != scopedLambdaLocalInit_.end()) {
-                checkTransitiveCapturesDisposed(*lit->second, visited);
-            }
-        }
+        if (const ast::LambdaExpr* inner = lambdaLiteralOfFunctionLocal(capSym))
+            checkTransitiveCapturesDisposed(*inner, visited, invokeLoc);
     }
+}
+
+// §28.2 (v0.357), #7435: see the declaration.
+const ast::LambdaExpr* MethodOwnership::lambdaLiteralOfFunctionLocal(
+        sema::Symbol* sym) const {
+    for (int hops = 0; sym && hops < 16; ++hops) {
+        auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+        if (!ls) return nullptr;
+        // A local that is an assignment target anywhere in the body may hold
+        // another function value by the time it is invoked.
+        if (scopedAssignedSyms_.count(sym)) return nullptr;
+        if (auto lit = scopedLambdaLocalInit_.find(ls);
+            lit != scopedLambdaLocalInit_.end())
+            return lit->second;
+        // `var g := h;` / `const g := h;`: the copy of a function value names
+        // the same closure.
+        const ast::Expr* init = nullptr;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
+            init = ld->initializer.get();
+        else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(ls->decl))
+            init = lc->value.get();
+        if (!init) return nullptr;
+        auto* src = dynamic_cast<const ast::IdentifierExpr*>(peelTopCastBang(init));
+        if (!src) return nullptr;
+        const sema::TypeRef* ty = ctx_.exprType(*src);
+        if (!ty || ty->kind != sema::TypeRef::Kind::Function) return nullptr;
+        sym = ctx_.exprSymbol(*src);
+    }
+    return nullptr;
 }
 
 // fix #7025 (follow-up, §28.2, v0.340): the METHOD-GROUP twin of
@@ -6155,9 +6274,17 @@ void MethodOwnership::reportMovedFromCapturesIn(const ast::LambdaExpr& lam,
                    "still-owned branch first, or give the closure an `owned` "
                    "parameter and pass the value in.");
         } else {
-            // Disposed (same-frame use-after-dispose). Same severity / Note
-            // pairing as checkRead's own warning — §28.2 checked-mode
-            // semantics carry over identically to the capture form.
+            // Disposed at the LITERAL: a closure over the variable formed
+            // after the explicit disposal. This stays a WARNING under v0.357
+            // (#7435): §28.2 — "A closure that captures the variable itself
+            // … reads the variable when it is invoked (§27.5): its invocation
+            // after the kill is a use of the variable under the first
+            // sentence, and a reassignment between the kill and the
+            // invocation lifts it". Forming the closure reads nothing, and
+            // `d.Dispose(); var f := lambda() => d.M(); d := new D(); f();`
+            // is a legal program, so the compile error is the INVOCATION's
+            // (`checkTransitiveCapturesDisposed`); the formation keeps the
+            // advisory it had.
             report(Severity::Warning, id->span.begin,
                    std::string("closure captures `") + std::string(id->name) +
                    "` after a dominating explicit Dispose() call "
@@ -6301,10 +6428,20 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
                     dynamic_cast<const ast::IdentifierExpr*>(call->callee.get())) {
                 if (sema::Symbol* sym = ctx_.exprSymbol(*calleeId)) {
                     if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
-                        auto lit = scopedLambdaLocalInit_.find(ls);
-                        if (lit != scopedLambdaLocalInit_.end()) {
+                        // §28.2 (v0.357), #7435: the closure the callee local
+                        // names — its own lambda literal, or the one a chain
+                        // of never-reassigned copies (`var g := h;`) leads
+                        // to. A local that is reassigned anywhere names no
+                        // one closure, so it is not asked (the invocation
+                        // would otherwise be charged with the captures of a
+                        // literal the local no longer holds).
+                        if (const ast::LambdaExpr* calleeLam =
+                                lambdaLiteralOfFunctionLocal(ls)) {
                             std::set<const ast::LambdaExpr*> visited;
-                            checkTransitiveCapturesDisposed(*lit->second, visited);
+                            checkTransitiveCapturesDisposed(
+                                *calleeLam, visited, call->span.begin);
+                        } else if (scopedLambdaLocalInit_.count(ls)) {
+                            // A reassigned lambda local: see above.
                         } else {
                             // fix #7025 (follow-up, §28.2, v0.340): the
                             // METHOD-GROUP twin of the lambda arm above — a
@@ -18725,7 +18862,7 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc,
         // of" is a property of the BINDING, not of its state, so an explicit
         // `Dispose()` on it does not lift the pin: the move-out is the same
         // A5 error the not-yet-disposed `using var` draws below. §28.2's
-        // use-after-dispose warning (the arm after this one) governs a
+        // use-after-dispose error (the arm after this one) governs a
         // consume of a plain owned local; it does not apply here. #7405
         report(
             Severity::Error, loc,
@@ -18736,32 +18873,42 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc,
         return;
     }
     if (st->state == OwnershipState::Disposed) {
-        // §28.2 (v0.303): under a *dominating* Dispose()/discard, EVERY use
-        // — read, borrow, AND consume (a `move`, an `owned` argument, a
-        // `using var` adoption) — draws §28.2's use-after-dispose WARNING,
-        // not §28.3's consume-table ERROR. The Disposed state here was set
-        // by a prior explicit Dispose() that dominates this consume site on
-        // every path (otherwise `lookupState` would have surfaced the
-        // `maybeConsumed` join flag, which still errors below), so the
-        // severity ruling applies: demote this arm to Warning. The
-        // diagnostic TEXT stays specific — "move from a local already
-        // disposed" rather than the read-side wording `checkRead` uses — so
-        // a programmer reading the warning still sees the consume shape and
-        // the disposed state at a glance; the message cites §28.2 explicitly
-        // to mark the regime change from the prior §28.3 error text.
+        // §28.2 (v0.357), #7435: "**The split is between the kills, never
+        // between the use forms**: under a *dominating* kill every use in the
+        // list above is this error — a **consume** exactly as a read is,
+        // `move x` and an `owned` argument position included, the repeated
+        // explicit disposal alone excepted". The Disposed state here was set
+        // by a kill that dominates this consume site on every path (otherwise
+        // `lookupState` would have surfaced the `maybeConsumed` join flag,
+        // which errors below under §28.3), so this consume is the same
+        // compile error `checkRead`'s Disposed arm reports for a read (the
+        // v0.303 ruling made both a warning; v0.346 made both the error).
+        // The diagnostic TEXT stays specific — "move from a local already
+        // disposed" rather than the read-side wording — so the programmer
+        // sees the consume shape and the disposed state at a glance.
         //
-        // Conditional-kill arms (the `maybeConsumed` branch below, and
-        // `markDisposedByName`'s own maybeConsumed arm) are UNCHANGED — the
-        // ruling is the severity of the dominating kill, not a relaxation of
-        // the conditional kill, which is §28.3's harder contract and the
-        // checked-disposal backstop the language relies on. // per §28.2,
-        // v0.303, #4450 (closes the implementation half of #3975)
+        // An await-spent task (`awaitSpent`, §30.5 Pattern B) is Disposed
+        // without an explicit disposal and keeps the pre-v0.346 warning, as
+        // in `checkRead`. // per §28.2, #4450
+        const bool dominatedUse = st->explicitlyDisposed && !st->awaitSpent;
         report(
-            Severity::Warning, loc,
-            std::string("move from a local `") + std::string(name) +
-            "` already disposed at this point (§28.2) — "
-            "use-after-dispose is undefined behaviour in unchecked mode "
-            "and raises DisposedAccessException in checked mode");
+            dominatedUse ? Severity::Error : Severity::Warning, loc,
+            dominatedUse
+                ? std::string("move from a local `") + std::string(name) +
+                  "` already disposed at this point (§28.2) — the explicit "
+                  "disposal reaches this consume on every path, and a "
+                  "consume the disposal dominates is §28.2's "
+                  "use-after-dispose compile error exactly as a read is "
+                  "(move the disposal after the last use of `" +
+                  std::string(name) + "`, or reassign it first)"
+                : std::string("move from a local `") + std::string(name) +
+                  "` already disposed at this point (§28.2) — "
+                  "use-after-dispose is undefined behaviour in unchecked "
+                  "mode and raises DisposedAccessException in checked mode");
+        if (dominatedUse && st->explicitDisposeLoc.line != 0)
+            report(Severity::Note, st->explicitDisposeLoc,
+                   std::string("explicit Dispose() of `") + std::string(name) +
+                   "` was here");
         // fix #3931 sibling sweep: deferred to the emit pass for the reason
         // traced in `markDisposedByName`'s MovedFrom arm above — a
         // suppressed-phase poison collapses the loop-header meet and silences
