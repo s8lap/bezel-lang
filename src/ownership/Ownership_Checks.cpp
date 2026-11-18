@@ -28127,6 +28127,67 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
             externOutCaptureCallQueue_.push_back(ce);
     } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e))
         callee = nc->callee.get();
+    // fix #7259 (§28.3 closure bullet *Set-erasing positions*, clause 4
+    // "Receivers", v0.359): a function value as the RECEIVER of an
+    // extension call whose head is `Object` is at a set-erasing position.
+    // The clause, verbatim: "A function value as the receiver of a member
+    // `Object` declares (`f.ToString()`, `f.GetHashCode()`, an interpolation
+    // hole) is not at a set-erasing position; as the receiver of an
+    // extension call whose head is `Object` — which §26.5 rule 2 reaches
+    // from a function-typed receiver (§3.1) — it is, the twin of §9.7's
+    // clause for the receiver of such a call."  The verdict is the bullet's
+    // own binary one: "At every set-erasing position a function value with
+    // a non-empty source set is rejected, and a capture-free one is
+    // admitted".
+    //
+    // WHY THE OWNERSHIP PASS.  The capture set is an ownership fact: only
+    // `exprIsFunctionValueWithNonEmptyCaptureSet` below knows it (a lambda
+    // literal's captures, a local bound to one, an instance method
+    // reference's receiver).  The ARGUMENT half of this very rule is
+    // checked in this pass, for the same reason, a few lines below.
+    //
+    // WHY THE HEAD MUST BE `Object`.  §3.1: a function value converts to
+    // exactly one type, `Object`; §26.5 rule 2 reaches an `extension
+    // Object` block from a function-typed receiver (the #7177 change), so
+    // `Object` is the only head such a receiver reaches, and the only head
+    // at which the receiver is converted to a type that announces no
+    // source set.  An extension on a CLASS head is the ordinary case — the
+    // receiver there is not a function value at all.
+    //
+    // WHY BOTH SPELLINGS.  `f.M(k)` and `f?.M(k)` are the same call
+    // (§7.5): MEASURED on the base tree, BOTH reach the extension body
+    // (`EXT-RAN` printed), so both put the receiver at that position.  A
+    // member access that is NOT called is a §27.6 method-reference
+    // FORMATION, which captures the receiver under §27.6's own rule, and
+    // is left alone.
+    if (callee) {
+        const ast::Expr* recv = nullptr;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+            recv = ma->target.get();
+        else if (auto* nm =
+                     dynamic_cast<const ast::NullCondMemberExpr*>(callee))
+            recv = nm->target.get();
+        if (recv) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                ctx_.exprSymbol(*callee));
+            const sema::TypeRef* head =
+                (ms && ms->extensionDecl && ms->extensionDecl->targetType)
+                    ? ctx_.resolvedType(*ms->extensionDecl->targetType)
+                    : nullptr;
+            if (head && head->kind == sema::TypeRef::Kind::Primitive &&
+                head->primitive == sema::PrimitiveType::Object &&
+                exprIsFunctionValueWithNonEmptyCaptureSet(*recv)) {
+                report(Severity::Error, recv->span.begin,
+                       std::string("function value carries captured "
+                                   "borrow(s) and may not be the receiver of "
+                                   "an extension call whose head is `Object` "
+                                   "— `Object` announces no source set; use a "
+                                   "capture-free function value (§28.3 "
+                                   "closure bullet, *Set-erasing positions*, "
+                                   "clause 4, v0.359)"));
+            }
+        }
+    }
     if (const auto* args = scopedArgsOf(e)) {
         // fix #7025 (follow-up, §27.6 / §28.2, v0.343): an ARGUMENT is a
         // formation site — `Take(d.Dispose)` forms a §27.6 method group over
