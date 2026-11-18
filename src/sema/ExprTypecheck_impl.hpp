@@ -4923,6 +4923,15 @@ private:
     // receiver, interface chain; the method's own type parameters excluded).
     const TypeRef* formalTypeAtReceiver(const TypeRef* pt, MethodSymbol* cand,
                                         const ast::Expr* recvTarget);
+    // fix #6667 (§26.5 rule 2, §27.3, v0.359): the free-type-variable
+    // binding (T -> the receiver's concrete instantiation) of the extension
+    // BLOCK that declares the extension member `m`, for the receiver type
+    // `recv`. §26.5 step 2: "the block-level type parameter is inferred from
+    // the receiver's type". Empty when `m` is not an extension member, when
+    // the block declares no free type variable, or when the receiver does
+    // not match the block's head.
+    std::vector<std::pair<std::string, TypeRef*>>
+    extensionBlockBindingFor(const MethodSymbol* m, const TypeRef* recv) const;
     // fix #6268 (§27.3 / §22.6, v0.339): procedure lambda literals whose
     // §27.3 target check the lambda arm DEFERRED because the threaded formal
     // belonged to one member of an overload set (`pendingLambdaTargetAmbiguous_`).

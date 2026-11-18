@@ -4898,7 +4898,31 @@ const TypeRef* ExprTC::formalTypeAtReceiver(const TypeRef* pt,
                                             MethodSymbol* cand,
                                             const ast::Expr* recvTarget) {
     TypeSymbol* par = cand->parent;
-    if (!pt || !par || par->genericParams.empty()) return pt;
+    if (!pt) return pt;
+    // fix #6667 (§26.5 rule 2, §27.3, v0.359): an EXTENSION member has no
+    // `parent` TypeSymbol (`Symbol.hpp:998`), so the guard below returned the
+    // formal UNSUBSTITUTED — the block's free type variable (`T`) reached
+    // the caller as a bare, declaration-less Named. Every §27.3
+    // body-vs-target predicate excludes such a slot ("a bare type-parameter
+    // slot may still be an unsubstituted callee type parameter here"), so
+    // the procedure-lambda / value-slot judgement never ran and a procedure
+    // lambda was admitted at a value-returning extension slot.
+    // §26.5 step 2 binds the block's parameter by the RECEIVER ("the
+    // block-level type parameter is inferred from the receiver's type"), so
+    // substitute the receiver's concrete instantiation here — the same
+    // binding the §26.5 rule-2 lookup records (`ctx_.exprExtBinding`) and
+    // `typeCall` substitutes into the call's RETURN type.
+    if (!par) {
+        if (!cand->extensionDecl || !recvTarget) return pt;
+        const TypeRef* recvTy = ctx_.exprType(*recvTarget);
+        if (!recvTy) return pt;
+        auto binding = extensionBlockBindingFor(cand, recvTy);
+        if (binding.empty()) return pt;
+        std::unordered_map<std::string_view, TypeRef*> solved;
+        for (const auto& [nm, ty] : binding) solved[nm] = ty;
+        return substituteReturnType(const_cast<TypeRef*>(pt), solved);
+    }
+    if (par->genericParams.empty()) return pt;
     std::unordered_set<std::string_view> ownGenerics;
     for (Symbol* gp : cand->genericParams)
         if (gp) ownGenerics.insert(gp->name);

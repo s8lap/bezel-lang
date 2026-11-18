@@ -15997,6 +15997,61 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                         substituteReturnType(
                                             pendingLambdaTargetReturn_,
                                             classSubst);
+                                // fix #6667 (§26.5 rule 2, §27.3, v0.359):
+                                // an EXTENSION member's formal free type
+                                // variables are the BLOCK's, and the block's
+                                // parameters are bound by the RECEIVER
+                                // (§26.5 step 2: "When an extension block is
+                                // declared on a generic type … the
+                                // block-level type parameter is inferred
+                                // from the receiver's type"). `classSubst`
+                                // above is the CLASS-level map, keyed on the
+                                // member's `parent` — an extension member has
+                                // none (`Symbol.hpp:998`), so it stayed EMPTY
+                                // and the formal's `T` reached the lambda
+                                // unsubstituted. MEASURED: `extension
+                                // Array<T>`'s `E(f: () -> T): T` at an
+                                // `Array<int>` receiver threaded `T` (a
+                                // declaration-less Named), which every
+                                // §27.3 body-vs-target predicate excludes
+                                // ("a bare type-parameter slot may still be
+                                // an unsubstituted callee type parameter"),
+                                // so the procedure lambda was admitted at a
+                                // value-returning slot and the callee read a
+                                // value the body never produced.
+                                // The binding is the one the §26.5 rule-2
+                                // lookup recorded on the call's callee
+                                // (`ctx_.exprExtBinding`) — the same map
+                                // `typeCall` substitutes into the call's
+                                // RETURN type (ExprTypecheck_Calls.cpp's
+                                // `!ms->parent && ms->extensionDecl` arm).
+                                if (calleeMs2 && !calleeMs2->parent &&
+                                    calleeMs2->extensionDecl) {
+                                    if (auto* maC = dynamic_cast<
+                                            const ast::MemberAccessExpr*>(
+                                            ce->callee.get())) {
+                                        if (const auto* bnd =
+                                                ctx_.exprExtBinding(*maC)) {
+                                            if (!bnd->empty()) {
+                                                std::unordered_map<
+                                                    std::string_view,
+                                                    TypeRef*> extSubst;
+                                                for (const auto& [nm, ty] : *bnd)
+                                                    extSubst[nm] = ty;
+                                                if (pendingLambdaTargetReturn_)
+                                                    pendingLambdaTargetReturn_ =
+                                                        substituteReturnType(
+                                                            pendingLambdaTargetReturn_,
+                                                            extSubst);
+                                                for (auto& p :
+                                                     pendingLambdaParamTypes_)
+                                                    if (p)
+                                                        p = substituteReturnType(
+                                                            p, extSubst);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }

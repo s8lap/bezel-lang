@@ -6848,6 +6848,18 @@ static std::vector<std::pair<std::string, TypeRef*>> extensionBlockBinding(
     return out;
 }
 
+// fix #6667 (§26.5 rule 2, §27.3, v0.359): the member-facing wrapper of
+// `extensionBlockBinding` — the same computation the method-reference
+// formation uses (§27.6), exposed so the CALL site's formal-type resolution
+// (`ExprTC::formalTypeAtReceiver`) can judge an extension member's formal
+// at the receiver's concrete instantiation instead of at the block's
+// unsubstituted free type variable.
+std::vector<std::pair<std::string, TypeRef*>>
+ExprTC::extensionBlockBindingFor(const MethodSymbol* m,
+                                  const TypeRef* recv) const {
+    return extensionBlockBinding(ctx_, m, recv);
+}
+
 // §27.6 (v0.355): the function type a method reference over an EXTENSION
 // member forms.
 //
