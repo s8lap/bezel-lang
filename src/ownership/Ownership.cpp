@@ -11897,27 +11897,9 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
                         ownedArgSourceIsBorrow(*rid);
                     if (isBinding && (rhsBorrow || rhsOwnedUnmarked)) {
                         report(Severity::Error, rid->span.begin,
-                               std::string("cannot assign `") +
-                                   std::string(rid->name) + "` to `" +
-                                   std::string(id->name) + "`: `" +
-                                   std::string(id->name) +
-                                   "` is in the OWNED state and the "
-                                   "right-hand side is an unmarked read of `" +
-                                   std::string(rid->name) +
-                                   "`, which is a BORROW — §28.3's state match "
-                                   "on reassignment requires an owned-state LHS "
-                                   "to receive an owned value (a fresh "
-                                   "producer, or a named owned binding under "
-                                   "the explicit transfer marker `x := move "
-                                   "y`); storing the borrow would make `" +
-                                   std::string(id->name) +
-                                   "` dispose a value it does not own. " +
-                                   (rhsOwnedUnmarked
-                                        ? std::string(
-                                              "Spell the transfer with `move`")
-                                        : std::string(
-                                              "Bind the borrow to a separate "
-                                              "local instead")));
+                               assignBorrowToOwnedLocalMessage(
+                                   std::string(id->name),
+                                   std::string(rid->name), rhsOwnedUnmarked));
                         // fix #8328 (§28.3 *State match on reassignment*,
                         // v0.355): the store is REJECTED, so it never happens
                         // — see the flag's own comment.
@@ -16084,6 +16066,69 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                                    selfAssignOwnedLocalMessage(
                                        std::string(tid->name)));
                             break;
+                        }
+                    }
+                    // fix #8782 (§28.3 *State match on reassignment*, v0.359):
+                    // the OTHER-BINDING state match `u := v;` — an unmarked
+                    // read of a different binding stored into an OWNED-STATE
+                    // local — in the LAMBDA-BODY spelling. §28.3: "Assigning a
+                    // borrow to an owned-state LHS ... is rejected" and item 1,
+                    // "an owned-state LHS requires an owned RHS — a fresh
+                    // producer, or a named owned binding under the explicit
+                    // transfer marker (`x := move y;`)"; an unmarked binding
+                    // read is a borrow. The rule names no scope. The
+                    // method-body arm (`handleAssignment`, #8137 fix-forward)
+                    // rejects it; this arm — a deliberately NARROW mirror — did
+                    // not, so `lambda() => do var u := new Cell(); var v :=
+                    // new Cell(); u := v; … end` compiled and the lambda
+                    // disposed `v`'s value through `u` AND through `v`
+                    // (MEASURED: core dump). The predicate is the method arm's,
+                    // verbatim: an Owned-state LHS (not a `using var`, which
+                    // its own diagnostic rejects), an unmarked RHS that is a
+                    // bare identifier (a `!` peeled) naming ANOTHER local or
+                    // parameter of a borrowable class/interface type, the RHS
+                    // being a borrow (`ownedArgSourceIsBorrow`) or an
+                    // Owned-state local read without `move`; a move-only VALUE
+                    // type keeps §15.3's no-op. The text is shared with the
+                    // method arm. A rejected store never happens (#8328), so the
+                    // state transition is skipped. // per §28.3, §15.3, v0.359
+                    if (as->value && !as->valueHasOwnedMarker &&
+                        st.state == OwnershipState::Owned) {
+                        const auto* orid =
+                            dynamic_cast<const ast::IdentifierExpr*>(
+                                lookThroughForceUnwrap(as->value.get()));
+                        const auto* ols =
+                            dynamic_cast<const sema::LocalSymbol*>(sym);
+                        const auto* old =
+                            ols ? dynamic_cast<const ast::LocalDecl*>(ols->decl)
+                                : nullptr;
+                        const char* moKind2 = nullptr;
+                        if (orid && !refersTo(sym, *orid) &&
+                            !(old && old->isUsing) &&
+                            !common::isMoveOnlyValueType(ctx_.exprType(*tid), ctx_,
+                                                         moKind2) &&
+                            isBorrowableOwnedSinkType(ctx_.exprType(*orid))) {
+                            sema::Symbol* orsym = ctx_.exprSymbol(*orid);
+                            const bool isBinding =
+                                dynamic_cast<sema::LocalSymbol*>(orsym) ||
+                                dynamic_cast<sema::ParameterSymbol*>(orsym);
+                            bool rhsOwnedUnmarked = false;
+                            if (dynamic_cast<sema::LocalSymbol*>(orsym)) {
+                                if (LocalOwnership* rst = lookupStateFor(*orid))
+                                    rhsOwnedUnmarked =
+                                        rst->state == OwnershipState::Owned;
+                            }
+                            const bool rhsBorrow =
+                                isBinding && !rhsOwnedUnmarked &&
+                                ownedArgSourceIsBorrow(*orid);
+                            if (isBinding && (rhsBorrow || rhsOwnedUnmarked)) {
+                                report(Severity::Error, orid->span.begin,
+                                       assignBorrowToOwnedLocalMessage(
+                                           std::string(tid->name),
+                                           std::string(orid->name),
+                                           rhsOwnedUnmarked));
+                                break;
+                            }
                         }
                     }
                     // fix #7963 (§28.3.3 first half / §28.3 *State match on

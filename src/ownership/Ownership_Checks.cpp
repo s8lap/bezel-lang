@@ -183,6 +183,31 @@ std::string selfAssignOwnedLocalMessage(const std::string& name) {
            "explicitly with `move`";
 }
 
+// fix #8782 (§28.3 *State match on reassignment*, v0.359): the single text of
+// the other-binding state-match rejection `u := v;` (an unmarked read of
+// ANOTHER binding stored into an owned-state local), shared by the method-body
+// arm (`handleAssignment`) and the lambda-body arm. Declared in
+// Ownership_impl.hpp.
+std::string assignBorrowToOwnedLocalMessage(const std::string& target,
+                                            const std::string& rhs,
+                                            bool rhsOwnedUnmarked) {
+    return std::string("cannot assign `") + rhs + "` to `" + target + "`: `" +
+           target +
+           "` is in the OWNED state and the "
+           "right-hand side is an unmarked read of `" +
+           rhs +
+           "`, which is a BORROW — §28.3's state match "
+           "on reassignment requires an owned-state LHS "
+           "to receive an owned value (a fresh "
+           "producer, or a named owned binding under "
+           "the explicit transfer marker `x := move "
+           "y`); storing the borrow would make `" +
+           target + "` dispose a value it does not own. " +
+           (rhsOwnedUnmarked ? std::string("Spell the transfer with `move`")
+                             : std::string("Bind the borrow to a separate "
+                                           "local instead"));
+}
+
 // fix #8160 (stdlib §6.10, v0.355; #5657): the OPERAND of an `as` cast — the
 // one spelling of a language spec §5.1 reference conversion that WIDENS the
 // expression's own static type on the page (`new TaskScope() as Object` has

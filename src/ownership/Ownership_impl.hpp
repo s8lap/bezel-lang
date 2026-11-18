@@ -418,6 +418,14 @@ const ast::Expr* lookThroughForceUnwrap(const ast::Expr* e);
 // Defined in Ownership_Checks.cpp.
 std::string selfAssignOwnedLocalMessage(const std::string& name);
 
+// fix #8782 (§28.3 *State match on reassignment*, v0.359): the ONE diagnostic
+// text for `u := v;` (an unmarked read of another binding stored into an
+// owned-state local), shared by the method-body arm and the lambda-body arm.
+// Defined in Ownership_Checks.cpp.
+std::string assignBorrowToOwnedLocalMessage(const std::string& target,
+                                            const std::string& rhs,
+                                            bool rhsOwnedUnmarked);
+
 // §28.8.1 (#867): the per-block dataflow lattice for the field-restoration
 // check. A `move` of an owned field leaves the field moved-from; the field
 // must be RESTORED (reassigned a value, incl. `null` for a nullable owned
