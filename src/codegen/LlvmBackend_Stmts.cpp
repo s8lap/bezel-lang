@@ -5105,6 +5105,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             if (!diverged_ && v) emitStringRelease(v);
             return diverged_;
         }
+        // fix #8506 (§21.9, §28.9, v0.357): the same release for EVERY
+        // discarded +1 string, not the one primitive `ToString()` shape just
+        // above. The question is "did the statement's expression hand over a
+        // +1 string?", and that is the classification's answer alone
+        // (`isPlusOneStringProducer`, the one every other consumer asks).
+        // §21.9 permits an expression statement of a non-`()` type ("the
+        // result is silently discarded"), and §28.9 leaves the string's
+        // lifetime to the runtime "without user involvement", so the
+        // statement must give the reference back. MEASURED on this fix's
+        // parent, 200 statements: `s.ToUpper();` and `h.Mint();` (a user
+        // method) leaked one string per statement. A bare null (a `?.`
+        // producer's null path) and an immortal sentinel release as no-ops.
+        if (es->expr && isPlusOneStringProducer(es->expr.get())) {
+            llvm::Value* v = lowerExpr(*es->expr);
+            if (!diverged_ && v && v->getType()->isPointerTy())
+                emitStringRelease(v);
+            return diverged_;
+        }
         // fix #6366 (§28.3 K8 *Unbound owned temporaries*, §28.9, §17.13, stdlib
         // §4.6/§4.7/§4.8, v0.338): a BARE COLLECTION-producer statement
         // (`f.Make();`, where `Make(): owned Array<int>` /

@@ -49,3 +49,40 @@ BEZEL_TEST(codegen_str_consumer_release, string_producer_null_comparison_is_rele
         "end Main; end C;");
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
 }
+
+// #8506 (§21.9 / §28.9): an expression statement whose discarded result is a
+// +1 string must release it: "the result is silently discarded" (§21.9), and
+// the string is runtime-managed (§28.9). The issue's own `s.ToUpper();`, a
+// user method and a pass-through call over a fresh argument. 200x.
+BEZEL_TEST(codegen_str_consumer_release, string_producer_statement_is_released_8506_spec_21_9) {
+    auto r = runAotChecked(
+        "module M; "
+        "class H "
+        "  private _n: int; "
+        "  public constructor(n: int) _n := n; end constructor; "
+        "  public method Mint(): string return \"KM\" + _n.ToString(); end Mint; "
+        "  public method Long(): string return \"long-producer-string-no-\" + _n.ToString(); end Long; "
+        "  public method MintQ(): string? return \"KQ\" + _n.ToString(); end MintQ; "
+        "  public property P: string get => \"KP\" + _n.ToString(); end P; "
+        "end H; "
+        "class Z "
+        "  public static method Id(s: string): string return s; end Id; "
+        "  public static method TakeO(o: Object): int return 1; end TakeO; "
+        "  public static method Len(s: string): int return s.Length; end Len; "
+        "end Z; "
+        "class C public static method Main(): int "
+        "  var i := 0; var tot := 0; "
+        "  var s := \"local\" + 1.ToString(); "
+        "  var h := new H(7); "
+        "  while i < 200 do "
+        "    i := i + 1; "
+        "    s.ToUpper(); "
+        "    h.Mint(); "
+        "    Z.Id(h.Long()); "
+        "    tot := tot + 1; "
+        "  end while; "
+        "  if tot = 200 * 1 then return 1; end; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
+}
