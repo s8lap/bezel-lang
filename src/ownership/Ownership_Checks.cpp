@@ -6232,11 +6232,75 @@ void MethodOwnership::reportCapturedThrowOperand(const ast::Expr& operand) {
         // base); asking again would report it twice.
         if (const auto* cid = dynamic_cast<const ast::IdentifierExpr*>(op))
             if (isCatchBorrow(ctx_.exprSymbol(*cid))) return;
+        // fix #8873 (§28.3 *Captured owned bindings*, §31.1, v0.359): an OWNED
+        // local of an ENCLOSING LAMBDA captured by this (nested) lambda. It
+        // has no entry in the method frame's `states_`, so the test above
+        // missed it; the owner lambda's own history decides.
+        if (reportEnclosingLambdaOwnedThrow(*op)) return;
         checkThrowOperandNotBorrowed(operand);
         return;
     }
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(op);
     reportCapturedOwnedConsume(id->name, id->span.begin, "throw");
+}
+
+// fix #8873 (§28.3 *Captured owned bindings*, §31.1 *The throw operand*,
+// v0.359). §28.3: "Inside a closure, a captured owned binding — an owned local
+// or `owned` parameter of the enclosing body — is uniformly in borrow state ...
+// every other owned-consuming use of it are compile errors"; §31.1: "The
+// operand is consumed as an owned value". The "enclosing body" of a nested
+// closure is the enclosing LAMBDA's body, so `throw c` of an owned local of an
+// enclosing lambda, written in a nested lambda, is the #7920 shape. The local
+// is tracked in no frame (`isCapturedOwnedBinding` reads the METHOD frame's
+// `states_`), so it is resolved against `closureScanStack_` (the same owner
+// resolution as `checkLambdaBodyThrowOperandNotBorrowed`, #8859): the binding
+// is CAPTURED iff its owner is not the throwing (innermost) lambda, and it is
+// OWNED iff every binding of it that precedes the throw is an owned
+// production (the same one-sided source-order rule, so an ambiguous history
+// is never rejected). Returns true when it reported. // per §28.3, §31.1, v0.359
+bool MethodOwnership::reportEnclosingLambdaOwnedThrow(const ast::Expr& op) {
+    if (closureScanStack_.size() < 2) return false;
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&op);
+    if (!id || id->name == "this" || id->name == "base") return false;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls || isCatchBorrow(sym)) return false;
+    std::uint32_t declOff = sym->declLoc.offset;
+    bool declKnown = sym->declLoc.line != 0;
+    if (!declKnown && sym->decl) {
+        declOff = sym->decl->span.begin.offset;
+        declKnown = sym->decl->span.begin.line != 0;
+    }
+    if (!declKnown) return false;
+    const ast::LambdaExpr* owner = nullptr;
+    for (auto it = closureScanStack_.rbegin(); it != closureScanStack_.rend();
+         ++it) {
+        const ast::LambdaExpr* cand = *it;
+        if (!cand) continue;
+        if (declOff >= cand->span.begin.offset &&
+            declOff < cand->span.end.offset) {
+            owner = cand;
+            break;
+        }
+    }
+    // Not declared by any enclosing lambda (method body: #7920's own arm), or
+    // declared by the throwing lambda itself (its own local: admitted).
+    if (!owner || owner == closureScanStack_.back()) return false;
+    if (!lambdaBodyLocalHoldsBorrow(ls, *owner, id->span.begin.offset,
+                                    OwnershipState::Owned))
+        return false;
+    reportOnce(Severity::Error, id->span.begin,
+               std::string("cannot throw captured owned binding `") +
+                   std::string(id->name) +
+                   "` inside a closure — a captured owned binding is "
+                   "borrow-state throughout the closure (§28.3, v0.184): the "
+                   "closure may not consume, transfer, reassign, or dispose "
+                   "it. The enclosing scope keeps the disposal obligation, so "
+                   "consuming it here disposes the value twice (double-dispose "
+                   "/ use-after-free). Give the closure an `owned` parameter "
+                   "and transfer the value in from outside, or restructure so "
+                   "the closure only borrows it.");
+    return true;
 }
 
 void MethodOwnership::reportCapturedOwnedConsume(std::string_view name,
@@ -13694,7 +13758,8 @@ void MethodOwnership::checkLambdaBodyThrowOperandNotBorrowed(
 // report a borrow it should not). // per §31.1, §28.3, v0.359, #8802, #8859
 bool MethodOwnership::lambdaBodyLocalHoldsBorrow(sema::LocalSymbol* ls,
                                                   const ast::LambdaExpr& lam,
-                                                  std::uint32_t atOffset) {
+                                                  std::uint32_t atOffset,
+                                                  OwnershipState want) {
     bool sawBinding = false;
     bool everyBindingBorrow = true;
     auto consider = [&](const ast::Expr* bound, std::uint32_t off) {
@@ -13702,7 +13767,7 @@ bool MethodOwnership::lambdaBodyLocalHoldsBorrow(sema::LocalSymbol* ls,
         // A binding that comes after the throw is not live at the throw.
         if (off >= atOffset) return;
         sawBinding = true;
-        if (producerState(*bound) != OwnershipState::Borrowed)
+        if (producerState(*bound) != want)
             everyBindingBorrow = false;
     };
     for (const auto& top : lam.stmts) {

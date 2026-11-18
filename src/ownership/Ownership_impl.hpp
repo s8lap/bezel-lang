@@ -4975,7 +4975,13 @@ private:
     // // per §31.1, §28.3, v0.359
     bool lambdaBodyLocalHoldsBorrow(sema::LocalSymbol* ls,
                                     const ast::LambdaExpr& lam,
-                                    std::uint32_t atOffset);
+                                    std::uint32_t atOffset,
+                                    OwnershipState want =
+                                        OwnershipState::Borrowed);
+
+    // fix #8873 (§28.3, §31.1, v0.359): `throw c` of an OWNED local of an
+    // ENCLOSING lambda, written in a nested lambda; true when it reported.
+    bool reportEnclosingLambdaOwnedThrow(const ast::Expr& op);
 
     // §31.1 / §28.3.7 (axiom A5, v0.350; issue #7412, owner ruling "reading
     // 1"): the `throw` operand is consumed as an owned value passed to the
