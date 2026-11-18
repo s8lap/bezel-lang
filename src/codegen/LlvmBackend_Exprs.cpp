@@ -14211,6 +14211,36 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     llvm::Value* r = lowerExpr(*bin.right);
     if (!l || !r) return nullptr;
     const auto& op = bin.op;
+    // fix #8125 (§8.4, §28.9, v0.357): `P = null` / `P <> null` where `P` is
+    // a +1 string producer. The comparison only READS the operand's
+    // null-ness, so the fresh string is this expression's to release (§28.9:
+    // a string's lifetime "is managed by the runtime without user
+    // involvement"). The null arms below compare the pointer and drop it, so
+    // every producer leaked here. MEASURED on this fix's parent, 200
+    // iterations: `(s?.Trim()) <> null` and `h.MintQ() <> null` (a user
+    // method) leaked one string per comparison. The classification is
+    // `isPlusOneStringProducer`'s, the one every other consumer asks, so the
+    // receiver spellings it admits are admitted here; a `?.` producer's
+    // short-circuit null is a bare null, which the release ignores.
+    if (op == "=" || op == "<>") {
+        const bool lNull =
+            dynamic_cast<const ast::NullLiteralExpr*>(bin.left.get());
+        const bool rNull =
+            dynamic_cast<const ast::NullLiteralExpr*>(bin.right.get());
+        if (lNull != rNull) {
+            const ast::Expr* pe = lNull ? bin.right.get() : bin.left.get();
+            llvm::Value* pv = lNull ? r : l;
+            if (pv->getType()->isPointerTy() && isPlusOneStringProducer(pe)) {
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    pv,
+                    llvm::ConstantPointerNull::get(
+                        llvm::cast<llvm::PointerType>(pv->getType())),
+                    "nullcmp.tmp");
+                emitStringRelease(pv);
+                return op == "=" ? isNull : builder_.CreateNot(isNull);
+            }
+        }
+    }
     // fix #2497 / §8.3 / §9.2 / §35.2: `this` (or `base`) inside a record/
     // choice instance method is lowered as a POINTER to the receiver storage
     // (CG9 — "this is the receiver ptr"; §35.2 — "this in a choice instance
