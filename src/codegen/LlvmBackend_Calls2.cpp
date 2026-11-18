@@ -27102,6 +27102,24 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     bool valueResult = !refResult && !voidResult;
     bool nullableReturn = valueResult && callTy && isNullableValueTy(callTy) &&
         retTy->isStructTy();
+    // fix #8920 (§7.5 / §35.9 / §28.3, v0.359): `callTy` is the LIFTED type
+    // (§7.5: "The result type is always nullable"), so it is `C?` whether the
+    // method returns `C?` or a bare `C`. A bare RECORD or CHOICE return is
+    // itself an LLVM struct, so `retTy->isStructTy()` alone mistook it for
+    // the already-nullable `{i8 hasValue; C}` carrier and passed the bare
+    // struct through as the result. The binding then got a slot of the bare
+    // `C`'s width while every consumer of a `C?` (§35.9: "the ordinary
+    // nullable value type") read it as `{i8, C}` — a 24-byte READ past an
+    // owning choice's slot under ASan at its scope-end disposal, a choice's
+    // tag read as `hasValue`, and malformed IR (`icmp i32, i8`) for a bare
+    // record. The callee returned the bare value exactly when the non-null
+    // inner of `callTy` lowers to `retTy`; that return is wrapped below like
+    // any other value return.
+    if (nullableReturn) {
+        sema::TypeRef innerCallTy = *callTy;
+        innerCallTy.nullable = false;
+        if (lowerTypeRef(&innerCallTy) == retTy) nullableReturn = false;
+    }
     // The §7.5 result type: a pointer for reference returns, the tagged struct
     // for value returns (StructType::get is uniqued, matching the consumer slot).
     llvm::Type* resTy = nullptr;
@@ -27607,23 +27625,13 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     pendingMethodCallExpr_ = &call;  // fix #6779: see lowerCall
     // fix #7538: the `?.` twin of lowerCallDispatch's call-site zero-store
     // (see `markMoveOnlyChoiceArgsMovedFrom`); this block runs on the
-    // non-null-receiver path only. NOT when the call's result is itself an
-    // OWNING CHOICE: that result is lifted through the `nullableReturn` arm
-    // above as if the callee's bare choice struct were already `{i8, C}`, and
-    // the binding's scope-end pass then reads the choice's tag as `hasValue`,
-    // so a returned `src` is never disposed by its taker and only the
-    // caller's still-populated slot disposes it. MEASURED: `var z :=
-    // p?.Pass(move src)` with `Pass` returning `src` went from clean to a
-    // 200-of-200 leak with the zero-store, so that shape keeps the pre-#7538
-    // behaviour: no zero-store on this path at all.
-    bool ncOwningChoiceResult = false;
-    if (callTy && callTy->kind == sema::TypeRef::Kind::Named &&
-        callTy->declaration &&
-        callTy->declaration->kind == ast::TypeDeclKind::Choice) {
-        auto verdict = common::classifyChoiceType(callTy, ctx_);
-        ncOwningChoiceResult =
-            verdict && *verdict == common::ChoiceClassification::Owning;
-    }
+    // non-null-receiver path only. fix #8920: it now applies to an
+    // OWNING-CHOICE result too. #7538 had exempted that shape because the
+    // result was mis-lifted (a bare `C` passed off as `{i8, C}`, see the
+    // `nullableReturn` comment above), so the taker never disposed a returned
+    // `src` and only the caller's still-populated slot did. With the result
+    // lifted correctly the taker disposes it, and the exemption would make
+    // that a second disposal.
     // fix #8624 (§7.5 / §28.14 / §28.9, v0.359): the `?.` twin of the `.`
     // form's closure-argument discharge (lowerCallDispatch's
     // `prepareCallClosureArgRelease`). Without it a lambda literal passed
@@ -27641,7 +27649,7 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     // argument at all and registers nothing, exactly as §7.5 requires.
     CallClosureArgRelease clRel =
         prepareCallClosureArgRelease(ms, args, argExprs, call);
-    if (!diverged_ && !ncOwningChoiceResult)
+    if (!diverged_)
         markMoveOnlyChoiceArgsMovedFrom(call, /*atCallSite=*/true, ms,
                                         /*baseQualified=*/false);
     llvm::Value* r = emitMethodCall(ms, args, /*baseQualified=*/false, &argExprs,
