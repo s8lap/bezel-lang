@@ -38923,7 +38923,7 @@ struct ClosureEscapeWalker {
     // walk, whose verdicts are unchanged.
     bool closureLocalAssignTakesReference = false;
     std::function<bool(const ast::CallExpr&, std::size_t)> callBoundedArg;
-    // fix #8753 (§28.9 / §27.5, v0.359): WHERE the KEPT walk met
+    // fix #8753 / #8769 (§28.9 / §27.5, v0.359): WHERE the KEPT walk met
     // target. Set only on that walk: every statement at which it set
     // keptWithoutReference_ (keptSiteStmts) and every statement that
     // assigns target outside a lambda (targetAssignStmts), recorded as the
@@ -39653,7 +39653,7 @@ struct ClosureEscapeWalker {
                 // fix-forward #8479: see keptWithoutReference_'s comment.
                 if (!inLambda && !inReferenceTakingSite_) {
                     keptWithoutReference_ = true;
-                    // fix #8753: see keptSiteStmts.
+                    // fix #8753 / #8769: see keptSiteStmts.
                     if (keptSiteStmts) keptSiteStmts->push_back(curStmt_);
                 }
             }
@@ -40074,7 +40074,7 @@ struct ClosureEscapeWalker {
 
     void stmt(const ast::Stmt* s) {
         if (!s) return;
-        // fix #8753: see keptSiteStmts. Restored on every return.
+        // fix #8753 / #8769: see keptSiteStmts. Restored on every return.
         struct CurStmtScope {
             const ast::Stmt*& slot;
             const ast::Stmt* saved;
@@ -40287,7 +40287,7 @@ struct ClosureEscapeWalker {
                 // (a lambda cannot reassign a local it does not capture). The
                 // envdtor owns the cell's release in this case.
                 if (inLambda) isCapturedCellSlot_ = true;
-                // fix #8753: see targetAssignStmts.
+                // fix #8753 / #8769: see targetAssignStmts.
                 else if (targetAssignStmts) targetAssignStmts->push_back(s);
                 // Walk the RHS (which escapes) but not the target — the
                 // target is `target` itself, recursing into it would re-mark
@@ -41868,15 +41868,15 @@ void Emitter::collectClosureReleaseEligible(
     // closureEscapingScopeEndRelease_: its release stays armed, its capture
     // cells are no longer freed with the scope.
     //
-    // For a reassigned local the verdict is per DEFINITION (fix #8753, the
-    // reaching-definition analysis below). Not handled (left as they were):
-    // assignments inside a lambda body, and targets that are not candidates
-    // (parameters, borrow candidates).
+    // For a reassigned local the verdict is per DEFINITION (fix #8753 /
+    // #8769, the reaching-definition analysis below). Not handled (left as
+    // they were): assignments inside a lambda body, and targets that are not
+    // candidates (parameters, borrow candidates).
     {
         std::unordered_set<const void*> candKeys;
         for (const ast::Node* c : candidates)
             candKeys.insert(static_cast<const void*>(c));
-        // src -> dst. fix #8753: `def` is the definition of dst that carries
+        // src -> dst. fix #8769: `def` is the definition of dst that carries
         // src's value (the AssignmentStmt, or for an owned alias's bind the
         // alias's own declaration, i.e. dst) and also the statement where the
         // value passes from src into dst.
@@ -41954,7 +41954,7 @@ void Emitter::collectClosureReleaseEligible(
         };
         // The KEPT walk (see closureLocalAssignTakesReference).
         std::unordered_set<const void*> kept, captured;
-        // fix #8753: where each walk met its target (keptSiteStmts).
+        // fix #8753 / #8769: where each walk met its target (keptSiteStmts).
         std::unordered_map<const void*, std::vector<const ast::Stmt*>>
             keptSitesOf, assignsOf;
         for (const ast::Node* c : candidates) {
@@ -41984,10 +41984,10 @@ void Emitter::collectClosureReleaseEligible(
                         static_cast<const void*>(as->target.get()));
         }
 
-        // fix #8753 (§28.9 / §27.5, v0.359): for a REASSIGNED
+        // fix #8753 / #8769 (§28.9 / §27.5, v0.359): for a REASSIGNED
         // closure local, "kept" is a property of a DEFINITION, not of the
         // local. The flow-insensitive verdict above (a reassigned `b` is
-        // kept if any of its values is, and never donates) lost a value:
+        // kept if any of its values is) got both directions wrong:
         //
         //   - #8753: `fs.Add(b); b := g;`. The value `fs` keeps is `b`'s
         //     initial one, whose only reference is `b`'s, and
@@ -41996,14 +41996,21 @@ void Emitter::collectClosureReleaseEligible(
         //     heap-use-after-free on the caller's first call through
         //     `fs[0]`. The same happens to a value `b := lambda …;` stores,
         //     at the next reassignment or at `b`'s scope-end release.
+        //   - #8769: `b := g; b := hs[0]; fs.Add(b);`. `fs` keeps `hs[0]`,
+        //     never `g`'s value, yet kept(b) made `g` a donor through the
+        //     edge `b := g`. MEASURED: `g`'s closure leaked once per call
+        //     (15264 B / 601 allocations, against 64 B / 1 on b279e8daf).
         //
         // The rule: a forward may-analysis over the body tracks which
         // definitions of `b` reach each point (`reach`), and which of those
         // have been kept since they were made (`keptSince`). A site that
         // keeps `b` (keptSiteStmts, or the statement where `b`'s value passes
         // into a local whose definition there is itself kept) marks every
-        // reaching definition kept. `b := b;` is not a kept site: the
-        // definitions reaching it still reach past it. Then:
+        // reaching definition kept. `b := b;` is neither a kept site nor a
+        // read: the definitions reaching it still reach past it. Then:
+        //   * an edge `b := g` makes `g` a donor only if that definition is
+        //     kept, and carries `g`'s value out of the frame at all only if
+        //     some read of `b` sees it (#8769);
         //   * a definition whose reference is the slot's own (the initial
         //     producer value, or `b := <producer>`) is donated by the slot
         //     once kept: a reassignment that finds such a definition kept
@@ -42037,6 +42044,10 @@ void Emitter::collectClosureReleaseEligible(
         struct DefFlow {
             bool complete = true;
             DefSet keptDefs;
+            // Definitions some read of `b` can see. An edge `b := g` whose
+            // definition is overwritten before any read carries `g`'s value
+            // nowhere (the reassignment releases the slot's reference).
+            DefSet usedDefs;
             std::set<const ast::AssignmentStmt*> keepOld;
             bool keptAtExit = false;
         };
@@ -42075,6 +42086,62 @@ void Emitter::collectClosureReleaseEligible(
                 }
                 if (hasOwn(st.keptSince)) everKeptOwn = true;
             };
+            auto useHere = [&](const FlowState& st) {
+                if (st.live) out.usedDefs.insert(st.reach.begin(), st.reach.end());
+            };
+            auto reads = [&](const ast::Expr* e) {
+                return e && bw.containsTargetAnywhere(e);
+            };
+            // Whether the statement's OWN expressions (not a nested body's
+            // statements, which are visited themselves) may read `b`. A kind
+            // not listed is assumed to.
+            auto headerReads = [&](const ast::Stmt* s) -> bool {
+                if (auto* d = dynamic_cast<const ast::LocalDecl*>(s))
+                    return nodeKey(s) != b && reads(d->initializer.get());
+                if (auto* d = dynamic_cast<const ast::LocalConstDecl*>(s))
+                    return reads(d->value.get());
+                if (auto* e = dynamic_cast<const ast::ExpressionStmt*>(s))
+                    return reads(e->expr.get());
+                if (auto* a = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+                    auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        a->target.get());
+                    auto* loc = id ? dynamic_cast<sema::LocalSymbol*>(
+                                         ctx_.exprSymbol(*id))
+                                   : nullptr;
+                    const bool toB = loc && loc->decl && nodeKey(loc->decl) == b;
+                    return ((!toB || a->op != ":=") &&
+                            reads(a->target.get())) ||
+                           reads(a->value.get());
+                }
+                if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s))
+                    return reads(r->value.get());
+                if (auto* t = dynamic_cast<const ast::ThrowStmt*>(s))
+                    return reads(t->value.get());
+                if (auto* y = dynamic_cast<const ast::YieldStmt*>(s))
+                    return reads(y->value.get());
+                if (dynamic_cast<const ast::BreakStmt*>(s) ||
+                    dynamic_cast<const ast::ContinueStmt*>(s) ||
+                    dynamic_cast<const ast::DoEndBlock*>(s) ||
+                    dynamic_cast<const ast::TryStmt*>(s))
+                    return false;
+                if (auto* i = dynamic_cast<const ast::IfStmt*>(s)) {
+                    if (reads(i->ifBranch.condition.get())) return true;
+                    for (auto& br : i->elifBranches)
+                        if (reads(br.condition.get())) return true;
+                    return false;
+                }
+                if (auto* f = dynamic_cast<const ast::ForStmt*>(s))
+                    return reads(f->iterable.get()) || reads(f->withExpr.get());
+                if (auto* c = dynamic_cast<const ast::CaseStmt*>(s)) {
+                    if (reads(c->scrutinee.get())) return true;
+                    for (auto& arm : c->arms)
+                        if (reads(arm.guard.get()) || reads(arm.exprBody.get()) ||
+                            arm.pattern)
+                            return true;
+                    return false;
+                }
+                return true;
+            };
             std::function<void(const ast::Stmt*, FlowState&)> flow;
             auto flowList = [&](const std::vector<std::unique_ptr<ast::Stmt>>& v,
                                 FlowState& st) {
@@ -42085,12 +42152,14 @@ void Emitter::collectClosureReleaseEligible(
                 for (FlowState* acc : tryAccs) joinInto(*acc, st);
             };
             auto loopFixpoint = [&](const std::vector<std::unique_ptr<ast::Stmt>>& v,
-                                    FlowState& st, bool headerKeeps) {
+                                    FlowState& st, bool headerKeeps,
+                                    bool headerReadsB) {
                 FlowState head = st;
                 FlowState h;
                 LoopFrame fr;
                 for (int iter = 0; iter < 64; ++iter) {
                     h = head;
+                    if (headerReadsB) useHere(h);
                     if (headerKeeps) keepHere(h);
                     fr = LoopFrame{};
                     FlowState bodySt = h;
@@ -42120,9 +42189,11 @@ void Emitter::collectClosureReleaseEligible(
                                       bw.isTargetIdent(selfAs->value.get());
                 if (sites.count(sk) && !ws && !selfPass) keepHere(st);
                 if (ws) {
-                    loopFixpoint(ws->body, st, sites.count(sk) != 0);
+                    loopFixpoint(ws->body, st, sites.count(sk) != 0,
+                                 reads(ws->condition.get()));
                     return;
                 }
+                if (!selfPass && headerReads(s)) useHere(st);
                 // LOCALDECL-ONLY: `b` is reassigned, so it is never a §21.1
                 // `const` local; any other declaration is not a definition of
                 // `b`, and a LocalConstDecl falls through to the end as one.
@@ -42210,7 +42281,8 @@ void Emitter::collectClosureReleaseEligible(
                     return;
                 }
                 if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
-                    loopFixpoint(fs->body, st, /*headerKeeps=*/false);
+                    loopFixpoint(fs->body, st, /*headerKeeps=*/false,
+                                 /*headerReadsB=*/false);
                     return;
                 }
                 if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
@@ -42228,6 +42300,7 @@ void Emitter::collectClosureReleaseEligible(
                     const FlowState catchEntry = acc;
                     for (auto& c : ts->catches) {
                         FlowState cs2 = catchEntry;
+                        if (reads(c.guard.get())) useHere(cs2);
                         flow(c.body.get(), cs2);
                         joinInto(after, cs2);
                     }
@@ -42280,6 +42353,9 @@ void Emitter::collectClosureReleaseEligible(
             if (f.complete) defFlows.emplace(key, std::move(f));
         }
         auto edgeCounts = [&](const DonorEdge& e) {
+            auto it = defFlows.find(e.dst);
+            if (it != defFlows.end())
+                return it->second.keptDefs.count(e.def) != 0;
             return kept.count(e.dst) && passesThrough(e.dst);
         };
         for (bool changed = true; changed;) {
@@ -42326,6 +42402,11 @@ void Emitter::collectClosureReleaseEligible(
             for (const DonorEdge& e : edges) {
                 const void* x = e.x;
                 const void* dst = e.dst;
+                // fix #8769: a definition no read of `dst` sees carries
+                // nothing out of the frame.
+                if (auto fit = defFlows.find(dst);
+                    fit != defFlows.end() && !fit->second.usedDefs.count(e.def))
+                    continue;
                 if (closureReleaseEligible_.count(dst) &&
                     !returnedByName.count(dst))
                     continue;
