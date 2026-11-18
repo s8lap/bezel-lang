@@ -5680,6 +5680,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!diverged_ && v)
                     freeUnboundOwnedBorrowingArrayTemp(
                         ds->value.get(), v, ctx_.exprType(*ds->value));
+                // fix #6421 (§17.13, §28.9, v0.357): `_ := P;` over a +1
+                // string producer. §17.13: for `string` "no disposal is
+                // required, so the discard does nothing beyond the warning
+                // suppression"; that removes the `Dispose()`, not the
+                // runtime's own release (§28.9: the lifetime "is managed by
+                // the runtime without user involvement"), and `var s := P;`
+                // already gives the same string back at scope end. Nothing
+                // did here. MEASURED on this fix's parent, 200 statements:
+                // `_ := "p" + s;`, `_ := s.ToUpper();` and `_ := h.Mint();`
+                // leaked one string each per statement. The classification
+                // alone decides (`isPlusOneStringProducer`), for every
+                // producer it knows; a bare null and a sentinel release as
+                // no-ops. This is the string-only release, placed after the
+                // collection arm, that #6421's first attempt was reverted
+                // for not being.
+                if (!diverged_ && v && v->getType()->isPointerTy() &&
+                    isPlusOneStringProducer(ds->value.get()))
+                    emitStringRelease(v);
                 // fix #2728 / §32.6 + §28.3 + §17.13 (v0.240): the same reclaim
                 // for a DISCARDED FFI-buffer factory (`_ := CString.From(s);`).
                 // Neither existing path covered it: the helper just above is a
