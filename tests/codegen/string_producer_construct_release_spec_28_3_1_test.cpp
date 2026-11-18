@@ -151,3 +151,58 @@ BEZEL_TEST(codegen_str_construct_release, string_producer_released_when_iterator
         "end C;");
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
 }
+
+// #8656 (§29.3 / §28.4 / §28.9): `yield break` has the effect of falling off
+// the end, so every open scope is disposed: the `using var` destructors run
+// (the live count returns to zero) and the string locals and the loop-owned
+// iterable are released. 200x.
+BEZEL_TEST(codegen_str_construct_release, yield_break_runs_scope_disposals_8656_spec_29_3) {
+    auto r = runAotChecked(
+        "module M; "
+        "class H "
+        "  private _n: int; "
+        "  public constructor(n: int) _n := n; end constructor; "
+        "  public method Mint(): string return \"KM\" + _n.ToString(); end Mint; "
+        "  public method Long(): string return \"long-producer-string-no-\" + _n.ToString(); end Long; "
+        "  public method MintQ(): string? return \"KQ\" + _n.ToString(); end MintQ; "
+        "  public property P: string get => \"KP\" + _n.ToString(); end P; "
+        "end H; "
+        "class R "
+        "  public static Live: int; "
+        "  public constructor() R.Live := R.Live + 1; end constructor; "
+        "  destructor R.Live := R.Live - 1; end destructor; "
+        "end R; "
+        "class C "
+        "  public static method W(h: H, i: int): IEnumerable<int> "
+        "    using var r := new R(); "
+        "    var k := 0; "
+        "    while k < 3 do "
+        "      using var q := new R(); "
+        "      var t := h.Mint(); "
+        "      yield return t.Length; "
+        "      if k = 1 then yield break; end if; "
+        "      k := k + 1; "
+        "    end while; "
+        "    yield return 100; "
+        "  end W; "
+        "  public static method E(h: H): IEnumerable<int> "
+        "    for var c in h.Long() do "
+        "      yield return 1; "
+        "      yield break; "
+        "    end; "
+        "    yield return 100; "
+        "  end E; "
+        "  public static method Main(): int "
+        "    var i := 0; var tot := 0; "
+        "    var h := new H(7); "
+        "    while i < 200 do "
+        "      i := i + 1; "
+        "      for var v in C.W(h, i) do tot := tot + v; end; "
+        "      for var v in C.E(h) do tot := tot + v; end; "
+        "    end while; "
+        "    if tot = 200 * 7 and R.Live = 0 then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
+}
