@@ -1012,6 +1012,18 @@ public:
     // holder — was not reached. // per §9.7, §28.3.8, v0.359
     void checkRecordFnComponentStore(const ast::NewExpr& ne);
     void checkRecordWithFnComponentStore(const ast::WithExpr& we);
+    // fix #8852 fix-forward (§9.1 / §9.3 / §28.3.8, v0.359): did this `new`
+    // site select the record's GENERATED PRIMARY constructor? §28.3.8's
+    // *Function-typed holders* names the primary constructor's call as the ONE
+    // store site for a record component, so the store rule fires only there;
+    // a call that resolved to a DECLARED constructor (§9.3) binds its
+    // arguments to that constructor's parameters, not to the components. The
+    // selection is the compiler's own §22.6 answer, published by
+    // `ExprTC::resolvePrimaryBodyCtorOverload` and read through
+    // `SemaContext::newCtorSelection` — never re-derived here.
+    // // per §9.1, §9.3, §28.3.8, v0.359
+    bool recordNewSelectsGeneratedPrimary(const ast::NewExpr& ne,
+                                          const sema::TypeSymbol* ts) const;
     // The `with(...)` / construction sites reached through a RETURNED
     // expression, including the nested forms `checkRecordAndWithFromTemporary-
     // Recursive` recurs into (a collection literal's elements, a conditional's

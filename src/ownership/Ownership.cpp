@@ -13225,7 +13225,7 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // borrow-bearing record, and it reports at the capture; this leg runs
     // only when that check was SILENT, so a program keeps the one diagnostic
     // it has always had, and the shapes the escape check does not reach (a
-    // receiver capture inside a construction's arguments — the §6652 gap) are
+    // receiver capture inside a construction's arguments — the #6652 gap) are
     // diagnosed here. // per §9.7, §28.3.8
     if (ctx_.diagnostics().diagnostics().size() == diagsBeforeReturn)
         checkRecordFnComponentStoreRecursive(e);

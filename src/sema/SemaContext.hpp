@@ -503,6 +503,63 @@ public:
         if (!newArgs) return false;
         return pureNewCtorAmbiguous_.count(newArgs) != 0;
     }
+    // fix #8852 (§9.1 / §9.3 / §28.3.8, v0.359): WHICH constructor a `new`
+    // site selected, for a target that has BOTH a GENERATED PRIMARY
+    // constructor (§9.1) and DECLARED constructors (§9.3) — the COMBINED
+    // form, whose resolution §22.6 ranks over the primary together with the
+    // declared ones.
+    //
+    // WHY A TABLE OF ITS OWN, and not `pureNewCtors_` above. That table
+    // answers §22.15's throw carve-out ("the INVOKED constructor of `E` is
+    // `pure`-declared") and is published for CLASSES ONLY; the question this
+    // table answers is a different one — §28.3.8's *Function-typed holders*
+    // names ONE store site, "an argument for a record component at every call
+    // of the record's GENERATED PRIMARY constructor (§9.1)", so the rule
+    // fires at a primary-constructor call and NOT at a call that resolved to
+    // a DECLARED constructor (a record body may declare a constructor with a
+    // different parameter list beside the generated primary — §9.3, line
+    // 1424). The two tables answer different questions about the same
+    // ranking, and the pure carve-out's own text (§22.15, a CLASS rule) says
+    // nothing about a record's components.
+    //
+    // The KEY is the address of the `NewExpr::args` vector — the same key
+    // shape and the same soundness argument as `resolvedNewCtors_` and
+    // `pureNewCtors_` above (no AST node is freed while sema and the
+    // ownership pass run, so an address is never reused for another site's
+    // arguments).
+    //
+    // The VALUE is the compiler's OWN §22.6 answer, published by
+    // `ExprTC::resolvePrimaryBodyCtorOverload` — the ranking that already
+    // exists for this exact candidate set. It is NOT re-derived by the
+    // consumer: a second ranking, built in the consumer, is how
+    // r40-rev-8134's FINDING 1 happened (that copy had no APPLICABILITY
+    // stage, so it could not tell "inapplicable" from "converting").
+    enum class NewCtorSelection {
+        // The selection was NOT determined: the target is not a local
+        // combined form (no AST `TypeDecl`, no positional fields), or the
+        // ranking DEFERRED (a call-site modifier, a `ref`/`out` formal, or
+        // candidates whose ownership modes differ — the shapes §22.6's
+        // applicability stage does not model here), or the ranking found no
+        // winner. A consumer that needs the invoked constructor treats this
+        // as "not the primary": the store rule fires only where the spec
+        // names the site.
+        Unknown = 0,
+        // The GENERATED PRIMARY constructor is the invoked constructor.
+        Primary,
+        // A DECLARED constructor is the invoked constructor.
+        Declared,
+    };
+    void setNewCtorSelection(const std::vector<ast::CallArgument>* newArgs,
+                             NewCtorSelection sel) {
+        if (newArgs) newCtorSelections_[newArgs] = sel;
+    }
+    NewCtorSelection newCtorSelection(
+        const std::vector<ast::CallArgument>* newArgs) const {
+        if (!newArgs) return NewCtorSelection::Unknown;
+        auto it = newCtorSelections_.find(newArgs);
+        return it == newCtorSelections_.end() ? NewCtorSelection::Unknown
+                                               : it->second;
+    }
     // fix #4084 (§28.3 / §23.4 / §14.1, v0.294): per-IndexExpr substituted
     // indexer-parameter TypeRefs — see `indexerSubstitutedParamTypes_` below
     // for the rationale. Populated by the typecheck pass from
@@ -1456,6 +1513,18 @@ private:
     // `setPureNewCtorAmbiguous` above).
     std::unordered_set<const std::vector<ast::CallArgument>*>
         pureNewCtorAmbiguous_;
+    // fix #8852 (§9.1 / §9.3 / §28.3.8, v0.359): WHICH constructor a
+    // `new` site selected, for a target with both a generated PRIMARY
+    // constructor and DECLARED ones — the combined form. Written by
+    // `ExprTC::resolvePrimaryBodyCtorOverload` (the compiler's own §22.6
+    // ranking of that candidate set), read by the ownership pass from
+    // `MethodOwnership::checkRecordFnComponentStore` (§28.3.8's
+    // *Function-typed holders* names the generated primary constructor's call
+    // as the store site). See `setNewCtorSelection` above for the key shape
+    // and the soundness argument.
+    std::unordered_map<const std::vector<ast::CallArgument>*,
+                       NewCtorSelection>
+        newCtorSelections_;
     // fix #4084 (§28.3 / §23.4 / §14.1, v0.294): per-IndexExpr substituted
     // indexer-parameter TypeRefs. Populated by the typecheck pass at the
     // SAME site it computes `substituteMemberType` for the §7

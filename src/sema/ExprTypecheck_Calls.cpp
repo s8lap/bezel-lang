@@ -33072,7 +33072,23 @@ bool ExprTC::resolvePrimaryBodyCtorOverload(const ast::NewExpr& ne,
         BindResult pb = bindArgsToParams(td->positionalFields, ne.args,
                                          ne.span.begin, std::string(),
                                          /*emit=*/false);
-        if (!pb.ok) return false;  // the primary is not a candidate: no tie
+        if (!pb.ok) {
+            // fix #8852 (§9.1 / §28.3.8, v0.359): the PRIMARY does not bind
+            // the call, so it is not a candidate (§22.5) and the invoked
+            // constructor is a DECLARED one. §28.3.8's *Function-typed
+            // holders* names ONE store site for a record component — "an
+            // argument for a record component at every call of the record's
+            // generated primary constructor (§9.1)" — and a call that
+            // resolved to a declared constructor is not that call, so the
+            // argument is the declared constructor's PARAMETER, not a
+            // component (§9.3: "A body constructor with a different parameter
+            // list is not required to chain to the primary"). Published so
+            // the ownership pass reads the compiler's own §22.6 answer
+            // instead of re-deriving one.
+            ctx_.setNewCtorSelection(
+                &ne.args, SemaContext::NewCtorSelection::Declared);
+            return false;  // the primary is not a candidate: no tie
+        }
         cands.push_back(&td->positionalFields);
         binds.push_back(std::move(pb));
         candCtors.push_back(nullptr);
@@ -33095,6 +33111,11 @@ bool ExprTC::resolvePrimaryBodyCtorOverload(const ast::NewExpr& ne,
         // carries no ConstructorSymbol, so it is published as the primary
         // marker, and the carve-out reports the primary's own reason.
         if (publish) ctx_.setPureNewCtorIsPrimary(&ne.args);
+        // fix #8852 (§9.1 / §28.3.8, v0.359): the same answer, published for
+        // the ownership pass's store-site question (§28.3.8 names the
+        // GENERATED PRIMARY constructor's call and no other).
+        ctx_.setNewCtorSelection(&ne.args,
+                                 SemaContext::NewCtorSelection::Primary);
         return false;
     }
 
@@ -33182,6 +33203,31 @@ bool ExprTC::resolvePrimaryBodyCtorOverload(const ast::NewExpr& ne,
             // genuinely unidentifiable, and the carve-out says exactly that.
             ctx_.setPureNewCtorAmbiguous(&ne.args);
         }
+    }
+    // fix #8852 (§9.1 / §28.3.8, v0.359): the same §22.6 WINNER, published
+    // for the ownership pass's store-site question — and published for
+    // RECORDS as well as classes, and whether or not `publish` (the pure
+    // carve-out's gate) is on. §28.3.8's *Function-typed holders* names ONE
+    // store site for a record component: "an argument for a record component
+    // at every call of the record's generated primary constructor (§9.1)". A
+    // call that resolved to a DECLARED constructor is not that call, so the
+    // argument is that constructor's PARAMETER (call-bounded, §28.14) and not
+    // a component — the store rule fires in the declared constructor's BODY,
+    // where the store is written, not at the call.
+    //
+    // A DEFERRED ranking (the shapes this function bails on above) and an
+    // UNDECIDABLE one leave the selection UNKNOWN, which is the absent entry
+    // — and an unknown selection is not the primary's call.
+    if (res.outcome == OverloadOutcome::Resolved &&
+        res.winnerIndex < candCtors.size()) {
+        ctx_.setNewCtorSelection(
+            &ne.args,
+            candCtors[res.winnerIndex]
+                ? SemaContext::NewCtorSelection::Declared
+                : SemaContext::NewCtorSelection::Primary);
+    } else {
+        ctx_.setNewCtorSelection(&ne.args,
+                                 SemaContext::NewCtorSelection::Unknown);
     }
     return res.outcome == OverloadOutcome::Ambiguous ||
            res.outcome == OverloadOutcome::Unreachable;

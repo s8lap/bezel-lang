@@ -24134,6 +24134,48 @@ void MethodOwnership::recordStorageComponents(
     }
 }
 
+// fix #8852 fix-forward (§9.1 / §9.3 / §28.3.8, v0.359): WHICH constructor
+// did this `new` site select? §28.3.8's *Function-typed holders* names ONE
+// store site for a record component — "an argument for a record component at
+// every call of the record's GENERATED PRIMARY constructor (§9.1)" — so the
+// store rule fires only at a call of the generated primary.
+//
+//  - A record that DECLARES NO constructor of its own has the generated
+//    primary as its only constructor (§9.1), so every call of it is a call of
+//    the primary. This is the shape issue #8852's repro has
+//    (`record R(f: () -> int)`), and the one the fix must keep rejecting.
+//  - A record that DOES declare one (§9.3) may have its call resolved to the
+//    declared constructor. The compiler's own §22.6 ranking of the two
+//    candidate sets — `ExprTC::resolvePrimaryBodyCtorOverload` — published
+//    its winner (`SemaContext::newCtorSelection`); this reads it. A call that
+//    resolved to a DECLARED constructor binds its arguments to that
+//    constructor's PARAMETERS, not to the record's components, so the store
+//    rule does not fire there (the store, if the declared constructor's body
+//    makes one, is judged in the body).
+//  - A selection the ranking could not determine (a DEFERRED ranking — a
+//    call-site modifier, a `ref`/`out` formal, candidates whose ownership
+//    modes differ — or an imported target, which carries no AST `TypeDecl`)
+//    is NOT the primary's call, and the rule does not fire there either.
+//
+// per §9.1, §9.3, §28.3.8, v0.359
+bool MethodOwnership::recordNewSelectsGeneratedPrimary(
+    const ast::NewExpr& ne, const sema::TypeSymbol* ts) const {
+    if (!ts) return false;
+    // Does the record declare a constructor of its own? A §9.1 generated
+    // primary carries NO `ConstructorSymbol` (§22.10: its parameter list
+    // lives on the TypeDecl and on the positional FIELD symbols), so every
+    // `ConstructorSymbol` member of the record is a DECLARED one.
+    bool declaresOwn = false;
+    for (sema::Symbol* m : ts->members) {
+        if (auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m)) {
+            if (!cs->isStatic) { declaresOwn = true; break; }
+        }
+    }
+    if (!declaresOwn) return true;  // the primary is the only constructor
+    return ctx_.newCtorSelection(&ne.args) ==
+           sema::SemaContext::NewCtorSelection::Primary;
+}
+
 // fix #8852 (§9.7 / §28.3.8, v0.359): the store of a function value into a
 // record's FUNCTION-TYPED component, at the CONSTRUCTION site.
 //
@@ -24197,6 +24239,27 @@ void MethodOwnership::checkRecordFnComponentStore(const ast::NewExpr& ne) {
         return;
     const sema::TypeSymbol* ts = rt->declaration;
     if (ts->kind != ast::TypeDeclKind::Record) return;
+    // fix #8852 fix-forward (§9.1 / §28.3.8, v0.359): §28.3.8's
+    // *Function-typed holders* names ONE store site for a record component —
+    // "an argument for a record component at every call of the record's
+    // GENERATED PRIMARY constructor (§9.1)" — so the rule fires only where
+    // the argument really initializes a component. A record body may declare
+    // a constructor with a DIFFERENT parameter list beside the generated
+    // primary (§9.3: "A body constructor with a different parameter list is
+    // not required to chain to the primary"), and a call that resolved to
+    // such a DECLARED constructor binds its arguments to that constructor's
+    // PARAMETERS — call-bounded ones (§28.3.8: "a record's declared
+    // constructor is checked like any other body, its plain function-typed
+    // parameter being call-bounded") — not to the components. §28.3.8's own
+    // words for a declared constructor's parameter: the store into the
+    // component, if the body makes one, is judged IN THE BODY.
+    //
+    // The selection is the compiler's OWN §22.6 answer, published by
+    // `ExprTC::resolvePrimaryBodyCtorOverload` and read here
+    // (`SemaContext::newCtorSelection`); it is NOT re-derived here — a
+    // second ranking, built in the consumer, is how r40-rev-8134's FINDING 1
+    // happened.
+    if (!recordNewSelectsGeneratedPrimary(ne, ts)) return;
     // The record's components: the §9.1 positional ones (index-aligned with
     // the constructor's parameters) and every component by name.
     std::vector<std::pair<std::string_view, const sema::TypeRef*>> positional;
