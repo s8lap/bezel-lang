@@ -23453,6 +23453,13 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // fix #3757 follow-up: closureLocalCandidates_ travels with the pair
     // above (see its declaration, LlvmBackend_impl.hpp).
     auto savedClosureLocalCandidates = closureLocalCandidates_;
+    // fix #7755 (§28.9, v0.359): the capture-CELL free state is per-function
+    // like the closure-release state above — the specialization pins and
+    // recomputes it below, so the outer body's own must survive the build.
+    auto savedCellFreeEligible = cellFreeEligible_;
+    auto savedUnwindUnsafeCellFree = unwindUnsafeCellFree_;
+    auto savedSharedCellEnvdtorFreeOwner = sharedCellEnvdtorFreeOwner_;
+    llvm::Function* savedCellFreeEligibleFn = cellFreeEligibleFn_;
     // fix #568 / §8.6: the specialized body's ReturnStmt lowering consults
     // currentReturnTypeNode_ (return-value boxing, nullable-value coercion). It
     // must name THIS method's declared return type while the body is emitted —
@@ -23771,6 +23778,21 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
         // #2854 regression test).
         collectClosureReleaseEligible(*ci.stmts);
         closureReleaseEligibleFn_ = specFn;
+        // fix #7755 (§28.9, v0.359): the capture-cell twin of the pin above.
+        // A captured, mutated local's heap CELL is freed at scope exit only
+        // when `currentFn_ == cellFreeEligibleFn_` and the local is in
+        // `cellFreeEligible_`; specFn is a freshly-created llvm::Function and
+        // this path never ran the pre-scan, so every captured cell of a
+        // generic specialization leaked (4 B per call for an `int`). Mirror
+        // emitFunctionBody's prolog (LlvmBackend_Setup.cpp: clear, pin,
+        // collectCellFreeEligible AFTER collectClosureReleaseEligible, whose
+        // result it consumes). The walk is keyed on the shared body AST's
+        // declarations, like the closure walk above.
+        cellFreeEligible_.clear();
+        unwindUnsafeCellFree_.clear();
+        sharedCellEnvdtorFreeOwner_.clear();
+        cellFreeEligibleFn_ = specFn;
+        collectCellFreeEligible(*ci.stmts);
         // fix #4174 follow-up: the closure twin of the string parameter
         // retain above — see retainAssignedClosureParams' own comment.
         // Paired with the closureReleaseEligibleFn_ = specFn pin just above,
@@ -23894,6 +23916,11 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     closureReleaseEligibleFn_ = savedClosureReleaseEligibleFn;
     closureLocalCandidates_ =
         std::move(savedClosureLocalCandidates);  // fix #3757 follow-up
+    // fix #7755: restore the outer body's capture-cell free state (see the save).
+    cellFreeEligible_ = std::move(savedCellFreeEligible);
+    unwindUnsafeCellFree_ = std::move(savedUnwindUnsafeCellFree);
+    sharedCellEnvdtorFreeOwner_ = std::move(savedSharedCellEnvdtorFreeOwner);
+    cellFreeEligibleFn_ = savedCellFreeEligibleFn;
     currentReturnTypeNode_ = savedRetNode;
     currentSpecMethodSymbol_ = savedSpecMs;  // fix #628
     emittingGenericTemplateBody_ = savedGenTemplate;  // #817
