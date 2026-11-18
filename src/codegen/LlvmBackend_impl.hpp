@@ -1641,7 +1641,9 @@ private:
     // cell per iteration. boxLocalSlot consults this when its current-BB store
     // heuristic would otherwise miss the init store (nested control flow puts it
     // in an earlier basic block) and wrongly reuse one stale cell. Keyed by the
-    // AllocaInst (module-lifetime, unique across the compilation — no clearing).
+    // AllocaInst and never cleared: a slot's address is unique for the whole
+    // compilation because the one path that takes a slot out of a function
+    // (retirePromotedSlot, fix #8848) drops it from here and never frees it.
     std::unordered_set<llvm::AllocaInst*> loopBodyDeclaredSlots_;
     // fix #2975 (§29.7 / §28.3 / §28.2, v0.240): the decl nodes whose
     // pure-`IEnumerable<T>`/`IOwningEnumerable<T>` local-decl coercion
@@ -1923,8 +1925,9 @@ private:
     // forwarders) drop a declaration created moments earlier whose body was never
     // emitted, so no block of theirs ever reaches this map.
     // Consulted SYNCHRONOUSLY by boxedStorage, which snapshots the entry into the
-    // pending read below. It is never read at module end, so a stale entry for a
-    // dead alloca can never be reached through a recycled address.
+    // pending read below. It is never read at module end, and a promoted holder
+    // is dropped from it and its address never reused (retirePromotedSlot, fix
+    // #8848), so an entry is only ever reached through the alloca it was made for.
     std::unordered_map<llvm::AllocaInst*, std::vector<llvm::BasicBlock*>>
         cellHolderReadyBlocks_;
     struct PendingHolderRead {
@@ -19309,6 +19312,18 @@ private:
     // a GEP into that heap region. Async-only (called from fixupSuspendDominance).
     void promoteDemotedSlotsToFrame(
         llvm::Function* fn, const std::vector<llvm::AllocaInst*>& demoted);
+    // fix #8848 (§27.5 / §30.2 / §30.13, v0.359): the ONE place a slot alloca
+    // leaves a function. It drops the slot from every table keyed by an
+    // alloca's address and then parks the unlinked alloca in `retiredSlots_`
+    // rather than freeing it, so the address is never reused while the emitter
+    // lives (see the definition in LlvmBackend_Async.cpp). A table keyed by an
+    // `llvm::AllocaInst*` / `llvm::Value*` must be dropped from there too.
+    void retirePromotedSlot(llvm::AllocaInst* a);
+    struct RetiredSlotDeleter {
+        void operator()(llvm::AllocaInst* a) const { a->deleteValue(); }
+    };
+    std::vector<std::unique_ptr<llvm::AllocaInst, RetiredSlotDeleter>>
+        retiredSlots_;
 
     // ---- Live suspend/resume state for the in-flight MoveNext / resume fn ----
     // Kind-agnostic frame state. The per-suspend-point spill/restore

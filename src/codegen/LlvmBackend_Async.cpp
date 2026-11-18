@@ -5960,8 +5960,12 @@ void Emitter::promoteDemotedSlotsToFrame(
     llvm::BasicBlock& entryBB0 = fn->getEntryBlock();
     std::vector<llvm::AllocaInst*> admitted;
     admitted.reserve(demoted.size());
+    // fix #8848: a slot registered twice must be admitted ONCE. Step (3)
+    // retires each admitted alloca, so a second entry for the same slot would
+    // lay out a second spill field and then retire a slot that is already gone.
+    std::unordered_set<llvm::AllocaInst*> seen;
     for (llvm::AllocaInst* a : demoted) {
-        if (!a) continue;
+        if (!a || !seen.insert(a).second) continue;
         std::vector<llvm::StoreInst*> zeroInit;
         bool blocked = false;
         for (llvm::User* u : a->users()) {
@@ -6051,8 +6055,48 @@ void Emitter::promoteDemotedSlotsToFrame(
             cb.CreateStructGEP(spillStructTy, spillPtr, i,
                                a->getName().str() + ".spill");
         a->replaceAllUsesWith(gep);
-        a->eraseFromParent();
+        retirePromotedSlot(a);
     }
+}
+
+
+// fix #8848 (§27.5 / §30.2 / §30.13, v0.359): take a promoted slot out of the
+// resume function WITHOUT leaving anything that can mistake a later alloca for
+// it. The emitter keeps side tables keyed by an alloca's ADDRESS (which slots
+// hold a capture cell and of what element type, which cells are refcounted,
+// which slots a frame field backs, ...), several of them never cleared between
+// methods. `eraseFromParent()` frees the AllocaInst, the allocator hands the
+// same address to an alloca of a LATER function, and that alloca then answers
+// to the erased slot's table entries: a plain `i32` local was read as the
+// HOLDER of a capture cell, which is a read of 8 bytes from a 4-byte stack
+// slot in the generated code (or IR that does not verify), in a method that
+// captures nothing.
+//
+// Two independent halves, either of which alone closes that:
+//   (1) every address-keyed table forgets the slot, so no table keeps a key
+//       for an alloca that is no longer in any function;
+//   (2) the alloca is UNLINKED and kept until the emitter is destroyed
+//       instead of being freed, so its address cannot be handed to another
+//       instruction while any table, any saved copy of one (a nested body's
+//       save/restore snapshot) or any slot pointer held elsewhere can still
+//       name it. This is the half that does not depend on (1)'s list being
+//       complete: a table added later is safe without being added there.
+// The emitted IR is the same as with `eraseFromParent()`: the slot has no
+// uses left (the caller has just replaced them all) and is in no block.
+void Emitter::retirePromotedSlot(llvm::AllocaInst* a) {
+    cellVars_.erase(a);
+    cellVarSyncSlot_.erase(a);
+    cellHolderReadyBlocks_.erase(a);
+    refcountedCellSlots_.erase(a);
+    loopBodyDeclaredSlots_.erase(a);
+    cdFreeEligibleSlots_.erase(a);
+    smAllocaToField_.erase(a);
+    smRestoredParamSlots_.erase(a);
+    smIterEnumFrameSlot_.erase(a);
+    smUnwindAwaitBlocks_.erase(a);
+
+    a->removeFromParent();
+    retiredSlots_.emplace_back(a);
 }
 
 

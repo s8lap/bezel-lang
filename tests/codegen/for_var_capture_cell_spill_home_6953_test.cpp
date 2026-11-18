@@ -164,6 +164,113 @@ BEZEL_TEST(for_var_capture_cell_spill_home_6953,
         "9950000\n");
 }
 
+// Async iterator with NESTED collection loops (`for y in xs` around
+// `for z in zs`, the lambda capturing both variables across two awaits and
+// two yields) and a nested range loop, drained 200 times. Base: a wrong total
+// (5442274) and leaked cells.
+// per §27.5, §21.4, §30.7 (issue #6953)
+BEZEL_TEST(for_var_capture_cell_spill_home_6953,
+           async_iterator_nested_for_in_arrays_and_range_x200_spec_27_5_30_7) {
+    BEZEL_EXPECT_EQ(checkedOut(R"BZL(module M;
+class C
+  public static async method Gen(xs: Array<int>, zs: Array<int>): IAsyncEnumerable<int>
+    for var y in xs do
+      for var z in zs do
+        var f := lambda(): int => y * 100 + z;
+        await Task.Delay(0);
+        yield return f();
+        await Task.Delay(0);
+        yield return f();
+      end;
+      for var w in 0..<2 do
+        var g := lambda(): int => y + w;
+        yield return g();
+        await Task.Delay(0);
+        yield return g();
+      end;
+    end;
+  end Gen;
+  public static async method Main(): Task<int>
+    var xs: Array<int> := [];
+    for var i in 0..<10 do xs.Add(i); end;
+    var zs: Array<int> := [1, 2, 3];
+    var total := 0;
+    for var k in 0..<200 do
+      await for var v in Gen(xs, zs) do total := total + v; end;
+    end;
+    Console.WriteLine(total);
+    return 0;
+  end Main;
+end C;)BZL"),
+        "5464000\n");
+}
+
+// A range loop and two collection loops (Array<int>, Array<string>) in ONE
+// async method, plus an async iterator nesting a range loop inside a
+// collection loop and the reverse, 200 times each. Base: the program aborts
+// with no output.
+// per §27.5, §21.4, §30.1, §30.7 (issue #6953)
+BEZEL_TEST(for_var_capture_cell_spill_home_6953,
+           range_and_collection_loops_in_one_async_body_x200_spec_27_5_30_1_30_7) {
+    BEZEL_EXPECT_EQ(checkedOut(R"BZL(module M;
+class C
+  public static async method Sum(xs: Array<int>, ss: Array<string>): Task<int>
+    var t := 0;
+    for var y in xs do
+      var f := lambda(): int => y * 10;
+      await Task.Delay(0);
+      t := t + f();
+    end;
+    for var r in 0..<xs.Count do
+      var g := lambda(): int => r + 1;
+      await Task.Delay(0);
+      t := t + g();
+    end;
+    for var s in ss do
+      var h := lambda(): int => s.Length;
+      await Task.Delay(0);
+      t := t + h();
+    end;
+    return t;
+  end Sum;
+  public static async method Gen(xs: Array<int>): IAsyncEnumerable<int>
+    for var y in xs do
+      for var r in 0..<2 do
+        var g := lambda(): int => y * 10 + r;
+        await Task.Delay(0);
+        yield return g();
+      end;
+    end;
+    for var r in 0..<3 do
+      for var y in xs do
+        var g := lambda(): int => y + r;
+        yield return g();
+        await Task.Delay(0);
+        yield return g();
+      end;
+    end;
+  end Gen;
+  public static async method Main(): Task<int>
+    var xs: Array<int> := [];
+    var ss: Array<string> := [];
+    for var i in 0..<25 do
+      xs.Add(i);
+      ss.Add("ab" + i.ToString());
+    end;
+    var a := 0;
+    var b := 0;
+    for var k in 0..<200 do
+      a := a + await Sum(xs, ss);
+      await for var v in Gen(xs) do b := b + v; end;
+    end;
+    Console.WriteLine(a);
+    Console.WriteLine(b);
+    return 0;
+  end Main;
+end C;)BZL"),
+        "683000\n1595000\n");
+}
+
 // CONTROL: an async iterator over an Array<int> yields the lambda itself
 // (escaping), and the consumer calls every one after the iterator finished.
 // Red (SEGV, no output) under the wrong fix named in the header.
