@@ -5226,6 +5226,40 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             if (!diverged_ && v) emitStringRelease(v);
             return diverged_;
         }
+        // fix #8763 (follow-up, §21.9 / §28.3.11 / §28.9, v0.359): a
+        // DISCARDED read of a FUNCTION-TYPED property whose getter is a BLOCK
+        // body.
+        //
+        // #8763 gave that getter a protocol: the getter hands the reader ONE
+        // reference (it transfers the returned local's +1, or retains one for a
+        // borrowed value) and the reader gives it back. A read that is
+        // DISCARDED — an expression statement whose value nobody takes
+        // (§21.9: "the result is silently discarded") — never gives it back,
+        // so the closure never reaches zero.
+        //
+        // MEASURED on the #8763 commit (621997773), the discarded-read probe
+        // (`h.P;` over 200 iterations, P a block getter returning a field's
+        // closure): "SUMMARY: AddressSanitizer: 72 byte(s) leaked in 2
+        // allocation(s)".
+        //
+        // The predicate is the SHARED one (`propertyReadMintsClosureRef`), the
+        // same question the producer side asks, so this arm releases exactly
+        // the references the getter handed over and no others. It is
+        // deliberately NARROWER than `isPlusOneClosureProducer`: that
+        // predicate also admits a lambda literal and a method reference (the
+        // discarded-PRODUCER half of the family, tracked separately as
+        // #8869), and this arm must not change that defect's behaviour.
+        //
+        // The arm's PLACE among its siblings is immaterial: a discarded
+        // expression is a +1 string or a +1 closure, never both (a string
+        // producer is not a function-typed property read), so at most one of
+        // these arms fires.
+        if (es->expr && propertyReadMintsClosureRef(es->expr.get())) {
+            llvm::Value* v = lowerExpr(*es->expr);
+            if (!diverged_ && v && v->getType()->isPointerTy())
+                emitClosureRelease(v);
+            return diverged_;
+        }
         // fix #8506 (§21.9, §28.9, v0.357): the same release for EVERY
         // discarded +1 string, not the one primitive `ToString()` shape just
         // above. The question is "did the statement's expression hand over a
@@ -5854,6 +5888,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!diverged_ && v)
                     freeUnboundOwnedBorrowingArrayTemp(
                         ds->value.get(), v, ctx_.exprType(*ds->value));
+                // fix #8763 (follow-up, §17.13 / §28.3.11 / §28.9, v0.359):
+                // `_ := h.P;` over a read of a FUNCTION-TYPED property whose
+                // getter is a BLOCK body. The getter handed the reader one
+                // reference and the discard drops it, so the discard is the
+                // discharge point (§17.13: "no disposal is required, so the
+                // discard does nothing beyond the warning suppression" — that
+                // removes the `Dispose()`, not the runtime's own release;
+                // §28.9 leaves the function value's lifetime to the runtime).
+                //
+                // The predicate is the SHARED one
+                // (`propertyReadMintsClosureRef`) — the same question the
+                // producer side asks — so this arm releases exactly the
+                // references the getter handed over. Its PLACE among the
+                // sibling releases is immaterial: a discarded expression is a
+                // +1 string or a +1 closure, never both.
+                if (!diverged_ && v && v->getType()->isPointerTy() &&
+                    propertyReadMintsClosureRef(ds->value.get()))
+                    emitClosureRelease(v);
                 // fix #6421 (§17.13, §28.9, v0.357): `_ := P;` over a +1
                 // string producer. §17.13: for `string` "no disposal is
                 // required, so the discard does nothing beyond the warning

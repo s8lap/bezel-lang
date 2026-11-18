@@ -13159,7 +13159,57 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             }
             if (rt && rt->kind == sema::TypeRef::Kind::Function) {
                 llvm::Value* closurePtr = lowerExpr(*call.callee);
-                return emitClosureCall(closurePtr, rt, &call);
+                // fix #8763 (follow-up, §27.5 / §28.9, v0.359): the DIRECT
+                // CALL `h.P()` is a read that does NOT take ownership — the
+                // call INVOKES the closure and drops it; no binding site ever
+                // owns the reference the getter handed over.
+                //
+                // #8763 gave the FUNCTION-TYPED block getter a protocol: the
+                // getter hands the reader ONE reference (it transfers the
+                // returned local's +1, or retains one for a borrowed value) and
+                // the reader gives it back. The reader-side half was taught
+                // only to the sites that TAKE ownership (a binding local, a
+                // store, an argument, a return); the direct call was not one
+                // of them, so the reference the getter handed over was never
+                // given back and the closure never reached zero.
+                //
+                // MEASURED on the #8763 commit (621997773), the direct-call
+                // probe (`while i < 200 do tot := tot + h.P(); …` over a
+                // property whose getter returns a FIELD's closure):
+                // "SUMMARY: AddressSanitizer: 72 byte(s) leaked in 2
+                // allocation(s)" — the field's closure over-retained, never
+                // freed. The variant that REPLACES the field every iteration
+                // ("h.P(); h.Reset(); …") leaked "14472 byte(s) in 402
+                // allocation(s)" — one closure per iteration, unbounded.
+                //
+                // THE RELEASE is after the call, never before: the reader's
+                // reference is what keeps the closure alive across the
+                // invocation (the field it was read from may be replaced
+                // while the call runs), so it may only be given back once
+                // the call has returned. §28.9 (v0.359): "Runtime management
+                // governs the *function value itself* — the heap-allocated
+                // closure object that backs it"; §28.3.11 puts the discharge
+                // at "the end of the full expression in which it is
+                // produced" — here the end of the call expression.
+                //
+                // Gated on the SAME predicate the producer side asks
+                // (`propertyReadMintsClosureRef`), so this site releases
+                // exactly the references the getter handed over and no
+                // others: an auto-property's read is a borrow of the field's
+                // own reference, an expression-bodied getter is inlined in the
+                // reader's frame, and a virtual / interface read runs the
+                // OVERRIDE's getter — none of them mints here.
+                //
+                // `!diverged_` mirrors #4078's release discipline in
+                // `emitClosureCall`: a closure that raised leaves the
+                // release to the unwind edge (a leak on the throw path is the
+                // safe direction; the reference is not released TWICE).
+                bool calleeMintsRef = propertyReadMintsClosureRef(call.callee.get());
+                llvm::Value* r = emitClosureCall(closurePtr, rt, &call);
+                if (calleeMintsRef && !diverged_ && closurePtr &&
+                    closurePtr->getType()->isPointerTy())
+                    emitClosureRelease(closurePtr);
+                return r;
             }
         }
     }

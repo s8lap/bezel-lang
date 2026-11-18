@@ -37585,6 +37585,72 @@ Emitter::LocalDeclInitView Emitter::localDeclInitView(const ast::Node* n) {
 }
 
 
+// fix #8763 (follow-up, §27.5 / §28.9, v0.359): the SHARED predicate for
+// "a read of this property hands the reader a +1 closure reference".
+//
+// #8763 gave the FUNCTION-TYPED block getter a protocol: the getter's
+// `return` either TRANSFERS the returned local's +1 to the reader or
+// RETAINS one reference for the reader (a BORROW — a field's closure), and
+// the reader's own scope-end release is what discharges it. This predicate is
+// the ONE place that decides whether a given property read is on that
+// protocol, so the producer side (`isPlusOneClosureProducer` — "the reader
+// owns this reference") and the discharge side (the read sites that must
+// GIVE the reference back: a direct call, a discarded read) can never
+// disagree.
+//
+// The GATES are the ones #8763 established, unchanged:
+//   * not an indexer (an indexer getter is a different emitter);
+//   * not slot-dispatched (`propGetSlot_` / `ifacePropertyGetIndex_`): a
+//     virtual or interface read runs the OVERRIDE's getter, a different body,
+//     whose mint this classification cannot see;
+//   * the declared type is a non-nullable function type (the getter's own
+//     mint is keyed on the same resolved type);
+//   * the getter is the BLOCK form, whose body is emitted out of line. The
+//     EXPRESSION-bodied form is lowered in the READER's frame and keeps the
+//     borrow classification (its read face is not this getter's out-of-line
+//     protocol).
+bool Emitter::blockGetterMintsClosureRef(
+        const sema::PropertySymbol* ps) const {
+    if (!ps || ps->isIndexer) return false;
+    if (propGetSlot_.count(ps) || ifacePropertyGetIndex_.count(ps))
+        return false;
+    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    if (!pd || !pd->type) return false;
+    const sema::TypeRef* pty = ctx_.resolvedType(*pd->type);
+    if (!pty || pty->kind != sema::TypeRef::Kind::Function || pty->nullable)
+        return false;
+    bool sawBlockGetter = false;
+    for (const auto& acc : pd->accessors) {
+        if (acc.isSet) continue;
+        if (acc.bodyKind != ast::PropertyAccessorBodyKind::Block)
+            return false;
+        sawBlockGetter = true;
+    }
+    return sawBlockGetter;
+}
+
+// fix #8763 (follow-up, §27.5 / §28.9, v0.359): the READ-SIDE twin of
+// `blockGetterMintsClosureRef` — "this EXPRESSION is a property read whose
+// getter hands the reader a +1 reference".
+//
+// Both spellings of the read are admitted: the qualified `obj.P`
+// (MemberAccessExpr) and the BARE / implicit-`this` `P` (IdentifierExpr).
+// The `?.` spelling (NullCondMemberExpr) is DELIBERATELY NOT admitted: it
+// lifts the result to §7.5's always-nullable type, so the value that reaches
+// the reader is a NULLABLE function value, and the read sites that consume it
+// have their own nullable protocol (the `?.` path is a pre-existing leak
+// class of its own — the same class #8481 tracks — and admitting it here
+// would release a reference the nullable protocol has not given up).
+bool Emitter::propertyReadMintsClosureRef(const ast::Expr* e) const {
+    if (!e) return false;
+    if (!dynamic_cast<const ast::MemberAccessExpr*>(e) &&
+        !dynamic_cast<const ast::IdentifierExpr*>(e))
+        return false;
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*e));
+    if (!ps) return false;
+    return blockGetterMintsClosureRef(ps);
+}
+
 bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     if (!init) return false;
     if (dynamic_cast<const ast::LambdaExpr*>(init)) return true;
@@ -37603,36 +37669,14 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     // an accessor ("the implementation reclaims the production; how is not
     // specified").
     //
-    // The GATES below keep the two sides in lockstep — the classification is
-    // only made where the getter that will run is the body inspected here:
-    //   * not an indexer (an indexer getter is a different emitter);
-    //   * not slot-dispatched (`propGetSlot_` / `ifacePropertyGetIndex_`):
-    //     a virtual or interface read runs the OVERRIDE's getter, a
-    //     different body, whose mint this classification cannot see;
-    //   * the declared type is a non-nullable function type (the getter's
-    //     own mint is keyed on the same resolved type);
-    //   * the getter is the BLOCK form, whose body is emitted out of line.
-    //     The EXPRESSION-bodied form is lowered in the READER's frame and
-    //     keeps the borrow classification (its read face is not this
-    //     getter's out-of-line protocol).
+    // The GATES that keep the two sides in lockstep live in the SHARED
+    // predicate `blockGetterMintsClosureRef` (defined above), so the producer
+    // side (here) and the discharge side (the read sites that must give the
+    // reference back — a direct call, a discarded read) ask the SAME question
+    // and cannot disagree.
     auto blockGetterMintsClosure =
             [this](const sema::PropertySymbol* ps) -> bool {
-        if (!ps || ps->isIndexer) return false;
-        if (propGetSlot_.count(ps) || ifacePropertyGetIndex_.count(ps))
-            return false;
-        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-        if (!pd || !pd->type) return false;
-        const sema::TypeRef* pty = ctx_.resolvedType(*pd->type);
-        if (!pty || pty->kind != sema::TypeRef::Kind::Function || pty->nullable)
-            return false;
-        bool sawBlockGetter = false;
-        for (const auto& acc : pd->accessors) {
-            if (acc.isSet) continue;
-            if (acc.bodyKind != ast::PropertyAccessorBodyKind::Block)
-                return false;
-            sawBlockGetter = true;
-        }
-        return sawBlockGetter;
+        return blockGetterMintsClosureRef(ps);
     };
     // fix #4040 (§17/§20 if-expression / §28.3 producers arm-meet, v0.294):
     // a `(if c then v1 else v2)` whose two branches are themselves +1 closure
@@ -37845,6 +37889,41 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
                 declaredFunc = tr->kind == sema::TypeRef::Kind::Function;
             }
             if (!declaredFunc) return true;
+            // fix #8763 (follow-up, §27.5 / §28.9, v0.359): the BARE
+            // (implicit-`this`) sibling of the MemberAccessExpr arm above.
+            //
+            // #8763 taught the reader side that a read of a FUNCTION-TYPED
+            // property whose getter is a BLOCK body hands the reader a +1
+            // closure reference (the getter retains it, or transfers the
+            // returned local's own +1). It taught that to the QUALIFIED read
+            // (`obj.P`) only: the bare spelling (`P`, inside the declaring
+            // class) was left out, so the BARE read's +1 had no owner — the
+            // binding local was not classified as a +1 producer, so no
+            // scope-end release was armed for it, and the reference the getter
+            // handed over was never given back.
+            //
+            // MEASURED on the #8763 commit (621997773), the bare-read probe
+            // (`var a := Mk; var b := P; var c := this.Mk; var d := this.P;`
+            // over 200 iterations): "SUMMARY: AddressSanitizer: 14472 byte(s)
+            // leaked in 402 allocation(s)" — 14400 B (the bare `Mk` local-
+            // return closure, 72 B per iteration) plus the 72 B the bare `P`
+            // field-return read over-retained. The qualified twins `this.Mk`
+            // and `this.P` leaked nothing.
+            //
+            // The same omission ALSO leaked in a getter that returns ANOTHER
+            // property: `property Q: () -> int get => do return P; end;` —
+            // the bare `P` inside Q's body was not a producer, so Q's own
+            // return-site mint retained a SECOND reference on top of the one
+            // P's getter had already handed over, and the extra reference was
+            // never released. MEASURED on 621997773, the chained-getter probe
+            // over 200 iterations: "SUMMARY: AddressSanitizer: 14400 byte(s)
+            // leaked in 400 allocation(s)" — every closure the loop's `Reset()`
+            // replaced stayed alive.
+            //
+            // The gate is the SHARED predicate `blockGetterMintsClosureRef`
+            // (the same one the qualified arm asks), so the two spellings of
+            // the read are classified by ONE question and cannot drift.
+            if (blockGetterMintsClosure(ps)) return true;
         }
     }
     // §27.6 (v0.184, #1758): a bare reference to a primitive-intrinsic static

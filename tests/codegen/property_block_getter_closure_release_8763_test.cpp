@@ -26,6 +26,14 @@
 // leak check); the getter is read in a loop so the leak cannot hide in
 // sanitizer noise.
 //
+// The last two rows are the FIX-FORWARD's: #8763 taught the reader side of
+// the block getter's protocol only to the read sites that TAKE ownership (a
+// binding local, a store, an argument, a return). A read that is INVOKED
+// directly (`h.P()`) takes no ownership — the call consumes the closure and
+// drops it — so the reference the getter handed over had no owner and leaked.
+// They are RED on #8763's commit (621997773) and green with the fix; the
+// three rows above them are red on the base the fix was written against.
+//
 // per §27.5, §28.9, §23.3, §23.4 (v0.359)
 
 #include <string>
@@ -128,4 +136,96 @@ BEZEL_TEST(property_block_getter_closure_release_8763,
         "  end; "
         "end Program;"),
         "200");
+}
+
+// fix #8763 (follow-up) — the DIRECT CALL `h.P()`.
+//
+// #8763 gave a FUNCTION-TYPED block getter a protocol: the getter hands the
+// reader ONE reference (it retains one for a BORROWED value — a field's
+// closure — or transfers the returned local's own +1) and the reader gives
+// it back. The reader-side half was taught to the sites that TAKE ownership
+// (a binding local, a store, an argument, a return). A read that is INVOKED
+// directly takes no ownership: the call consumes the closure and drops it,
+// and no binding site ever owns the reference the getter handed over.
+//
+// MEASURED on the #8763 commit (621997773), 200 iterations of this program:
+//   "SUMMARY: AddressSanitizer: 72 byte(s) leaked in 2 allocation(s)"
+// — the field's closure, over-retained by the getter and never given back.
+//
+// The row loops 200 times so the leak cannot hide in the sanitizer's noise,
+// and it reads the DATA (the closure's own result) so a fix that misreads
+// the value cannot pass it.
+BEZEL_TEST(property_block_getter_closure_release_8763,
+           block_getter_direct_call_reference_released_200x_spec_28_9) {
+    BEZEL_EXPECT_EQ(stdoutChecked(
+        "module M; "
+        "public class H "
+        "  private f: () -> int; "
+        "  public constructor() f := lambda(): int => 5; end; "
+        "  public property P: () -> int "
+        "    get => do return f; end; "
+        "  end; "
+        "end H; "
+        "public static class Program "
+        "  public static method Main(args: Array<string>): int "
+        "    var i := 0; "
+        "    var tot := 0; "
+        "    using var h := new H(); "
+        "    while i < 200 do tot := tot + h.P(); i := i + 1; end; "
+        "    Console.Write(tot); "
+        "    return 0; "
+        "  end; "
+        "end Program;"),
+        "1000");
+}
+
+// fix #8763 (follow-up) — the DIRECT CALL with the field REPLACED every
+// iteration.
+//
+// The unbounded twin of the row above: `Reset()` replaces the field's
+// closure each iteration, so the reference the getter handed over is a
+// reference to a DIFFERENT closure every time, and the leak grows without
+// bound instead of saturating at one closure.
+//
+// MEASURED on the #8763 commit (621997773), 200 iterations of this program:
+//   "SUMMARY: AddressSanitizer: 14472 byte(s) leaked in 402 allocation(s)"
+// — one closure (72 B, in 2 allocations) per iteration.
+//
+// The printed total (3599) is the program's own: 5 from the constructor's
+// closure, then 6 + 6 + 6 per iteration after the first reset.
+BEZEL_TEST(property_block_getter_closure_release_8763,
+           block_getter_direct_call_after_field_reset_released_200x_spec_28_9) {
+    BEZEL_EXPECT_EQ(stdoutChecked(
+        "module M; "
+        "public class H "
+        "  public n: int; "
+        "  private f: () -> int; "
+        "  public constructor(x: int) n := x; f := lambda(): int => 5; end; "
+        "  public method Reset() f := lambda(): int => 6; end; "
+        "  public property P: () -> int "
+        "    get => do return f; end; "
+        "  end; "
+        "  public property T: () -> int "
+        "    get => do return this.f; end; "
+        "  end; "
+        "  public property W: () -> int "
+        "    get => do try return f; finally n := n + 1; end; end; "
+        "  end; "
+        "end H; "
+        "public static class Program "
+        "  public static method Main(args: Array<string>): int "
+        "    var i := 0; "
+        "    var tot := 0; "
+        "    using var h := new H(3); "
+        "    while i < 200 do "
+        "      tot := tot + h.P(); "
+        "      h.Reset(); "
+        "      tot := tot + h.T() + h.W(); "
+        "      i := i + 1; "
+        "    end; "
+        "    Console.Write(tot); "
+        "    return 0; "
+        "  end; "
+        "end Program;"),
+        "3599");
 }

@@ -22843,6 +22843,33 @@ private:
     // *call*, which is not a value-producing reference). Used to gate release
     // eligibility.
     bool isPlusOneClosureProducer(const ast::Expr* init) const;
+    // fix #8763 (follow-up, §27.5 / §28.9, v0.359): true when a READ of this
+    // property hands the reader a +1 closure reference — the FUNCTION-TYPED
+    // block getter's own protocol (#8763): the getter's `return` either
+    // TRANSFERS the returned local's +1 to the reader or RETAINS one
+    // reference for the reader (a borrow — a field's closure). The reader
+    // owns that reference and must give it back.
+    //
+    // SHARED on purpose: the producer side (`isPlusOneClosureProducer` — "the
+    // reader's binding owns this reference") and the discharge side (the read
+    // sites that do NOT take ownership — a direct call `h.P()`, a discarded
+    // read) ask this ONE question, so the two halves of the protocol cannot
+    // disagree about which reads mint a reference.
+    //
+    // The gates: not an indexer; not slot-dispatched (`propGetSlot_` /
+    // `ifacePropertyGetIndex_` — a virtual or interface read runs the
+    // OVERRIDE's getter, a different body); the declared type is a
+    // non-nullable function type; the getter is the BLOCK form (the
+    // EXPRESSION-bodied form is lowered in the reader's own frame and keeps
+    // the borrow classification).
+    bool blockGetterMintsClosureRef(const sema::PropertySymbol* ps) const;
+    // fix #8763 (follow-up, §27.5 / §28.9, v0.359): the READ-SIDE twin of
+    // `blockGetterMintsClosureRef` — "this EXPRESSION is a property read
+    // whose getter hands the reader a +1 reference". Both spellings of the
+    // read are admitted (the qualified `obj.P` and the bare / implicit-`this`
+    // `P`). The `?.` spelling is NOT: it lifts the result to §7.5's
+    // always-nullable type, so it has its own nullable protocol.
+    bool propertyReadMintsClosureRef(const ast::Expr* e) const;
 
     // fix #3195 / §28.14: walk an expression or statement collecting every
     // bare `IdentifierExpr` (a method/parameter/local reference) it contains,
