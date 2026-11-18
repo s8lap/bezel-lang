@@ -7549,18 +7549,50 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
     // captured-cell classification, which that scope does not hold, is saved
     // by hand. Mirrors emitFunctionBody / the destructor-body site (#2887).
     //
-    // A getter whose own type is a function type is left unanalysed (the
-    // pre-fix behaviour): `return f;` of a local closure mints the caller's
-    // reference by the declared return type (ClosureEscapeWalker's
-    // coalesceReturnTransfers), and a getter has no `currentReturnTypeNode_`
-    // for that to read. The bounded leak stays there (the safe direction).
+    // fix #8763 (§27.5 / §28.9, v0.359): a FUNCTION-TYPED getter is analysed
+    // like every other body. The pre-fix exclusion ("a getter whose own type
+    // is a function type is left unanalysed ... The bounded leak stays there
+    // (the safe direction)") was sound ONLY while the getter had no way to
+    // mint the reader's reference: the closure-return mint is keyed on the
+    // body's declared return type, which a lazily emitted getter did not
+    // publish, so the escape walk's verdict for the returned local could not
+    // be paired with a mint. The publish below gives the getter that
+    // declared return type, and with it the verdict a method body gets: the
+    // returned local's own +1 LEAVES the frame with the value (the mint's
+    // transfer, `returnedClosureLocalOwnsPlusOne`), so its scope-end release
+    // stays disarmed — and every OTHER closure local in the body is released
+    // at scope end, exactly as in an ordinary method body.
+    //
+    // MEASURED on r30-c1 (1128406b7) with `bezelc --sanitize=address` on
+    // #8763's literal repro (`get => do var g := lambda(): int => n + 1;
+    // return g; end;`, 50 reads): "SUMMARY: AddressSanitizer: 3600 byte(s)
+    // leaked in 100 allocation(s)".
     std::optional<CaptureReclaimSetScope> getterClosureScope;
     std::unordered_set<const void*> savedGetterClosureCapturedCell;
     std::unordered_set<const void*> savedGetterClosureCapturedCellReassigned;
     const sema::TypeRef* getterRetTy =
         pd->type ? ctx_.resolvedType(*pd->type) : nullptr;
-    const bool analyzeGetterClosures =
-        getterRetTy && getterRetTy->kind != sema::TypeRef::Kind::Function;
+    const bool analyzeGetterClosures = getterRetTy != nullptr;
+    // fix #8763: publish the getter's OWN declared return type, the way a
+    // method body publishes `currentReturnTypeNode_`, so `emitReturn`'s
+    // closure-return mint can see that this body owes the reader one
+    // reference (§28.9: "the implementation reclaims the production; how is
+    // not specified" — the choice made here is the same one the method
+    // protocol already makes, and the same one the `string` getter protocol
+    // makes: the getter hands the reader a reference the reader owns).
+    //
+    // Published for a FUNCTION-TYPED getter only. The same field also gates
+    // the `string`-return mint, which a getter's read face must not perform
+    // (axiom A4 — "Accessor read faces are lend-only"; #2694's leak), and a
+    // function-typed getter can never reach that arm: it is gated on the
+    // DECLARED return type being `string`. The node published here is the
+    // accessor's own declared type — the same node `accessorReturnTypeNode_`
+    // already publishes for the REPRESENTATION arms — so the representation
+    // behaviour of the body is unchanged.
+    const ast::Type* savedGetterReturnTypeNode = currentReturnTypeNode_;
+    const bool publishGetterReturnType =
+        getterRetTy && getterRetTy->kind == sema::TypeRef::Kind::Function;
+    if (publishGetterReturnType) currentReturnTypeNode_ = pd->type.get();
     if (analyzeGetterClosures) {
         getterClosureScope.emplace(*this);
         savedGetterClosureCapturedCell = closureLocalCapturedCell_;
@@ -7591,6 +7623,8 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
     lowerScopedBlock(acc->stmts);
     if (!builder_.GetInsertBlock()->getTerminator())
         emitImplicitReturn(fn);
+    if (publishGetterReturnType)
+        currentReturnTypeNode_ = savedGetterReturnTypeNode;
     if (analyzeGetterClosures) {
         closureLocalCapturedCell_ =
             std::move(savedGetterClosureCapturedCell);

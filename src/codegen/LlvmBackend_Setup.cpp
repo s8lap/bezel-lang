@@ -37588,6 +37588,52 @@ Emitter::LocalDeclInitView Emitter::localDeclInitView(const ast::Node* n) {
 bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     if (!init) return false;
     if (dynamic_cast<const ast::LambdaExpr*>(init)) return true;
+    // fix #8763 (§27.5 / §28.9, v0.359): a read of a FUNCTION-TYPED property
+    // whose getter is a BLOCK body yields a +1 closure that the READER owns.
+    //
+    // The getter is emitted out of line (`ensurePropertyBlockGetter` ->
+    // `bz$prop$<name>$get`) and publishes its own declared return type, so
+    // its `return` mints the reader's reference exactly as a method's return
+    // mints its caller's: the reference either TRANSFERS out of the getter
+    // (the returned local owns it — `returnedClosureLocalOwnsPlusOne`) or is
+    // RETAINED for the reader (the returned value is a borrow). Either way
+    // the reader holds one reference, and the reader's own scope-end release
+    // is what discharges it — the protocol the METHOD twin already follows
+    // (`isUserMethodClosureReturnCall`), and the one §28.9 leaves open for
+    // an accessor ("the implementation reclaims the production; how is not
+    // specified").
+    //
+    // The GATES below keep the two sides in lockstep — the classification is
+    // only made where the getter that will run is the body inspected here:
+    //   * not an indexer (an indexer getter is a different emitter);
+    //   * not slot-dispatched (`propGetSlot_` / `ifacePropertyGetIndex_`):
+    //     a virtual or interface read runs the OVERRIDE's getter, a
+    //     different body, whose mint this classification cannot see;
+    //   * the declared type is a non-nullable function type (the getter's
+    //     own mint is keyed on the same resolved type);
+    //   * the getter is the BLOCK form, whose body is emitted out of line.
+    //     The EXPRESSION-bodied form is lowered in the READER's frame and
+    //     keeps the borrow classification (its read face is not this
+    //     getter's out-of-line protocol).
+    auto blockGetterMintsClosure =
+            [this](const sema::PropertySymbol* ps) -> bool {
+        if (!ps || ps->isIndexer) return false;
+        if (propGetSlot_.count(ps) || ifacePropertyGetIndex_.count(ps))
+            return false;
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd || !pd->type) return false;
+        const sema::TypeRef* pty = ctx_.resolvedType(*pd->type);
+        if (!pty || pty->kind != sema::TypeRef::Kind::Function || pty->nullable)
+            return false;
+        bool sawBlockGetter = false;
+        for (const auto& acc : pd->accessors) {
+            if (acc.isSet) continue;
+            if (acc.bodyKind != ast::PropertyAccessorBodyKind::Block)
+                return false;
+            sawBlockGetter = true;
+        }
+        return sawBlockGetter;
+    };
     // fix #4040 (§17/§20 if-expression / §28.3 producers arm-meet, v0.294):
     // a `(if c then v1 else v2)` whose two branches are themselves +1 closure
     // producers lowers to a PHI of the two arms' closure pointers
@@ -37757,6 +37803,13 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
                 declaredFunc = tr->kind == sema::TypeRef::Kind::Function;
             }
             if (!declaredFunc) return true;
+            // fix #8763 (§27.5 / §28.9, v0.359): the declared type IS a
+            // function type, so the §27.6 thunk-promotion reading does not
+            // apply (the read is an ordinary value read, not a thunk cell).
+            // The BLOCK-bodied getter's own protocol still hands the reader a
+            // +1 (see the helper above), so the read IS a +1 producer and the
+            // binding local owns that reference.
+            if (blockGetterMintsClosure(ps)) return true;
         }
     }
     // fix #5318 (§27.6 / §28.6, v0.315): the BARE (implicit-`this`) sibling
