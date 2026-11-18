@@ -15398,6 +15398,18 @@ private:
     struct CallClosureArgRelease {
         std::vector<llvm::Value*> syncIter;
         std::vector<llvm::Value*> callBounded;
+        // fix #8867 (§28.14 / §28.9 / §30.1, v0.359): the call-bounded
+        // release for a PLAIN (non-iterator) ASYNC callee. Kept in its own
+        // vector — not merged into `callBounded` — because the two differ in
+        // one respect: `callBounded` also consumes the lambda's CAPTURED
+        // CELLS at the call site (`consumeLastLambdaCapturedCells`), which is
+        // right for a sync callee (the callee is done with the callback when
+        // the call returns) and WRONG for an async one (the callee's frame
+        // still holds the closure, so the cells must outlive the call — the
+        // iterator arms already decline the cell consumption for the same
+        // reason). The two vectors are disjoint by construction: `callBounded`
+        // requires a non-async callee, this one requires a plain async callee.
+        std::vector<llvm::Value*> callBoundedAsync;
         std::vector<llvm::Value*> scoped;
         // The `unwindTarget_` the exception-edge cleanup replaced; the
         // caller restores it immediately after the call.
@@ -15412,6 +15424,19 @@ private:
     CallClosureArgRelease prepareCallClosureArgRelease(
         sema::MethodSymbol* ms, const std::vector<llvm::Value*>& args,
         const std::vector<const ast::Expr*>& argExprs, const ast::CallExpr& call);
+
+    // fix #8867 (§28.14 / §28.9 / §30.1, v0.359): does the ASYNC callee's
+    // frame hold its own +1 on the function-typed formal at parameter index
+    // `pi`? The predicate reads the CALLEE's own parameter symbol — the same
+    // authority `emitAsyncMethod`'s entry retain reads — so the call site's
+    // release and the callee's hold cannot drift. It answers NO for a formal
+    // whose declared type is not a function type (a bare `T` at a generic
+    // instantiation: §28.14 / #1921 / #2248 — the frame does not hold it, so
+    // the caller must keep its +1) and for a formal with a modifier
+    // (`scoped` is storage-bounded, `owned` transfers ownership in, `ref`/`out`
+    // alias the caller's location — each has its own discharge).
+    bool calleeFrameHoldsClosureParam(sema::MethodSymbol* ms,
+                                       std::size_t pi);
 
     // The NORMAL-return edge of the same discharge: releases each closure
     // the call site owns and consumes the lambda's captured cells (#3498).
@@ -19928,6 +19953,40 @@ private:
     // edges, which are mutually exclusive (§30.5), so each task drops each
     // parameter exactly once.
     void emitAsyncStringParamRelease(llvm::Value* self);
+
+    // fix #8867 (§28.14 *Call-bounded × deferred activation*, shape (1) "Frame
+    // residence" / §28.9 / §30.1, v0.359): the frame published by
+    // emitAsyncMethod for the PLAIN (call-bounded) function-typed formal.
+    // §28.14: "A callee whose call mints a deferred-activation frame (… an
+    // `async` callee's task; …) holds a plain function-typed parameter in that
+    // frame … The bound is the frame's life (K6.1): a task's settlement
+    // (§30.1)." So the frame takes its OWN +1 on the closure cell at entry and
+    // drops it at the terminal edge — the async twin of the async ITERATOR's
+    // capture-store retain (#2609) and of the borrowed-string-parameter hold
+    // above. The caller's producer +1 is the caller's to drop (the call-bounded
+    // arm of `prepareCallClosureArgRelease`), exactly as the sync/async
+    // ITERATOR arrangement (#1864 / #2609) already does. Null outside
+    // emitAsyncMethod, and inside it only for the duration of the frame's own
+    // emission, so a nested async-lambda or lazy generic-specialization
+    // emission cannot release the OUTER frame's parameters.
+    const StateMachineFrame* asyncClosurePinFrame_ = nullptr;
+
+    // fix #8867: the capture-field indices of the plain function-typed formals
+    // of *asyncClosurePinFrame_, in declaration order. Populated by the same
+    // loop in emitAsyncMethod that takes the entry retains, so the retain set
+    // and the release set cannot drift.
+    std::vector<unsigned> asyncClosurePinFields_;
+
+    // fix #8867: drop the +1 this frame's entry function took on each plain
+    // function-typed parameter, reading each value back through the frame
+    // `self` so the release targets the value that was retained (the body's
+    // own reassignment of the parameter slot is a different quantity — see
+    // retainAssignedClosureParams). Nulls each field after releasing it,
+    // mirroring emitAsyncStringParamRelease, so a second call on the same
+    // frame is a no-op rather than an over-release. Called from BOTH terminal
+    // edges, which are mutually exclusive (§30.5), so each task drops each
+    // parameter exactly once.
+    void emitAsyncClosureParamRelease(llvm::Value* self);
 
     // Pass 2: emit a function's body.
     void emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn);

@@ -19649,6 +19649,27 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
         const bool isSyncIterCallee =
             mdCb->bodyKind == ast::MethodBodyKind::Block &&
             containsYield(mdCb->stmts);
+        // fix #8867 (§28.14 *Call-bounded × deferred activation*, shape (1)
+        // "Frame residence" / §28.9 / §30.1, v0.359): a PLAIN (non-iterator)
+        // ASYNC callee holds the call-bounded callback in its TASK FRAME until
+        // the task settles — §28.14: "A callee whose call mints a
+        // deferred-activation frame (… an `async` callee's task; …) holds a
+        // plain function-typed parameter in that frame … The bound is the
+        // frame's life (K6.1): a task's settlement (§30.1)." The frame takes
+        // its OWN +1 on the closure cell (emitAsyncMethod) and drops it at the
+        // task's terminal edge, so the producer's +1 is the CALLER's to drop
+        // right after the call — exactly as for a sync callee, and exactly as
+        // the sync/async ITERATOR arrangement already does (#1864 / #2609,
+        // whose callee frame likewise takes its own +1 and drops it at
+        // Dispose).
+        //
+        // The async ITERATOR is EXCLUDED: its frame hold is #2609's and its
+        // call-site release is the `rel.syncIter` arm above — arming both
+        // would double-release.
+        const bool isPlainAsyncCallee =
+            isAsyncMethod(ms) &&
+            !(mdCb->bodyKind == ast::MethodBodyKind::Block &&
+              (containsYield(mdCb->stmts) || returnsAsyncIteratorType(ms)));
         // (1) The DECLARED return type: `void` (nothing can carry the callback
         // out at all), or a single-part Named head that is neither a
         // deferred-activation frame nor a generic parameter of the method or
@@ -19753,10 +19774,27 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
         // return type is a non-deferred, non-function type param. isMethodOwnTypeParamReturn
         // is set only when isTypeParam=true, declaredReturnOk=false, and the head
         // is not a deferred activation frame.
+        //
+        // fix #8867 (§28.14 *Call-bounded × deferred activation*, shape (1)
+        // "Frame residence" / §28.9 / §30.1, v0.359): a PLAIN async callee
+        // bypasses the two frame-head exclusions, because the frame now HOLDS
+        // the callback properly: `declaredReturnOk` excludes a callee whose
+        // declared return announces a frame (a Task), and `callResultOk`
+        // excludes the same at the call site — but for a plain async method
+        // that frame is the TASK, and §28.14 bounds the callback by the
+        // task's settlement, which the frame's own hold implements. The
+        // bypass is armed ONLY for a plain async callee whose frame really
+        // holds the formal (`calleeFrameHoldsClosureParam` below), so the
+        // exclusion's soundness argument — "a callee that announces a frame
+        // may hold the callback past the call" — is discharged by the frame
+        // hold rather than by dropping the exclusion.
         const bool enterCallBoundedArm =
-            !isAsyncMethod(ms) && !isSyncIterCallee &&
-            (declaredReturnOk || isMethodOwnTypeParamReturn) &&
-            callResultOk && argExprs.size() == args.size() &&
+            (!isAsyncMethod(ms) || isPlainAsyncCallee) &&
+            !isSyncIterCallee &&
+            (declaredReturnOk || isMethodOwnTypeParamReturn ||
+             isPlainAsyncCallee) &&
+            (callResultOk || isPlainAsyncCallee) &&
+            argExprs.size() == args.size() &&
             args.size() >= mdCb->params.size() &&
             args.size() - mdCb->params.size() <= 1;
         if (enterCallBoundedArm) {
@@ -19859,7 +19897,25 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
                     isObjectFormalInspectOnlyArgPosition(call, pi))
                     formalIsFunction = true;
                 if (!formalIsFunction) continue;
-                if (argExprs[ai] && isPlusOneClosureProducer(argExprs[ai]))
+                // fix #8867 (§28.14 / §28.9 / §30.1, v0.359): for a PLAIN
+                // ASYNC callee the caller's release is sound only when the
+                // callee's FRAME holds its own +1 on the callback (the retain
+                // emitAsyncMethod takes at frame entry, dropped at the task's
+                // terminal edge). The predicate reads the CALLEE's own
+                // parameter symbol — the same authority the frame retain reads
+                // — so the two sites cannot drift. A formal whose declared
+                // type is not a function type (a bare `T` at a generic
+                // instantiation — §28.14 / #1921 / #2248) is NOT held by the
+                // frame, so the caller keeps its +1 there (a leak, the safe
+                // direction).
+                if (isPlainAsyncCallee &&
+                    !calleeFrameHoldsClosureParam(ms, pi))
+                    continue;
+                if (!argExprs[ai] || !isPlusOneClosureProducer(argExprs[ai]))
+                    continue;
+                if (isPlainAsyncCallee)
+                    rel.callBoundedAsync.push_back(args[ai]);
+                else
                     rel.callBounded.push_back(args[ai]);
             }
         }
@@ -20062,10 +20118,11 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
     // exactly-once argument.
     rel.savedUnwindTarget = unwindTarget_;
     if (!rel.syncIter.empty() || !rel.callBounded.empty() ||
-        !rel.scoped.empty()) {
+        !rel.callBoundedAsync.empty() || !rel.scoped.empty()) {
         std::vector<llvm::Value*> allClosureArgs;
         allClosureArgs.reserve(rel.syncIter.size() +
                                rel.callBounded.size() +
+                               rel.callBoundedAsync.size() +
                                rel.scoped.size());
         allClosureArgs.insert(allClosureArgs.end(),
                               rel.syncIter.begin(),
@@ -20073,6 +20130,14 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
         allClosureArgs.insert(allClosureArgs.end(),
                               rel.callBounded.begin(),
                               rel.callBounded.end());
+        // fix #8867: the plain-async callee's vector — disjoint from the
+        // other three by construction (it requires a plain async callee; the
+        // sync-iter arm requires an iterator callee, the call-bounded arm
+        // requires a non-async callee, and the scoped arm requires a `scoped`
+        // modifier), so combining them never double-releases.
+        allClosureArgs.insert(allClosureArgs.end(),
+                              rel.callBoundedAsync.begin(),
+                              rel.callBoundedAsync.end());
         // fix #3195: also release on the unwind edge.
         allClosureArgs.insert(allClosureArgs.end(),
                               rel.scoped.begin(),
@@ -20080,6 +20145,28 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
         unwindTarget_ = closureArgUnwindCleanup(allClosureArgs);
     }
     return rel;
+}
+
+// fix #8867 (§28.14 *Call-bounded × deferred activation*, shape (1) "Frame
+// residence" / §28.9 / §30.1, v0.359): does the ASYNC callee's frame hold its
+// own +1 on the function-typed formal at parameter index `pi`?
+//
+// The predicate reads the CALLEE's own parameter symbol — the same authority
+// `emitAsyncMethod`'s entry retain reads (`paramTypeOf` + the modifier) — so
+// the call site's release and the callee's hold cannot drift. It answers NO
+// for a formal whose declared type is not a function type (a bare `T` at a
+// generic instantiation: §28.14 / #1921 / #2248 — the frame does not hold it,
+// so the caller must keep its +1 there) and for a formal with a modifier
+// (`scoped` is storage-bounded, `owned` transfers ownership in, `ref`/`out`
+// alias the caller's location — each has its own discharge).
+bool Emitter::calleeFrameHoldsClosureParam(sema::MethodSymbol* ms,
+                                            std::size_t pi) {
+    if (!ms || pi >= ms->params.size()) return false;
+    auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[pi]);
+    if (!ps) return false;
+    if (!ps->modifier.empty()) return false;
+    const sema::TypeRef* pt = paramTypeOf(ps);
+    return pt && pt->kind == sema::TypeRef::Kind::Function;
 }
 
 // fix #8624 (§7.5 / §28.14 / §28.9, v0.359): the NORMAL-return edge of
@@ -20095,6 +20182,19 @@ void Emitter::releaseCallClosureArgs(const CallClosureArgRelease& rel) {
     // producer's evaluation and here, so it runs exactly once per evaluation
     // of the call and is mutually exclusive with the unwind cleanup above.
     for (llvm::Value* cl : rel.callBounded) emitClosureRelease(cl);
+    // fix #8867 (§28.14 / §28.9 / §30.1, v0.359): the plain-async callee's
+    // release — the producer's +1 on a callback passed to a PLAIN (non-
+    // iterator) ASYNC method's call-bounded formal. The callee's frame took
+    // its own +1 at entry (emitAsyncMethod) and drops it at the task's
+    // terminal edge, so the callback stays alive until the task settles
+    // (§28.14's frame residence) while the producer's +1 is the caller's to
+    // drop here — exactly as for a sync callee.
+    //
+    // It does NOT consume the lambda's CAPTURED CELLS (the `callBounded`
+    // arm's `consumeLastLambdaCapturedCells` below): the frame still holds the
+    // closure across the call, so the cells must outlive it — the same
+    // reason the iterator arms decline that consumption.
+    for (llvm::Value* cl : rel.callBoundedAsync) emitClosureRelease(cl);
     // fix #3498 (§28.14 / §27.5 / §28.9, v0.283): the CAPTURE-CELL half of
     // the release above. #1073 drops the producer's +1 on the CLOSURE here
     // because §28.14 makes the callee's hold end with the call; the cells

@@ -1266,6 +1266,19 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // for `resumeFn` this commit adds in the pre-scan block below.
     MoveOnlyArrayTransferScope moveOnlyArrayScope(*this);
     smKind_ = SuspendKind::Await;
+    // fix #8867 (§28.14 / §28.9 / §30.1, v0.359): save/restore the closure-pin
+    // publication around this emission. `emitAsyncMethod` is re-entered by a
+    // NESTED emission — a generic async method monomorphized inside this body
+    // (buildSpecializedMethodFn) — and that nested emission publishes ITS
+    // frame's hold in the same two members. Without the save/restore the
+    // nested emission would take this frame's hold away from this frame's
+    // teardown (its terminal edge would then release the OUTER frame's
+    // closure against the NESTED frame's field index — a wild release), or
+    // leave this frame's +1 unreleased (a leak). Restoring at the end keeps
+    // each frame's hold its own.
+    const StateMachineFrame* savedAsyncClosurePinFrame_ = asyncClosurePinFrame_;
+    std::vector<unsigned> savedAsyncClosurePinFields_;
+    savedAsyncClosurePinFields_.swap(asyncClosurePinFields_);
 
     // §30.9 / §31.2 (#438): `await` is now supported in a try BODY, a catch ARM
     // BODY, and a FINALLY (lowerTry lowers each handler's resume block in place
@@ -1563,6 +1576,52 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 break;
             }
         }
+        // fix #8867 (§28.14 *Call-bounded × deferred activation*, shape (1)
+        // "Frame residence" / §28.9 / §30.1, v0.359): the same hold for a
+        // PLAIN (call-bounded) function-typed PARAMETER.
+        //
+        // §28.14 states it: "A callee whose call mints a deferred-activation
+        // frame (the kinds of §28.3 *Deferred-activation callees*: an `async`
+        // callee's task; …) holds a plain function-typed parameter in that
+        // frame, and frame residence is not an escape sink: the
+        // deferred-activation return type is the signature-level announcement
+        // of the retention. The bound is the frame's life (K6.1): a task's
+        // settlement (§30.1)." So the async method's frame takes its OWN +1
+        // on the closure cell here, and the terminal edge drops exactly that
+        // +1 — the async twin of the async ITERATOR's capture-store retain
+        // (#2609, below) and of the borrowed-string-parameter hold above.
+        //
+        // WHY THE FRAME MUST HOLD IT. The callee's body runs after the call
+        // returns its Task (§30.1), possibly after a suspension on another
+        // thread, so the closure must stay alive until the task settles. The
+        // caller's producer +1 is dropped at the call site (the call-bounded
+        // arm of `prepareCallClosureArgRelease`), so without this retain the
+        // frame would hold a raw pointer to a freed cell — a use-after-free
+        // when the resumed body invokes the callback — and the producer's +1
+        // would leak (the defect #8867 reports: 64 B per call, MEASURED).
+        //
+        // bz_closure_retain is null-safe, so a nullable function-typed formal
+        // is safe to hold.
+        for (std::size_t ci = 0; ci < frame.captures.size(); ++ci) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                frame.captures[ci].first);
+            if (!ps) continue;                   // 'this' capture — skip
+            // Only a PLAIN (empty-modifier) formal is call-bounded (§28.14):
+            // a `scoped` formal is storage-bounded (the callee may store the
+            // callback, and owns it), an `owned` formal transfers ownership
+            // in, and a `ref`/`out` formal aliases the caller's location.
+            // Each of those has its own discharge; none of them is this hold.
+            if (!ps->modifier.empty()) continue;
+            sema::TypeRef* pt = paramTypeOf(ps);
+            if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
+            unsigned fieldIdx = frame.captureStart + (unsigned)ci;
+            llvm::Value* fptr =
+                builder_.CreateStructGEP(frame.structTy, st, fieldIdx);
+            llvm::Value* cl =
+                builder_.CreateLoad(ptrTy(), fptr, "async.clcap");
+            emitClosureRetain(cl);
+            asyncClosurePinFields_.push_back(fieldIdx);
+        }
         // fix #7841 (§30.1, §26.7, §28.9, v0.355): the same hold for the
         // `this` of an `extension string` member. §30.1 names "its `this`
         // receiver" beside the plain parameters as a borrow "held ... until
@@ -1593,6 +1652,10 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // this function alongside asyncOwnedParamFrame_, so a nested emission
         // that completes its own frame cannot reach this one.
         asyncStringPinFrame_ = asyncStringPinFields_.empty() ? nullptr : &frame;
+        // fix #8867: the same publication for the plain function-typed
+        // formal's hold (the closure twin of the string pin above).
+        asyncClosurePinFrame_ =
+            asyncClosurePinFields_.empty() ? nullptr : &frame;
 
         // §22.7 / §22.13 / §24 (#1502): run the entry-point static-init
         // prologue BEFORE driving the state machine. emitFunctionBody's async
@@ -2075,6 +2138,11 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             // every faulted task. Success and fault are mutually exclusive
             // terminal states, so the pair is exactly-once.
             emitAsyncStringParamRelease(self);
+            // fix #8867 (§28.14 / §28.9 / §30.1, v0.359): the closure twin
+            // of the string hold above — the fault edge's half of the plain
+            // function-typed formal's frame hold. A fault IS a settlement
+            // (§30.5), so the frame's +1 is dropped here.
+            emitAsyncClosureParamRelease(self);
             // §30.5: the frame is dead on this terminal (fault) path — free it.
             // §30.13 (#439-followup): free the cross-suspend spill area first (if
             // any) — it is a side allocation pointed to from the frame.
@@ -2200,6 +2268,14 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // read against a frame that is no longer being emitted.
         asyncStringPinFrame_ = nullptr;
         asyncStringPinFields_.clear();
+        // fix #8867: the same discipline for the plain function-typed formal's
+        // frame hold — the publication is RESTORED to whatever the enclosing
+        // emission had (null at the top level), so a nested async-lambda or
+        // lazy generic-specialization emission completing its OWN frame cannot
+        // release this frame's parameters, and this frame's own teardown
+        // cannot release a nested frame's parameters either.
+        asyncClosurePinFrame_ = savedAsyncClosurePinFrame_;
+        asyncClosurePinFields_.swap(savedAsyncClosurePinFields_);
     }
 }
 
@@ -6273,6 +6349,37 @@ void Emitter::emitAsyncStringParamRelease(llvm::Value* self) {
     }
 }
 
+// fix #8867 (§28.14 *Call-bounded × deferred activation*, shape (1) "Frame
+// residence" / §28.9 / §30.1, v0.359): the closure twin of
+// emitAsyncStringParamRelease above — the SUCCESS-and-FAULT half of the
+// async-method frame's hold on a PLAIN (call-bounded) function-typed formal.
+//
+// §28.14: the frame's life is the task's settlement, so the +1 the entry
+// function took on the closure cell is dropped here, on whichever terminal
+// edge fires. The two edges are mutually exclusive (§30.5), so each task
+// drops each parameter exactly once. Each field is nulled after its release
+// (mirroring emitAsyncStringParamRelease), so a repeated call is a no-op
+// rather than an over-release. MUST run before `free(self)`, since it reads
+// through the frame pointer; both call sites satisfy that.
+//
+// The GEP uses the PUBLISHED frame's own struct type (not `smStateStruct_`):
+// the field indices belong to that frame, and a nested async-lambda or lazy
+// generic-specialization emission in between must not be able to make the
+// release read through a different frame's layout.
+void Emitter::emitAsyncClosureParamRelease(llvm::Value* self) {
+    if (!asyncClosurePinFrame_ || !self) return;
+    for (unsigned fieldIdx : asyncClosurePinFields_) {
+        llvm::Value* fptr = builder_.CreateStructGEP(
+            asyncClosurePinFrame_->structTy, self, fieldIdx);
+        llvm::Value* v = builder_.CreateLoad(ptrTy(), fptr, "acpin.arg");
+        // null-safe by construction: §28.9's bz_closure_release is a no-op on
+        // null, which is also what makes a nullable function-typed formal safe
+        // to hold.
+        emitClosureRelease(v);
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), fptr);
+    }
+}
+
 // §30.1 / §30.9: complete the outer task. `value` is the lowered return value
 // (null for a `Task` with no value, or a fall-off completion). The result is
 // copied by the runtime (bz_task_complete malloc+memcpy's `result_size` bytes),
@@ -6338,6 +6445,13 @@ void Emitter::emitAsyncComplete(llvm::Value* value) {
     // async.fault boundary; the two terminal states are mutually exclusive
     // (§30.5), so each parameter's entry +1 is dropped exactly once per task.
     emitAsyncStringParamRelease(self);
+    // fix #8867 (§28.14 / §28.9 / §30.1, v0.359): the closure twin of the
+    // string hold above — the SUCCESS edge's half of the plain function-typed
+    // formal's frame hold. §28.14's frame residence is bounded by the task's
+    // settlement, which is here; the fault edge's twin is in the async.fault
+    // boundary, and the two terminal states are mutually exclusive (§30.5), so
+    // each parameter's entry +1 is dropped exactly once per task.
+    emitAsyncClosureParamRelease(self);
     // §30.5 (minimal): the frame is dead once the task is completed on a terminal
     // path. In the synchronous / already-done cut the resume runs inline to
     // completion with no pending suspension, so freeing the frame here is safe and
