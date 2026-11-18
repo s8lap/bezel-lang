@@ -208,3 +208,79 @@ BEZEL_TEST(ownership_nested_lambda_capture_cell_7031,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "2200\n");  // 200 * (5 + 6)
 }
+
+// ============================================================================
+// Row 5 — FIX-FORWARD: the frame is the body of an ESCAPING (returned) lambda
+// (§27.5 / §28.9, v0.359).
+//
+// The non-author review of the first #7031 commit (r42-rev-m70, probe r41)
+// found that the frame-level admission turned this CLEAN program into a
+// leaking one: 1600 B / 400 capture cells at 200 activations. The returned
+// lambda `R` declares `k`; the enclosing `Make`'s scan already recorded `k`
+// as escaping-captured (its collectLambdaCaptures walk over the escaping `R`
+// covers R's whole body), and that entry survives into R's own re-scan. With
+// the admission, `k` entered cellFreeEligible_, which switched off the #4509
+// refcount route that reclaims the cell, while the stale entry still blocked
+// the scope-end route — nobody freed it. The fix-forward declines the
+// admission when one of the nested lambda's captures already carries such an
+// entry. RED on a1dc7b9d8 (the first commit), GREEN with the fix-forward.
+//
+// Value: each `g()` returns k = 3; 200 iterations x 2 calls = 1200.
+// ============================================================================
+BEZEL_TEST(ownership_nested_lambda_capture_cell_7031,
+           returned_lambda_frame_nested_forwarder_no_leak_spec_27_5) {
+    auto r = runAotChecked(
+        "module M; public class C "
+        "  public static method Make(): () -> int "
+        "    return lambda() => do var k := 3; "
+        "      var f2 := lambda() => lambda() => k; return f2()(); end; "
+        "  end Make; "
+        "  public static method Main(): int "
+        "    var total := 0; "
+        "    for var j in 0..<200 do var g := C.Make(); "
+        "      total := total + g() + g(); end; "
+        "    Console.WriteLine(total); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "1200\n");  // 200 * (3 + 3)
+}
+
+// ============================================================================
+// Row 6 — FIX-FORWARD: the escaping frame is the lambda a local forwarder
+// `o` returns (§27.5 / §28.9, v0.359; review probe r45).
+//
+// A different route to the same stale entry: `Make`'s scan attributes R's
+// captures to R as a #3804 transparent forward target of `o` (called once),
+// so `k` — R's own local — is recorded as escaping-captured. Clean on the
+// first commit's base, 800 B / 200 cells on a1dc7b9d8; clean again with the
+// fix-forward.
+//
+// Value: each `g()` returns k + 1 = 4; 200 iterations = 800.
+// ============================================================================
+BEZEL_TEST(ownership_nested_lambda_capture_cell_7031,
+           forwarded_lambda_frame_nested_forwarder_no_leak_spec_27_5) {
+    auto r = runAotChecked(
+        "module M; public class C "
+        "  public static method Main(): int "
+        "    var total := 0; "
+        "    for var j in 0..<200 do "
+        "      var g := C.Make(); total := total + g(); "
+        "    end; "
+        "    Console.WriteLine(total); "
+        "    return 0; "
+        "  end Main; "
+        "  public static method Make(): () -> int "
+        "    var o := lambda(): () -> int => lambda() => do var k := 3; "
+        "      var f2 := lambda() => lambda() => k + 1; return f2()(); end; "
+        "    return o(); "
+        "  end Make; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "800\n");  // 200 * (3 + 1)
+}

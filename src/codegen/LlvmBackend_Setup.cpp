@@ -50570,6 +50570,36 @@ void Emitter::collectCellFreeEligible(
                 return;
             if (!sawInvokedAtOnce) return;  // only the `L(...)(...)` shape
             if (calls != 1) return;         // exactly one call to `L`
+            // fix-forward #7031: decline when an ENCLOSING frame's scan
+            // already recorded one of `H`'s captures as escaping-captured.
+            // `declsCapturedByEscaping_` is saved/restored around a nested
+            // lambda's lowering (CaptureReclaimSetScope) but never cleared
+            // for its re-scan, so inside the body of an ESCAPING lambda `R`
+            // (returned, or stored into a sink) it still holds every symbol
+            // the enclosing frame's collectLambdaCaptures(R, escaping) walk
+            // found in R's whole body — R's OWN local `k` included. That
+            // stale entry makes the scope-end route (boxedCellFree) decline
+            // `k`, and the #4509 refcount route is armed only while `k` is
+            // NOT in cellFreeEligible_. Admitting here would put `k` into
+            // cellFreeEligible_ and so turn off the one route that reclaimed
+            // the cell: MEASURED, `return lambda() => do var k := 3; var f2
+            // := lambda() => lambda() => k; return f2()(); end` leaked
+            // 1600 B / 400 cells at 200 activations (clean without the
+            // admission). Declining leaves the frame on its pre-admission
+            // classification, which the refcount route reclaims.
+            {
+                std::unordered_set<const sema::Symbol*> hSyms;
+                if (h->exprBody) walkExpr(ctx, h->exprBody.get(), hSyms);
+                for (auto& s : h->stmts) walkStmt(ctx, s.get(), hSyms);
+                for (const sema::Symbol* s : hSyms) {
+                    const void* key = nullptr;
+                    if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s))
+                        key = static_cast<const void*>(loc->decl);
+                    else if (dynamic_cast<const sema::ParameterSymbol*>(s))
+                        key = static_cast<const void*>(s);
+                    if (key && em.declsCapturedByEscaping_.count(key)) return;
+                }
+            }
             resultConsumedLocally4525.insert(static_cast<const void*>(g));
         }
 
