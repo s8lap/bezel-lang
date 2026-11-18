@@ -15197,6 +15197,58 @@ private:
     llvm::BasicBlock* closureArgUnwindCleanup(
         const std::vector<llvm::Value*>& closures);
 
+    // fix #8624 (§7.5 / §28.14 / §28.9, v0.359): the closure-ARGUMENT
+    // discharge of a call to a USER method — the ONE definition the `.`
+    // call path (`lowerCallDispatch`) and the `?.` call path
+    // (`lowerNullCondCall`) share.
+    //
+    // §28.14's call-bounded default makes a +1 closure producer passed
+    // DIRECTLY to a PLAIN (function-typed, un-`scoped`) parameter a
+    // caller-owned temporary nobody else drops: the callee holds no
+    // reference once the call returns, so the CALL SITE must release the
+    // closure cell (and the captured cells its env points at) after the
+    // call. The `.` path has always done that (#1073, #1864, #3195,
+    // #3498); the `?.` path did NOT, so a lambda literal passed to a `?.`
+    // method call leaked its 64 B closure cell — and its env block — on
+    // EVERY call (#8624). §7.5 is what makes the two paths obliged to
+    // agree: "`x?.M` returns null if `x` is null; otherwise it performs
+    // the access" — the `?.` spelling performs the SAME access as `x.M`,
+    // so the call site's discharge of a call-bounded callback is part of
+    // that access, not an extra. A predicate kept in ONE of the two paths
+    // would be exactly the drift the codebase's own notes warn about
+    // (the "#5672 sibling trap"), hence ONE definition, called from both.
+    //
+    // The three vectors are the three DISJOINT discharge shapes the `.`
+    // path has always had, and their mutual disjointness is what lets
+    // them share one cleanup block and one release list:
+    //   * `syncIter` — a SYNC/ASYNC ITERATOR callee, whose frame retains
+    //     its own +1 on the cell (#1864);
+    //   * `callBounded` — a PLAIN (call-bounded) parameter (#1073);
+    //   * `scoped` — a `scoped` parameter whose callee body provably
+    //     never references it, so the callee provably did not store it
+    //     (#3195).
+    struct CallClosureArgRelease {
+        std::vector<llvm::Value*> syncIter;
+        std::vector<llvm::Value*> callBounded;
+        std::vector<llvm::Value*> scoped;
+        // The `unwindTarget_` the exception-edge cleanup replaced; the
+        // caller restores it immediately after the call.
+        llvm::BasicBlock* savedUnwindTarget = nullptr;
+    };
+
+    // Computes the three vectors and installs the EXCEPTION-edge cleanup
+    // (`closureArgUnwindCleanup`) as `unwindTarget_`, saving the previous
+    // target in the returned struct. The caller restores
+    // `rel.savedUnwindTarget` right after the call and then calls
+    // `releaseCallClosureArgs` on the normal-return edge.
+    CallClosureArgRelease prepareCallClosureArgRelease(
+        sema::MethodSymbol* ms, const std::vector<llvm::Value*>& args,
+        const std::vector<const ast::Expr*>& argExprs, const ast::CallExpr& call);
+
+    // The NORMAL-return edge of the same discharge: releases each closure
+    // the call site owns and consumes the lambda's captured cells (#3498).
+    void releaseCallClosureArgs(const CallClosureArgRelease& rel);
+
     // fix-forward #5262-ff (§4.6 / §28.3 "Exception-path discharge" / §28.9,
     // v0.313): the exception-edge release for #5262's borrowed-string-argument
     // pin. `closureArgUnwindCleanup`'s exact twin — it drops each pinned
