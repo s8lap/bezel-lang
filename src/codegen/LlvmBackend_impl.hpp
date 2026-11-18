@@ -2075,6 +2075,30 @@ private:
     // inlined constructor body (one constructor body constructing another)
     // reads its own depth while it is lowered.
     std::size_t capturedParamDeclScopeDepth_ = 1;
+    // fix #8765 follow-up (§27.5 / §28.9, v0.359): the BODY the depth above
+    // is a depth INTO — the `currentFn_` the inlined constructor body is
+    // lowered into. The RAII below spans the constructor body's whole dynamic
+    // extent, and a body lowered INSIDE that window — a lambda, an async
+    // resume, an iterator moveNext, a thunk — clears `disposeStack_` and
+    // restarts at depth 1 while the constructor's threshold (>= 2) is still
+    // set. Compared against that body's own depths, the inherited threshold
+    // admitted the free of the NESTED body's own captured-parameter cell at a
+    // nested block's end — #3403's hazard, one level down (MEASURED: a lambda
+    // in a generic constructor body capturing ITS OWN parameter in a nested
+    // `do` block and reading it after the block died with an ASan SEGV, a null
+    // READ in `lam$0`). The same pairing #4523 made for `declScopeDepth_`
+    // (`declScopeDepthFn_`): a depth is only meaningful in the body it was
+    // recorded for, so `capturedParamDeclScopeDepthHere()` reads it only when
+    // `currentFn_` is that body and falls back to the root scope (1) in every
+    // other — every body-switching site sets `currentFn_`, so no site has to
+    // remember to reset the threshold.
+    llvm::Function* capturedParamDeclScopeFn_ = nullptr;
+    std::size_t capturedParamDeclScopeDepthHere() const {
+        return capturedParamDeclScopeFn_ &&
+                       capturedParamDeclScopeFn_ == currentFn_
+                   ? capturedParamDeclScopeDepth_
+                   : 1;
+    }
     // fix #8765 (§27.5 / §28.9, v0.359): RAII for
     // `capturedParamDeclScopeDepth_`. An INLINED constructor body declares
     // ITS parameters in the scope it opens for its own body, so the depth is
@@ -2085,12 +2109,16 @@ private:
     struct CapturedParamScopeDepth {
         Emitter* self;
         std::size_t saved;
+        llvm::Function* savedFn;
         CapturedParamScopeDepth(Emitter* e, std::size_t depth)
-            : self(e), saved(e->capturedParamDeclScopeDepth_) {
+            : self(e), saved(e->capturedParamDeclScopeDepth_),
+              savedFn(e->capturedParamDeclScopeFn_) {
             e->capturedParamDeclScopeDepth_ = depth;
+            e->capturedParamDeclScopeFn_ = e->currentFn_;
         }
         ~CapturedParamScopeDepth() {
             self->capturedParamDeclScopeDepth_ = saved;
+            self->capturedParamDeclScopeFn_ = savedFn;
         }
         CapturedParamScopeDepth(const CapturedParamScopeDepth&) = delete;
         CapturedParamScopeDepth& operator=(const CapturedParamScopeDepth&) =

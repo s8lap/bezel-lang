@@ -21741,9 +21741,13 @@ void Emitter::consumeLastLambdaCapturedCells() {
         // body's own top level is at the parameter's own depth, so the free
         // is admitted; a capture in a NESTED block of the ctor body is
         // deeper, so the free is still declined and the #3403 hazard keeps
-        // its SIGSEGV-avoiding behaviour.
+        // its SIGSEGV-avoiding behaviour. The threshold is read through
+        // `capturedParamDeclScopeDepthHere()`, which honours it only in the
+        // body the inlined constructor is lowered into: a lambda (or any
+        // other body) lowered INSIDE the constructor body restarts its
+        // `disposeStack_` at depth 1 and its own parameters are at ITS root.
         if (ce.isParam &&
-            disposeStack_.size() > capturedParamDeclScopeDepth_)
+            disposeStack_.size() > capturedParamDeclScopeDepthHere())
             continue;
         auto dd = declScopeDepth_.find(ce.key);
         if (dd != declScopeDepth_.end() && dd->second < disposeStack_.size()) {

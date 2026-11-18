@@ -49,6 +49,7 @@
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
+using bezel::test::runAotCheckedLenient;
 
 namespace {
 
@@ -57,6 +58,21 @@ namespace {
 // marker differs from the expected output and the row fails.
 std::string checkedOut(const std::string& program) {
     JitResult r = runAotChecked(program);
+    if (!r.ran) return "<did-not-run>";
+    if (r.exitCode != 0) return "<exit " + std::to_string(r.exitCode) + ">";
+    return r.stdoutText;
+}
+
+// The stdout of a run under generated-code ASan with LeakSanitizer OFF
+// (runAotCheckedLenient), or a marker naming what failed. For the two
+// nested-body rows below: their subject is a use-after-free (a null cell
+// read), not a leak — the cell of a parameter captured in a NESTED block of
+// its own body and read after that block is DELIBERATELY not reclaimed there
+// (#3403's guard, the bounded leak #3403's rule accepts; the non-generic
+// twin of the same program leaks the same 800 B / 200 on the base and with
+// this fix), so the memory net that decides them is ASan, not LSan.
+std::string asanOut(const std::string& program) {
+    JitResult r = runAotCheckedLenient(program);
     if (!r.ran) return "<did-not-run>";
     if (r.exitCode != 0) return "<exit " + std::to_string(r.exitCode) + ">";
     return r.stdoutText;
@@ -194,4 +210,91 @@ public static class Program
 end Program;
 )BZL"),
               "22100\n");
+}
+
+// fix-forward (review r42-rev-m78 probes b12 / b15): the depth threshold the
+// fix above sets for an inlined constructor body must not leak into a
+// DIFFERENT body lowered inside it. A block lambda formed in a GENERIC
+// constructor body is lowered into its own function with a fresh
+// `disposeStack_` (its root scope is depth 1 again), so with the
+// constructor's threshold (>= 2) inherited, #3403's guard admitted the free
+// of the LAMBDA's own parameter `m`'s cell at the nested `do` block's end,
+// nulled the holder, and `return s + m` read through null: an ASan SEGV
+// (READ of address 0) in `lam$0`, with no output. The threshold is now
+// honoured only in the body it was set for (`currentFn_`). §27.5 (v0.359):
+// "Captured variables are heap-allocated in a closure object" — the lambda
+// reads its own captured `m`, so s = m and each construction adds 2i:
+// 2 * 19900 = 39800.
+BEZEL_TEST(codegen_inline_ctor_param_capture_cell_release_8765,
+           lambda_in_generic_ctor_own_param_captured_in_nested_block_read_after_200x_spec_27_5) {
+    BEZEL_EXPECT_EQ(asanOut(R"BZL(
+module T;
+public class G<T>
+  public v: int;
+  public constructor(x: T, n: int)
+    var outer := lambda(m: int): int => do
+      var s := 0;
+      do
+        var g := lambda(): int => m;
+        s := g();
+      end;
+      return s + m;
+    end;
+    v := outer(n);
+  end;
+end;
+public static class Program
+  public static method Main(args: Array<string>): int
+    var i := 0; var tot := 0;
+    while i < 200 do using var h := new G<string>("a", i); tot := tot + h.v; i := i + 1; end;
+    Console.Write(tot);
+    return 0;
+  end;
+end;
+)BZL"),
+              "39800");
+}
+
+// The same hazard two blocks deep in the lambda, with the generic
+// constructor itself constructed two blocks deep in the caller's loop body
+// (so the inherited threshold was 5): outer(n) = (n + 1) + n and
+// outer(n + 1) = (n + 2) + (n + 1), so each construction adds 4i + 4:
+// 4 * 19900 + 800 = 80400.
+BEZEL_TEST(codegen_inline_ctor_param_capture_cell_release_8765,
+           lambda_in_generic_ctor_own_param_captured_two_blocks_deep_caller_nested_200x_spec_27_5) {
+    BEZEL_EXPECT_EQ(asanOut(R"BZL(
+module T;
+public class G<T>
+  public v: int;
+  public constructor(x: T, n: int)
+    var outer := lambda(m: int): int => do
+      var s := 0;
+      do
+        do
+          var g := lambda(): int => m + 1;
+          s := g();
+        end;
+      end;
+      return s + m;
+    end;
+    v := outer(n) + outer(n + 1);
+  end;
+end;
+public static class Program
+  public static method Main(args: Array<string>): int
+    var i := 0; var tot := 0;
+    while i < 200 do
+      do
+        do
+          using var h := new G<string>("a", i); tot := tot + h.v;
+        end;
+      end;
+      i := i + 1;
+    end;
+    Console.Write(tot);
+    return 0;
+  end;
+end;
+)BZL"),
+              "80400");
 }
