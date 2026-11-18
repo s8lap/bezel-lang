@@ -29001,6 +29001,21 @@ bool MethodOwnership::scopedFormalAt(const ast::Expr* callee,
             const std::size_t bp = boundFormalIndex(*args, argPos, formals);
             return bp < formals.size() && formals.modifier(bp) == "scoped";
         }
+        // fix #8778 (§28.14, v0.359): a `this(...)` / `base(...)` constructor
+        // CHAIN call. Its callee is the bare identifier `this`/`base`, which
+        // resolves to no symbol, so the arm above answered "no `scoped`
+        // formal" for every chain argument and the §28.14 admission was never
+        // queued for it: a call-bounded parameter forwarded by `base(f)` into
+        // a `scoped` base formal was silently accepted while the `new B(f)`
+        // spelling of the same forward is rejected. Read the chain target's
+        // BOUND formal through the same resolver the owned-sink classifiers
+        // use (`calleeOrChainFormals`, fix #3751), so both spellings reach
+        // `checkScopedAdmission` alike.
+        if (!formals.valid() && args) {
+            const CalleeFormals chain = resolveChainCtorParams(callee, *args);
+            if (chain.valid())
+                return boundModifier(*args, argPos, chain) == "scoped";
+        }
     }
     // The builtin / function-value arms below apply only to callees that did
     // NOT resolve to a MethodSymbol — a true function-value callee (`var g:
@@ -29143,6 +29158,21 @@ MethodOwnership::ScopedBound MethodOwnership::scopedBoundingLocal(
         return {};
     }
     if (!callee) return {};
+    // Form 1 for a constructor CHAIN call (fix #8778, §28.14 v0.359): a
+    // `this(...)` / `base(...)` call is a constructor call whose constructed
+    // object is the object under construction, `this`. It therefore resolves
+    // to the `this` arm: a closure argument capturing only `this` (or state
+    // reached through it) is admitted, and one capturing a local or a
+    // parameter of the constructor is rejected — the stored callback outlives
+    // the constructor's frame. Recognised by the same chain resolver that
+    // `scopedFormalAt` arms this admission with. Interpretation recorded in
+    // the #8778 commit: the spec's `this` arm is worded "per forms 3/4"; the
+    // stricter reading (no bound at all) would also reject a `this`-only
+    // capture, which the base accepted and which cannot dangle.
+    if (auto* chainCall = dynamic_cast<const ast::CallExpr*>(&callNode))
+        if (chainCall->callee.get() == callee &&
+            resolveChainCtorParams(callee, chainCall->args).valid())
+            return {K::This, nullptr};
     // Does the call return `owned`? — needed for forms 2 and 3. User methods
     // carry `returnOwned`; the builtin `Subscribe`/`Register` return
     // `owned Subscription` (stdlib §2.11 / §6.5 / §6.1). `.Add` returns unit,
