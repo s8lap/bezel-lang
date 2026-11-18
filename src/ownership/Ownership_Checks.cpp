@@ -29903,38 +29903,73 @@ bool MethodOwnership::captureTypeHoldsNoBorrow(
 // capture-bearing.
 bool MethodOwnership::exprIsFunctionValueWithNonEmptyCaptureSet(
     const ast::Expr& arg) {
-    // Lambda: check if it captures anything.  scopedCollectCaptures collects
-    // all identifiers including the lambda's own params — filter those out.
-    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&arg)) {
-        std::vector<const ast::IdentifierExpr*> rawCaps;
-        scopedCollectCaptures(*lam, rawCaps);
-        if (!rawCaps.empty()) {
-            std::unordered_set<const sema::Symbol*> paramSet;
-            if (const std::vector<sema::Symbol*>* ps = ctx_.lambdaParams(lam))
-                for (sema::Symbol* p : *ps) paramSet.insert(p);
-            for (const ast::IdentifierExpr* id : rawCaps) {
-                if (const sema::Symbol* s = ctx_.exprSymbol(*id))
-                    if (!paramSet.count(s) && captureContributesSource(s))
-                        return true;
-            }
-        }
-        return false;
-    }
+    std::unordered_set<const ast::Expr*> visited;
+    return setErasingSourceSet(arg, /*direct=*/true, visited) ==
+           SetErasingSourceSet::NonEmpty;
+}
+
+// Does `lam` capture a binding that counts? `scopedCollectCaptures` collects
+// every identifier of the body, the lambda's own parameters included — those
+// are not captures of the outer scope. With `countAll`, every capture counts
+// (the pre-#8785 reading); without it, clause 1's exemption applies
+// (`captureContributesSource`). // per §28.3
+bool MethodOwnership::lambdaHasCountedCapture(const ast::LambdaExpr& lam,
+                                              bool countAll) {
+    std::vector<const ast::IdentifierExpr*> rawCaps;
+    scopedCollectCaptures(lam, rawCaps);
+    if (rawCaps.empty()) return false;
+    std::unordered_set<const sema::Symbol*> paramSet;
+    if (const std::vector<sema::Symbol*>* ps = ctx_.lambdaParams(&lam))
+        for (sema::Symbol* p : *ps) paramSet.insert(p);
+    for (const ast::IdentifierExpr* id : rawCaps)
+        if (const sema::Symbol* s = ctx_.exprSymbol(*id))
+            if (!paramSet.count(s) && (countAll || captureContributesSource(s)))
+                return true;
+    return false;
+}
+
+// fix #8785 / fix #8871 (§28.3 closure bullet, *Provenance*, v0.359): the
+// source set of the function value `e`, as far as this body traces it.
+//
+// `direct` is true for the expression AT the set-erasing position (and the
+// arms of a conditional or the operand of a `!` there), false for the value of
+// a definition the trace follows. A directly read local whose reaching
+// definitions include an UNTRACED form and no non-empty one keeps the verdict
+// it had before the trace existed — its lambda-literal initializer counted
+// with every capture — so the trace never admits a read on the strength of a
+// form it did not follow.
+//
+// `visited` holds the identifier reads already expanded for this verdict. A
+// read met again contributes nothing new: every result joins one union, and
+// "a cycle adds nothing beyond the sources its assignments carry in from
+// outside it" (clause 1). // per §28.3
+MethodOwnership::SetErasingSourceSet MethodOwnership::setErasingSourceSet(
+    const ast::Expr& e, bool direct,
+    std::unordered_set<const ast::Expr*>& visited) {
+    using Set = SetErasingSourceSet;
+    auto join = [](Set a, Set b) {
+        if (a == Set::NonEmpty || b == Set::NonEmpty) return Set::NonEmpty;
+        if (a == Set::Untraced || b == Set::Untraced) return Set::Untraced;
+        return Set::Empty;
+    };
+    // Lambda: its captures, the lambda's own parameters excepted (clause 1).
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e))
+        return lambdaHasCountedCapture(*lam, /*countAll=*/false)
+                   ? Set::NonEmpty
+                   : Set::Empty;
     // Method reference: a static method has no captures; an instance method
     // reference captures its receiver (the spec's provenance clause 2).
     // Per the spec, only a method member (not a property, field, etc.) is
     // a function value in this sense. Check the resolved symbol.
-    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&arg)) {
-        // An incomplete member access carries nothing: no receiver, so
-        // nothing to capture.
-        if (!ma->target) return false;
-        // Only a method member is a function value here. A property access
-        // like `CancellationToken.None` has a target too but is not a
-        // function value.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        // An incomplete member access, an unresolved one, and a property,
+        // field or const read are not method references: nothing the trace
+        // follows.
+        if (!ma->target) return Set::Untraced;
         sema::Symbol* sym = ctx_.exprSymbol(*ma);
-        if (!sym) return false;  // Unresolved
+        if (!sym) return Set::Untraced;
         auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
-        if (!ms) return false;  // Property, field, const: not a function value
+        if (!ms) return Set::Untraced;
         // A STATIC method has no receiver, so `TypeName.Method` carries the
         // EMPTY source set and is admitted at a set-erasing position per
         // §28.3's binary rule. Only an INSTANCE method reference captures its
@@ -29948,88 +29983,116 @@ bool MethodOwnership::exprIsFunctionValueWithNonEmptyCaptureSet(
         // `exprIsStaticMemberRead` (Ownership.cpp) and §2.7's
         // `hasMod(ms->modifiers, "static")` test (ExprTypecheck.cpp) read.
         for (std::string_view mod : ms->modifiers)
-            if (mod == "static") return false;
-        return true;  // Instance method reference: the receiver is a capture
+            if (mod == "static") return Set::Empty;
+        return Set::NonEmpty;  // Instance method reference: the receiver
     }
-    // Identifier: a local carrying captures, or a parameter whose initializer
-    // is a capture-bearing lambda.  A plain function-typed parameter binding
-    // itself is not a capture — the captures come from the lambda that provided
-    // its value.
-    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&arg)) {
-        sema::Symbol* sym = ctx_.exprSymbol(*id);
-        if (!sym) return false;
-        // A local that aliases a call-bounded parameter carries the alias's
-        // captures.
-        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
-            // The local's initializer: trace through it.
-            auto it = scopedLambdaLocalInit_.find(sym);
-            if (it != scopedLambdaLocalInit_.end()) {
-                // Initialized from a lambda: check the lambda's captures.
-                // scopedCollectCaptures walks the body and collects all
-                // identifiers, INCLUDING the lambda's own params.  Filter
-                // those out — a lambda param is not a capture of the outer
-                // scope.
-                //
-                // fix #8785 (fix-forward; §28.3 *Provenance* clause 6,
-                // v0.359): "A local or parameter contributes, at each read,
-                // the union of the sets of the forms the flow analysis traces
-                // it to, over every assignment that reaches the read". The
-                // initializer is that union only for a local that is never
-                // an assignment target. This arm reads no later assignment,
-                // so for a REASSIGNED local (`seFlowAssigned_`: an assignment
-                // target or an `out`/`ref` argument anywhere in the body,
-                // lambda bodies and binding atoms included) clause 1's value
-                // exemption does not apply: every capture of the initializer
-                // stays counted, exactly as before #8785
-                // (`var n := 1; var f := lambda() => n; f := lambda() => r.V;`
-                // must not read as capture-free on the initializer alone).
-                const bool reassigned =
-                    !seFlowComplete_ || seFlowAssigned_.count(sym) != 0;
-                std::vector<const ast::IdentifierExpr*> rawCaps;
-                scopedCollectCaptures(*it->second, rawCaps);
-                if (!rawCaps.empty()) {
-                    // Build the set of this lambda's own params to filter.
-                    std::unordered_set<const sema::Symbol*> paramSet;
-                    if (const std::vector<sema::Symbol*>* ps =
-                            ctx_.lambdaParams(it->second))
-                        for (sema::Symbol* p : *ps) paramSet.insert(p);
-                    for (const ast::IdentifierExpr* id : rawCaps) {
-                        if (const sema::Symbol* s = ctx_.exprSymbol(*id))
-                            if (!paramSet.count(s) &&
-                                (reassigned || captureContributesSource(s)))
-                                return true;
-                    }
-                }
-            }
-            // Alias chain: does it ultimately alias a call-bounded parameter?
-            if (callBoundedAlias_.count(sym)) return true;
+    // Conditional: the union of both arms.
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        Set r = Set::Empty;
+        if (cd->thenValue)
+            r = join(r, setErasingSourceSet(*cd->thenValue, direct, visited));
+        if (cd->elseValue)
+            r = join(r, setErasingSourceSet(*cd->elseValue, direct, visited));
+        return r;
+    }
+    // Postfix-bang: the operand's set.
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e))
+        return pb->operand ? setErasingSourceSet(*pb->operand, direct, visited)
+                           : Set::Untraced;
+    // `a ?? b`: either operand may be the value — the union.
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->op != "??" || !be->left || !be->right) return Set::Untraced;
+        return join(setErasingSourceSet(*be->left, direct, visited),
+                    setErasingSourceSet(*be->right, direct, visited));
+    }
+    // `null` carries no function value at all.
+    if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) return Set::Empty;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    if (!id) return Set::Untraced;
+
+    // Identifier: a local or a parameter (clause 6).
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+    if (!ls && !ps) return Set::Untraced;
+    // A local that aliases a call-bounded parameter carries the alias's
+    // captures.
+    if (ls && callBoundedAlias_.count(sym)) return Set::NonEmpty;
+    if (!visited.insert(id).second) return Set::Empty;
+
+    // The definitions: the declaration (a parameter's incoming value is
+    // untraced — clause 3's plain function-typed parameter is not judged
+    // here) and every assignment.
+    std::vector<SetErasingFlowDef> defs;
+    bool flowInsensitive = !seFlowComplete_ || seFlowCaptured_.count(sym) != 0;
+    if (ps) {
+        defs.push_back({nullptr, /*traced=*/false, /*kills=*/true,
+                        /*positioned=*/true, SetErasingFlowPos{}});
+    } else {
+        const ast::Expr* init = nullptr;
+        bool known = false;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
+            init = ld->initializer.get();
+            known = true;
+        } else if (auto* lc =
+                       dynamic_cast<const ast::LocalConstDecl*>(ls->decl)) {
+            init = lc->value.get();
+            known = true;
         }
-        return false;
+        auto dp = seFlowDeclPos_.find(ls->decl);
+        if (known && dp != seFlowDeclPos_.end()) {
+            defs.push_back({init, /*traced=*/true, /*kills=*/true,
+                            /*positioned=*/true, dp->second});
+        } else {
+            // A for-variable, a pattern or catch binding, or a declaration
+            // the walk did not place: untraced, and it reaches every read.
+            defs.push_back({nullptr, /*traced=*/false, /*kills=*/false,
+                            /*positioned=*/false, SetErasingFlowPos{}});
+        }
     }
-    // Conditional: check both arms.
-    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&arg)) {
-        bool thenHas = cd->thenValue
-                           ? exprIsFunctionValueWithNonEmptyCaptureSet(*cd->thenValue)
-                           : false;
-        bool elseHas = cd->elseValue
-                           ? exprIsFunctionValueWithNonEmptyCaptureSet(*cd->elseValue)
-                           : false;
-        return thenHas || elseHas;
+    auto ad = seFlowDefs_.find(sym);
+    if (ad != seFlowDefs_.end())
+        defs.insert(defs.end(), ad->second.begin(), ad->second.end());
+    auto rp = seFlowReads_.find(id);
+    if (rp == seFlowReads_.end()) flowInsensitive = true;
+
+    Set r = Set::Empty;
+    for (const SetErasingFlowDef& d : defs) {
+        // Clause 1: a captured binding holds "every value it is ever assigned
+        // … whatever the assignment's position relative to the capture or to
+        // the read"; clause 6: any other binding "the assignments that reach
+        // the read".
+        if (!flowInsensitive && d.positioned &&
+            !setErasingFlowReaches(d, rp->second, defs))
+            continue;
+        if (!d.traced)
+            r = join(r, Set::Untraced);
+        else if (d.value)
+            r = join(r, setErasingSourceSet(*d.value, /*direct=*/false, visited));
     }
-    // Postfix-bang: delegate to the operand.
-    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&arg))
-        return pb->operand
-                   ? exprIsFunctionValueWithNonEmptyCaptureSet(*pb->operand)
-                   : false;
-    return false;
+    if (direct && r == Set::Untraced && ls) {
+        auto it = scopedLambdaLocalInit_.find(sym);
+        if (it != scopedLambdaLocalInit_.end() &&
+            lambdaHasCountedCapture(*it->second, /*countAll=*/true))
+            r = Set::NonEmpty;
+    }
+    return r;
 }
 
-// fix #8785 (fix-forward; §28.3 *Provenance* clause 6, v0.359): collect
-// `seFlowAssigned_` — see its declaration. // per §28.3
+// fix #8871 (§28.3 *Provenance* clause 6, v0.359): build the flow facts of
+// `body` (see `seFlowNodes_`). // per §28.3
 void MethodOwnership::setErasingFlowBuild(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    seFlowNodes_.clear();
+    seFlowNodes_.push_back({-1, SetErasingFlowKind::Root, nullptr, 0});
+    seFlowCur_ = 0;
+    seFlowSeq_ = 0;
     seFlowComplete_ = true;
-    seFlowAssigned_.clear();
+    seFlowDefs_.clear();
+    seFlowDeclPos_.clear();
+    seFlowReads_.clear();
+    seFlowParamLambda_.clear();
+    seFlowCaptured_.clear();
     setErasingFlowStmts(body);
 }
 
@@ -30039,19 +30102,61 @@ void MethodOwnership::setErasingFlowStmts(
         if (s) setErasingFlowStmt(*s);
 }
 
+// One identifier use: its read position, and whether the use captures the
+// binding — it sits in a lambda body that does not declare it (clause 1). A
+// local whose declaration the walk has not placed (a for-variable, a pattern
+// or catch binding) counts as captured: its trace is flow-insensitive.
+void MethodOwnership::setErasingFlowUse(const ast::IdentifierExpr& id) {
+    const sema::Symbol* sym = ctx_.exprSymbol(id);
+    if (!sym) return;
+    const int here = seFlowNodes_[seFlowCur_].lambda;
+    if (auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym)) {
+        auto dp = seFlowDeclPos_.find(ls->decl);
+        if (dp == seFlowDeclPos_.end() ||
+            seFlowNodes_[dp->second.node].lambda != here)
+            seFlowCaptured_.insert(sym);
+    } else if (dynamic_cast<const sema::ParameterSymbol*>(sym)) {
+        auto pl = seFlowParamLambda_.find(sym);
+        const int declared = pl == seFlowParamLambda_.end() ? 0 : pl->second;
+        if (declared != here) seFlowCaptured_.insert(sym);
+    } else {
+        return;
+    }
+    seFlowReads_[&id] = {seFlowCur_, ++seFlowSeq_};
+}
+
 // The expression walk: every sub-expression through the ONE exhaustive walk
 // (`forEachSyncSubExpr`, which stops at a lambda), plus what that walk leaves
 // to its caller — a lambda's body, a `case` expression's block-form arms.
 void MethodOwnership::setErasingFlowExpr(const ast::Expr* e) {
+    using Kind = SetErasingFlowKind;
     common::forEachSyncSubExpr(e, [&](const ast::Expr& n) {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&n)) {
+            setErasingFlowUse(*id);
+            return;
+        }
         if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&n)) {
-            setErasingFlowExpr(lam->exprBody.get());
-            setErasingFlowStmts(lam->stmts);
+            setErasingFlowIn(Kind::Lambda, lam, [&] {
+                if (const std::vector<sema::Symbol*>* ps =
+                        ctx_.lambdaParams(lam))
+                    for (sema::Symbol* p : *ps)
+                        seFlowParamLambda_[p] = seFlowCur_;
+                setErasingFlowExpr(lam->exprBody.get());
+                setErasingFlowStmts(lam->stmts);
+            });
             return;
         }
         if (auto* cse = dynamic_cast<const ast::CaseExpr*>(&n)) {
             for (const ast::CaseArm& arm : cse->arms)
-                setErasingFlowStmts(arm.stmts);
+                if (!arm.stmts.empty())
+                    setErasingFlowIn(Kind::Arm, cse,
+                                     [&] { setErasingFlowStmts(arm.stmts); });
+            return;
+        }
+        if (auto* bx = dynamic_cast<const ast::BindExpr*>(&n)) {
+            // A binding atom's clauses are declarations (§17.15).
+            for (const auto& cl : bx->clauses)
+                if (cl) seFlowDeclPos_[cl.get()] = {seFlowCur_, ++seFlowSeq_};
             return;
         }
         // An `out`/`ref` argument overwrites its identifier with a value this
@@ -30071,24 +30176,38 @@ void MethodOwnership::setErasingFlowExpr(const ast::Expr* e) {
             auto* oid = dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
             if (!oid) continue;
             if (const sema::Symbol* osym = ctx_.exprSymbol(*oid))
-                seFlowAssigned_.insert(osym);
+                seFlowDefs_[osym].push_back(
+                    {nullptr, /*traced=*/false, /*kills=*/false,
+                     /*positioned=*/true, {seFlowCur_, ++seFlowSeq_}});
         }
     });
 }
 
-// The statement walk.
+// The statement walk, in evaluation order. A definition takes its sequence
+// number AFTER its value is walked, so a read inside the value (`f := (if c
+// then f else g)`) precedes the definition it feeds.
 void MethodOwnership::setErasingFlowStmt(const ast::Stmt& s) {
-    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s))
-        return setErasingFlowExpr(ld->initializer.get());
-    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s))
-        return setErasingFlowExpr(lc->value.get());
+    using Kind = SetErasingFlowKind;
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        setErasingFlowExpr(ld->initializer.get());
+        seFlowDeclPos_[ld] = {seFlowCur_, ++seFlowSeq_};
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        setErasingFlowExpr(lc->value.get());
+        seFlowDeclPos_[lc] = {seFlowCur_, ++seFlowSeq_};
+        return;
+    }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
         setErasingFlowExpr(as->value.get());
         setErasingFlowExpr(as->target.get());
         if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                 as->target.get()))
             if (const sema::Symbol* tsym = ctx_.exprSymbol(*tid))
-                seFlowAssigned_.insert(tsym);
+                seFlowDefs_[tsym].push_back(
+                    {as->value.get(), /*traced=*/true,
+                     /*kills=*/as->op == ":=", /*positioned=*/true,
+                     {seFlowCur_, ++seFlowSeq_}});
         return;
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s))
@@ -30104,43 +30223,61 @@ void MethodOwnership::setErasingFlowStmt(const ast::Stmt& s) {
     if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s))
         return setErasingFlowExpr(is->target.get());
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        // Conditions sit outside the arms; sibling arms are disjoint.
         setErasingFlowExpr(ifs->ifBranch.condition.get());
-        setErasingFlowStmts(ifs->ifBranch.body);
+        setErasingFlowIn(Kind::Arm, ifs,
+                         [&] { setErasingFlowStmts(ifs->ifBranch.body); });
         for (const auto& eb : ifs->elifBranches) {
             setErasingFlowExpr(eb.condition.get());
-            setErasingFlowStmts(eb.body);
+            setErasingFlowIn(Kind::Arm, ifs,
+                             [&] { setErasingFlowStmts(eb.body); });
         }
-        setErasingFlowStmts(ifs->elseBody);
+        setErasingFlowIn(Kind::Arm, ifs,
+                         [&] { setErasingFlowStmts(ifs->elseBody); });
         return;
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-        setErasingFlowExpr(ws->condition.get());
-        setErasingFlowStmts(ws->body);
+        setErasingFlowIn(Kind::Loop, ws, [&] {
+            setErasingFlowExpr(ws->condition.get());
+            setErasingFlowStmts(ws->body);
+        });
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-        setErasingFlowExpr(fs->iterable.get());
-        setErasingFlowExpr(fs->withExpr.get());
-        setErasingFlowStmts(fs->body);
+        setErasingFlowIn(Kind::Loop, fs, [&] {
+            setErasingFlowExpr(fs->iterable.get());
+            setErasingFlowExpr(fs->withExpr.get());
+            setErasingFlowStmts(fs->body);
+        });
         return;
     }
     if (auto* de = dynamic_cast<const ast::DoEndBlock*>(&s))
-        return setErasingFlowStmts(de->body);
+        return setErasingFlowStmts(de->body);  // runs unconditionally
     if (auto* tr = dynamic_cast<const ast::TryStmt*>(&s)) {
-        setErasingFlowStmts(tr->body);
+        // The body may be left at any statement; a catch arm runs after part
+        // of it; `finally` after either. Catch arms are disjoint.
+        setErasingFlowIn(Kind::Block, tr,
+                         [&] { setErasingFlowStmts(tr->body); });
         for (const ast::CatchArm& ca : tr->catches) {
             setErasingFlowExpr(ca.guard.get());
-            if (ca.body) setErasingFlowStmt(*ca.body);
+            if (ca.body)
+                setErasingFlowIn(Kind::Arm, &tr->catches,
+                                 [&] { setErasingFlowStmt(*ca.body); });
         }
-        setErasingFlowStmts(tr->finallyBody);
+        setErasingFlowIn(Kind::Block, tr,
+                         [&] { setErasingFlowStmts(tr->finallyBody); });
         return;
     }
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        // The scrutinee and the guards sit outside the arms (a pattern holds
+        // constants only).
         setErasingFlowExpr(cs->scrutinee.get());
         for (const ast::CaseArm& arm : cs->arms) {
             setErasingFlowExpr(arm.guard.get());
-            setErasingFlowExpr(arm.exprBody.get());
-            setErasingFlowStmts(arm.stmts);
+            setErasingFlowIn(Kind::Arm, cs, [&] {
+                setErasingFlowExpr(arm.exprBody.get());
+                setErasingFlowStmts(arm.stmts);
+            });
         }
         return;
     }
@@ -30148,8 +30285,73 @@ void MethodOwnership::setErasingFlowStmt(const ast::Stmt& s) {
         dynamic_cast<const ast::ContinueStmt*>(&s) ||
         dynamic_cast<const ast::LocalTypeDecl*>(&s))
         return;
-    // A statement kind this walk does not know: nothing is trusted.
+    // A statement kind this walk does not know: no flow fact is trusted.
     seFlowComplete_ = false;
+}
+
+bool MethodOwnership::setErasingFlowAncestorOrEqual(int anc, int node) const {
+    for (int n = node; n >= 0; n = seFlowNodes_[n].parent)
+        if (n == anc) return true;
+    return false;
+}
+
+// Are `a` and `b` in two different arms of one construct? Then no forward
+// path runs from one to the other (a loop's back edge is judged apart).
+bool MethodOwnership::setErasingFlowDisjointArms(int a, int b) const {
+    for (int ca = a; ca > 0; ca = seFlowNodes_[ca].parent) {
+        const int common = seFlowNodes_[ca].parent;
+        if (!setErasingFlowAncestorOrEqual(common, b)) continue;
+        // `common` is the lowest common ancestor iff `ca` is not itself an
+        // ancestor of `b`.
+        if (setErasingFlowAncestorOrEqual(ca, b)) return false;
+        int cb = b;
+        while (cb > 0 && seFlowNodes_[cb].parent != common)
+            cb = seFlowNodes_[cb].parent;
+        if (cb <= 0) return false;
+        const SetErasingFlowNode& na = seFlowNodes_[ca];
+        const SetErasingFlowNode& nb = seFlowNodes_[cb];
+        return na.kind == SetErasingFlowKind::Arm &&
+               nb.kind == SetErasingFlowKind::Arm && na.group == nb.group;
+    }
+    return false;
+}
+
+// The innermost loop that encloses both `a` and `b` within one body (a lambda
+// body is its own: each invocation has fresh bindings), or -1.
+int MethodOwnership::setErasingFlowCommonLoop(int a, int b) const {
+    for (int n = b; n >= 0; n = seFlowNodes_[n].parent) {
+        if (seFlowNodes_[n].kind == SetErasingFlowKind::Lambda) return -1;
+        if (seFlowNodes_[n].kind == SetErasingFlowKind::Loop &&
+            setErasingFlowAncestorOrEqual(n, a))
+            return n;
+    }
+    return -1;
+}
+
+// Does definition `d` of an UNCAPTURED binding reach the read at `read`?
+//   * forward: `d` precedes the read and the two are not in disjoint arms;
+//   * around a back edge: one loop encloses both.
+// Either path is cut by a KILLING definition `k` (a plain `:=`, the
+// declaration) that every such path runs through: `k` precedes the read and
+// sits directly in a node that encloses the read — so reaching the read means
+// having run `k` — and, for the forward path, follows `d`; for the back
+// edge, sits inside the loop. // per §28.3 clause 6
+bool MethodOwnership::setErasingFlowReaches(
+    const SetErasingFlowDef& d, const SetErasingFlowPos& read,
+    const std::vector<SetErasingFlowDef>& defs) const {
+    bool fwd = d.pos.seq < read.seq &&
+               !setErasingFlowDisjointArms(d.pos.node, read.node);
+    const int loop = setErasingFlowCommonLoop(d.pos.node, read.node);
+    bool back = loop >= 0;
+    if (!fwd && !back) return false;
+    for (const SetErasingFlowDef& k : defs) {
+        if (!k.kills || !k.positioned || k.pos.seq >= read.seq) continue;
+        if (!setErasingFlowAncestorOrEqual(k.pos.node, read.node)) continue;
+        if (k.pos.seq > d.pos.seq) fwd = false;
+        if (back && setErasingFlowAncestorOrEqual(loop, k.pos.node))
+            back = false;
+    }
+    return fwd || back;
 }
 
 

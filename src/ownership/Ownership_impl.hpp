@@ -7294,24 +7294,88 @@ private:
     };
     std::vector<SetErasingCheck> setErasingCheckQueue_;
     void reportSetErasingPosition(const SetErasingCheck& c);
-    // fix #8785 (fix-forward; §28.3 *Provenance* clause 6, v0.359): the locals
-    // and parameters that are an assignment target, or an `out`/`ref`
-    // argument, ANYWHERE in the body. Collected by `setErasingFlowBuild` —
-    // its own COMPLETE walk of the body (every statement kind, every
-    // expression kind through `forEachSyncSubExpr`, lambda bodies and binding
-    // atoms included), run only for a body that queued a set-erasing
-    // position. `scopedAssignedSyms_` is not that set: the pre-scan does not
-    // descend into a binding atom, so an assignment in a lambda body there
-    // (`(var t := 1; lambda() => do f := … end)`) never reaches it.
-    // `seFlowComplete_` is false when the walk met a statement kind it does
-    // not know; every local then reads as reassigned.
-    std::unordered_set<const sema::Symbol*> seFlowAssigned_;
+    // fix #8871 (§28.3 closure bullet, *Provenance* clauses 1 and 6, v0.359):
+    // the flow facts the set-erasing verdict reads a local or parameter
+    // through. "A local or parameter contributes, at each read, the union of
+    // the sets of the forms the flow analysis traces it to, over every
+    // assignment that reaches the read — a captured local or parameter over
+    // every assignment to it in any body (clause 1)". Built by
+    // `setErasingFlowBuild` — its own COMPLETE walk of the body (every
+    // statement kind, every expression kind through `forEachSyncSubExpr`,
+    // lambda bodies and binding atoms included), run only for a body that
+    // queued a set-erasing position. The walk records, in evaluation order:
+    //   * a STRUCTURE tree (`SetErasingFlowNode`): one node per conditional
+    //     arm (an `if` branch, a `case` arm, a `catch` arm), per `try` body
+    //     and `finally` block, per loop, per lambda body. A position is
+    //     (innermost node, sequence number) — never a source span;
+    //   * every definition of a local or parameter: its declaration
+    //     (`seFlowDeclPos_`, keyed by the declaring node) and each
+    //     assignment (`seFlowDefs_`); an `out`/`ref` argument is an untraced,
+    //     non-killing definition;
+    //   * the position of every identifier read (`seFlowReads_`);
+    //   * the CAPTURED bindings (`seFlowCaptured_`): used in a lambda body
+    //     that does not declare them.
+    enum class SetErasingFlowKind { Root, Arm, Block, Loop, Lambda };
+    struct SetErasingFlowNode {
+        int parent;
+        SetErasingFlowKind kind;
+        const void* group;  // an Arm's construct: sibling arms are disjoint
+        int lambda;         // innermost enclosing Lambda node, 0 = the body
+    };
+    struct SetErasingFlowPos {
+        int node = 0;
+        unsigned seq = 0;
+    };
+    struct SetErasingFlowDef {
+        const ast::Expr* value;  // null with `traced`: contributes nothing
+        bool traced;             // false: a form this body cannot trace
+        bool kills;              // a plain `:=` or a declaration
+        bool positioned;         // false: reaches every read
+        SetErasingFlowPos pos;
+    };
+    std::vector<SetErasingFlowNode> seFlowNodes_;
+    int seFlowCur_ = 0;
+    unsigned seFlowSeq_ = 0;
     bool seFlowComplete_ = false;
+    std::unordered_map<const sema::Symbol*, std::vector<SetErasingFlowDef>>
+        seFlowDefs_;
+    std::unordered_map<const ast::Node*, SetErasingFlowPos> seFlowDeclPos_;
+    std::unordered_map<const ast::Expr*, SetErasingFlowPos> seFlowReads_;
+    std::unordered_map<const sema::Symbol*, int> seFlowParamLambda_;
+    std::unordered_set<const sema::Symbol*> seFlowCaptured_;
     void setErasingFlowBuild(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void setErasingFlowStmt(const ast::Stmt& s);
     void setErasingFlowStmts(const std::vector<std::unique_ptr<ast::Stmt>>& ss);
     void setErasingFlowExpr(const ast::Expr* e);
+    void setErasingFlowUse(const ast::IdentifierExpr& id);
+    template <typename F>
+    void setErasingFlowIn(SetErasingFlowKind kind, const void* group, F&& f) {
+        const int saved = seFlowCur_;
+        const int self = static_cast<int>(seFlowNodes_.size());
+        seFlowNodes_.push_back(
+            {saved, kind, group,
+             kind == SetErasingFlowKind::Lambda ? self
+                                                : seFlowNodes_[saved].lambda});
+        seFlowCur_ = self;
+        f();
+        seFlowCur_ = saved;
+    }
+    bool setErasingFlowAncestorOrEqual(int anc, int node) const;
+    bool setErasingFlowDisjointArms(int a, int b) const;
+    int setErasingFlowCommonLoop(int a, int b) const;
+    bool setErasingFlowReaches(const SetErasingFlowDef& d,
+                               const SetErasingFlowPos& read,
+                               const std::vector<SetErasingFlowDef>& defs) const;
+    // The source set of a function-valued expression, as far as this body
+    // traces it. `Untraced` is a form whose provenance the trace does not
+    // follow (a call result, a member read, an `out` argument, a parameter's
+    // incoming value). // per §28.3
+    enum class SetErasingSourceSet { Empty, NonEmpty, Untraced };
+    SetErasingSourceSet setErasingSourceSet(
+        const ast::Expr& e, bool direct,
+        std::unordered_set<const ast::Expr*>& visited);
+    bool lambdaHasCountedCapture(const ast::LambdaExpr& lam, bool countAll);
     // fix #8785 (§28.3 closure bullet *Provenance* clause 1, v0.359): does this
     // CAPTURED binding contribute a source to the closure's source set?  Only
     // a capture POSITIVELY identified as a value type that holds no borrow
