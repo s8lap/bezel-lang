@@ -363,3 +363,152 @@ BEZEL_TEST(ownership_owning_choice_param_dispose_7722,
     BEZEL_EXPECT_FALSE(
         bezel::test::diagnosticMessageContains(r, "sanitizer fired"));
 }
+
+// =====================================================================
+// THE FUNCTION-VALUE PATHS (fix-forward of the rejected first attempt,
+// review r42-rev-m71). §15.3 *Parameter passing*: "for a move-only V, it
+// is by value-move (transfer ownership). The caller's argument expression
+// is in moved-from state after the call." §28.3: every owned value is
+// disposed exactly once on every path. The callee's discharge is ONE
+// decision per BODY, so it must hold for every path that reaches the body —
+// including a call through a FUNCTION VALUE (§27.6 method reference, a
+// function-typed field, a lambda that forwards its own parameter, a
+// higher-order method). On those paths the caller keeps and disposes its
+// own value, so the callee must not dispose it as well.
+//
+// RED on 70912e757 (the first attempt): heap-use-after-free — the callee
+// freed the payload and the caller's scope-end discharge read it. GREEN with
+// the fix: exactly 200 dispositions, no sanitizer report. Each program loops
+// 200x (a one-shot run hides an allocator-reuse UAF).
+// =====================================================================
+namespace {
+const char* kFvPrelude =
+    "module M; "
+    "class Res "
+    "  public static N: int := 0; "
+    "  public constructor() end constructor; "
+    "  destructor Res.N := Res.N + 1; end destructor; "
+    "end Res; "
+    "choice OChoice Text(owned r: Res), Empty; end OChoice; ";
+
+void expectExactlyOnce200(const JitResult& r) {
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(lastNonEmptyLine(r.stdoutText), "200");
+    BEZEL_EXPECT_FALSE(
+        bezel::test::diagnosticMessageContains(r, "sanitizer fired"));
+}
+}  // namespace
+
+// Review probe b01: a static method reference stored in a local and invoked.
+BEZEL_TEST(ownership_owning_choice_param_dispose_7722,
+           function_value_static_method_ref_disposes_exactly_once) {
+    std::string src = std::string(kFvPrelude) +
+        "class Program "
+        "  public static method Take(o: OChoice): int return 1; end Take; "
+        "  public static method Main() "
+        "    var i := 0; "
+        "    while i < 200 do "
+        "      var f: (OChoice) -> int := Program.Take; "
+        "      var b := OChoice.Text(new Res()); "
+        "      var k := f(b); "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(Res.N); "
+        "  end Main; "
+        "end Program;";
+    expectExactlyOnce200(runAotChecked(src));
+}
+
+// Review probe b34: a bound INSTANCE method reference (non-virtual).
+BEZEL_TEST(ownership_owning_choice_param_dispose_7722,
+           function_value_instance_method_ref_disposes_exactly_once) {
+    std::string src = std::string(kFvPrelude) +
+        "class Holder "
+        "  public constructor() end constructor; "
+        "  public method Take(o: OChoice): int return 1; end Take; "
+        "end Holder; "
+        "class Program "
+        "  public static method Main() "
+        "    var i := 0; "
+        "    var h := new Holder(); "
+        "    while i < 200 do "
+        "      var f: (OChoice) -> int := h.Take; "
+        "      var b := OChoice.Text(new Res()); "
+        "      var k := f(b); "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(Res.N); "
+        "  end Main; "
+        "end Program;";
+    expectExactlyOnce200(runAotChecked(src));
+}
+
+// Review probe b35: a lambda that forwards its OWN parameter to a direct call
+// of the method — the lambda's caller still owns the value.
+BEZEL_TEST(ownership_owning_choice_param_dispose_7722,
+           function_value_lambda_forwarding_its_param_disposes_exactly_once) {
+    std::string src = std::string(kFvPrelude) +
+        "class Program "
+        "  public static method Take(o: OChoice): int return 1; end Take; "
+        "  public static method Main() "
+        "    var i := 0; "
+        "    var g := lambda(o: OChoice) => Program.Take(o); "
+        "    while i < 200 do "
+        "      var b := OChoice.Text(new Res()); "
+        "      var k := g(b); "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(Res.N); "
+        "  end Main; "
+        "end Program;";
+    expectExactlyOnce200(runAotChecked(src));
+}
+
+// Review probe b36: a method reference held in a function-typed FIELD.
+BEZEL_TEST(ownership_owning_choice_param_dispose_7722,
+           function_value_method_ref_in_field_disposes_exactly_once) {
+    std::string src = std::string(kFvPrelude) +
+        "class Box "
+        "  public F: (OChoice) -> int; "
+        "  public constructor() F := Program.Take; end constructor; "
+        "end Box; "
+        "class Program "
+        "  public static method Take(o: OChoice): int return 1; end Take; "
+        "  public static method Main() "
+        "    var i := 0; "
+        "    var bx := new Box(); "
+        "    while i < 200 do "
+        "      var b := OChoice.Text(new Res()); "
+        "      var k := bx.F(b); "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(Res.N); "
+        "  end Main; "
+        "end Program;";
+    expectExactlyOnce200(runAotChecked(src));
+}
+
+// Review probe b02: a HIGHER-ORDER method that forwards its own parameter to
+// a function value bound to the method. (On r30-c1 this leaked; the first
+// attempt traded the leak for a use-after-free.)
+BEZEL_TEST(ownership_owning_choice_param_dispose_7722,
+           function_value_higher_order_forward_disposes_exactly_once) {
+    std::string src = std::string(kFvPrelude) +
+        "class Program "
+        "  public static method Take(o: OChoice): int return 1; end Take; "
+        "  public static method Call(f: (OChoice) -> int, o: OChoice): int "
+        "    return f(o); "
+        "  end Call; "
+        "  public static method Main() "
+        "    var i := 0; "
+        "    while i < 200 do "
+        "      var k := Call(Program.Take, OChoice.Text(new Res())); "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(Res.N); "
+        "  end Main; "
+        "end Program;";
+    expectExactlyOnce200(runAotChecked(src));
+}

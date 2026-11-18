@@ -24751,6 +24751,23 @@ private:
                                          sema::MethodSymbol* callee = nullptr,
                                          bool baseQualified = false,
                                          bool admitPlainMoveOnly = false);
+    // fix #7722 (§15.3, §28.1 clause 1, §28.3, v0.359): the ONE predicate both
+    // the callee (`registerUnwindOwnedParam`) and the call site's pre-call
+    // mark read for a PLAIN move-only (owning-choice) parameter. See the
+    // definition in LlvmBackend_Setup.cpp.
+    bool plainMoveOnlyParamDischargedByCallee(sema::MethodSymbol* cms);
+    bool plainMoveOnlyCalleeShapeAdmits(sema::MethodSymbol* cms);
+    void collectPlainMoveOnlyForwardSites();
+    // The METHOD whose formal `psym` is (null for a lambda's formal).
+    sema::MethodSymbol* plainMoveOnlyParamOwner(const sema::Symbol* psym);
+    std::unordered_map<const sema::Symbol*, sema::MethodSymbol*>
+        plainMoveOnlyParamOwner_;
+    bool plainMoveOnlyScanDone_ = false;
+    bool plainMoveOnlyScanIncomplete_ = false;
+    // Method NAMES a plain move-only parameter must NOT be discharged for: a
+    // method of that name is formed as a function value, or a call of it
+    // forwards a parameter its forwarder does not own.
+    std::unordered_set<std::string> plainMoveOnlyBlockedNames_;
 
     // Does `emitMethodCall(ms, …, baseQualified, …)` reach its runtime target
     // through a vtable or itable slot (so the function that runs is whichever

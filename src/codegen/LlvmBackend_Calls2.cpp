@@ -10011,6 +10011,14 @@ void Emitter::markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call,
             // substituted to `OChoice`, a value-like choice, a class) is NOT a
             // transfer formal here either.
             if (!admitPlainMoveOnly) continue;
+            // fix-forward (r42-rev-m71): the CALLEE's own admission decides.
+            // `registerUnwindOwnedParam` reads the SAME predicate, so the
+            // pre-call mark is made exactly where the callee disposes: a
+            // callee that is formed as a function value anywhere (whose body
+            // then also runs behind a thunk whose caller keeps its value), or
+            // that is handed a parameter its forwarder does not own, is
+            // declined on both sides and keeps the base's behaviour.
+            if (!plainMoveOnlyParamDischargedByCallee(ms)) continue;
             const sema::TypeRef* declared = ps->resolvedDeclType;
             if (!declared && ps->declType)
                 declared = ctx_.resolvedType(*ps->declType);

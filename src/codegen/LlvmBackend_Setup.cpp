@@ -25949,6 +25949,421 @@ void Emitter::registerUnwindOwnedLocal(const ast::LocalDecl* ld) {
 }
 
 
+// fix #7722 (§15.3 *Parameter passing*, §28.1 clause 1, §28.3, v0.359): may
+// the callee `cms` discharge a PLAIN move-only (owning-choice) parameter at its
+// own scope end, with every call site marking the caller's source moved-from
+// BEFORE the call?
+//
+// The callee's disposal is one decision per BODY, but a body can be reached on
+// paths that do not mark the caller's source: a call through a FUNCTION VALUE
+// (a method reference — §27.6 — stored in a local, a field, or passed to a
+// higher-order method) runs the body behind a thunk whose caller keeps and
+// disposes its own value, and a lambda that forwards its OWN parameter to the
+// method hands it a value the lambda's caller still owns. On any such path the
+// caller's discharge and the callee's meet: a double disposal. The answer is
+// therefore ONE predicate, read by BOTH sides — the callee
+// (`registerUnwindOwnedParam`) and the call site's pre-call mark
+// (`markMoveOnlyChoiceArgsMovedFrom`, `admitPlainMoveOnly`) — so the two can
+// never disagree: either both act (the callee disposes, the caller's source is
+// zeroed first) or neither does (the base's behaviour, where the caller's
+// discharge is the sole one: a leak, never a double free).
+//
+// It is true only when ALL of these hold:
+//  (1) the callee's SHAPE lets every direct call site mark before the call
+//      (the callee-side mirror of the call site's `calleeEntryMayThrow` gate:
+//      no vtable/itable slot, not imported, no `requires`, a block body, not
+//      async, no checked-mode entry guard on an instance member, not
+//      generic);
+//  (2) it is NOT reachable from another module when this is a library
+//      artifact (an importer's call sites and method references are not
+//      visible here);
+//  (3) no method of that NAME is formed as a VALUE anywhere in the module
+//      (`collectPlainMoveOnlyForwardSites`);
+//  (4) no direct call of that name forwards a parameter the forwarding
+//      function does not itself own — a lambda's parameter, a constructor /
+//      accessor / operator parameter — and every METHOD whose parameter is
+//      forwarded is itself admitted (a least fixed point over the forward
+//      edges).
+// Keyed by NAME, not symbol, on purpose: an overloaded or re-resolved callee
+// cannot slip past the scan; a collision only declines (a leak).
+bool Emitter::plainMoveOnlyCalleeShapeAdmits(sema::MethodSymbol* cms) {
+    if (!cms) return false;
+    // (1g) A GENERIC method, or a member of a generic type: its bodies are
+    //      emitted per instantiation, on demand, and the call site and the
+    //      body need not read the SAME symbol. Declined on both sides.
+    if (!cms->genericParams.empty()) return false;
+    if (cms->parent && !cms->parent->genericParams.empty()) return false;
+    if (cms->extensionDecl && !cms->extensionDecl->genericConstraints.empty())
+        return false;
+    // (1a) A DYNAMICALLY REACHABLE member: the call site dispatches through a
+    //      vtable or itable slot and does not mark at the call site.
+    if (vtableSlot_.count(cms) != 0) return false;
+    if (!isStaticMethod(cms) && cms->parent) {
+        for (const sema::TypeSymbol* t = cms->parent; t; t = baseClassOf(t))
+            for (const sema::TypeSymbol* b : t->baseTypes)
+                if (b && b->kind == ast::TypeDeclKind::Interface) return false;
+    }
+    // (1b) An IMPORTED callee's prologue is not readable here (#7617).
+    if (ctx_.isImported(cms)) return false;
+    // (1c) A `requires` clause (own or inherited) runs in the ENTRY prologue,
+    //      ahead of the root scope: on that raise the callee disposes nothing.
+    if (!cms->inheritedRequiresClauses.empty()) return false;
+    const auto* cmd = dynamic_cast<const ast::MethodDecl*>(cms->decl);
+    if (!cmd) return false;
+    for (const auto& c : cmd->contractClauses)
+        if (c.kind == ast::ContractClause::Kind::Requires) return false;
+    // (1d) An EXPRESSION body opens no root scope (#7707).
+    if (cmd->bodyKind != ast::MethodBodyKind::Block) return false;
+    // (1e) An ASYNC method's static initializer runs in its task entry.
+    if (isAsyncMethod(cms)) return false;
+    // (1f) The checked-disposal receiver guard and the checked-contracts entry
+    //      invariant are emitted ahead of the body of an instance member.
+    if (!isStaticMethod(cms)) {
+        if (checkedDisposal_) return false;
+        if (checkedContracts_ && cms->parent &&
+            cms->parent->kind == ast::TypeDeclKind::Class &&
+            hasClassInvariant(cms->parent))
+            return false;
+    }
+    // (2) Reachable from ANOTHER module (§13.2: a top-level type defaults to
+    //     `internal`): an importer can call it, or form it as a value, on a
+    //     path this module never sees. Only a LIBRARY artifact can be
+    //     imported (§33.6; the executable's main module is never a
+    //     dependency, `CodegenOptions::isMainModule`).
+    const bool memberVisible = cms->visibility == ast::Visibility::Public ||
+                               cms->visibility == ast::Visibility::Protected;
+    if (!isMainModule_ && memberVisible &&
+        (!cms->parent || cms->parent->visibility == ast::Visibility::Public))
+        return false;
+    return true;
+}
+
+sema::MethodSymbol* Emitter::plainMoveOnlyParamOwner(const sema::Symbol* psym) {
+    collectPlainMoveOnlyForwardSites();
+    auto it = plainMoveOnlyParamOwner_.find(psym);
+    return it == plainMoveOnlyParamOwner_.end() ? nullptr : it->second;
+}
+
+bool Emitter::plainMoveOnlyParamDischargedByCallee(sema::MethodSymbol* cms) {
+    if (!cms) return false;
+    if (!plainMoveOnlyCalleeShapeAdmits(cms)) return false;
+    collectPlainMoveOnlyForwardSites();
+    if (plainMoveOnlyScanIncomplete_) return false;  // fail closed
+    return plainMoveOnlyBlockedNames_.count(std::string(cms->name)) == 0;
+}
+
+// The whole-module scan behind (3) and (4) of
+// `plainMoveOnlyParamDischargedByCallee`. Its traversal mirrors
+// `collectRecordFieldWriteSites` and fails closed the same way: an
+// unrecognised node kind sets `plainMoveOnlyScanIncomplete_`, and the
+// predicate then admits nothing.
+void Emitter::collectPlainMoveOnlyForwardSites() {
+    if (plainMoveOnlyScanDone_) return;
+    plainMoveOnlyScanDone_ = true;
+
+    // Which METHOD owns a parameter symbol. A parameter with no entry here (a
+    // lambda's, a constructor's, an accessor's) is never owned by an admitted
+    // body.
+    auto& paramOwner = plainMoveOnlyParamOwner_;
+    for (const auto& sym : ctx_.symbols())
+        if (auto* m = dynamic_cast<sema::MethodSymbol*>(sym.get()))
+            for (sema::Symbol* p : m->params)
+                if (p) paramOwner[p] = m;
+
+    std::vector<std::pair<std::string, sema::MethodSymbol*>> edges;
+    auto block = [&](std::string_view n) {
+        plainMoveOnlyBlockedNames_.insert(std::string(n));
+    };
+
+    // The names of the direct calls whose ARGUMENT the walk is inside (all of
+    // them, innermost last: a nested argument is attributed to every
+    // enclosing call, which can only decline more). Reset at a lambda body.
+    std::vector<std::string_view> argOf;
+    int lambdaDepth = 0;
+
+    // Does this parameter read carry an owning choice? Unknown counts as yes.
+    auto mayBeOwningChoice = [&](const ast::Expr& e) {
+        const sema::TypeRef* t = ctx_.exprType(e);
+        if (!t) return true;
+        if (t->kind != sema::TypeRef::Kind::Named) return false;
+        if (!t->declaration) return true;  // a type parameter: decline
+        if (t->declaration->kind != ast::TypeDeclKind::Choice) return false;
+        auto v = common::classifyChoiceType(t, ctx_);
+        return !v || *v == common::ChoiceClassification::Owning;
+    };
+    auto noteParamRead = [&](const ast::Expr& e) {
+        if (argOf.empty()) return;
+        sema::Symbol* s = ctx_.exprSymbol(e);
+        if (!dynamic_cast<sema::ParameterSymbol*>(s)) return;
+        if (!mayBeOwningChoice(e)) return;
+        auto it = paramOwner.find(s);
+        for (std::string_view n : argOf) {
+            if (lambdaDepth > 0 || it == paramOwner.end()) block(n);
+            else edges.emplace_back(std::string(n), it->second);
+        }
+    };
+    // A method NAMED in a value position is formed as a function value
+    // (§27.6). An unresolved name is treated the same way.
+    auto noteValueName = [&](const ast::Expr& e, std::string_view n) {
+        sema::Symbol* s = ctx_.exprSymbol(e);
+        if (!s || dynamic_cast<sema::MethodSymbol*>(s)) block(n);
+        if (sema::MethodSymbol* sel = ctx_.methodRefSelectedOverload(e))
+            block(sel->name);
+    };
+
+    std::function<void(const ast::Expr*)> walkExpr;
+    std::function<void(const ast::Stmt*)> walkStmt;
+    auto walkArgs = [&](std::string_view callee,
+                        const std::vector<ast::CallArgument>& args) {
+        if (!callee.empty()) argOf.push_back(callee);
+        for (const ast::CallArgument& a : args) walkExpr(a.value.get());
+        if (!callee.empty()) argOf.pop_back();
+    };
+    // A call's CALLEE names the method it calls; that is not a formation.
+    auto walkCall = [&](const ast::Expr* callee,
+                        const std::vector<ast::CallArgument>& args) {
+        std::string_view name;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(callee)) {
+            name = id->name;
+            noteParamRead(*id);
+        } else if (auto* ma =
+                       dynamic_cast<const ast::MemberAccessExpr*>(callee)) {
+            name = ma->member;
+            walkExpr(ma->target.get());
+        } else if (auto* nm =
+                       dynamic_cast<const ast::NullCondMemberExpr*>(callee)) {
+            name = nm->member;
+            walkExpr(nm->target.get());
+        } else {
+            walkExpr(callee);
+        }
+        walkArgs(name, args);
+    };
+
+    walkExpr = [&](const ast::Expr* e) {
+        if (!e) return;
+        if (dynamic_cast<const ast::IntLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::FloatLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::CharLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::StringLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::VerbatimStringExpr*>(e)) return;
+        if (dynamic_cast<const ast::BoolLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::NullLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::TypeOfExpr*>(e)) return;
+        if (dynamic_cast<const ast::NameOfExpr*>(e)) return;
+        if (dynamic_cast<const ast::DefaultExpr*>(e)) return;
+        if (dynamic_cast<const ast::UnitExpr*>(e)) return;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            noteParamRead(*id);
+            noteValueName(*id, id->name);
+            return; }
+        if (dynamic_cast<const ast::MarkedTransferExpr*>(e)) {
+            // `owned x` names a binding; an unresolved one declines.
+            if (!ctx_.exprSymbol(*e))
+                for (std::string_view n : argOf) block(n);
+            noteParamRead(*e);
+            return; }
+        if (auto* si = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (const auto& part : si->parts) walkExpr(part.expr.get());
+            return; }
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            noteValueName(*ma, ma->member);
+            walkExpr(ma->target.get()); return; }
+        if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            noteValueName(*nm, nm->member);
+            walkExpr(nm->target.get()); return; }
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
+            walkCall(ce->callee.get(), ce->args); return; }
+        if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            walkCall(nc->callee.get(), nc->args); return; }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            walkExpr(ix->target.get()); walkArgs({}, ix->indices); return; }
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            walkExpr(pb->operand.get()); return; }
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+            walkArgs({}, ne->args); return; }
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            walkExpr(be->left.get()); walkExpr(be->right.get()); return; }
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            walkExpr(ue->operand.get()); return; }
+        if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            walkExpr(tt->operand.get()); return; }
+        if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            walkExpr(co->condition.get()); walkExpr(co->thenValue.get());
+            walkExpr(co->elseValue.get()); return; }
+        if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            walkExpr(th->operand.get()); return; }
+        if (auto* rg = dynamic_cast<const ast::RangeExpr*>(e)) {
+            walkExpr(rg->lo.get()); walkExpr(rg->hi.get());
+            walkExpr(rg->step.get()); return; }
+        if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+            walkExpr(we->source.get());
+            for (const auto& a : we->assigns) walkExpr(a.value.get());
+            return; }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (const auto& el : cl->elements) walkExpr(el.get());
+            for (const auto& k : cl->keys) walkExpr(k.get());
+            return; }
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            // A lambda body is its own function: the calls of the enclosing
+            // argument do not reach into it, and every parameter it forwards
+            // is one its CALLER still owns.
+            auto savedArgOf = std::move(argOf);
+            argOf.clear();
+            ++lambdaDepth;
+            walkExpr(lam->exprBody.get());
+            for (const auto& s : lam->stmts) walkStmt(s.get());
+            for (const ast::Param& p : lam->params)
+                walkExpr(p.defaultValue.get());
+            --lambdaDepth;
+            argOf = std::move(savedArgOf);
+            return; }
+        if (auto* cx = dynamic_cast<const ast::CaseExpr*>(e)) {
+            walkExpr(cx->scrutinee.get());
+            for (const ast::CaseArm& arm : cx->arms) {
+                walkExpr(arm.guard.get());
+                walkExpr(arm.exprBody.get());
+                for (const auto& s : arm.stmts) walkStmt(s.get());
+            }
+            return; }
+        if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+            for (const auto& c : bx->clauses) walkStmt(c.get());
+            walkExpr(bx->body.get());
+            return; }
+        plainMoveOnlyScanIncomplete_ = true;
+    };
+
+    walkStmt = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            walkExpr(ld->initializer.get()); return; }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            walkExpr(lc->value.get()); return; }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            walkExpr(as->target.get()); walkExpr(as->value.get()); return; }
+        if (auto* is = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            walkExpr(is->target.get()); return; }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            walkExpr(rs->value.get()); return; }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            walkExpr(es->expr.get()); return; }
+        if (auto* th = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            walkExpr(th->value.get()); return; }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            walkExpr(ds->value.get()); return; }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            walkExpr(ys->value.get()); return; }
+        if (dynamic_cast<const ast::BreakStmt*>(s)) return;
+        if (dynamic_cast<const ast::ContinueStmt*>(s)) return;
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s)) {
+            walkExpr(ifs->ifBranch.condition.get());
+            for (const auto& b : ifs->ifBranch.body) walkStmt(b.get());
+            for (const auto& br : ifs->elifBranches) {
+                walkExpr(br.condition.get());
+                for (const auto& b : br.body) walkStmt(b.get());
+            }
+            for (const auto& b : ifs->elseBody) walkStmt(b.get());
+            return; }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            walkExpr(ws->condition.get());
+            for (const auto& b : ws->body) walkStmt(b.get()); return; }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            walkExpr(fs->iterable.get()); walkExpr(fs->withExpr.get());
+            for (const auto& b : fs->body) walkStmt(b.get()); return; }
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (const auto& b : db->body) walkStmt(b.get()); return; }
+        if (auto* tr = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (const auto& b : tr->body) walkStmt(b.get());
+            for (const ast::CatchArm& c : tr->catches) {
+                walkExpr(c.guard.get());
+                walkStmt(c.body.get());
+            }
+            for (const auto& b : tr->finallyBody) walkStmt(b.get());
+            return; }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            walkExpr(cs->scrutinee.get());
+            for (const ast::CaseArm& arm : cs->arms) {
+                walkExpr(arm.guard.get());
+                walkExpr(arm.exprBody.get());
+                for (const auto& a : arm.stmts) walkStmt(a.get());
+            }
+            return; }
+        plainMoveOnlyScanIncomplete_ = true;
+    };
+
+    std::function<void(const ast::Member*)> walkMember;
+    walkMember = [&](const ast::Member* mem) {
+        if (!mem) return;
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(mem)) {
+            walkExpr(fd->initializer.get()); return; }
+        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(mem)) {
+            walkExpr(pd->autoInitializer.get());
+            walkExpr(pd->exprBody.get());
+            for (const ast::PropertyAccessor& acc : pd->accessors) {
+                walkExpr(acc.exprBody.get());
+                for (const auto& s : acc.stmts) walkStmt(s.get());
+            }
+            return; }
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(mem)) {
+            walkExpr(md->exprBody.get());
+            for (const auto& s : md->stmts) walkStmt(s.get());
+            for (const ast::Param& p : md->params)
+                walkExpr(p.defaultValue.get());
+            return; }
+        if (auto* od = dynamic_cast<const ast::OperatorDecl*>(mem)) {
+            walkExpr(od->exprBody.get());
+            for (const auto& s : od->stmts) walkStmt(s.get());
+            return; }
+        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(mem)) {
+            for (const auto& s : cd->body) walkStmt(s.get());
+            for (const ast::Param& p : cd->params)
+                walkExpr(p.defaultValue.get());
+            return; }
+        if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(mem)) {
+            for (const auto& s : dd->body) walkStmt(s.get()); return; }
+        if (dynamic_cast<const ast::InvariantDecl*>(mem)) return;
+        if (dynamic_cast<const ast::EventDecl*>(mem)) return;
+        if (auto* kd = dynamic_cast<const ast::ConstDecl*>(mem)) {
+            walkExpr(kd->value.get()); return; }
+        if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(mem)) {
+            if (nt->decl)
+                for (const auto& sub : nt->decl->members) walkMember(sub.get());
+            return; }
+        plainMoveOnlyScanIncomplete_ = true;
+    };
+
+    // Every declaration body in THIS module (the same three arms as
+    // `collectRecordFieldWriteSites`; an imported body cannot call or form an
+    // admitted callee, which (2) keeps unreachable from other modules).
+    for (const auto& sym : ctx_.symbols()) {
+        const ast::Node* d = sym ? sym->decl : nullptr;
+        if (!d) continue;
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(d)) {
+            for (const auto& mem : td->members) walkMember(mem.get());
+        } else if (auto* xd = dynamic_cast<const ast::ExtensionDecl*>(d)) {
+            for (const auto& mem : xd->members) walkMember(mem.get());
+        } else if (auto* mem = dynamic_cast<const ast::Member*>(d)) {
+            walkMember(mem);
+        }
+    }
+
+    // (4) The least fixed point over the forward edges: a call of `n` that
+    // forwards a parameter of method F is admitted only if F itself is (F
+    // then owns the parameter and the pre-call mark zeroes F's slot).
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const auto& [n, owner] : edges) {
+            if (plainMoveOnlyBlockedNames_.count(n)) continue;
+            if (plainMoveOnlyCalleeShapeAdmits(owner) &&
+                !plainMoveOnlyBlockedNames_.count(std::string(owner->name)))
+                continue;
+            plainMoveOnlyBlockedNames_.insert(n);
+            changed = true;
+        }
+    }
+}
+
+
 void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
                                        llvm::AllocaInst* slot) {
     // §28.3: an `owned` parameter is auto-disposed when an exception
@@ -26084,67 +26499,30 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
             // the base's verdict on both arms, and the shapes it admits (a
             // static, block-bodied, non-imported member with no `requires`
             // clause) go from LEAK to clean.
+            //
+            // fix-forward (r42-rev-m71): the admission is no longer decided
+            // from the callee's SHAPE alone. A shape-admitted callee disposed
+            // its parameter for EVERY caller, but a call through a FUNCTION
+            // VALUE (a method reference, a function-typed field, a lambda that
+            // forwards its own parameter) reaches the same body with no
+            // caller-side mark, so caller and callee both disposed (MEASURED:
+            // heap-use-after-free on `var f := Program.Take; f(b)`). The
+            // predicate now also requires that no such path exists anywhere in
+            // the module — see `plainMoveOnlyParamDischargedByCallee`.
             if (ps->modifier != "owned") {
-                bool calleeDisposes = false;
-                if (sema::MethodSymbol* cms = currentMethod_) {
-                    bool ok = true;
-                    // (1) A DYNAMICALLY REACHABLE member. The call site
-                    //     dispatches through a vtable or an itable slot, so it
-                    //     cannot know which body runs and does not mark the
-                    //     caller's source at the call site. A virtual or
-                    //     `override` member has a vtable slot; an instance
-                    //     member of a class that implements an interface has
-                    //     an itable slot.
-                    if (vtableSlot_.count(cms) != 0) ok = false;
-                    if (ok && !isStaticMethod(cms) && cms->parent) {
-                        for (const sema::TypeSymbol* t = cms->parent; t;
-                             t = baseClassOf(t)) {
-                            for (const sema::TypeSymbol* b : t->baseTypes)
-                                if (b &&
-                                    b->kind == ast::TypeDeclKind::Interface)
-                                    ok = false;
-                            if (!ok) break;
-                        }
-                    }
-                    // (2) An IMPORTED callee's prologue was compiled by its
-                    //     own module and is not readable here (#7617).
-                    if (ctx_.isImported(cms)) ok = false;
-                    // (3) A `requires` clause (own or inherited) is evaluated
-                    //     in the ENTRY prologue, ahead of the root scope: on
-                    //     that raise the callee disposes nothing.
-                    if (!cms->inheritedRequiresClauses.empty()) ok = false;
-                    const auto* cmd =
-                        dynamic_cast<const ast::MethodDecl*>(cms->decl);
-                    if (!cmd) {
-                        ok = false;
-                    } else {
-                        for (const auto& c : cmd->contractClauses)
-                            if (c.kind == ast::ContractClause::Kind::Requires)
-                                ok = false;
-                        // (4) An EXPRESSION body opens no root scope, so it
-                        //     never enrolls a parameter disposal at all
-                        //     (#7707).
-                        if (cmd->bodyKind != ast::MethodBodyKind::Block)
-                            ok = false;
-                    }
-                    // (5) An ASYNC method's static initializer runs in its
-                    //     task entry, not at the call site's point.
-                    if (isAsyncMethod(cms)) ok = false;
-                    // (6) The checked-disposal receiver guard and the
-                    //     checked-contracts entry invariant are emitted ahead
-                    //     of the body, on an instance member.
-                    if (ok && !isStaticMethod(cms)) {
-                        if (checkedDisposal_) ok = false;
-                        if (checkedContracts_ && cms->parent &&
-                            cms->parent->kind == ast::TypeDeclKind::Class &&
-                            hasClassInvariant(cms->parent))
-                            ok = false;
-                    }
-                    calleeDisposes = ok;
-                }
+                // The OWNER is read from the parameter symbol itself, not from
+                // `currentMethod_`: a lambda's formal is bound while
+                // `currentMethod_` is the ENCLOSING method, and a generic
+                // instantiation's body is emitted on demand while it is still
+                // the CALLER (MEASURED: `Wrap<int>.Take` bound with
+                // `currentMethod_` = `Main`). A formal no method owns (a
+                // lambda's) is never admitted.
+                sema::MethodSymbol* cms = plainMoveOnlyParamOwner(psym);
+                const bool ownFormal = cms != nullptr;
                 // Not admitted: the caller's scope-end discharge is the sole
                 // one (the base's behaviour) — a leak, never a double free.
-                if (!calleeDisposes) return;
+                if (!ownFormal || !plainMoveOnlyParamDischargedByCallee(cms))
+                    return;
             }
             Disposal d{slot, nullptr};
             d.owningChoice = true;
