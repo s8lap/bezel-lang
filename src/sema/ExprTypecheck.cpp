@@ -9341,6 +9341,89 @@ void ExprTC::checkAssignable(
         reportNotConvertible();
         return;
     }
+    // fix #8408 (§5.1 "Reference conversions", §12.7, §17.4, v0.357): an
+    // INTERFACE-typed source at a CLASS-typed target.
+    //
+    // THE RULE. §5.1's implicit reference conversions are a CLOSED list —
+    // "identity: every type converts to itself"; "class to base class,
+    // transitively, up to `Object`"; "any type to `Object`"; "a type to an
+    // interface it implements or conforms to"; "interface to extended
+    // interface, directly or transitively"; "a type parameter to an interface
+    // or class its constraints guarantee conformance to"; and §12.9's
+    // variance-induced conversions. NONE of them converts an INTERFACE to a
+    // CLASS: a downcast needs §12.7's checked spellings (`is` / `as`).
+    //
+    // WHAT WAS BROKEN. The declaration-keyed Named↔Named block above requires
+    // BOTH `from->declaration` and `to->declaration`, so it never sees a
+    // pair whose TARGET is a declaration-less built-in class (`Exception`,
+    // `IOException`, `StringBuilder`, …). Every class-target arm further
+    // down is keyed on the SOURCE being a class — `from->declaration->kind ==
+    // Class`, or a declaration-less built-in CLASS head — so a USER interface
+    // source (a declaration of kind `Interface`) matches none of them, and
+    // the function's final "Mixed / generic-parameter / null-literal cases:
+    // skip" ACCEPTED the pair. MEASURED on the base (r30-c1 @ e69d8b050):
+    // the issue's repro compiled and printed `Log: 'hello'` and then
+    // `Log: ''` — the second argument is not an `Exception` at all, and the
+    // `Message` read went through a vtable the object does not have. The
+    // same shape was accepted at a LOCAL, at a `StringBuilder` parameter and
+    // at an `IOException` parameter, and a built-in interface source
+    // (`IDisposable`, `IEnumerable<T>`) was accepted at a class parameter
+    // too.
+    //
+    // WHAT STAYS ADMITTED, each for its own §5.1 row (none of them is an
+    // interface source):
+    //   * a class to a base class, transitively (`A` at an `Exception`
+    //     parameter) — "class to base class";
+    //   * a class to an interface it implements (`A` at an `IMark` parameter)
+    //     — "a type to an interface it implements";
+    //   * an interface to `Object` — "any type to `Object`" (the root
+    //     `Object` is the Primitive `Object` ref, not a Named class, so it
+    //     never reaches this arm);
+    //   * an interface to an interface it extends — "interface to extended
+    //     interface";
+    //   * a type parameter to the interface or class its constraints
+    //     guarantee — the type-parameter row (a type parameter is not an
+    //     interface source here);
+    //   * an interface to an interface it neither extends nor implements —
+    //     never admitted before this arm either (the `IDisposable` arm below
+    //     rejects it with its own §5.1 wording).
+    {
+        // The SOURCE: an interface. A user-declared interface carries a
+        // TypeSymbol of kind `Interface`; a built-in interface head
+        // (`IDisposable`, `IEnumerable<T>`, …) carries none.
+        bool fromIsInterface =
+            from->kind == TypeRef::Kind::Named &&
+            ((from->declaration &&
+              from->declaration->kind == ast::TypeDeclKind::Interface) ||
+             (!from->declaration &&
+              common::isBuiltinInterfaceHead(from->headName())));
+        // The TARGET: a class. A user class carries a TypeSymbol of kind
+        // `Class`; a built-in class carries none and is named by the
+        // heap-pointer-reference / built-in-exception tables — the same
+        // "built-in class" notion the #6684 arm below uses, so the two arms
+        // read one set of names.
+        bool toIsClass = false;
+        if (to->kind == TypeRef::Kind::Named) {
+            if (to->declaration) {
+                toIsClass = to->declaration->kind == ast::TypeDeclKind::Class;
+            } else {
+                std::string_view toH = to->headName();
+                toIsClass = !toH.empty() &&
+                            (common::isHeapPointerReferenceBuiltin(toH) ||
+                             common::isBuiltinExceptionName(toH)) &&
+                            !common::isBuiltinInterfaceHead(toH);
+            }
+        }
+        if (fromIsInterface && toIsClass) {
+            std::string toName(namedTypeSimpleName(to));
+            reportNotConvertible(
+                "an interface type is not implicitly convertible to a class "
+                "type: §5.1 lists no conversion from an interface to a "
+                "class — test the runtime type with `is " + toName +
+                "` (§12.7) or convert with `as " + toName + "` (§17.4)");
+            return;
+        }
+    }
     // §4.16 / §8.6 (#970): a span type (ArraySpan<T>/ReadOnlyArraySpan<T>/
     // Span<T>/ReadOnlySpan<T>) is implicitly coercible to IReadOnlySpan<T>
     // for call-bounded parameter passing. The span is boxed into a heap-managed
