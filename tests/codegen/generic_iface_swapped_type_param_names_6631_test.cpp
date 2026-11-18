@@ -93,33 +93,31 @@ BEZEL_TEST(generic_iface_swapped_type_param_names_6631,
 // The capture with THREE type parameters, the receiver's arguments a
 // three-cycle (`IM<V,T,U>`): `Use<int,string,bool>` instantiates the receiver
 // at `IM<int,string,bool>` — the witness `Put(a: int, b: string, c: bool)`
-// (prints 1) — and `Use<string,int,bool>` at `IM<string,int,bool>` (prints 2).
-// On the base both calls reached the first instantiation (1 then 1).
+// (prints `ISB 5 2 True`) — and `Use<string,int,bool>` at `IM<string,int,bool>`
+// (prints `SIB 3 10 False`). The program is well-typed: each call's arguments
+// are in the receiver's own parameter order (V, T, U). On the base both calls
+// reached the first instantiation.
 BEZEL_TEST(generic_iface_swapped_type_param_names_6631,
            three_type_parameters_spec_11_1_11_2_14_1) {
     auto r = runAotChecked(
         std::string("module M;\n"
                     "public interface IM<T, U, V>\n"
-                    "  method Put(a: T, b: U, c: V): int;\n"
+                    "  method Put(a: T, b: U, c: V): string;\n"
                     "end IM;\n"
-                    "public class Impl: IM<int, string, bool>,"
-                    " IM<string, int, bool>\n"
+                    "public class Impl: IM<int, string, bool>, IM<string, int, bool>\n"
                     "  public constructor() end constructor;\n"
-                    "  public method Put(a: int, b: string, c: bool): int => 1;\n"
-                    "  public method Put(a: string, b: int, c: bool): int => 2;\n"
+                    "  public method Put(a: int, b: string, c: bool): string => $\"ISB {a + 1} {b.Length} {c}\";\n"
+                    "  public method Put(a: string, b: int, c: bool): string => $\"SIB {a.Length} {b + 1} {c}\";\n"
                     "end Impl;\n"
                     "public class Program\n"
-                    "  public static method Use<V, T, U>(i: IM<V, T, U>,"
-                    " a: T, b: U, c: V): int => i.Put(a, b, c);\n"
+                    "  public static method Use<V, T, U>(i: IM<V, T, U>, a: V, b: T, c: U): string => i.Put(a, b, c);\n"
                     "  public static method Main()\n"
                     "    var t := new Impl();\n"
-                    "    Console.WriteLine(Program.Use<int, string, bool>"
-                    "(t, \"s\", true, 4));\n"
-                    "    Console.WriteLine(Program.Use<string, int, bool>"
-                    "(t, 4, true, \"s\"));\n"
+                    "    Console.WriteLine(Program.Use<int, string, bool>(t, 4, \"ss\", true));\n"
+                    "    Console.WriteLine(Program.Use<string, int, bool>(t, \"sss\", 9, false));\n"
                     "  end Main;\n"
                     "end Program;\n"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("1\n2\n"));
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("ISB 5 2 True\nSIB 3 10 False\n"));
 }
