@@ -4037,6 +4037,31 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // duration of the nested call so the lambda's own completion sites see
         // "no owned-param frame" (a correct no-op).
         asyncOwnedParamFrame_ = nullptr;
+        // fix-forward #8867 (§28.14 / §28.9 / §30.1, v0.359): the CLOSURE-PIN
+        // publication needs the SAME suppression across this nested emission.
+        //
+        // WHY. `emitAsyncMethod` publishes the frame that holds its plain
+        // (call-bounded) function-typed formal's +1 in `asyncClosurePinFrame_`
+        // / `asyncClosurePinFields_`, and the frame's terminal edge
+        // (`emitAsyncClosureParamRelease`) drops it. The publication is live
+        // for the WHOLE of the enclosing method's body emission, so it is
+        // still live while THIS nested async lambda's own machine is emitted.
+        // The lambda's completion calls `emitAsyncClosureParamRelease(self)`
+        // with the LAMBDA's frame pointer, but the published frame's struct
+        // type and field indices are the ENCLOSING METHOD's — so the release
+        // reads a word of the LAMBDA's frame with the OUTER's layout and
+        // releases it as a closure: a refcount over-release abort (§28.9) or,
+        // when the word is not a closure at all, an ASan bad-free.
+        //
+        // So: save, NULL and restore, exactly as `asyncOwnedParamFrame_` is
+        // handled above. The enclosing method's own terminal edge still sees
+        // its publication (the restore runs before the enclosing emission
+        // continues), so the enclosing frame's +1 is still dropped exactly
+        // once — by the frame that took it.
+        const StateMachineFrame* savedAsyncClosurePinFrame = asyncClosurePinFrame_;
+        std::vector<unsigned> savedAsyncClosurePinFields;
+        savedAsyncClosurePinFields.swap(asyncClosurePinFields_);
+        asyncClosurePinFrame_ = nullptr;
         // fix #4118 (§30.5, v0.295): asyncChainedReturn_ / asyncBorrowedReturn_
         // are the §30.5 Pattern A return-kind detection flags — deliberately
         // NOT part of BEZEL_SM_FRAME_MEMBERS (LlvmBackend_impl.hpp's own
@@ -4178,6 +4203,11 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
 
         closureReleaseEligible_ = std::move(savedClosureRelElig);
         closureReleaseEligibleFn_ = savedClosureRelEligFn;
+        // fix-forward #8867: restore the closure-pin publication the save/null
+        // above took aside — the enclosing method's own terminal edge must
+        // still see its own frame's hold. See the save's comment.
+        asyncClosurePinFrame_ = savedAsyncClosurePinFrame;
+        asyncClosurePinFields_.swap(savedAsyncClosurePinFields);
         closureLocalCandidates_ =
             std::move(savedClosureLocalCandidates);  // fix #3757 follow-up
         cellFreeEligible_ = std::move(savedCellFreeElig);
@@ -4296,6 +4326,20 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     asyncResultSemaType_ = nullptr;
     asyncPatternAResultDisposer_ = nullptr;
     asyncOwnedParamFrame_ = nullptr;
+    // fix-forward #8867 (§28.14 / §28.9 / §30.1, v0.359): the CLOSURE-PIN
+    // publication gets the same suppression in the SYNC-lambda branch, for
+    // the same reason as in the async branch above. A nested emission inside
+    // this body (a nested async lambda, a generic async method
+    // monomorphized here, an iterator) publishes ITS own frame in
+    // `smStateStruct_` / `smSelf_`, so a completion site inside it would
+    // reach `emitAsyncClosureParamRelease` with the ENCLOSING method's
+    // publication still live and release a word of the NESTED frame with the
+    // OUTER's layout. Null the publication for the duration of this body and
+    // restore it after, so only the frame that took the +1 drops it.
+    const StateMachineFrame* savedAsyncClosurePinFrameSync = asyncClosurePinFrame_;
+    std::vector<unsigned> savedAsyncClosurePinFieldsSync;
+    savedAsyncClosurePinFieldsSync.swap(asyncClosurePinFields_);
+    asyncClosurePinFrame_ = nullptr;
     asyncChainedReturn_ = false;
     asyncBorrowedReturn_ = false;
     // fix #3738 (§15.1.1 / §15.3 / §27.5, v0.286): pin the §15.3 (#747)
@@ -4870,6 +4914,11 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // fix #3505: smFrameSaveSync's destructor puts the frame back at the end of
     // this block; only the members outside the retracted frame are by hand.
     asyncHandlerSpillSlots_ = std::move(savedAsyncHandlerSpillSlotsSync);
+    // fix-forward #8867: restore the closure-pin publication the save/null
+    // above took aside — the enclosing method's own terminal edge must still
+    // see its own frame's hold. See the save's comment.
+    asyncClosurePinFrame_ = savedAsyncClosurePinFrameSync;
+    asyncClosurePinFields_.swap(savedAsyncClosurePinFieldsSync);
     asyncChainedReturn_ = savedAsyncChainedReturnSync;       // fix #2747
     asyncBorrowedReturn_ = savedAsyncBorrowedReturnSync;     // fix #2747
     }

@@ -50,6 +50,13 @@
 //
 // FAIL-WITHOUT / PASS-WITH. Both rows are RED on the base (the closure
 // leaks) and GREEN with the fix.
+//
+// FIX-FORWARD (this lane, on top of the rejected bc79cc072): the three rows
+// at the bottom pin the B1 defect the review found — the closure-pin
+// publication (`asyncClosurePinFrame_` / `asyncClosurePinFields_`) leaked
+// into a NESTED ASYNC LAMBDA's completion, which then released a word of the
+// LAMBDA's own frame with the ENCLOSING method's layout (§28.9). They are
+// RED on bc79cc072 and GREEN with the fix-forward.
 
 #include <iostream>
 #include <string>
@@ -192,6 +199,138 @@ BEZEL_TEST(async_call_bounded_closure_leak_8867,
         "end C;";
     auto r = runAotChecked(source);
     expectClean(r, 0, "200\n");
+}
+
+// ---------------------------------------------------------------------------
+// FIX-FORWARD of #8867 (the review's B1): the closure-pin publication must
+// not reach a NESTED ASYNC LAMBDA's completion.
+//
+// §28.14 (v0.359) *Call-bounded × deferred activation*, shape (1) "Frame
+// residence": the async callee holds the plain function-typed formal in its
+// task frame, and "The bound is the frame's life (K6.1): a task's settlement
+// (§30.1)" — so the +1 is dropped by the frame that took it, at that frame's
+// terminal edge, and by no other frame.
+//
+// `emitAsyncMethod` publishes that hold in `asyncClosurePinFrame_` /
+// `asyncClosurePinFields_` for the WHOLE of its body emission. A nested
+// async lambda in that body is emitted inline by `lowerLambda` ->
+// `emitAsyncLambda`, which swaps `smStateStruct_` / `smSelf_` to the LAMBDA's
+// own (differently laid out) frame. The publication was not suppressed
+// across that emission (unlike `asyncOwnedParamFrame_`, which is nulled for
+// exactly this reason), so the LAMBDA's completion ran
+// `emitAsyncClosureParamRelease` with the LAMBDA's frame pointer and the
+// ENCLOSING method's struct type and field indices: it released a word of the
+// LAMBDA's own frame as a closure.
+//
+// §28.9 (v0.359) makes that a hard error, not a leak: "a function value is
+// released when its last holder is gone" — releasing a word that is not a
+// closure (or releasing the same closure twice) is the over-release the
+// runtime aborts on.
+//
+// RED on bc79cc072 (the branch this lane fixes forward):
+//   * the awaiting shape: `bezel: fatal: refcount over-release (closure) —
+//     two releases for one reference; terminating per §28.9` (exit 134);
+//   * the capturing shape: an AddressSanitizer `bad-free` ("attempting free
+//     on address which was not malloc()-ed").
+// GREEN with the fix-forward: the nested lambda's completion no longer
+// reaches the enclosing method's publication, so only the frame that took the
+// +1 drops it.
+// ---------------------------------------------------------------------------
+
+// THE AWAITING NESTED LAMBDA: the enclosing async method holds a plain
+// (call-bounded) function-typed formal AND its body declares an async lambda
+// that awaits. The lambda's frame is a different struct with a different
+// layout, so the release read the wrong word.
+//
+// 200 iterations, so the shape cannot hide under the sanitizer's noise.
+BEZEL_TEST(async_call_bounded_closure_leak_8867,
+           nested_async_lambda_in_async_callee_does_not_over_release_spec_28_9) {
+    const std::string source =
+        "module M; "
+        "class C "
+        "  public static async method Outer(h: (int) -> int): Task<int> "
+        "    var f := async lambda(n: int): Task<int> => do "
+        "      await Task.Delay(1); "
+        "      return n + 1; "
+        "    end; "
+        "    var x := await f(1); "
+        "    await Task.Delay(1); "
+        "    return x + h(2); "
+        "  end Outer; "
+        "  public static async method Main(): Task<int> "
+        "    var a := 0; "
+        "    for var k in 0..<200 do "
+        "      a := a + await Outer(lambda(v: int): int => v * 2); "
+        "    end; "
+        "    Console.WriteLine(a); "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+    auto r = runAotChecked(source);
+    expectClean(r, 0, "1200\n");
+}
+
+// THE SAME SHAPE WITHOUT A SUSPENSION in the nested lambda: the lambda's
+// machine still completes (and still runs its terminal edge), so the
+// publication still reached it — the suspension is not what makes the hazard,
+// the nested COMPLETION is.
+BEZEL_TEST(async_call_bounded_closure_leak_8867,
+           nested_async_lambda_without_await_does_not_over_release_spec_28_9) {
+    const std::string source =
+        "module M; "
+        "class C "
+        "  public static async method Outer(h: (int) -> int): Task<int> "
+        "    var f := async lambda(n: int): Task<int> => do "
+        "      return n + 1; "
+        "    end; "
+        "    var x := await f(1); "
+        "    return x + h(2); "
+        "  end Outer; "
+        "  public static async method Main(): Task<int> "
+        "    var a := 0; "
+        "    for var k in 0..<200 do "
+        "      a := a + await Outer(lambda(v: int): int => v * 2); "
+        "    end; "
+        "    Console.WriteLine(a); "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+    auto r = runAotChecked(source);
+    expectClean(r, 0, "1200\n");
+}
+
+// THE CAPTURING SHAPE: the nested async lambda CAPTURES the enclosing
+// method's call-bounded formal, so the lambda's frame holds the closure
+// itself. On bc79cc072 the lambda's completion released that word as a
+// closure — a word of the LAMBDA's frame that is not a closure cell at all —
+// and the runtime freed it: an AddressSanitizer `bad-free`.
+//
+// The row asserts the program's own output (600 = 200 × (h(1) + 1) = 200 ×
+// (2 + 1)) as well as the absence of the sanitizer report, so a fix that
+// merely stopped the abort without keeping the callback alive would fail it.
+BEZEL_TEST(async_call_bounded_closure_leak_8867,
+           nested_async_lambda_capturing_param_does_not_bad_free_spec_28_9) {
+    const std::string source =
+        "module M; "
+        "class C "
+        "  public static async method Outer(h: (int) -> int): Task<int> "
+        "    var f := async lambda(n: int): Task<int> => do "
+        "      await Task.Delay(1); "
+        "      return h(n) + 1; "
+        "    end; "
+        "    return await f(1); "
+        "  end Outer; "
+        "  public static async method Main(): Task<int> "
+        "    var a := 0; "
+        "    for var k in 0..<200 do "
+        "      a := a + await Outer(lambda(v: int): int => v * 2); "
+        "    end; "
+        "    Console.WriteLine(a); "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+    auto r = runAotChecked(source);
+    expectClean(r, 0, "600\n");
 }
 
 }  // namespace
