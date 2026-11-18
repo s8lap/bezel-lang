@@ -486,14 +486,68 @@ static bool bareBoundSubstitutionRejects(const TypeRef* arg,
         if (u->primitive == PrimitiveType::Object)
             return argPrim && arg->primitive != PrimitiveType::Object &&
                    arg->primitive != PrimitiveType::None;
+        // fix #8777 (§14.2 *Type-parameter bounds*, v0.359): `Object` is a
+        // subtype of no other primitive ("at `U := long` it admits `long`
+        // alone"), so `D<int>.ZY<Object>` is refused like `ZY<string>`.
         if (argPrim)
-            return arg->primitive != PrimitiveType::Object &&
-                   arg->primitive != PrimitiveType::None &&
+            return arg->primitive != PrimitiveType::None &&
                    arg->primitive != u->primitive;
         return argDeclared;
     }
     if (isOpenTypeParamRef(u)) return argPrim || argDeclared;
+    // fix #8777 (§14.2 *Type-parameter bounds* + the conformance rule, §9.7,
+    // v0.359): U := a built-in interface with no synthesized declaration
+    // (`IDisposable` and the rest of the disposal family). A primitive, a
+    // record or an enum "can never" conform to it (§9.7), so none is a
+    // subtype of the substitution.
+    if (u->kind == TypeRef::Kind::Named && !u->declaration && !u->nullable &&
+        primitiveNeverConformsToBuiltinIface(u->headName())) {
+        if (argPrim) return arg->primitive != PrimitiveType::None;
+        return arg->kind == TypeRef::Kind::Named && arg->declaration &&
+               (arg->declaration->kind == ast::TypeDeclKind::Record ||
+                arg->declaration->kind == ast::TypeDeclKind::Enum);
+    }
     return false;
+}
+
+// fix #8777 (§14.2 *Type-parameter bounds* and the conformance rule, v0.359):
+// a PRIMITIVE argument against the substitution `u` for the bound's type
+// parameter, where `u` is a compiler-known builtin interface with a
+// synthesized declaration (`IComparable<int>`, `IEquatable<Object>`,
+// `INumber<int>`...). "A substitution S ... satisfies `where T: U` exactly when
+// S is non-nullable and is a subtype of the substitution for `U` ... a type
+// conforming to an interface substitution": a primitive conforms to those
+// interfaces only as its stdlib declaration lists them
+// (`primitiveConformsToBuiltinInstanceIface`, `primitiveConformsToStaticIface`),
+// the same tables the direct-bound arm reads. Rejects only when the
+// primitive PROVABLY does not conform; an open generic argument, `Object` or
+// any undecided shape stays deferred.
+static bool primitiveRejectedByBuiltinInterfaceSubstitution(
+    const TypeRef* arg, const TypeRef* u) {
+    if (!arg || !u || arg->kind != TypeRef::Kind::Primitive || arg->nullable)
+        return false;
+    if (arg->primitive == PrimitiveType::None ||
+        arg->primitive == PrimitiveType::Object)
+        return false;
+    if (u->kind != TypeRef::Kind::Named || !u->declaration ||
+        !u->declaration->isSynthesizedBuiltinInterface)
+        return false;
+    const std::string_view head = u->declaration->name;
+    if (head == "INumber" || head == "ISteppable" || head == "IParsable") {
+        if (!primitiveConformsToStaticIface(arg->primitive, head)) return true;
+        // `where T: INumber<T>` (stdlib §2.19): a primitive conforms at its
+        // own type alone, so `int` is not an `INumber<long>`.
+        if (u->genericArgs.size() == 1 && u->genericArgs[0] &&
+            u->genericArgs[0]->kind == TypeRef::Kind::Primitive &&
+            !u->genericArgs[0]->nullable &&
+            u->genericArgs[0]->primitive != PrimitiveType::None &&
+            u->genericArgs[0]->primitive != PrimitiveType::Object)
+            return u->genericArgs[0]->primitive != arg->primitive;
+        return false;
+    }
+    return primitiveConformsToBuiltinInstanceIface(arg->primitive, head,
+                                                   u->genericArgs) ==
+           PrimBuiltinIfaceConformance::Rejects;
 }
 
 static bool isBuiltinTimeValueRecord(const TypeRef* t) {
@@ -10444,7 +10498,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                             boundOpenArg ||
                                             (boundSubst != bound &&
                                              boundSubst->kind ==
-                                                 TypeRef::Kind::Primitive))) {
+                                                 TypeRef::Kind::Primitive) ||
+                                            // fix #8777: a builtin interface
+                                            // substitution with no declaration
+                                            // (`IDisposable`), decided by
+                                            // `bareBoundSubstitutionRejects`.
+                                            (boundSubst != bound &&
+                                             boundSubst->kind ==
+                                                 TypeRef::Kind::Named &&
+                                             primitiveNeverConformsToBuiltinIface(
+                                                 boundSubst->headName())))) {
                                     // the ENCLOSING CLASS's own parameter,
                                     // substituted with the receiver's class
                                     // argument (#8663: §14.2's
@@ -10460,6 +10523,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                             : std::string(
                                                   item.boundParamName);
                                     if (argRef->nullable) {
+                                        report(uName);
+                                    } else if (uSubst->nullable &&
+                                               (argDecl ||
+                                                (argRef->kind ==
+                                                     TypeRef::Kind::Primitive &&
+                                                 argRef->primitive !=
+                                                     PrimitiveType::None))) {
+                                        // fix #8777 (§14.2 *Type-parameter
+                                        // bounds*, v0.359): "at a nullable
+                                        // substitution for `U` it admits no
+                                        // type, none being identical to it
+                                        // and a nullable type being neither
+                                        // a class nor an interface".
                                         report(uName);
                                     } else if (uSubst->declaration &&
                                                argDecl &&
@@ -10480,6 +10556,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         // interfaces it conforms to by the
                                         // stdlib's own declaration (left to
                                         // the defer below).
+                                        report(uName);
+                                    } else if (primitiveRejectedByBuiltinInterfaceSubstitution(
+                                                   argRef, uSubst)) {
+                                        // fix #8777 (§14.2 *Type-parameter
+                                        // bounds*, v0.359): a primitive
+                                        // against a builtin-interface
+                                        // substitution it provably does not
+                                        // conform to (`IComparable<long>`
+                                        // for `int`).
                                         report(uName);
                                     } else if (!uSubst->declaration &&
                                                bareBoundSubstitutionRejects(
