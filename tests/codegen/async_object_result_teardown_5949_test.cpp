@@ -284,6 +284,110 @@ BEZEL_TEST(async_object_result_teardown_5949,
                   "n := n + 4; end;")));
 }
 
+// fix #8743 (§28.9 / §30.5, v0.359): the row above, at the other ways the
+// task of that body ends. The frame's one reference to the function value is
+// handed to the task at `return b;`, and the task - the last holder -
+// releases it at teardown unless a reader that may keep the value read the
+// result first. Each of the four rows below leaked the 64-byte closure cell
+// per iteration on 551624deb (3840 B / 60, the capturing one 4560 B / 180).
+
+// The task is never awaited: only its teardown can release the result.
+BEZEL_TEST(async_object_result_teardown_5949,
+          task_object_function_value_through_object_local_never_awaited_looped_30_5) {
+    expectCleanRun(src(
+        "public static async method F(): Task<Object> "
+        "var f := lambda() => 1; var b: Object := f as Object; return b; "
+        "end F; ",
+        "async method Main(): Task<int>",
+        loopAsync("do using var t := F(); n := n + 4; end;")));
+}
+
+// The task is awaited and the result discarded.
+BEZEL_TEST(async_object_result_teardown_5949,
+          task_object_function_value_through_object_local_await_discarded_looped_30_5) {
+    expectCleanRun(src(
+        "public static async method F(): Task<Object> "
+        "var f := lambda() => 1; var b: Object := f as Object; return b; "
+        "end F; ",
+        "async method Main(): Task<int>",
+        loopAsync("do using var t := F(); await t; n := n + 4; end;")));
+}
+
+// The lambda captures a local of the body (§27.5): its environment and the
+// capture cell go with the closure.
+BEZEL_TEST(async_object_result_teardown_5949,
+          task_object_capturing_function_value_through_object_local_looped_30_5) {
+    expectCleanRun(src(
+        "public static async method F(): Task<Object> "
+        "var c: int := 3; var f := lambda() => c; "
+        "var b: Object := f as Object; return b; end F; ",
+        "async method Main(): Task<int>",
+        loopAsync("do using var t := F(); var r := await t; "
+                  "n := n + 4; end;")));
+}
+
+// The body suspends between the bind and the `return` (§30.1), so the awaiter
+// is already waiting when the result is handed over.
+BEZEL_TEST(async_object_result_teardown_5949,
+          task_object_function_value_through_object_local_after_suspension_looped_30_5) {
+    expectCleanRun(src(
+        "public static async method F(): Task<Object> "
+        "var f := lambda() => 1; var b: Object := f as Object; "
+        "await Task.Delay(1); return b; end F; ",
+        "async method Main(): Task<int>",
+        loopAsync("do using var t := F(); var r := await t; "
+                  "n := n + 4; end;")));
+}
+
+// BASE-GREEN CONTROL (lane contract §7; green on 551624deb, a
+// heap-use-after-free under the plausible wrong fix "the task - or the
+// frame - releases the function value whoever read it", which is #6051's
+// defect). §28.9 (v0.359): a function value is runtime-managed, so one a
+// reader took out of the awaited `Object` and stored stays callable after
+// the task is gone. Four readers in one program, because the corpus runner
+// has no AddressSanitizer leg: a single await; a second await of the same
+// task; a producer that suspends before its `return` (the reader is already
+// waiting); a chained `return await` (§30.5 kind 2). The kept function values
+// are never released (the store takes no reference, #5866), so the oracle is
+// AddressSanitizer without LeakSanitizer. Per i: 3 * (i + 1) + (i + 2);
+// summed over 0..49: 4 * 1225 + 250 = 5150.
+BEZEL_TEST(async_object_result_teardown_5949,
+          control_function_value_read_from_task_object_outlives_task_28_9) {
+    JitResult r = bezel::test::runAotCheckedLenient(R"BZL(
+module M;
+type Fn := () -> int;
+public class Program
+  public static async method F(k: int): Task<Object>
+    var f := lambda() => k + 1; var b: Object := f as Object; return b;
+  end F;
+  public static async method Slow(k: int): Task<Object>
+    var f := lambda() => k + 2; var b: Object := f as Object;
+    await Task.Delay(1);
+    return b;
+  end Slow;
+  public static async method Fwd(k: int): Task<Object>
+    return await F(k);
+  end Fwd;
+  public static async method Main(): Task<int>
+    var fs := new Array<Fn>();
+    for var i in 0..<50 do
+      do using var t := F(i); var r := await t; var g := r as Fn; fs.Add(g!); end;
+      do using var t := F(i); var r := await t; var r2 := await t; var g := r2 as Fn; fs.Add(g!); end;
+      do using var t := Slow(i); var r := await t; var g := r as Fn; fs.Add(g!); end;
+      do using var t := Fwd(i); var r := await t; var g := r as Fn; fs.Add(g!); end;
+    end for;
+    var n: int := 0;
+    for var f in fs do n := n + f(); end for;
+    Console.WriteLine(n);
+    return 0;
+  end Main;
+end Program;
+)BZL");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("5150\n"));
+}
+
 // A value-typed FIELD read is boxed at the return - "no borrow and is not
 // reached" - so the field-read rejection must not fire on it.
 BEZEL_TEST(async_object_result_teardown_5949,

@@ -5308,6 +5308,10 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
     // same T the encoder boxed for.
     const sema::TypeRef* resultBoxedTy =
         channelReceiveAggregateElementTy(un.operand.get());
+    // fix #8743: an `Object` result may be a function value the task holds a
+    // reference to; record its read (see objectAwaitResultReads_).
+    pendingObjectAwaitRead_ =
+        !resultBoxedTy && isPlainObjectRef(ctx_.exprType(un));
     return emitAwaitSuspend(task, resultTy, freeTaskAfter, takeResultAfter,
                             markSpentAfter, deferTaskFree, freeOnFault,
                             /*onFault=*/{}, deferToScopeOnly, drainChainOnTake,
@@ -5335,6 +5339,9 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                        const sema::TypeRef* resultBoxedTy,
                                        const std::function<void(llvm::Value*)>&
                                            faultTail) {
+    // fix #8743: read and reset before anything else can lower an await.
+    const bool recordObjectRead = pendingObjectAwaitRead_;
+    pendingObjectAwaitRead_ = false;
     if (!task) return nullptr;
 
     // Store the awaited task into the frame's pending-task slot so the resumed
@@ -5634,7 +5641,7 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
         builder_.CreateCall(awaitFn, {awaitedTask});
         result = llvm::ConstantPointerNull::get(ptrTy());
     } else {
-        llvm::Value* resPtr =
+        llvm::CallInst* resPtr =
             builder_.CreateCall(awaitFn, {awaitedTask}, "await.result.ptr");
         if (resultBoxedTy) {
             // #5305 / §30.15 / #5305-ff2: the awaited result is the channel
@@ -5651,6 +5658,11 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                            "await.boxed");
         } else {
             result = builder_.CreateLoad(resultTy, resPtr, "await.result");
+            // fix #8743 (§28.9 / §30.5, v0.359): see objectAwaitResultReads_.
+            if (recordObjectRead && resultTy->isPointerTy())
+                objectAwaitResultReads_.emplace_back(
+                    llvm::WeakTrackingVH(resPtr),
+                    llvm::WeakTrackingVH(result));
         }
         // The result is loaded BY VALUE into the await site before the task is
         // freed below, so the value (and the task's freed result buffer) do not

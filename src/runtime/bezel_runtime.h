@@ -1098,6 +1098,18 @@ int8_t bz_task_needs_caller_disposal(void* source);
 // result buffer (owned by the task; valid until bz_task_free). Returns null on error.
 void* bz_task_await_sync(void* task);
 
+// fix #8743 (§28.9 / §30.5, v0.359): the same read for a result codegen has
+// proved is never observed (it reaches no instruction but a store into a slot
+// nothing loads). bz_task_await_sync DISOWNS a function-value result the task
+// holds a reference to (bz_task_fnval_result_release), because its reader may
+// keep the value past the task; this entry leaves that disposer armed.
+void* bz_task_await_sync_unobserved(void* task);
+
+// fix #8743: the result disposer of a `Task<Object>` whose body returned its
+// own reference to a function value; releases it at the task's teardown
+// unless a read disowned it first. Not a function value: left alone.
+void bz_task_fnval_result_release(void* obj);
+
 // Retrieve the error message (valid after bz_task_is_error returns true).
 const char* bz_task_error(void* task);
 

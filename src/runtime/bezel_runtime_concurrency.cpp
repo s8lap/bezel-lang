@@ -1291,9 +1291,35 @@ int8_t bz_task_needs_caller_disposal(void* tp) {
 // inside continuations (g_current_domain != null), and those must not abort.
 // Only the slow-path (task not yet done while inside a domain continuation)
 // would deadlock; that case aborts with a diagnostic message.
-void* bz_task_await_sync(void* tp) {
+// fix #8743 (§28.9 / §30.5, v0.359): the result disposer of a `Task<Object>`
+// whose body returned its own reference to a function value (the producing
+// `return` attaches it; see Emitter::asyncReturnTransfersClosureLocal). §28.9
+// leaves a function value's lifecycle to the runtime, and here the runtime is
+// the last holder: the body's frame gave up the one reference its local held,
+// so the task releases it at teardown. Word 0 is tested first, so a value that
+// is not a function value is left alone (a bounded leak, never a release of a
+// reference another holder owns).
+void bz_task_fnval_result_release(void* obj) {
+    if (obj && bz_obj_is_fnval(obj)) bz_closure_release(obj);
+}
+
+// A function value is not retained by the positions that go on holding it (a
+// collection slot, a capture, a field — the "kept without a reference"
+// convention), so a reader that receives the result pointer could keep it
+// past the task. A read therefore DISOWNS the result by default: the task
+// drops the disposer above and the function value is left alive (the leak
+// the task had before #8743, never a use-after-free). Only
+// bz_task_await_sync_unobserved, which codegen selects for a read it has
+// proved goes nowhere, leaves the disposer armed. Caller holds task->mtx.
+static void bz_task_disown_fnval_result(bz_task_t* task) {
+    if (task->result_disposer == bz_task_fnval_result_release)
+        task->result_disposer = nullptr;
+}
+
+static void* bz_task_await_sync_impl(void* tp, bool observesResult) {
     auto* task = (bz_task_t*)tp;
     std::unique_lock<std::mutex> lk(task->mtx);
+    if (observesResult) bz_task_disown_fnval_result(task);
     // Fast path: already done — return immediately (no blocking, no domain risk).
     // This path is taken by WhenAll/WhenAny internals and by the result-reads
     // inside continuations (g_current_domain != null, task already complete).
@@ -1314,7 +1340,18 @@ void* bz_task_await_sync(void* tp) {
         abort();
     }
     task->cv.wait(lk, [task]{ return task->done; });
+    // The disposer is attached before the task completes, so a blocking read
+    // that started earlier disowns again now that the result exists.
+    if (observesResult) bz_task_disown_fnval_result(task);
     return task->is_error ? nullptr : task->result;
+}
+
+void* bz_task_await_sync(void* tp) {
+    return bz_task_await_sync_impl(tp, /*observesResult=*/true);
+}
+
+void* bz_task_await_sync_unobserved(void* tp) {
+    return bz_task_await_sync_impl(tp, /*observesResult=*/false);
 }
 
 const char* bz_task_error(void* tp) {

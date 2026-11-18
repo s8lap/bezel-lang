@@ -4152,6 +4152,35 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // touch freed memory. // per §30.5 kind 1 + kind 2, v0.252
             // fix #3125: pass borrowedReturn too — see emitAsyncPatternAResultDecision.
             emitAsyncPatternAResultDecision(chainedReturn, borrowedReturn);
+            // fix #8743 (§28.9 / §30.5, v0.359): `var f := lambda() => 1; var
+            // b: Object := f as Object; return b;` under `Task<Object>`. The
+            // result is a function value, runtime-managed (§28.9), so the
+            // decision above attached nothing; and nothing mints the result's
+            // reference, so the one this frame holds through `f` is what the
+            // task received - `f` is not released at scope end (the #8717
+            // guard: releasing it left the result dangling, #6051). The frame
+            // therefore hands its reference to the task, the last holder,
+            // which releases it at teardown (bz_task_fnval_result_release)
+            // unless a reader that may keep the value disowned it first
+            // (bz_task_await_sync). Before bz_task_complete, as above. Only
+            // this direct edge: a `return` routed through a `finally` attaches
+            // nothing and the function value stays kept.
+            if (borrowedReturn && !chainedReturn && rs->value &&
+                objectReclaimThunk_ &&
+                asyncPatternAResultDisposer_ == objectReclaimThunk_ &&
+                asyncReturnTransfersClosureLocal(rs->value.get())) {
+                llvm::Value* otField = builder_.CreateStructGEP(
+                    smStateStruct_, smSelf_, asyncOuterTaskField_);
+                llvm::Value* outerTask =
+                    builder_.CreateLoad(ptrTy(), otField, "fnvalres.outer");
+                auto* setDisposerFn = declareC(
+                    "bz_task_set_result_disposer",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                auto* releaseFn = declareC(
+                    "bz_task_fnval_result_release",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(setDisposerFn, {outerTask, releaseFn});
+            }
             // fix #3788 / §27.5 / §28.9 / §30.5 (v0.286): the BLOCK-bodied twin
             // of #3773 (expression-body async lambda mint, landed in
             // LlvmBackend_Async.cpp ~L2218). This async arm completes the task

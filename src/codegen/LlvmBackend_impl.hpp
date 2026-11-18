@@ -1400,6 +1400,8 @@ public:
         // the finished CFGs. Must run BEFORE the verifier — it is what makes the
         // exposed capture-cell holder reads well-defined.
         fixupCapturedCellHolderReads();
+        // fix #8743: after every fixup that can add a use of an await result.
+        retargetUnobservedObjectAwaitReads();
 #ifndef NDEBUG
         bool wantVerify = true;
 #else
@@ -1961,6 +1963,26 @@ private:
     std::vector<PendingHolderRead> pendingHolderReads_;
     // Runs once from run(), before the module verifier.
     void fixupCapturedCellHolderReads();
+
+    // fix #8743 (§28.9 / §30.5, v0.359): an `await` whose result is `Object`
+    // reads the task's result with bz_task_await_sync, which DISOWNS a
+    // function value the task holds a reference to (the reader may keep it:
+    // a function value is not retained by the positions that go on holding
+    // it). Each such read is recorded here - the runtime call and the load of
+    // the result word - and retargetUnobservedObjectAwaitReads, run once from
+    // run() after every body is lowered, moves the reads whose value provably
+    // goes nowhere onto bz_task_await_sync_unobserved, which leaves the task's
+    // disposer armed. The proof is on the finished IR, so it does not depend
+    // on any walk of the source recognizing every use: every use of the
+    // loaded word is a store into an alloca that nothing loads or passes on
+    // (`var r := await t;` with `r` never mentioned again, or `await t;`).
+    // Anything else - a later load, a frame spill, a call - keeps the default
+    // read. Handles, not raw pointers: a later fixup may erase either
+    // instruction (see PendingHolderRead above).
+    bool pendingObjectAwaitRead_ = false;
+    std::vector<std::pair<llvm::WeakTrackingVH, llvm::WeakTrackingVH>>
+        objectAwaitResultReads_;
+    void retargetUnobservedObjectAwaitReads();
 
     // #429 / §27.5: cells registered by the most-recent lowerLambda call:
     // pairs of (newSlot, captured-decl-or-sym-key) for freshly-boxed,
@@ -22186,6 +22208,18 @@ private:
     // `collectClosureReleaseEligible` walks the declaring body, and a nested
     // lambda's own re-scan leaves the enclosing body's entries alone.
     std::unordered_set<const void*> closureEscapingScopeEndRelease_;
+    // fix #8743 (§28.9 / §30.5, v0.359): `Object` locals `b` of an async
+    // `Task<Object>` body bound by `var b: Object := f as Object;`, where `f`
+    // is a closure local this frame holds the one reference of (a lambda
+    // initializer, never reassigned, its own scope-end release armed) and the
+    // only way either leaves the frame is `return b;`. The forwarded-bind pass
+    // keeps `f` (nothing mints the result's reference, so `f`'s own is what
+    // the task receives); such a `return b;` hands that reference to the task,
+    // which releases it at teardown (asyncReturnTransfersClosureLocal). Keyed
+    // by `b`'s declaration node and rewritten by each
+    // collectClosureReleaseEligible walk of the declaring body.
+    std::unordered_set<const void*> closureObjectReturnTransfer_;
+    bool asyncReturnTransfersClosureLocal(const ast::Expr* valueExpr) const;
     // fix #4434 (§27.5 / §28.9, v0.298): closure-typed locals whose slot is
     // captured by a downstream lambda (the slot lives in `cellVars_` — a heap
     // cell, not a bare ptr). The envdtor's release is the sole owner of the

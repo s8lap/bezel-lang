@@ -36340,6 +36340,21 @@ bool Emitter::isCallBoundedClosureArgPosition(const ast::CallExpr& call,
 // THIS body (a lambda/thunk body whose locals were not walked returns false
 // here → its returns fall back to the retain path, which is safe — at worst
 // a leak, never a UAF/double-free). Parallel to returnedStringLocalOwnsPlusOne.
+// fix #8743 (§28.9 / §30.5, v0.359): is `valueExpr` the `b` of a `return b;`
+// that hands this frame's reference to a function value over to the task -
+// see closureObjectReturnTransfer_. The fn-token test is
+// returnedClosureLocalOwnsPlusOne's: the set describes the body being lowered.
+bool Emitter::asyncReturnTransfersClosureLocal(
+        const ast::Expr* valueExpr) const {
+    if (currentFn_ != closureReleaseEligibleFn_) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(valueExpr);
+    if (!id) return false;
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    return loc && loc->decl &&
+           closureObjectReturnTransfer_.count(
+               static_cast<const void*>(loc->decl)) != 0;
+}
+
 bool Emitter::returnedClosureLocalOwnsPlusOne(const ast::Expr* e) const {
     if (currentFn_ != closureReleaseEligibleFn_) return false;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -38701,6 +38716,13 @@ struct ClosureEscapeWalker {
     // Set when the ReturnStmt stmt() arm visits a value that IS the target
     // ident.
     bool isReturned_ = false;
+    // fix #8743 (§28.9 / §30.5, v0.359): a second walk of a forwarded bind
+    // that asks "does the target leave the frame in any way OTHER than a
+    // `return` of its bare name?" (collectClosureReleaseEligible,
+    // closureObjectReturnTransfer_). With this set, such a `return` outside a
+    // lambda is skipped and only noted in sawIgnoredBareReturn_.
+    bool ignoreBareReturn_ = false;
+    bool sawIgnoredBareReturn_ = false;
     // fix #8480 (§28.9, v0.357): for a target the body ASSIGNS TO
     // (`assignedSomewhere`, pre-seeded by collectClosureReleaseEligible from
     // its ClosureLocalAssignScan), the walk never short-circuits, and it
@@ -39976,6 +39998,11 @@ struct ClosureEscapeWalker {
             // NOT a return transfer of target: the cell's lifetime is the
             // call return, and the existing call-site release handles it. So
             // only the bare-ident case marks isReturned_.
+            if (ignoreBareReturn_ && !inLambda && r->value &&
+                isTargetIdent(r->value.get())) {
+                sawIgnoredBareReturn_ = true;  // fix #8743
+                return;
+            }
             if (r->value && isTargetIdent(r->value.get())) {
                 isReturned_ = true;
                 // fix #8480 (§28.9, v0.357): for an assigned-to target the
@@ -41389,6 +41416,7 @@ void Emitter::collectClosureReleaseEligible(
             const void* bound;
             std::vector<const void*> sources;
             int ownLevel;  // 0 confined, 1 reference-taking, 2 kept
+            const ast::Stmt* boundDecl = nullptr;  // fix #8743: a `var` bind
             bool assignBound = false;  // fix #8743: bound by `b := …`
             // fix #8743: a record local bound by `new RB(… g …)`
             // (recordCtorForwardsTarget). It is walked in recordHolderMode,
@@ -41404,6 +41432,7 @@ void Emitter::collectClosureReleaseEligible(
             LocalDeclInitView v = localDeclInitView(s);
             if (v.init) {
                 ForwardedBind fb{static_cast<const void*>(s), {}, 0};
+                fb.boundDecl = s;
                 for (const void* x : fwdSources) {
                     if (x == static_cast<const void*>(s)) continue;
                     ClosureEscapeWalker xw{ctx_, x};
@@ -41514,6 +41543,81 @@ void Emitter::collectClosureReleaseEligible(
                     int& xl = level[x];
                     if (xl < lv) { xl = lv; changed = true; }
                 }
+            }
+        }
+        // fix #8743 (§28.9 / §30.5, v0.359): `var f := lambda() => 1; var b:
+        // Object := f as Object; return b;` in a body whose `return` mints
+        // nothing. `f` is kept below (level 2): its reference is the one the
+        // result carries. In an async `Task<Object>` body that reference can
+        // be handed to the task, which releases it at teardown - the release
+        // this frame's scope end would have made, deferred to the last
+        // holder (§28.9 leaves a function value's lifecycle to the runtime).
+        // Recorded here, with every condition that makes the handover exact:
+        //   - `b` is a plain `var b: Object := f as Object;`, never
+        //     reassigned, so at `return b;` it holds the cell `f` holds;
+        //   - `f` is a candidate bound to a lambda, never reassigned, whose
+        //     own walk armed its scope-end release (so nothing of `f` leaves
+        //     the frame and the frame holds exactly the one reference);
+        //   - nothing else forwards `f` or `b` out of the frame, and `b`
+        //     itself leaves only by a `return` of its bare name (the second
+        //     walk below ignores exactly those).
+        // Anything short of that leaves `f` kept and never released, as
+        // before. The return site decides the rest (an async `Task<Object>`
+        // method body, no enclosing `finally`).
+        for (const ForwardedBind& fb : binds)
+            closureObjectReturnTransfer_.erase(fb.bound);
+        if (coalesceReturnTransfers) {
+            for (const ForwardedBind& fb : binds) {
+                if (!fb.boundDecl || fb.assignBound || fb.recordHolder ||
+                    fb.ownLevel != 2 || fb.sources.size() != 1)
+                    continue;
+                const void* x = fb.sources[0];
+                if (!closureReleaseEligible_.count(x) ||
+                    assignedLocals.count(x) || assignedLocals.count(fb.bound))
+                    continue;
+                const ast::Node* xDecl = nullptr;
+                for (const ast::Node* c : candidates)
+                    if (static_cast<const void*>(c) == x) xDecl = c;
+                if (!xDecl) continue;
+                LocalDeclInitView xv = localDeclInitView(xDecl);
+                if (xv.isUsing ||
+                    !dynamic_cast<const ast::LambdaExpr*>(xv.init))
+                    continue;
+                LocalDeclInitView bv = localDeclInitView(fb.boundDecl);
+                const sema::TypeRef* bTy =
+                    bv.type ? ctx_.resolvedType(*bv.type) : nullptr;
+                if (bv.isUsing || !isPlainObjectRef(bTy) || bTy->nullable)
+                    continue;
+                auto* asE = dynamic_cast<const ast::TypeTestExpr*>(bv.init);
+                ClosureEscapeWalker xw{ctx_, x};
+                if (!asE || asE->op != "as" || !asE->operand ||
+                    !xw.isTargetIdent(asE->operand.get()) ||
+                    !isPlainObjectRef(ctx_.exprType(*asE)))
+                    continue;
+                // Nothing else carries `f` or `b` out of the frame.
+                auto lvOf = [&](const void* k) {
+                    auto it = level.find(k);
+                    return it == level.end() ? 0 : it->second;
+                };
+                bool sole = lvOf(fb.bound) == 0;
+                for (const ForwardedBind& o : binds) {
+                    if (&o == &fb) continue;
+                    if (std::find(o.sources.begin(), o.sources.end(), x) !=
+                            o.sources.end() &&
+                        std::max(o.ownLevel, lvOf(o.bound)) != 0)
+                        sole = false;
+                }
+                if (!sole) continue;
+                ClosureEscapeWalker tw{ctx_, fb.bound};
+                tw.coalesceReturnTransfers = coalesceReturnTransfers;
+                tw.scrutineeBorrowMode = true;
+                tw.walkWholeBody = true;
+                tw.assignBinds = &assignBinds;
+                tw.ignoreBareReturn_ = true;
+                for (auto& s : body) tw.stmt(s.get());
+                if (tw.sawIgnoredBareReturn_ && !tw.escaped &&
+                    !tw.mayOutliveScope_)
+                    closureObjectReturnTransfer_.insert(fb.bound);
             }
         }
         bool anyDemoted = false;

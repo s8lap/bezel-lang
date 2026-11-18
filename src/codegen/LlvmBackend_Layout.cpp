@@ -6850,6 +6850,61 @@ llvm::Value* Emitter::boxedStorage(llvm::AllocaInst* slot, llvm::Type*& elemTy) 
 // null dereference into a load/store of storage that lives as long as the frame;
 // a cell that is never allocated was already never freed (`free(null)` is a
 // no-op), so nothing here can double-free or free early.
+// fix #8743 (§28.9 / §30.5, v0.359): see objectAwaitResultReads_. A recorded
+// read keeps the default bz_task_await_sync - which disowns a function-value
+// result the task holds a reference to - unless the finished IR proves the
+// result word goes nowhere:
+//   - the runtime call's only user is the load of the result word;
+//   - every user of that load is a store OF it INTO an alloca;
+//   - every user of each such alloca is a store INTO it (the alloca is never
+//     loaded, never stored anywhere, never passed to a call - a frame spill,
+//     a capture cell or a later read of the local each fail this).
+// Then nothing can hold the result past the task, and the read is moved onto
+// bz_task_await_sync_unobserved, leaving the task's own release armed. Any
+// instruction this does not recognize keeps the default: the function value
+// is left alive, never released under a holder.
+void Emitter::retargetUnobservedObjectAwaitReads() {
+    if (objectAwaitResultReads_.empty()) return;
+    llvm::Function* unobservedFn = nullptr;
+    for (const auto& [callVH, loadVH] : objectAwaitResultReads_) {
+        auto* call = llvm::dyn_cast_or_null<llvm::CallInst>(
+            static_cast<llvm::Value*>(callVH));
+        auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(
+            static_cast<llvm::Value*>(loadVH));
+        if (!call || !load || !call->getParent() || !load->getParent())
+            continue;
+        llvm::Function* callee = call->getCalledFunction();
+        if (!callee || callee->getName() != "bz_task_await_sync") continue;
+        if (load->getPointerOperand() != call || !call->hasOneUse()) continue;
+        bool unobserved = true;
+        for (const llvm::User* u : load->users()) {
+            auto* st = llvm::dyn_cast<llvm::StoreInst>(u);
+            auto* slot = st ? llvm::dyn_cast<llvm::AllocaInst>(
+                                  st->getPointerOperand())
+                            : nullptr;
+            if (!slot || st->getValueOperand() != load) {
+                unobserved = false;
+                break;
+            }
+            for (const llvm::User* su : slot->users()) {
+                auto* sst = llvm::dyn_cast<llvm::StoreInst>(su);
+                if (!sst || sst->getPointerOperand() != slot ||
+                    sst->getValueOperand() == slot) {
+                    unobserved = false;
+                    break;
+                }
+            }
+            if (!unobserved) break;
+        }
+        if (!unobserved) continue;
+        if (!unobservedFn)
+            unobservedFn = declareC("bz_task_await_sync_unobserved", ptrTy(),
+                                    {ptrTy()});
+        call->setCalledFunction(unobservedFn);
+    }
+    objectAwaitResultReads_.clear();
+}
+
 void Emitter::fixupCapturedCellHolderReads() {
     if (pendingHolderReads_.empty()) return;
     // Group by function so one DominatorTree serves every read in it.
