@@ -376,10 +376,13 @@ BEZEL_TEST(ownership_owning_choice_param_dispose_7722,
 // higher-order method). On those paths the caller keeps and disposes its
 // own value, so the callee must not dispose it as well.
 //
-// RED on 70912e757 (the first attempt): heap-use-after-free — the callee
-// freed the payload and the caller's scope-end discharge read it. GREEN with
-// the fix: exactly 200 dispositions, no sanitizer report. Each program loops
-// 200x (a one-shot run hides an allocator-reuse UAF).
+// NOT fixed here: a HIGHER-ORDER method that forwards its own parameter
+// through a function value (`Call(f, o) return f(o);` with a target that
+// ignores `o`) still leaks, as on r30-c1 — the forwarder cannot know whether
+// the target moves the value into a local (which disposes it), so it
+// declines (rule (5) of `plainMoveOnlyParamDischargedByCallee`). Discharging
+// it there was the rejected attempt's use-after-free when the target DID
+// move the value (review r42-s87-7722 probes d01 / d02 / d03 / d09).
 // =====================================================================
 namespace {
 const char* kFvPrelude =
@@ -390,125 +393,203 @@ const char* kFvPrelude =
     "  destructor Res.N := Res.N + 1; end destructor; "
     "end Res; "
     "choice OChoice Text(owned r: Res), Empty; end OChoice; ";
-
-void expectExactlyOnce200(const JitResult& r) {
-    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(lastNonEmptyLine(r.stdoutText), "200");
-    BEZEL_EXPECT_FALSE(
-        bezel::test::diagnosticMessageContains(r, "sanitizer fired"));
-}
 }  // namespace
 
-// Review probe b01: a static method reference stored in a local and invoked.
+// Each row below FOLDS the shapes a wrong fix breaks into one program with the
+// named-local shape the fix repairs (`TakeA(a)`, a LEAK on r30-c1), so the row is
+// RED on the base AND red under each wrong fix it names, while the method
+// NAMES keep every shape's admission independent (the predicate is keyed by
+// name). Every shape constructs one `Res` per iteration: 5 shapes x 200
+// iterations = 1000 dispositions, exactly once each, no sanitizer report.
+// MEASURED on r30-c1: 800 and "3200 byte(s) leaked in 200 allocation(s)" (the
+// TakeA part) on all three rows.
+//
+// Row A — the FUNCTION-VALUE TARGETS (review r42-rev-m71 probes b01, b34,
+// b35, b36): a static method reference in a local, a bound instance method
+// reference, a lambda forwarding its OWN parameter to a direct call, and a
+// method reference in a function-typed field. The callee's discharge is ONE
+// decision per BODY, so it must hold for every path that reaches the body
+// (§27.6: a method reference forms a function value over the same method).
+// RED under the wrong fix "decide the callee's discharge from its shape
+// alone" (70912e757: heap-use-after-free, the callee freed the payload and
+// the caller's scope-end discharge read it).
 BEZEL_TEST(ownership_owning_choice_param_dispose_7722,
-           function_value_static_method_ref_disposes_exactly_once) {
-    std::string src = std::string(kFvPrelude) +
-        "class Program "
-        "  public static method Take(o: OChoice): int return 1; end Take; "
-        "  public static method Main() "
-        "    var i := 0; "
-        "    while i < 200 do "
-        "      var f: (OChoice) -> int := Program.Take; "
-        "      var b := OChoice.Text(new Res()); "
-        "      var k := f(b); "
-        "      i := i + 1; "
-        "    end while; "
-        "    Console.WriteLine(Res.N); "
-        "  end Main; "
-        "end Program;";
-    expectExactlyOnce200(runAotChecked(src));
-}
-
-// Review probe b34: a bound INSTANCE method reference (non-virtual).
-BEZEL_TEST(ownership_owning_choice_param_dispose_7722,
-           function_value_instance_method_ref_disposes_exactly_once) {
+           function_value_targets_dispose_exactly_once) {
     std::string src = std::string(kFvPrelude) +
         "class Holder "
         "  public constructor() end constructor; "
-        "  public method Take(o: OChoice): int return 1; end Take; "
+        "  public method Take2(o: OChoice): int return 1; end Take2; "
         "end Holder; "
+        "class Box "
+        "  public F: (OChoice) -> int; "
+        "  public constructor() F := Program.Take4; end constructor; "
+        "end Box; "
         "class Program "
+        "  public static method TakeA(o: OChoice): int return 1; end TakeA; "
+        "  public static method Take1(o: OChoice): int return 1; end Take1; "
+        "  public static method Take3(o: OChoice): int return 1; end Take3; "
+        "  public static method Take4(o: OChoice): int return 1; end Take4; "
         "  public static method Main() "
         "    var i := 0; "
         "    var h := new Holder(); "
+        "    var bx := new Box(); "
+        "    var g := lambda(o: OChoice) => Program.Take3(o); "
         "    while i < 200 do "
-        "      var f: (OChoice) -> int := h.Take; "
-        "      var b := OChoice.Text(new Res()); "
-        "      var k := f(b); "
+        "      var a := OChoice.Text(new Res()); "
+        "      var ka := TakeA(a); "
+        "      var f1: (OChoice) -> int := Program.Take1; "
+        "      var b1 := OChoice.Text(new Res()); "
+        "      var k1 := f1(b1); "
+        "      var f2: (OChoice) -> int := h.Take2; "
+        "      var b2 := OChoice.Text(new Res()); "
+        "      var k2 := f2(b2); "
+        "      var b3 := OChoice.Text(new Res()); "
+        "      var k3 := g(b3); "
+        "      var b4 := OChoice.Text(new Res()); "
+        "      var k4 := bx.F(b4); "
         "      i := i + 1; "
         "    end while; "
         "    Console.WriteLine(Res.N); "
         "  end Main; "
-        "end Program;";
-    expectExactlyOnce200(runAotChecked(src));
+        "end Program; ";
+    JitResult r = runAotChecked(src);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(lastNonEmptyLine(r.stdoutText), "1000");
+    BEZEL_EXPECT_FALSE(
+        bezel::test::diagnosticMessageContains(r, "sanitizer fired"));
 }
 
-// Review probe b35: a lambda that forwards its OWN parameter to a direct call
-// of the method — the lambda's caller still owns the value.
+// Row B — ARGUMENTS THE CALLER'S MARK CANNOT GIVE UP (review r42-rev-s76
+// probes c45, c28, c28b, c14a).
+//   * A property setter that forwards its implicit `value` to a plain
+//     move-only formal (`h1.P := b1`). §23.3 (v0.359): "The setter's implicit
+//     `value` parameter has no modifier by default and takes a borrow of the
+//     property's declared type" — the assignment's source still owns the
+//     value, so the forwarded-to callee must not dispose it.
+//   * A getter / expression property that returns a FIELD, passed to a plain
+//     move-only formal (`TakeG(h2.Get())`, `TakeP(h3.P)`): the receiver
+//     still disposes the field, so the call result is not a fresh value the
+//     callee owns. (Whether `return _f` is admitted at all is #6233's
+//     question; the row pins only that the callee adds no second disposal.)
+//   * `TakeB(b4!)` at a callee that is NOT admitted (it is formed as a
+//     value): §17.8 (v0.359) classifies `x!` "by its position exactly as the
+//     bare read `x` is", but only an admitted callee takes the value, so the
+//     caller's source must keep it here.
+// RED under the wrong fix 16ca39b96 (heap-use-after-free on the setter and
+// getter shapes, and a 200-of-200 leak on the `!` shape: an argument-mark
+// that peeled `!` for every call).
 BEZEL_TEST(ownership_owning_choice_param_dispose_7722,
-           function_value_lambda_forwarding_its_param_disposes_exactly_once) {
+           accessor_value_field_getter_and_bang_arguments_dispose_exactly_once) {
     std::string src = std::string(kFvPrelude) +
+        "class H1 "
+        "  private _k: int := 0; "
+        "  public constructor() end constructor; "
+        "  public property P: OChoice "
+        "    get => OChoice.Empty; "
+        "    set => do _k := Program.TakeS(value); end; "
+        "  end P; "
+        "end H1; "
+        "class H2 "
+        "  private _f: OChoice := OChoice.Empty; "
+        "  public constructor() _f := OChoice.Text(new Res()); end constructor; "
+        "  public method Get(): OChoice return _f; end Get; "
+        "end H2; "
+        "class H3 "
+        "  private _f: OChoice := OChoice.Empty; "
+        "  public constructor() _f := OChoice.Text(new Res()); end constructor; "
+        "  public property P: OChoice => _f; "
+        "end H3; "
         "class Program "
-        "  public static method Take(o: OChoice): int return 1; end Take; "
+        "  public static method TakeA(o: OChoice): int return 1; end TakeA; "
+        "  public static method TakeS(o: OChoice): int return 1; end TakeS; "
+        "  public static method TakeG(o: OChoice): int return 1; end TakeG; "
+        "  public static method TakeP(o: OChoice): int return 1; end TakeP; "
+        "  public static method TakeB(o: OChoice): int return 1; end TakeB; "
         "  public static method Main() "
+        "    var fb: (OChoice) -> int := Program.TakeB; "
         "    var i := 0; "
-        "    var g := lambda(o: OChoice) => Program.Take(o); "
         "    while i < 200 do "
-        "      var b := OChoice.Text(new Res()); "
-        "      var k := g(b); "
+        "      var a := OChoice.Text(new Res()); "
+        "      var ka := TakeA(a); "
+        "      var h1 := new H1(); "
+        "      var b1 := OChoice.Text(new Res()); "
+        "      h1.P := b1; "
+        "      var h2 := new H2(); "
+        "      var k2 := TakeG(h2.Get()); "
+        "      var h3 := new H3(); "
+        "      var k3 := TakeP(h3.P); "
+        "      var b4: OChoice? := OChoice.Text(new Res()); "
+        "      var k4 := TakeB(b4!); "
         "      i := i + 1; "
         "    end while; "
         "    Console.WriteLine(Res.N); "
         "  end Main; "
-        "end Program;";
-    expectExactlyOnce200(runAotChecked(src));
+        "end Program; ";
+    JitResult r = runAotChecked(src);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(lastNonEmptyLine(r.stdoutText), "1000");
+    BEZEL_EXPECT_FALSE(
+        bezel::test::diagnosticMessageContains(r, "sanitizer fired"));
 }
 
-// Review probe b36: a method reference held in a function-typed FIELD.
+// Row C — A METHOD THAT HANDS ITS OWN PARAMETER TO A BODY ITS SCOPE END
+// CANNOT SEE: through a function value whose target moves the value into a
+// local (a method, `CallM`, and a lambda, `CallL`), as an indexer argument
+// whose getter moves it (`FwdIx`), and through a function-typed field
+// (`FwdBox`). None of those calls zero-stores the forwarder's parameter slot,
+// and the target disposes the local it moved the value into, so the
+// forwarder must not dispose the parameter as well (§15.3 *Parameter
+// passing*, v0.359: "for a move-only V, it is by value-move (transfer
+// ownership)"; §28.3: exactly once on every path).
+// RED under the wrong fix 16ca39b96 (heap-use-after-free: it admitted the
+// forwarder because only DIRECT-call arguments were scanned).
 BEZEL_TEST(ownership_owning_choice_param_dispose_7722,
-           function_value_method_ref_in_field_disposes_exactly_once) {
+           parameter_forwarded_to_an_unseen_body_disposes_exactly_once) {
     std::string src = std::string(kFvPrelude) +
+        "class Ix "
+        "  public constructor() end constructor; "
+        "  public property [o: OChoice]: int "
+        "    get => do var x := o; return 1; end; "
+        "  end; "
+        "end Ix; "
         "class Box "
         "  public F: (OChoice) -> int; "
-        "  public constructor() F := Program.Take; end constructor; "
+        "  public constructor() F := lambda(o: OChoice) => do var x := o; return 1; end; end constructor; "
         "end Box; "
         "class Program "
-        "  public static method Take(o: OChoice): int return 1; end Take; "
+        "  public static method TakeA(o: OChoice): int return 1; end TakeA; "
+        "  public static method Keep(o: OChoice): int var x := o; return 1; end Keep; "
+        "  public static method CallM(f: (OChoice) -> int, o: OChoice): int return f(o); end CallM; "
+        "  public static method CallL(f: (OChoice) -> int, o: OChoice): int return f(o); end CallL; "
+        "  public static method FwdIx(h: Ix, o: OChoice): int return h[o]; end FwdIx; "
+        "  public static method FwdBox(bx: Box, o: OChoice): int return bx.F(o); end FwdBox; "
         "  public static method Main() "
         "    var i := 0; "
+        "    var h := new Ix(); "
         "    var bx := new Box(); "
         "    while i < 200 do "
-        "      var b := OChoice.Text(new Res()); "
-        "      var k := bx.F(b); "
+        "      var a := OChoice.Text(new Res()); "
+        "      var ka := TakeA(a); "
+        "      var k1 := CallM(Program.Keep, OChoice.Text(new Res())); "
+        "      var k2 := CallL(lambda(o: OChoice) => do var x := o; return 1; end, OChoice.Text(new Res())); "
+        "      var b3 := OChoice.Text(new Res()); "
+        "      var k3 := FwdIx(h, b3); "
+        "      var b4 := OChoice.Text(new Res()); "
+        "      var k4 := FwdBox(bx, b4); "
         "      i := i + 1; "
         "    end while; "
         "    Console.WriteLine(Res.N); "
         "  end Main; "
-        "end Program;";
-    expectExactlyOnce200(runAotChecked(src));
-}
-
-// Review probe b02: a HIGHER-ORDER method that forwards its own parameter to
-// a function value bound to the method. (On r30-c1 this leaked; the first
-// attempt traded the leak for a use-after-free.)
-BEZEL_TEST(ownership_owning_choice_param_dispose_7722,
-           function_value_higher_order_forward_disposes_exactly_once) {
-    std::string src = std::string(kFvPrelude) +
-        "class Program "
-        "  public static method Take(o: OChoice): int return 1; end Take; "
-        "  public static method Call(f: (OChoice) -> int, o: OChoice): int "
-        "    return f(o); "
-        "  end Call; "
-        "  public static method Main() "
-        "    var i := 0; "
-        "    while i < 200 do "
-        "      var k := Call(Program.Take, OChoice.Text(new Res())); "
-        "      i := i + 1; "
-        "    end while; "
-        "    Console.WriteLine(Res.N); "
-        "  end Main; "
-        "end Program;";
-    expectExactlyOnce200(runAotChecked(src));
+        "end Program; ";
+    JitResult r = runAotChecked(src);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(lastNonEmptyLine(r.stdoutText), "1000");
+    BEZEL_EXPECT_FALSE(
+        bezel::test::diagnosticMessageContains(r, "sanitizer fired"));
 }

@@ -10103,7 +10103,24 @@ void Emitter::markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call,
             emitEnsureStaticInit(ms->parent);
             hoistStaticInit = false;  // once, ahead of the first zero-store
         }
-        markOwningChoiceArgMovedFrom(a.value.get());
+        // fix #7722 (§17.8, v0.359): at an ADMITTED plain move-only formal the
+        // null-forgiving read is the same transfer as the bare read. §17.8:
+        // "The null-forgiving operator preserves ownership ... it does not
+        // move, copy, or borrow beyond what reading `x` already does", and
+        // "Over a named owned binding, `x!` is therefore classified by its
+        // position exactly as the bare read `x` is". So `Take(b!)` moves `b`
+        // into a callee that now disposes it, and the pre-call mark must zero
+        // `b`'s slot. ONLY here: peeling `!` for every argument mark (the
+        // post-dispatch sweep at a DECLINED callee included) zeroed `b` where
+        // the callee does not dispose it, so nobody did (MEASURED, review
+        // r42-rev-s76: c14a / c14d / c14e, clean on r30-c1, leaked 200 of
+        // 200). The scan's argument-shape rule classifies `b!` as `b`, so the
+        // callee's admission and this mark agree.
+        const ast::Expr* src = a.value.get();
+        if (plainMoveOnlyFormal)
+            if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(src))
+                src = pb->operand.get();
+        markOwningChoiceArgMovedFrom(src);
     }
 }
 

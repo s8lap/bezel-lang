@@ -9184,22 +9184,6 @@ void Emitter::markOwningChoiceMovedFromCore(const ast::LocalDecl* targetLd,
                 sid = dynamic_cast<const ast::IdentifierExpr*>(
                     u->operand.get());
     }
-    // fix #7722 (§17.8 / §15.3, v0.359): the NULL-FORGIVING read is the same
-    // transfer. §17.8: "The null-forgiving operator preserves ownership ... it
-    // does not move, copy, or borrow beyond what reading `x` already does",
-    // and "Over a named owned binding, `x!` is therefore classified by its
-    // position exactly as the bare read `x` is" — so `Take(b!)` at a plain
-    // move-only formal moves `b` exactly as `Take(b)` does, and the source
-    // must be marked moved-from on that spelling too. The local-target entry
-    // above already peels the `!` (fix #7725 / #7726); the ARGUMENT path
-    // (this core, reached from `markOwningChoiceArgMovedFrom`) did not, so
-    // `b!` kept its scope-end active-case disposal beside the callee's —
-    // a double free (the same shape the `move` spelling had, which the
-    // `move` peel above already covers).
-    if (!sid) {
-        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(srcExpr))
-            sid = dynamic_cast<const ast::IdentifierExpr*>(pb->operand.get());
-    }
     if (!sid) return;
     sema::Symbol* ssym = ctx_.exprSymbol(*sid);
     if (!ssym) return;
