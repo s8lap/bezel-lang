@@ -2,6 +2,7 @@
 #include "sema/TypeResolution_impl.hpp"
 
 #include <algorithm>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -9,6 +10,7 @@
 #include "ast/Node.hpp"
 #include "common/BuiltinRegistry.hpp"
 #include "sema/Symbol.hpp"
+#include "sema/TypeInstantiationSites.hpp"
 #include "sema/TypeRef.hpp"
 
 namespace bezel::sema {
@@ -241,6 +243,9 @@ bool isNonNullableReferenceType(const TypeRef* t) {
 }
 
 void Resolver::run(const ast::SourceFile& src) {
+    // fix #6767: clear this context's published sites first, so a context
+    // allocated where an earlier one lived never reads that one's list.
+    publishTypeInstantiations(ctx_, {});
     // §2.8.1 rule 4 (v0.188): "An `import` naming the enclosing file's own
     // module is rejected ('a module cannot import itself')." The enclosing
     // file's own module name is whatever this file's own `module Name;`
@@ -988,6 +993,57 @@ void Resolver::run(const ast::SourceFile& src) {
     // Immediately after its sibling so the two §14.6 verdicts are adjacent in
     // both the source and the diagnostic order.
     checkExpandingGenericMemberEdges();
+    // fix #6767 (§3.6 rule 2, §9.4, v0.359): hand every recorded generic-type
+    // instantiation site to the ownership pass, whose §9.4 per-instantiation
+    // receiver-capture requirement is known only after it reads the member
+    // bodies (TypeInstantiationSites.hpp).
+    std::vector<RecordedTypeInstantiation> published;
+    published.reserve(instantiations_.size());
+    for (const GenericInstantiation& inst : instantiations_) {
+        RecordedTypeInstantiation r;
+        r.type = inst.type;
+        r.enclosingType = inst.enclosingType;
+        r.argRefs = inst.argRefs;
+        r.argAsts = inst.argAsts;
+        r.siteKey = inst.siteKey;
+        r.loc = inst.loc;
+        r.methodGenericParams = inst.methodGenericParams;
+        published.push_back(std::move(r));
+    }
+    publishTypeInstantiations(ctx_, std::move(published));
+}
+
+// fix #6767: the side table TypeInstantiationSites.hpp documents, keyed by the
+// context it was recorded on.
+namespace {
+std::mutex& typeInstantiationsMutex() {
+    static std::mutex m;
+    return m;
+}
+std::unordered_map<const SemaContext*, std::vector<RecordedTypeInstantiation>>&
+typeInstantiationsByContext() {
+    static std::unordered_map<const SemaContext*,
+                              std::vector<RecordedTypeInstantiation>>
+        table;
+    return table;
+}
+}  // namespace
+
+void publishTypeInstantiations(const SemaContext& ctx,
+                               std::vector<RecordedTypeInstantiation> sites) {
+    std::lock_guard<std::mutex> lock(typeInstantiationsMutex());
+    typeInstantiationsByContext()[&ctx] = std::move(sites);
+}
+
+std::vector<RecordedTypeInstantiation> takeTypeInstantiations(
+    const SemaContext& ctx) {
+    std::lock_guard<std::mutex> lock(typeInstantiationsMutex());
+    auto& table = typeInstantiationsByContext();
+    auto it = table.find(&ctx);
+    if (it == table.end()) return {};
+    std::vector<RecordedTypeInstantiation> out = std::move(it->second);
+    table.erase(it);
+    return out;
 }
 
 // fix #4702 (§9.3 "Combined form" / §9.9 "Constructor-only records",

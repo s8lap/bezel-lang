@@ -30,7 +30,39 @@ struct RecordSubstEnv;  // §9.7/#2145 instantiation-site substitution env
                         // (common/OwnershipFacts.hpp); pointer-only here
 }  // namespace bezel::common
 
+namespace bezel::sema {
+struct RecordedTypeInstantiation;  // sema/TypeInstantiationSites.hpp (#6767)
+}  // namespace bezel::sema
+
 namespace bezel::ownership {
+
+// fix #6767 (§9.4, §3.6 rule 2, v0.359): one member of a GENERIC record whose
+// body forms a closure over `this` at a §28.3 sink (returned, or stored in a
+// field, property, indexer or collection, or written through an `out`/`ref`
+// parameter) where the record's declaration holds no borrow — its components
+// typed by a type parameter. §9.4: "For a generic value kind both counts are
+// read at each instantiation (§3.6 rule 2)", so whether the closure's copy of
+// the receiver carries a borrow is a property of each constructed type, and
+// §3.6 rule 2 makes it "a requirement of the constructed type, checked at
+// every site that names it whether or not the program reaches that member".
+// The member bodies record these while the pass runs; checkOwnership joins
+// them against the recorded instantiation sites at its end
+// (MethodOwnership::checkGenericReceiverCaptureInstantiations).
+struct GenericReceiverCaptureObligation {
+    const sema::TypeSymbol* record = nullptr;  // the generic record
+    std::string member;    // the member whose body forms the closure
+    std::string what;      // the sink, worded as reportReceiverCaptureAtSink
+    std::string capture;   // `this` / `base` / the implicit-`this` member
+    SourceLocation loc;    // the capturing identifier
+    const ast::IdentifierExpr* id = nullptr;  // dedup key (a body may be
+                                              // walked more than once)
+};
+// The collector checkOwnership installs for the duration of one pass (null
+// outside one: a MethodOwnership run elsewhere records nothing).
+std::vector<GenericReceiverCaptureObligation>*
+activeGenericReceiverCaptureObligations();
+void setActiveGenericReceiverCaptureObligations(
+    std::vector<GenericReceiverCaptureObligation>* sink);
 
 // fix #7483 (§15.3 *Parameter passing* / §22.3, v0.355): is this formal's
 // DECLARED TYPE a MOVE-ONLY VALUE TYPE — the owning inline array
@@ -528,6 +560,18 @@ public:
     // (receiverCarriesBorrowForSink): a class or interface, or a record or
     // choice that holds borrows (§9.7, §35.4); tracker #6721.
     void setReceiverType(sema::TypeSymbol* ts) { receiverType_ = ts; }
+    // fix #6767: the instance member whose body is analysed, named by the
+    // per-instantiation receiver-capture diagnostic.
+    void setReceiverMemberName(std::string name) {
+        receiverMemberName_ = std::move(name);
+    }
+    // fix #6767: the end-of-pass join — every site naming an instantiation
+    // of an obligated record (directly, or through a chain of generic types
+    // whose parameter it is substituted by) whose receiver holds a borrow
+    // is rejected at that site.
+    void checkGenericReceiverCaptureInstantiations(
+        const std::vector<GenericReceiverCaptureObligation>& obligations,
+        const std::vector<sema::RecordedTypeInstantiation>& sites);
 
     // fix #5252 (§23.3 / §28.3, v0.313): the implicit `value` parameter of a
     // `set(owned)` accessor whose body is being analysed (null for every
@@ -5021,6 +5065,20 @@ private:
     // the capturing identifier (`this`, `base`, or the implicit-`this` member
     // name) of the first such lambda in `e`, or null.
     const ast::IdentifierExpr* receiverCaptureIn(const ast::Expr& e) const;
+    // fix #6767: the same search without the receiverCarriesBorrowForSink
+    // gate (a generic record's per-instantiation leg).
+    const ast::IdentifierExpr* findReceiverCapture(const ast::Expr& e) const;
+    // fix #6767 (§9.4, §3.6 rule 2, v0.359): the receiver-capture leg at one
+    // sink `e` (`what` names it). A receiver that carries a borrow at its
+    // declaration is rejected here; a GENERIC record's is recorded as a
+    // GenericReceiverCaptureObligation, decided at each instantiation.
+    void checkReceiverCaptureAtSink(const ast::Expr& e,
+                                    const std::string& what);
+    // fix #6767: does the constructed record type `inst` (a Named TypeRef
+    // whose genericArgs are the instantiation's) hold a borrow — the
+    // receiverCarriesBorrowForSink walk, under the instantiation's
+    // substitution.
+    bool recordInstantiationCarriesBorrow(const sema::TypeRef* inst) const;
     // True when the receiver's `this` carries a borrow the sink rule judges:
     // a class or interface receiver, or a borrow-bearing record or choice
     // (§9.7, §35.4). A borrow-free value receiver's copy contributes nothing
@@ -5450,6 +5508,8 @@ private:
     const sema::ConstructorSymbol* enclosingCtor_ = nullptr;
     // fix #6630 / #6634: see setReceiverType above.
     sema::TypeSymbol* receiverType_ = nullptr;
+    // fix #6767: see setReceiverMemberName above.
+    std::string receiverMemberName_;
     // fix #6630 / #6634: widens collectIdentifiersIn to every Expr-bearing
     // kind for the receiver-capture leg only (see collectIdentifiersIn).
     mutable bool deepCaptureWalk_ = false;

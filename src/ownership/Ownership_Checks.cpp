@@ -20,6 +20,7 @@
 #include "common/BuiltinRegistry.hpp"  // #1985: isBuiltinExceptionName
 #include "common/DisposalKind.hpp"     // #7406: isRuntimeManagedValue
 #include "common/OwnershipFacts.hpp"  // #1801: bare-type-parameter source set
+#include "sema/TypeInstantiationSites.hpp"  // fix #6767
 #include "common/PatternAResultCollection.hpp"  // fix #3638: the both-sides
                                                 // §30.5 Pattern A
                                                 // intrinsic-collection result
@@ -9347,6 +9348,12 @@ bool MethodOwnership::receiverIsMoveOnlyChoice() const {
 const ast::IdentifierExpr* MethodOwnership::receiverCaptureIn(
     const ast::Expr& e) const {
     if (!receiverCarriesBorrowForSink()) return nullptr;
+    return findReceiverCapture(e);
+}
+
+const ast::IdentifierExpr* MethodOwnership::findReceiverCapture(
+    const ast::Expr& e) const {
+    if (!receiverType_) return nullptr;
     std::vector<const ast::LambdaExpr*> lambdas;
     std::function<void(const ast::Expr&)> findLambdas =
         [&](const ast::Expr& x) {
@@ -9429,6 +9436,353 @@ void MethodOwnership::reportReceiverCaptureAtSink(
            "§28.14)");
 }
 
+// fix #6767 (§9.4, §3.6 rule 2, v0.359): see GenericReceiverCaptureObligation
+// (Ownership_impl.hpp). The collector checkOwnership installs.
+namespace {
+thread_local std::vector<GenericReceiverCaptureObligation>*
+    tlGenericReceiverCaptureObligations = nullptr;
+}  // namespace
+
+std::vector<GenericReceiverCaptureObligation>*
+activeGenericReceiverCaptureObligations() {
+    return tlGenericReceiverCaptureObligations;
+}
+
+void setActiveGenericReceiverCaptureObligations(
+    std::vector<GenericReceiverCaptureObligation>* sink) {
+    tlGenericReceiverCaptureObligations = sink;
+}
+
+void MethodOwnership::checkReceiverCaptureAtSink(const ast::Expr& e,
+                                                 const std::string& what) {
+    if (!receiverType_) return;
+    if (receiverCarriesBorrowForSink()) {
+        if (const ast::IdentifierExpr* cap = findReceiverCapture(e))
+            reportReceiverCaptureAtSink(*cap, what);
+        return;
+    }
+    // §9.4 (v0.359): "For a generic value kind both counts are read at each
+    // instantiation (§3.6 rule 2)". A generic RECORD whose declaration holds
+    // no borrow — the components typed by a type parameter read as holding
+    // none there — holds one at an instantiation that substitutes a type
+    // that does (§9.7: "Reference-typed fields in records are always
+    // borrows"). Record the member's requirement; the instantiation sites
+    // decide it. (A generic choice is judged at its declaration, its
+    // type-parameter payloads read as holding borrows there — #6767's
+    // recorded residual.)
+    if (receiverType_->kind != ast::TypeDeclKind::Record ||
+        receiverType_->genericParams.empty())
+        return;
+    std::vector<GenericReceiverCaptureObligation>* sink =
+        activeGenericReceiverCaptureObligations();
+    if (!sink) return;
+    const ast::IdentifierExpr* cap = findReceiverCapture(e);
+    if (!cap) return;
+    for (const GenericReceiverCaptureObligation& o : *sink)
+        if (o.id == cap && o.what == what) return;
+    GenericReceiverCaptureObligation o;
+    o.record = receiverType_;
+    o.member = receiverMemberName_;
+    o.what = what;
+    o.capture = std::string(cap->name);
+    o.loc = cap->span.begin;
+    o.id = cap;
+    sink->push_back(std::move(o));
+}
+
+// The receiverCarriesBorrowForSink record walk, read under the
+// instantiation's substitution: §9.7's field kinds over every instance storage
+// member, auto-properties included (#6708), each bare-parameter component
+// resolved to its type argument (#2145's RecordSubstEnv).
+bool MethodOwnership::recordInstantiationCarriesBorrow(
+    const sema::TypeRef* inst) const {
+    if (!inst || inst->kind != sema::TypeRef::Kind::Named ||
+        !inst->declaration ||
+        inst->declaration->kind != ast::TypeDeclKind::Record)
+        return false;
+    if (isBorrowBearingRecordOrSpan(inst)) return true;
+    common::RecordSubstEnv env;
+    common::seedRecordSubstEnv(*inst->declaration, *inst, nullptr, env);
+    const common::RecordSubstEnv* envp = env.map.empty() ? nullptr : &env;
+    bool carries = false;
+    std::unordered_set<const sema::TypeRef*> seen;
+    seen.insert(inst);
+    sema::recordStorageMembers(
+        inst->declaration, ctx_, [&](const sema::RecordStorageMember& rsm) {
+            if (rsm.type && recordFieldIsBorrowCarrying(rsm.type, seen, envp)) {
+                carries = true;
+                return false;  // stop
+            }
+            return true;
+        });
+    return carries;
+}
+
+namespace {
+// The spelling of a resolved type argument, for the diagnostic.
+std::string spellTypeArgForDiag(const sema::TypeRef* t) {
+    if (!t) return "?";
+    std::string out;
+    switch (t->kind) {
+        case sema::TypeRef::Kind::Named: {
+            out = t->declaration ? std::string(t->declaration->name)
+                                 : std::string(t->headName());
+            if (!t->genericArgs.empty()) {
+                out += "<";
+                for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                    if (i) out += ", ";
+                    out += spellTypeArgForDiag(t->genericArgs[i]);
+                }
+                out += ">";
+            }
+            break;
+        }
+        case sema::TypeRef::Kind::InlineArray:
+            out = std::string("[") +
+                  (t->arraySizeValue >= 0 ? std::to_string(t->arraySizeValue)
+                                          : std::string("N")) +
+                  (t->arrayOwned ? " owned]" : "]") +
+                  spellTypeArgForDiag(t->arrayElement);
+            break;
+        case sema::TypeRef::Kind::Primitive: {
+            using P = sema::PrimitiveType;
+            switch (t->primitive) {
+                case P::Bool: out = "bool"; break;
+                case P::Char: out = "char"; break;
+                case P::String: out = "string"; break;
+                case P::Byte: out = "byte"; break;
+                case P::SByte: out = "sbyte"; break;
+                case P::Short: out = "short"; break;
+                case P::UShort: out = "ushort"; break;
+                case P::Int: out = "int"; break;
+                case P::UInt: out = "uint"; break;
+                case P::Long: out = "long"; break;
+                case P::ULong: out = "ulong"; break;
+                case P::Float: out = "float"; break;
+                case P::Double: out = "double"; break;
+                case P::Decimal: out = "decimal"; break;
+                case P::Object: out = "Object"; break;
+                case P::None: out = "the type argument"; break;
+            }
+            break;
+        }
+        default:
+            out = "the type argument";
+            break;
+    }
+    if (t->nullable) out += "?";
+    return out;
+}
+
+// A bare type-parameter argument naming a parameter of `enclosing` (and not
+// one the enclosing generic METHOD binds): the chained case, whose argument
+// is decided at `enclosing`'s own instantiations. Returns that parameter's
+// index, or npos.
+std::size_t chainedParamIndex(
+    const sema::TypeRef* arg, const sema::TypeSymbol* enclosing,
+    const std::vector<ast::GenericParam>* methodParams) {
+    constexpr std::size_t npos = static_cast<std::size_t>(-1);
+    if (!arg || arg->kind != sema::TypeRef::Kind::Named || arg->declaration ||
+        !arg->genericArgs.empty() || !enclosing)
+        return npos;
+    const std::string_view n = arg->headName();
+    if (methodParams)
+        for (const ast::GenericParam& gp : *methodParams)
+            if (gp.name == n) return npos;  // the method's, not tracked here
+    for (std::size_t i = 0; i < enclosing->genericParams.size(); ++i)
+        if (enclosing->genericParams[i] &&
+            enclosing->genericParams[i]->name == n)
+            return i;
+    return npos;
+}
+}  // namespace
+
+void MethodOwnership::checkGenericReceiverCaptureInstantiations(
+    const std::vector<GenericReceiverCaptureObligation>& obligations,
+    const std::vector<sema::RecordedTypeInstantiation>& sites) {
+    constexpr std::size_t npos = static_cast<std::size_t>(-1);
+    // The obligated records, in the order their obligations were recorded
+    // (deterministic: the pass walks declarations in source order).
+    std::vector<const GenericReceiverCaptureObligation*> firstPerRecord;
+    for (const GenericReceiverCaptureObligation& o : obligations) {
+        bool have = false;
+        for (const GenericReceiverCaptureObligation* f : firstPerRecord)
+            if (f->record == o.record) have = true;
+        if (!have) firstPerRecord.push_back(&o);
+    }
+    // One diagnostic per (site, record).
+    std::set<std::pair<const void*, const sema::TypeSymbol*>> reported;
+    for (const GenericReceiverCaptureObligation* ob : firstPerRecord) {
+        const sema::TypeSymbol* rec = ob->record;
+        // A pending chain: `rec`'s arguments `tmpl`, whose positions `pos`
+        // hold the bare parameter `param` of the generic type `type`; the
+        // argument `type`'s instantiations give it decides the requirement.
+        struct Pending {
+            const sema::TypeSymbol* type;
+            std::size_t param;
+            std::vector<sema::TypeRef*> tmpl;
+            std::vector<std::size_t> pos;
+            std::vector<std::string> chain;  // the types between, outermost last
+        };
+        std::vector<Pending> work;
+        std::set<std::pair<const sema::TypeSymbol*, std::size_t>> seen;
+        auto judge = [&](const std::vector<sema::TypeRef*>& args,
+                         const sema::RecordedTypeInstantiation& site,
+                         const std::vector<std::string>& chain) {
+            for (const sema::TypeRef* a : args)
+                if (!a || a->kind == sema::TypeRef::Kind::Error) return;
+            sema::TypeRef inst;
+            inst.kind = sema::TypeRef::Kind::Named;
+            inst.declaration = const_cast<sema::TypeSymbol*>(rec);
+            inst.genericArgs = args;
+            if (!recordInstantiationCarriesBorrow(&inst)) return;
+            if (!reported.insert({site.siteKey ? site.siteKey : &site, rec})
+                     .second)
+                return;
+            // §3.6 rule 2: "a diagnostic naming the property, the offending
+            // type argument, and the structural reason".
+            std::string offending;
+            for (std::size_t i = 0; i < args.size(); ++i) {
+                std::unordered_set<const sema::TypeRef*> seenArg;
+                if (!recordFieldIsBorrowCarrying(args[i], seenArg, nullptr))
+                    continue;
+                std::string pn =
+                    i < rec->genericParams.size() && rec->genericParams[i]
+                        ? std::string(rec->genericParams[i]->name)
+                        : std::string("?");
+                if (!offending.empty()) offending += ", ";
+                offending += "`" + spellTypeArgForDiag(args[i]) +
+                             "` for `" + pn + "`";
+            }
+            const std::string instName =
+                spellTypeArgForDiag(&inst);
+            std::string via;
+            if (!chain.empty()) {
+                via = " (reached through ";
+                for (std::size_t i = 0; i < chain.size(); ++i) {
+                    if (i) via += ", then ";
+                    via += chain[i];
+                }
+                via += ")";
+            }
+            report(Severity::Error, site.loc,
+                   std::string("this site names `") + instName + "`" + via +
+                   ", an instantiation of the generic record `" +
+                   std::string(rec->name) + "` whose receiver value holds "
+                   "borrows" +
+                   (offending.empty() ? std::string()
+                                      : " — the type argument " + offending +
+                                            " is or holds a reference, and a "
+                                            "record's reference-typed fields "
+                                            "are borrows (§9.7)") +
+                   "; `" + std::string(rec->name) + "`'s member `" +
+                   (ob->member.empty() ? std::string("?") : ob->member) +
+                   "` forms a closure that captures " +
+                   (ob->capture == "this" || ob->capture == "base"
+                        ? "`" + ob->capture + "`"
+                        : "the receiver (`" + ob->capture + "` reads `this`)") +
+                   " (line " + std::to_string(ob->loc.line) + ") and is " +
+                   ob->what + ", and at this instantiation that closure "
+                   "captures a copy of the receiver value carrying those "
+                   "borrows, so its source set is non-empty and the §28.3 sink "
+                   "rule rejects it (§9.4, v0.359: for a generic value kind "
+                   "both counts are read at each instantiation; §3.6 rule 2: "
+                   "the requirement belongs to the constructed type and is "
+                   "checked at every site that names it, whether or not the "
+                   "member is reached). Copy the data the closure needs into "
+                   "a local and capture that, or pass the closure to a "
+                   "`scoped` parameter (§28.14)");
+        };
+        auto enqueueChains = [&](const std::vector<sema::TypeRef*>& tmpl,
+                                 const std::vector<std::size_t>& candidates,
+                                 const std::vector<sema::TypeRef*>& args,
+                                 const sema::RecordedTypeInstantiation& site,
+                                 const std::vector<std::string>& chain) {
+            // Group the candidate positions by the enclosing parameter their
+            // argument names.
+            std::vector<std::pair<std::size_t, std::vector<std::size_t>>> groups;
+            for (std::size_t c : candidates) {
+                if (c >= args.size()) continue;
+                const std::size_t pi = chainedParamIndex(
+                    args[c], site.enclosingType, site.methodGenericParams);
+                if (pi == npos) continue;
+                bool placed = false;
+                for (auto& g : groups)
+                    if (g.first == pi) {
+                        g.second.push_back(c);
+                        placed = true;
+                    }
+                if (!placed) groups.push_back({pi, {c}});
+            }
+            for (auto& g : groups) {
+                Pending p;
+                p.type = site.enclosingType;
+                p.param = g.first;
+                p.tmpl = tmpl;
+                // Translate the grouped ARG positions to template positions.
+                p.pos = g.second;
+                p.chain = chain;
+                p.chain.insert(p.chain.begin(),
+                               "`" + std::string(site.enclosingType->name) +
+                                   "`'s type parameter `" +
+                                   std::string(site.enclosingType
+                                                   ->genericParams[g.first]
+                                                   ->name) +
+                                   "`");
+                work.push_back(std::move(p));
+            }
+        };
+        // Direct sites: `rec<…>` named with its own arguments.
+        for (const sema::RecordedTypeInstantiation& site : sites) {
+            if (site.type != rec) continue;
+            judge(site.argRefs, site, {});
+            std::vector<std::size_t> all;
+            for (std::size_t i = 0; i < site.argRefs.size(); ++i)
+                all.push_back(i);
+            enqueueChains(site.argRefs, all, site.argRefs, site, {});
+        }
+        // Chained sites: `Outer<U>` holding `rec<U>`, decided at each
+        // `Outer<X>` (§3.6 rule 2: "a requirement of that instantiation ...
+        // is decided ... at the instantiations the declaration's own
+        // instantiations form by substitution ... through any chain of such
+        // declarations, the diagnostic landing at the first site whose
+        // argument decides the requirement and naming the chain").
+        while (!work.empty()) {
+            Pending p = std::move(work.back());
+            work.pop_back();
+            if (!seen.insert({p.type, p.param}).second) continue;
+            for (const sema::RecordedTypeInstantiation& site : sites) {
+                if (site.type != p.type) continue;
+                if (p.param >= site.argRefs.size()) continue;
+                sema::TypeRef* arg = site.argRefs[p.param];
+                if (!arg || arg->kind == sema::TypeRef::Kind::Error) continue;
+                std::vector<sema::TypeRef*> args = p.tmpl;
+                for (std::size_t i : p.pos)
+                    if (i < args.size()) args[i] = arg;
+                judge(args, site, p.chain);
+                // Still a bare parameter one level out: keep re-keying.
+                const std::size_t pi = chainedParamIndex(
+                    arg, site.enclosingType, site.methodGenericParams);
+                if (pi == npos) continue;
+                Pending q;
+                q.type = site.enclosingType;
+                q.param = pi;
+                q.tmpl = p.tmpl;
+                q.pos = p.pos;
+                q.chain = p.chain;
+                q.chain.insert(q.chain.begin(),
+                               "`" + std::string(site.enclosingType->name) +
+                                   "`'s type parameter `" +
+                                   std::string(site.enclosingType
+                                                   ->genericParams[pi]
+                                                   ->name) +
+                                   "`");
+                work.push_back(std::move(q));
+            }
+        }
+    }
+}
+
 void MethodOwnership::checkReceiverCaptureOnStore(
     const ast::AssignmentStmt& as) {
     if (!receiverType_ || as.op != ":=" || !as.target || !as.value) return;
@@ -9459,8 +9813,7 @@ void MethodOwnership::checkReceiverCaptureOnStore(
         }
     }
     if (what.empty()) return;
-    if (const ast::IdentifierExpr* cap = receiverCaptureIn(*as.value))
-        reportReceiverCaptureAtSink(*cap, what);
+    checkReceiverCaptureAtSink(*as.value, what);
 }
 
 void MethodOwnership::checkReceiverCaptureCollectionStore(
@@ -9485,12 +9838,16 @@ void MethodOwnership::checkReceiverCaptureCollectionStore(
         return;
     for (const ast::CallArgument& a : call.args) {
         if (!a.value) continue;
+        const std::string what = std::string("stored in a collection (`.") +
+                                 std::string(m) + "(...)`)";
         if (const ast::IdentifierExpr* cap = receiverCaptureIn(*a.value)) {
-            reportReceiverCaptureAtSink(
-                *cap, std::string("stored in a collection (`.") +
-                          std::string(m) + "(...)`)");
+            reportReceiverCaptureAtSink(*cap, what);
             return;
         }
+        // fix #6767: a generic record's capture is decided per instantiation
+        // (a no-op for a receiver judged at its declaration, just above).
+        if (!receiverCarriesBorrowForSink())
+            checkReceiverCaptureAtSink(*a.value, what);
     }
 }
 

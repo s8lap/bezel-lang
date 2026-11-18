@@ -23,6 +23,7 @@
 #include "sema/ConstFold.hpp"   // §15.3 (#1549): fold a constant `move arr[i]` index
 #include "sema/EnumValues.hpp"  // enumHasZeroConstant — §7.9 / §17.11 enum row (#3072)
 #include "sema/SemaContext.hpp"
+#include "sema/TypeInstantiationSites.hpp"  // fix #6767: the instantiation sites
 #include "sema/Symbol.hpp"
 
 namespace bezel::ownership {
@@ -2300,8 +2301,7 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     checkClosureEscapesOnReturn(exprBody, EscapeScope::Method);
     // fix #6634 (§28.3 sink rule, §9.4, v0.340): `M(): () -> T => lambda() =>
     // this.x` returns the lambda exactly as the block form's `return` does.
-    if (const ast::IdentifierExpr* cap = receiverCaptureIn(exprBody))
-        reportReceiverCaptureAtSink(*cap, "returned from the method");
+    checkReceiverCaptureAtSink(exprBody, "returned from the method");
     // fix #4428 (§9.7, v0.301): the `=>` expression-body sibling of the
     // block-body `handleReturn -> checkRecordBorrowEscapesOnReturn` call.
     // Mirrors the block-body return-site coverage so an expression-bodied
@@ -13096,8 +13096,7 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // fix #6634 (§28.3 sink rule, §9.4, v0.340): a returned lambda that
     // captures the receiver. Inert for a lambda body's own `return` (a
     // lambda-body run never has a receiver type set).
-    if (const ast::IdentifierExpr* cap = receiverCaptureIn(e))
-        reportReceiverCaptureAtSink(*cap, "returned from the method");
+    checkReceiverCaptureAtSink(e, "returned from the method");
     checkRecordBorrowEscapesOnReturn(e);  // D2: §9.7 borrow-bearing record
     // #1066 / §9.7 (v0.153): `return new Bag([…])` from a temporary is a
     // dangling borrow exactly as a local-decl initializer is.
@@ -20288,6 +20287,7 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
         if (md->bodyKind == ast::MethodBodyKind::Block) {
             MethodOwnership mo(ctx);
             mo.setReceiverType(receiverType);
+            mo.setReceiverMemberName(std::string(md->name));
             // #2073 / §28.10: a method body is "generic" for lint purposes
             // when EITHER the method declares its own `<T>` parameters OR the
             // enclosing type is generic (`class C<T> method M(c: T) using var
@@ -20319,6 +20319,7 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
             // on expression bodies). // per §28.3, §5.11
             MethodOwnership mo(ctx);
             mo.setReceiverType(receiverType);
+            mo.setReceiverMemberName(std::string(md->name));
             mo.runExprBodyOwningReturnCheck(
                 *md->exprBody, paramSymsOf(m, ctx),
                 md->returnType.get(), md->returnOwned, methodIsAsync(*md),
@@ -20339,8 +20340,10 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
         mo.setEnclosingCtor(ctorSymbolOf(m, ctx));
         // fix #6630 (§28.3 sink rule, v0.340): a constructor body has a
         // receiver too (a static constructor does not).
-        if (!cd->isStatic)
+        if (!cd->isStatic) {
             mo.setReceiverType(receiverTypeSymbolOf(enclosingType, ctx));
+            mo.setReceiverMemberName("constructor");
+        }
         mo.run(cd->body, paramSymsOf(m, ctx));
     } else if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
         MethodOwnership mo(ctx);
@@ -21444,8 +21447,26 @@ void MethodOwnership::checkForStmtStructuralMutation(const ast::ForStmt& fs) {
 }
 
 bool checkOwnership(const ast::SourceFile& src, sema::SemaContext& ctx) {
+    // fix #6767 (§9.4, §3.6 rule 2, v0.359): the member bodies record each
+    // generic record's receiver-capture requirement; the sites resolveTypes
+    // recorded decide it once every body has been read.
+    std::vector<GenericReceiverCaptureObligation> obligations;
+    struct CollectorScope {
+        std::vector<GenericReceiverCaptureObligation>* prev;
+        explicit CollectorScope(std::vector<GenericReceiverCaptureObligation>* o)
+            : prev(activeGenericReceiverCaptureObligations()) {
+            setActiveGenericReceiverCaptureObligations(o);
+        }
+        ~CollectorScope() { setActiveGenericReceiverCaptureObligations(prev); }
+    } collectorScope(&obligations);
     for (const auto& d : src.topDecls) {
         if (d) checkTopDecl(*d, ctx);
+    }
+    std::vector<sema::RecordedTypeInstantiation> sites =
+        sema::takeTypeInstantiations(ctx);
+    if (!obligations.empty() && !sites.empty()) {
+        MethodOwnership mo(ctx);
+        mo.checkGenericReceiverCaptureInstantiations(obligations, sites);
     }
     return !ctx.diagnostics().hasErrors();
 }
