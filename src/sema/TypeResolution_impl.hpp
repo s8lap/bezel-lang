@@ -1172,8 +1172,20 @@ private:
     // after type-alias resolution? A null pointer denotes the type parameter
     // carrying no `where` clause at all (the empty set). Shared by
     // checkOverrideSignatureMatch's override-constraint-inheritance check.
-    bool constraintSetsEquivalent(const ast::GenericConstraint* a,
-                                  const ast::GenericConstraint* b);
+    //
+    // fix #8684 (§14.2, v0.357): `substA` — when non-null, the `a` side's
+    // TYPE items are put through it before the comparison. §14.2 reads the
+    // inherited set "under the implemented interface's or overridden base's
+    // substitution": `class D: IBox<Num>` inherits `IBox<T>`'s
+    // `where S: IBox<T>` as `where S: IBox<Num>` (T := Num), so a
+    // restatement in that form restates the SAME set and is legal. The
+    // interface-implementation path passes the implemented interface's own
+    // type-argument substitution; every other caller leaves it null, and the
+    // comparison is then the raw one it has always been.
+    bool constraintSetsEquivalent(
+        const ast::GenericConstraint* a,
+        const ast::GenericConstraint* b,
+        const std::function<TypeRef*(TypeRef*)>* substA = nullptr);
 
     // fix #2391 (§14.2/§2.8.2, v0.236): the IMPORTED-base analog of
     // `constraintSetsEquivalent`. Compares an override's locally-declared

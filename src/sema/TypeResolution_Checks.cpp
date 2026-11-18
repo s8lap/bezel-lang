@@ -7368,7 +7368,9 @@ bool Resolver::overrideParamsMatch(MethodSymbol* derived, MethodSymbol* base) {
 // transparently the first time the Type node is resolved — TypeResolution_
 // Names.cpp's alias-copy-into-ref path).
 bool Resolver::constraintSetsEquivalent(const ast::GenericConstraint* a,
-                                        const ast::GenericConstraint* b) {
+                                        const ast::GenericConstraint* b,
+                                        const std::function<TypeRef*(TypeRef*)>*
+                                            substA) {
     static const std::vector<ast::ConstraintItem> kEmpty;
     const auto& ai = a ? a->items : kEmpty;
     const auto& bi = b ? b->items : kEmpty;
@@ -7386,6 +7388,15 @@ bool Resolver::constraintSetsEquivalent(const ast::GenericConstraint* a,
             if (ia.kind == "type") {
                 TypeRef* ta = ia.typeArg ? ctx_.resolvedType(*ia.typeArg) : nullptr;
                 TypeRef* tb = ib.typeArg ? ctx_.resolvedType(*ib.typeArg) : nullptr;
+                // fix #8684 (§14.2, v0.357): the `a` side is read UNDER the
+                // implemented interface's own type-argument substitution
+                // (§14.2: "the inherited set is read under the implemented
+                // interface's or overridden base's substitution"), so
+                // `IBox<T>`'s `where S: IBox<T>` is compared as
+                // `where S: IBox<Num>` on `class D: IBox<Num>` — the SAME set.
+                // A null `substA` (every other caller) leaves the `a` side
+                // exactly as written.
+                if (substA && ta) ta = (*substA)(ta);
                 if (!typeRefEqual(ta, tb)) continue;
             }
             used[j] = true;
@@ -10135,6 +10146,18 @@ void Resolver::checkAbstractImplementations() {
                 std::unordered_map<std::string_view, const TypeRef*> implSubst;
                 auto csIt = classSubst.find(implClass);
                 if (csIt != classSubst.end()) implSubst = csIt->second;
+                // fix #8684 (§14.2, v0.357): the IMPLEMENTED INTERFACE's own
+                // type-argument substitution, as the constraint-set
+                // comparison's substitution function. §14.2 reads the
+                // inherited set "under the implemented interface's ... or
+                // overridden base's substitution", so `class D: IBox<Num>`
+                // inherits `IBox<T>`'s `where S: IBox<T>` as
+                // `where S: IBox<Num>` (T := Num). It is the SAME
+                // substitution (`obl.subst`) the parameter/return comparison
+                // below applies to the interface member's own types, so the
+                // clause and the signature are read in one scope.
+                const std::function<TypeRef*(TypeRef*)> ifaceSubst =
+                    [&](TypeRef* tr) { return substTypeRef(tr, obl.subst); };
                 // fix #3194: WHERE a §11.2 conformance diagnostic points. An
                 // IMPORTED witness has no location in THIS compilation —
                 // `Symbol::declLoc` defaults to 0:0 — and a diagnostic at 0:0
@@ -10338,9 +10361,20 @@ void Resolver::checkAbstractImplementations() {
                 // `where` clause must match the interface method's constraint
                 // set exactly (or be omitted to inherit it). A differing clause
                 // is a compile error. Constraints are compared positionally by
-                // the method's own generic parameter (not the interface's
-                // substitution — method type parameters are fresh per
-                // declaration and are not mapped by the interface substitution).
+                // the method's own generic parameter — a METHOD type parameter
+                // is fresh per declaration and is not mapped by the interface
+                // substitution (§11.2's *Generic members*: the two
+                // declarations' method-level type parameters correspond by
+                // position).
+                //
+                // fix #8684 (§14.2, v0.357): the INTERFACE's own type
+                // parameters ARE mapped, by the implemented interface's
+                // substitution — §14.2: "the inherited set is read under the
+                // implemented interface's or overridden base's substitution,
+                // its method type parameters renamed positionally". So
+                // `class D: IBox<Num>` inherits `IBox<T>`'s
+                // `where S: IBox<T>` as `where S: IBox<Num>` (T := Num), and a
+                // restatement in that form is the SAME set.
                 // Only report a mismatch when the interface DECLARES a
                 // constraint the implementation does not match — a constraint
                 // the interface does not declare is inherited from the
@@ -10413,7 +10447,23 @@ void Resolver::checkAbstractImplementations() {
                         // match — report an error.
                         bool match = false;
                         if (imIsLocal && implIsLocal) {
-                            match = constraintSetsEquivalent(imGC, implGC);
+                            // fix #8684 (§14.2, v0.357): read the interface's
+                            // constraint set UNDER THE IMPLEMENTED INTERFACE'S
+                            // OWN TYPE-ARGUMENT SUBSTITUTION. §14.2: "the
+                            // inherited set is read under the implemented
+                            // interface's or overridden base's substitution" —
+                            // `class D: IBox<Num>` inherits `IBox<T>`'s
+                            // `where S: IBox<T>` as `where S: IBox<Num>`
+                            // (T := Num), so an implementation that RESTATES
+                            // it in that form restates the SAME set and is
+                            // legal ("the clauses may instead be restated in
+                            // an equivalent form"). Without the
+                            // substitution the raw `IBox<T>` was compared
+                            // with the implementation's `IBox<Num>`, the two
+                            // compared unequal, and the declaration was
+                            // over-rejected.
+                            match = constraintSetsEquivalent(imGC, implGC,
+                                                             &ifaceSubst);
                         } else if (!imIsLocal && implIsLocal) {
                             // Interface imported, impl local: build a temporary
                             // AST constraint from the imported metadata.
