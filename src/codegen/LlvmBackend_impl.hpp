@@ -19068,6 +19068,65 @@ private:
         llvm::Function* cellFreeEligibleFn_;
     };
 
+    // fix #8762 (§27.5 / §28.9, v0.359): the closure-local scope-end analysis
+    // for a NESTED ACCESSOR BODY — a property setter body, an indexer
+    // accessor body — emitted either INLINED into the enclosing body or as its
+    // own function.
+    //
+    // An ordinary method / destructor body runs the closure-local analysis
+    // (collectCapturedCellClosureLocals, collectClosureReleaseEligible,
+    // collectBoxCaptureLocals, collectDefinitelyEscapingLambdas, then
+    // collectCellFreeEligible) and PINS the per-function tokens
+    // (closureReleaseEligibleFn_, boxCaptureLocalsFn_, cellFreeEligibleFn_)
+    // that every scope-end consumer gates on (`lowerLocalDecl`'s closureRelease
+    // arm, `consumeLastLambdaCapturedCells`' boxedCellFree arm, …). An accessor
+    // body did not, so a lambda-valued local formed in a setter / indexer
+    // accessor body never had its closure released at scope end: MEASURED on
+    // r30-c1 (1128406b7), `bezelc --sanitize=address` on the issue's literal
+    // repro — 4196 B in 149 allocations over 50 setter calls
+    // (`set => do var g := lambda(): int => value + 1; n := g(); end;`).
+    // This scope installs the analysis for ONE accessor body and restores the
+    // enclosing body's state afterwards — the same two-halves-of-one-contract
+    // discipline `CaptureReclaimSetScope` documents (LANE_RULES §8).
+    //
+    // `separateFn`:
+    //   * non-null — the accessor body is emitted as its OWN function
+    //     (`ensureIndexerBlockGetter`, `ensurePropertyAccessorFn`,
+    //     `ensureIndexerSetterFn`): the three fn TOKENS are pinned to that
+    //     function, exactly as `emitFunctionBody` pins them for a method body.
+    //   * null — the accessor body is INLINED into the enclosing body
+    //     (`lowerPropertySetValue`, `lowerIndexerSet`): the enclosing body's
+    //     tokens stay as they are, because the locals the accessor body
+    //     declares are lowered with `currentFn_` == the enclosing function and
+    //     the scope-end consumers gate on
+    //     `currentFn_ == closureReleaseEligibleFn_`. Re-pinning them here
+    //     would be a no-op at best and a wrong-function gate at worst.
+    //
+    // `closureLocalCallCounts_` is deliberately NOT cleared (the call-site
+    // release discipline counts CALL SITES per local, and the accessor body's
+    // locals are distinct decl pointers from the enclosing body's, so the two
+    // count sets cannot collide). Clearing it — as the #6766 block-getter
+    // site does — would drop the ENCLOSING body's counts, because an accessor
+    // body is emitted in the middle of another body.
+    struct AccessorClosureScope {
+        AccessorClosureScope(Emitter& e,
+                             const std::vector<std::unique_ptr<ast::Stmt>>& body,
+                             llvm::Function* separateFn);
+        ~AccessorClosureScope();
+        AccessorClosureScope(const AccessorClosureScope&) = delete;
+        AccessorClosureScope& operator=(const AccessorClosureScope&) = delete;
+    private:
+        Emitter& e_;
+        CaptureReclaimSetScope reclaim_;
+        // `closureLocalCapturedCell_` / `closureLocalCapturedCellReassigned_`
+        // are populated by `collectCapturedCellClosureLocals`, which
+        // `CaptureReclaimSetScope` does NOT hold — saved by hand, exactly as
+        // the #6766 block-getter site does.
+        std::unordered_set<const void*> savedCapturedCell_;
+        std::unordered_set<const void*> savedCapturedCellReassigned_;
+        bool analysed_ = false;
+    };
+
     // fix #3705 / fix #3697 (§28.9 / §28.11 / §29.7 / §30.7, v0.286): the
     // borrowing-collection twin of `CaptureReclaimSetScope` above — save and
     // restore the five collection-reclaim eligibility SETS, their five function

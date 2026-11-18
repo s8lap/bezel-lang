@@ -4494,7 +4494,18 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
         llvm::BasicBlock* savedAccEnd = inlinedAccessorEnd_;
         auto* accEndBB = llvm::BasicBlock::Create(llvm_, "idxset.end", currentFn_);
         inlinedAccessorEnd_ = accEndBB;
-        bool term = lowerScopedBlock(*setterStmts);
+        bool term = false;
+        {
+            // fix #8762 (§27.5 / §28.9, v0.359): the closure-local scope-end
+            // analysis for THIS indexer-setter body — the INDEXER twin of the
+            // property setter's block in `lowerPropertySetValue`. The body is
+            // INLINED into the enclosing function, so the enclosing body's fn
+            // tokens stay and only the SETS are replaced for the duration of
+            // the body.
+            AccessorClosureScope setterClosureScope(*this, *setterStmts,
+                                                     nullptr);
+            term = lowerScopedBlock(*setterStmts);
+        }
         inlinedAccessorEnd_ = savedAccEnd;
         if (!term) builder_.CreateBr(accEndBB);
         builder_.SetInsertPoint(accEndBB);
@@ -7235,6 +7246,60 @@ Emitter::NestedBodyScope::~NestedBodyScope() {
 }
 
 
+// fix #8762 (§27.5 / §28.9, v0.359): install the closure-local scope-end
+// analysis for ONE nested accessor body. See the struct's declaration comment
+// in LlvmBackend_impl.hpp for the full argument; this is the mechanism the
+// #6766 block-getter site already spelled out inline, generalised so the
+// setter / indexer-accessor emitters use the SAME release and not a parallel
+// one.
+//
+// The ORDER of the collectors is load-bearing: `collectCellFreeEligible`
+// consumes `collectClosureReleaseEligible`'s result, so it must run last.
+Emitter::AccessorClosureScope::AccessorClosureScope(
+        Emitter& e, const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        llvm::Function* separateFn)
+    : e_(e), reclaim_(e) {
+    savedCapturedCell_ = e.closureLocalCapturedCell_;
+    savedCapturedCellReassigned_ = e.closureLocalCapturedCellReassigned_;
+    if (body.empty()) return;
+    analysed_ = true;
+    e.closureReleaseEligible_.clear();
+    // The fn TOKEN: a separate accessor function pins it to ITSELF (the
+    // consumers gate on `currentFn_ == closureReleaseEligibleFn_`, and
+    // `currentFn_` IS the accessor function there); an INLINED accessor body
+    // keeps the enclosing body's token, because its locals are lowered with
+    // `currentFn_` == the enclosing function.
+    if (separateFn) e.closureReleaseEligibleFn_ = separateFn;
+    e.boxCaptureLocals_.clear();
+    e.singleCaptureLocals_.clear();
+    e.multiCaptureLocals_.clear();
+    e.assignedCaptureVars_.clear();
+    e.returnedCaptureVars_.clear();
+    e.definitelyEscapingLambdas_.clear();
+    if (separateFn) e.boxCaptureLocalsFn_ = separateFn;
+    e.cellFreeEligible_.clear();
+    e.unwindUnsafeCellFree_.clear();
+    e.sharedCellEnvdtorFreeOwner_.clear();
+    if (separateFn) e.cellFreeEligibleFn_ = separateFn;
+    e.collectCapturedCellClosureLocals(body);
+    e.collectClosureReleaseEligible(body);
+    e.collectBoxCaptureLocals(body);
+    e.collectDefinitelyEscapingLambdas(body);
+    // Must run AFTER collectClosureReleaseEligible (uses its result).
+    e.collectCellFreeEligible(body);
+}
+
+Emitter::AccessorClosureScope::~AccessorClosureScope() {
+    if (analysed_) {
+        e_.closureLocalCapturedCell_ = std::move(savedCapturedCell_);
+        e_.closureLocalCapturedCellReassigned_ =
+            std::move(savedCapturedCellReassigned_);
+    }
+    // `reclaim_` restores every set / token it holds, including the two fn
+    // tokens, in its own destructor.
+}
+
+
 llvm::Function* Emitter::ensurePropertyBlockGetter(
                                           const ast::PropertyDecl* pd,
                                           const ast::PropertyAccessor* acc,
@@ -8131,7 +8196,16 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
             bool savedEmittingGenericTemplateBody = emittingGenericTemplateBody_;
             if (accessorSpecTagNow() == 0 && !cls->genericParams.empty())
                 emittingGenericTemplateBody_ = true;
-            lowerScopedBlock(blockGet->stmts);
+            {
+                // fix #8762 (§27.5 / §28.9, v0.359): the closure-local
+                // scope-end analysis for THIS accessor body — the vtable/itable
+                // slot face of the block getter, the twin of the standalone
+                // `ensurePropertyBlockGetter` site's #6766 block. The body is
+                // its own function, so the fn tokens are pinned to it.
+                AccessorClosureScope accessorClosureScope(*this, blockGet->stmts,
+                                                          fn);
+                lowerScopedBlock(blockGet->stmts);
+            }
             if (!builder_.GetInsertBlock()->getTerminator())
                 emitImplicitReturn(fn);
             emittingGenericTemplateBody_ = savedEmittingGenericTemplateBody;
@@ -8308,6 +8382,12 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                 }
             }
         } else if (setAcc) {
+            // fix #8762 (§27.5 / §28.9, v0.359): the closure-local scope-end
+            // analysis for THIS accessor body — the vtable/itable slot face of
+            // the block setter, the twin of the standalone property-setter
+            // path's block in `lowerPropertySetValue`. The body is its own
+            // function, so the fn tokens are pinned to it.
+            AccessorClosureScope accessorClosureScope(*this, setAcc->stmts, fn);
             if (setAcc->bodyKind == ast::PropertyAccessorBodyKind::Expression &&
                 setAcc->exprBody)
                 lowerExpr(*setAcc->exprBody);
@@ -8474,7 +8554,14 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     accessorReturnTypeFn_   = fn;
 
     // --- Emit body ---
-    lowerScopedBlock(acc->stmts);
+    {
+        // fix #8762 (§27.5 / §28.9, v0.359): the closure-local scope-end
+        // analysis for THIS indexer-getter body — the INDEXER spelling of the
+        // #6766 block-getter fix in `ensurePropertyBlockGetter`. The body is
+        // its own function, so the fn tokens are pinned to it.
+        AccessorClosureScope accessorClosureScope(*this, acc->stmts, fn);
+        lowerScopedBlock(acc->stmts);
+    }
     if (!builder_.GetInsertBlock()->getTerminator())
         emitImplicitReturn(fn);
 
@@ -9110,7 +9197,15 @@ llvm::Function* Emitter::ensureIndexerSetterFn(const sema::TypeSymbol* cls,
         locals_[pd] = slot;
     }
     if (setterExpr) lowerExpr(*setterExpr);
-    else if (setterStmts) lowerScopedBlock(*setterStmts);
+    else if (setterStmts) {
+        // fix #8762 (§27.5 / §28.9, v0.359): the closure-local scope-end
+        // analysis for THIS indexer-setter body — the itable/vtable slot face,
+        // the twin of the inline indexer-setter path's block in
+        // `lowerIndexerSet`. The body is its own function, so the fn tokens are
+        // pinned to it.
+        AccessorClosureScope accessorClosureScope(*this, *setterStmts, fn);
+        lowerScopedBlock(*setterStmts);
+    }
     if (!builder_.GetInsertBlock()->getTerminator())
         builder_.CreateRetVoid();
 
@@ -9511,11 +9606,18 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
         auto* accEndBB = llvm::BasicBlock::Create(llvm_, "setter.end", currentFn_);
         inlinedAccessorEnd_ = accEndBB;
         bool term = false;
-        if (setter->bodyKind == ast::PropertyAccessorBodyKind::Expression &&
-            setter->exprBody)
-            lowerExpr(*setter->exprBody);
-        else
-            term = lowerScopedBlock(setter->stmts);
+        {
+            // fix #8762 (§27.5 / §28.9, v0.359): the closure-local scope-end
+            // analysis for THIS setter body — the STATIC-property twin of the
+            // instance path's block below. Same mechanism, same reason.
+            AccessorClosureScope setterClosureScope(*this, setter->stmts,
+                                                     nullptr);
+            if (setter->bodyKind == ast::PropertyAccessorBodyKind::Expression &&
+                setter->exprBody)
+                lowerExpr(*setter->exprBody);
+            else
+                term = lowerScopedBlock(setter->stmts);
+        }
         inlinedAccessorEnd_ = savedAccEnd;
         if (!term) builder_.CreateBr(accEndBB);
         builder_.SetInsertPoint(accEndBB);
@@ -9726,11 +9828,22 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
     bool savedInlinedSetterBareTFieldReleaseSafe =
         inlinedSetterBareTFieldReleaseSafe_;
     if (substInstalledSet) inlinedSetterBareTFieldReleaseSafe_ = true;
-    if (setter->bodyKind == ast::PropertyAccessorBodyKind::Expression &&
-        setter->exprBody)
-        lowerExpr(*setter->exprBody);
-    else
-        term = lowerScopedBlock(setter->stmts);
+    {
+        // fix #8762 (§27.5 / §28.9, v0.359): the closure-local scope-end
+        // analysis for THIS setter body. The body is INLINED into the
+        // enclosing function (`currentFn_` is the caller's), so the
+        // enclosing body's fn tokens stay and only the SETS are replaced for
+        // the duration of the body — see AccessorClosureScope's declaration
+        // comment. Without it, a lambda-valued local in a setter body had no
+        // scope-end release registered: MEASURED 4196 B in 149 allocations
+        // over 50 calls of the issue's literal repro.
+        AccessorClosureScope setterClosureScope(*this, setter->stmts, nullptr);
+        if (setter->bodyKind == ast::PropertyAccessorBodyKind::Expression &&
+            setter->exprBody)
+            lowerExpr(*setter->exprBody);
+        else
+            term = lowerScopedBlock(setter->stmts);
+    }
     inlinedSetterBareTFieldReleaseSafe_ =
         savedInlinedSetterBareTFieldReleaseSafe;
     inlinedAccessorEnd_ = savedAccEnd;
