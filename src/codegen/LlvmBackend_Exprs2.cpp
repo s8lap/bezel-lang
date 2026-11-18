@@ -1774,6 +1774,32 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         retSemaTy = expectedRetSema;
         retTy = lowerTypeRef(retSemaTy);
     }
+    // fix #8794 (§7.4 *Narrowing inside a lambda body*, §22.6, §27.3, v0.359):
+    // an expression body that is a §7.4-narrowed read of a nullable value type
+    // (`const k: int? := 5; var f: () -> int := lambda() => k;`) has the
+    // declared `{i8, T}` carrier as its exprType, so the body-derived retTy
+    // above is the CARRIER, while sema typed the read (and every caller of the
+    // `() -> int` value) at the non-nullable `T`: the caller read the return
+    // register as an `int` and got garbage. `lowerExpr` has already extracted
+    // the payload for a narrowed read (fix #6674), so the target's non-nullable
+    // return slot is authoritative here, as for the carrier and Range cases
+    // above; the emit path then coerces the payload to it.
+    if (lam.exprBody && !lam.retType && retSemaTy &&
+        isNullableValueTy(retSemaTy) &&
+        ctx_.isNarrowedValueRead(*lam.exprBody)) {
+        // The lambda's own sema type is the target slot where no expected
+        // function type was threaded (an assignment `f := lambda() => k`, the
+        // body of an enclosing lambda).
+        const sema::TypeRef* slot = expectedRetSema;
+        if (!slot)
+            if (sema::TypeRef* lamTy = ctx_.exprType(lam))
+                if (lamTy->kind == sema::TypeRef::Kind::Function)
+                    slot = lamTy->funcReturn;
+        if (slot && !slot->nullable) {
+            retSemaTy = slot;
+            retTy = lowerTypeRef(retSemaTy);
+        }
+    }
     // fix #8289 (§27.3, §5.1, §29.2, v0.355): the same for an UNASCRIBED lambda
     // whose body is an `Array<T>` / `Set<T>` / `Stack<T>` / `Queue<T>` / lazy
     // pipeline at an `IEnumerable<T>`-family return slot. The body-derived

@@ -663,6 +663,28 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // `lowerCollectionIndexerSet` (LlvmBackend_Assign.cpp) — a SEPARATE
         // `IndexExpr` branch below that `return`s before reaching this shared
         // preamble — can reuse the identical logic instead of a second copy.
+        // fix #8794 (§7.4 *Narrowing inside a lambda body*, §22.6, v0.359): a
+        // lambda literal assigned to a function-typed target whose expression
+        // body is a §7.4-narrowed read of a nullable value type
+        // (`f := lambda() => k;`, `f: () -> int`) takes its return slot from
+        // the target, as a typed-local initializer does (lowerLocalDecl): the
+        // body's own exprType is the declared carrier `T?`, so without the
+        // target the closure returns the carrier to a caller reading `int`.
+        // Gated to exactly that shape: no other assigned lambda sees a target.
+        struct ExpectedFnRestore {
+            const sema::TypeRef*& slot;
+            const sema::TypeRef* saved;
+            ~ExpectedFnRestore() { slot = saved; }
+        } expectedFnRestore{expectedFunctionType_, expectedFunctionType_};
+        if (as->target && as->value && as->op == ":=")
+            if (auto* lamRhs =
+                    dynamic_cast<const ast::LambdaExpr*>(as->value.get()))
+                if (lamRhs->exprBody && !lamRhs->retType &&
+                    ctx_.isNarrowedValueRead(*lamRhs->exprBody))
+                    if (const sema::TypeRef* tt = ctx_.exprType(*as->target))
+                        if (tt->kind == sema::TypeRef::Kind::Function &&
+                            tt->funcReturn && !tt->funcReturn->nullable)
+                            expectedFunctionType_ = tt;
         if (as->target && as->value) {
             // per §24: `event += handler` / `event -= handler` (inside the
             // declaring class) desugar to Add/Remove — not a real compound
