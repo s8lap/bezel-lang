@@ -35,7 +35,7 @@ JOBS=${JOBS:-8}
 # bezelc and named in its LICENSES/README.
 PKGS="clang21=21.1.2-r2 llvm21-dev=21.1.2-r1 llvm21-static=21.1.2-r1
   musl-dev=1.2.5-r24 gcc=15.2.0-r2 libstdc++-dev=15.2.0-r2
-  zlib-static=1.3.2-r1 zstd-static=1.5.7-r2
+  zlib-static=1.4-r0 zstd-static=1.5.7-r2
   cmake=4.1.3-r0 samurai=1.2-r7 bash=5.3.3-r1"
 # The apks are cached in APKCACHE, so a re-run does not download 360 MB again.
 ln -sf "$APKCACHE" /etc/apk/cache

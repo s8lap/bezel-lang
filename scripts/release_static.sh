@@ -128,11 +128,11 @@ zstd-1.5.6-LICENSE 7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c
 musl-1.2.5-COPYRIGHT f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5
 "
 # The licence texts of what the --full musl bezelc links (#6715): LLVM 21.1.2,
-# zlib 1.3.2, zstd 1.5.7 and musl 1.2.5, the versions of the pinned Alpine 3.23
-# packages. (The zstd 1.5.7 text is byte-identical to 1.5.6's.)
+# zlib 1.4, zstd 1.5.7 and musl 1.2.5, the versions of the pinned Alpine 3.23
+# packages. (The zstd 1.5.7 text is byte-identical to 1.5.6's, and the zlib 1.4 text to 1.3.2's.)
 FULL_SOURCES="
 llvm-21.1.2-LICENSE.TXT 8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-21.1.2/llvm/LICENSE.TXT
-zlib-1.3.2-LICENSE e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2 https://raw.githubusercontent.com/madler/zlib/v1.3.2/LICENSE
+zlib-1.4-LICENSE e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2 https://raw.githubusercontent.com/madler/zlib/v1.4/LICENSE
 zstd-1.5.7-LICENSE 7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8 https://raw.githubusercontent.com/facebook/zstd/v1.5.7/LICENSE
 musl-1.2.5-COPYRIGHT f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5
 "
@@ -323,14 +323,14 @@ lic_copy "$LIC/gcc/COPYING3" gcc-COPYING3
 lic_copy "$LIC/gcc/COPYING.RUNTIME" gcc-COPYING.RUNTIME
 if [ "$FULL" = ON ]; then
   lic_copy "$DL_DIR/llvm-21.1.2-LICENSE.TXT" LLVM-LICENSE.TXT
-  lic_copy "$DL_DIR/zlib-1.3.2-LICENSE" zlib-LICENSE
+  lic_copy "$DL_DIR/zlib-1.4-LICENSE" zlib-LICENSE
   lic_copy "$DL_DIR/zstd-1.5.7-LICENSE" zstd-LICENSE
   lic_copy "$DL_DIR/musl-1.2.5-COPYRIGHT" musl-COPYRIGHT
   LIC_ROWS="  LLVM-LICENSE.TXT        LLVM 21.1.2 (static): Apache License 2.0 with LLVM
                           Exceptions (Alpine $(pin_of llvm21-static))
   gcc-COPYING3,           libstdc++ and libgcc (static): GPL-3.0 with the GCC Runtime
   gcc-COPYING.RUNTIME     Library Exception (Alpine $(pin_of gcc), $(pin_of libstdc++-dev))
-  zlib-LICENSE            zlib 1.3.2 (static): zlib License (Alpine $(pin_of zlib-static))
+  zlib-LICENSE            zlib 1.4 (static): zlib License (Alpine $(pin_of zlib-static))
   zstd-LICENSE            zstd 1.5.7 (static): BSD-3-Clause; zstd is dual BSD / GPLv2
                           and the BSD terms are used (Alpine $(pin_of zstd-static))
   musl-COPYRIGHT          musl 1.2.5 (static): MIT (Alpine $(pin_of musl-dev))"

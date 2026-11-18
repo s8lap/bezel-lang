@@ -15,7 +15,7 @@
 #   bezelc:
 #     (always)                     LLVM 21 (static)       LICENSES/LLVM-LICENSE.TXT
 #     "basic_string::_M_create"    libstdc++, libgcc      LICENSES/gcc-COPYING3, gcc-COPYING.RUNTIME
-#     "Mark Adler"                 zlib 1.3.2             LICENSES/zlib-LICENSE
+#     "Mark Adler"                 zlib 1.4               LICENSES/zlib-LICENSE
 #     "Src size is incorrect"      zstd                   LICENSES/zstd-LICENSE
 #     "No error information"       musl (strerror(0))     LICENSES/musl-COPYRIGHT
 #   lib/bezel/x86_64-linux-musl/bin/ld.lld:
