@@ -10,6 +10,16 @@
 // convertible to the target type" diagnostic (checkAssignable's
 // function-to-non-function arm did not exempt the callee's own free formal).
 //
+// A plain function-typed PARAMETER of the caller is a different shape: §28.3
+// closure bullet, *Provenance*, clause 3 (v0.359) gives it a non-empty source
+// set ("A **plain function-typed parameter** of the enclosing body contributes
+// itself: its signature announces no set (K2.4), so the value is bounded by
+// the call"), so passing it at a bare type parameter is a set-erasing position
+// ("At every set-erasing position a function value with a non-empty source set
+// is rejected, and a capture-free one is admitted") and the call is REJECTED.
+// That row was flipped by fix-forward #8896; a LOCAL function value is
+// capture-free, so the rows above stay ACCEPTED.
+//
 // A lambda LITERAL and a method reference are phase 2 (§14.5 / §27.6) and are
 // NOT self-determined: the controls below pin that they stay rejected against
 // a bare `U`. (Rows for the value form were removed from fix #5162's test file
@@ -96,9 +106,19 @@ BEZEL_TEST(generic_bare_typeparam_function_value_arg_5178,
     BEZEL_EXPECT_EQ(r.stdoutText, "42\n");
 }
 
-// Static void method; the function value is a parameter of the caller.
+// REJECT: static void method; the function value is a plain function-typed
+// PARAMETER of the caller.
+// FLIPPED by fix-forward #8896 (was `static_void_method_infers_function_parameter_value`,
+// which read the parameter as carrying only what its caller happens to pass).
+// §28.3 closure bullet, *Provenance*, clause 3 (v0.359): "A **plain
+// function-typed parameter** of the enclosing body contributes itself: its
+// signature announces no set (K2.4), so the value is bounded by the call" — so
+// `f`'s set is non-empty whatever `Main` passes, and `Util5178d.Take(f)`
+// (U := `() -> int`) is a set-erasing position, where "a function value with a
+// non-empty source set is rejected" (*Set-erasing positions*). The generic body
+// is not re-checked, so `Take` never storing `x` does not admit the call.
 BEZEL_TEST(generic_bare_typeparam_function_value_arg_5178,
-           static_void_method_infers_function_parameter_value) {
+           static_void_method_rejects_function_parameter_value_at_bare_type_param) {
     auto r = runAot(
         "module M; "
         "public static class Util5178d "
@@ -117,9 +137,10 @@ BEZEL_TEST(generic_bare_typeparam_function_value_arg_5178,
         "    return 0; "
         "  end Main; "
         "end;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, "took\n5\n");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "may not be passed where the parameter is declared at a bare type "
+           "parameter"));
 }
 
 // CONTROL (phase 2): a lambda LITERAL against a bare `U` is not self-
