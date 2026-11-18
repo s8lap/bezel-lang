@@ -29609,6 +29609,120 @@ MethodOwnership::ScopedBound MethodOwnership::scopedBoundingLocal(
     return resolveChainHead(recv);
 }
 
+// fix #8785 (§28.3 closure bullet *Provenance* clause 1, v0.359): does this
+// CAPTURED binding contribute a source to the closure's source set?
+//
+// The clause, verbatim: "a captured local or parameter of a value type that
+// holds borrows ([§3.6]) the sources of the borrows it carries, ...; a
+// captured value that carries no borrow — a value type that holds none, a
+// null-source value, a `string` — contributes nothing, and lives in its heap
+// capture cell".
+//
+// So a capture of a VALUE type that holds NO borrows contributes NOTHING: the
+// closure's source set stays empty, and §28.3's set-erasing rule is binary
+// on that set ("At every set-erasing position a function value with a
+// non-empty source set is rejected, and a capture-free one is admitted",
+// v0.359) — the capture-free closure is ADMITTED there.
+//
+// Every other capture is COUNTED, exactly as before this change:
+//   * a class- or interface-typed capture — a borrow, carrying its binding's
+//     source (clause 1);
+//   * a value type that HOLDS borrows (a borrow-bearing record, choice or
+//     inline array) — the sources of the borrows it carries (clause 1);
+//   * a function-typed capture — its own set, transitively (clause 1);
+//   * an owned local or an `owned` parameter — its enclosing scope;
+//   * a `ref`/`out` parameter — the declaring body's scope, whatever its type;
+//   * a `string` capture — §28.3's clause 1 says a `string` contributes
+//     nothing either, but that is a SIBLING shape of the same predicate and
+//     is filed separately; #8785's shape is the VALUE-TYPE capture, so a
+//     `string` capture stays counted here;
+//   * a capture whose type is unknown — conservatively counted.
+//
+// A capture of `this`/`base` resolves to no symbol, so it is not counted here
+// at all (unchanged).
+bool MethodOwnership::captureContributesSource(
+    const sema::Symbol* sym) const {
+    if (!sym) return false;
+    const sema::TypeRef* t = nullptr;
+    if (auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym)) {
+        // §28.3 *Captured owned bindings*: a captured owned local contributes
+        // its enclosing scope.
+        if (symbolIsOwnedObligation(sym)) return true;
+        t = ls->declType;
+    } else if (auto* ps = dynamic_cast<const sema::ParameterSymbol*>(sym)) {
+        if (symbolIsOwnedObligation(sym)) return true;
+        // §28.3 *Provenance* clause 1: "a captured `ref` or `out` parameter,
+        // whatever its type, the declaring body's scope as well".
+        if (ps->modifier == "ref" || ps->modifier == "out" ||
+            ps->modifier == "out owned")
+            return true;
+        t = ps->resolvedDeclType;
+        if (!t && ps->declType) t = ctx_.resolvedType(*ps->declType);
+    } else {
+        // Not a local and not a parameter: unchanged (conservative).
+        return true;
+    }
+    if (!t) return true;  // an unresolved type: conservative
+    switch (t->kind) {
+        case sema::TypeRef::Kind::Primitive:
+            // §3.1: the primitive VALUE types (`bool`, `char`, the numeric
+            // types) hold no borrows — §28.3 *Provenance* clause 1: such a
+            // capture "contributes nothing". `string` is a reference type
+            // (§3.1) and `Object` holds a class reference: both stay counted.
+            switch (t->primitive) {
+                case sema::PrimitiveType::Bool:
+                case sema::PrimitiveType::Char:
+                case sema::PrimitiveType::Byte:
+                case sema::PrimitiveType::SByte:
+                case sema::PrimitiveType::Short:
+                case sema::PrimitiveType::UShort:
+                case sema::PrimitiveType::Int:
+                case sema::PrimitiveType::UInt:
+                case sema::PrimitiveType::Long:
+                case sema::PrimitiveType::ULong:
+                case sema::PrimitiveType::Float:
+                case sema::PrimitiveType::Double:
+                case sema::PrimitiveType::Decimal:
+                    return false;
+                default:
+                    return true;
+            }
+        case sema::TypeRef::Kind::Function:
+            // A captured function value contributes its own set, transitively
+            // (§28.3 *Provenance* clause 1).
+            return true;
+        case sema::TypeRef::Kind::Unit:
+            return false;
+        case sema::TypeRef::Kind::InlineArray:
+            // §3.6: an inline array holds borrows iff its element type does
+            // (§9.7: "a borrow-bearing inline array (one whose element type is
+            // a reference type or a borrow-bearing record ...)").
+            return isBorrowBearingRecordOrSpan(t);
+        case sema::TypeRef::Kind::Named: {
+            if (!t->declaration) {
+                // A bare type parameter (or an unresolvable builtin head):
+                // §28.1 clauses 3/5 read a type parameter admitting a
+                // class-or-interface substitution as borrow-bearing.
+                return captureTypeIsBorrowBearing(t);
+            }
+            const ast::TypeDeclKind k = t->declaration->kind;
+            if (k == ast::TypeDeclKind::Class ||
+                k == ast::TypeDeclKind::Interface)
+                return true;  // a borrow
+            // A value builtin is a scalar/struct: it holds no borrows (§2.5).
+            if (t->declaration->isValueBuiltin) return false;
+            // A record, a choice or an enum: §3.6's holds-borrows property.
+            if (k == ast::TypeDeclKind::Choice) return isBorrowBearingChoice(t);
+            if (k == ast::TypeDeclKind::Record)
+                return isBorrowBearingRecord(t) || isBorrowBearingRecordOrSpan(t);
+            return false;  // an enum holds no borrows
+        }
+        case sema::TypeRef::Kind::Error:
+            break;
+    }
+    return true;  // conservative
+}
+
 // §28.3 closure bullet *Set-erasing positions* (v0.330): a function value
 // with a non-empty source set may not be passed to a set-erasing parameter.
 // This helper determines whether `arg` is a function value with captures
@@ -29616,6 +29730,11 @@ MethodOwnership::ScopedBound MethodOwnership::scopedBoundingLocal(
 // set and is admitted at a set-erasing position.  Captures are: a local
 // variable captured by a lambda, or `this` captured by an instance method
 // reference.
+//
+// fix #8785 (§28.3 *Provenance* clause 1, v0.359): a capture is counted only
+// when it contributes a source — a capture of a value type that holds no
+// borrows contributes NOTHING (clause 1), so it does not make the closure
+// capture-bearing.
 bool MethodOwnership::exprIsFunctionValueWithNonEmptyCaptureSet(
     const ast::Expr& arg) {
     // Lambda: check if it captures anything.  scopedCollectCaptures collects
@@ -29629,7 +29748,8 @@ bool MethodOwnership::exprIsFunctionValueWithNonEmptyCaptureSet(
                 for (sema::Symbol* p : *ps) paramSet.insert(p);
             for (const ast::IdentifierExpr* id : rawCaps) {
                 if (const sema::Symbol* s = ctx_.exprSymbol(*id))
-                    if (!paramSet.count(s)) return true;
+                    if (!paramSet.count(s) && captureContributesSource(s))
+                        return true;
             }
         }
         return false;
@@ -29693,7 +29813,9 @@ bool MethodOwnership::exprIsFunctionValueWithNonEmptyCaptureSet(
                         for (sema::Symbol* p : *ps) paramSet.insert(p);
                     for (const ast::IdentifierExpr* id : rawCaps) {
                         if (const sema::Symbol* s = ctx_.exprSymbol(*id))
-                            if (!paramSet.count(s)) return true;
+                            if (!paramSet.count(s) &&
+                                captureContributesSource(s))
+                                return true;
                     }
                 }
             }

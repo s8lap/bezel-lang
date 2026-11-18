@@ -7266,6 +7266,12 @@ private:
     // with a non-empty source set may not be passed to a set-erasing
     // parameter.  Determines whether `arg` is a function value with captures.
     bool exprIsFunctionValueWithNonEmptyCaptureSet(const ast::Expr& arg);
+    // fix #8785 (§28.3 closure bullet *Provenance* clause 1, v0.359): does this
+    // CAPTURED binding contribute a source to the closure's source set?  A
+    // capture of a value type that holds NO borrows contributes nothing, so
+    // the closure stays capture-free and is admitted at a §28.3 set-erasing
+    // position; every other capture is counted.
+    bool captureContributesSource(const sema::Symbol* sym) const;
     void scopedCollectCaptures(const ast::LambdaExpr& lam,
                                std::vector<const ast::IdentifierExpr*>& out);
     void scopedCaptureWalkStmt(const ast::Stmt& s,
