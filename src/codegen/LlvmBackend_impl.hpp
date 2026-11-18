@@ -2041,6 +2041,12 @@ private:
         bool dictEntryKeyReleaseDeferred = false;
     };
     std::vector<LastCellEntry> lastLambdaCapturedCells_;
+    // fix #8857 (§27.3, §7.4, §22.6, v0.359): the LLVM function type of the
+    // closure entry the most recent `lowerLambda` call emitted (set on its single
+    // exit, so a lambda nested in the body does not leave its own). An
+    // immediately-invoked lambda's call site reads its return type from here
+    // rather than re-deriving it from the body's sema type.
+    llvm::FunctionType* lastLambdaFnTy_ = nullptr;
     // §27.5 / §28.9 (#969): block-nesting depth (== disposeStack_.size()) of each
     // LOCAL at its declaration, keyed by its LocalDecl AST node. Used by the
     // boxedCellFree registration to skip freeing a capture cell at an inner

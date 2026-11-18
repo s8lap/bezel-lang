@@ -5244,6 +5244,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         }
     }
 
+    lastLambdaFnTy_ = fnTy;   // fix #8857: read by the IIFE call site
     return closureObj;
 }
 

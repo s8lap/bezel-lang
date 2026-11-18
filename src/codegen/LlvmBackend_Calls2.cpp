@@ -13062,7 +13062,11 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // the local's owner scope, released exactly once.
         const bool savedInArgumentLambda = inArgumentLambda_;
         inArgumentLambda_ = true;
+        lastLambdaFnTy_ = nullptr;
         llvm::Value* closureObj = lowerLambda(*iifeLam);
+        // fix #8857: taken before the arguments are lowered (a lambda nested
+        // in an argument would overwrite the member).
+        llvm::FunctionType* iifeEntryFnTy = lastLambdaFnTy_;
         inArgumentLambda_ = savedInArgumentLambda;
         if (!closureObj) return nullptr;
         // #2182 / §28.3: an IIFE is non-escaping — emitClosureRelease below
@@ -13166,7 +13170,18 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // (same logic as lowerLambda), falling back to i32 when null.
         // This matches what lowerLambda emits for the actual LLVM function.
         llvm::Type* retTy = i32();
-        if (iifeLam->exprBody) {
+        // fix #8857 (§27.3, §7.4 *Narrowing inside a lambda body*, §22.6,
+        // v0.359): the closure entry `lowerLambda` just emitted is the
+        // authority for the call's return type. Re-deriving it from the body's
+        // sema type read a §7.4-narrowed captured `int?` (`(lambda(): int =>
+        // k)()`) as the declared `{i8, i32}` carrier while the entry returns
+        // the `int` §27.3's ascription / §22.6's non-nullable read declares:
+        // garbage in a `var`, an IR verifier failure in `x += ...` or a nested
+        // lambda. The derivation below stays the fallback for a lambda whose
+        // emit left no function type.
+        if (iifeEntryFnTy) {
+            retTy = iifeEntryFnTy->getReturnType();
+        } else if (iifeLam->exprBody) {
             if (auto* rt = ctx_.exprType(*iifeLam->exprBody))
                 retTy = lowerTypeRef(rt);
             // fix #678 (narrowed) / §27.2: mirror the void-builtin check in
