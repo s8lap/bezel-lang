@@ -5244,6 +5244,59 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 emitStringRelease(v);
             return diverged_;
         }
+        // fix #7112 (§28.9, v0.359): the CLOSURE twin of #8506's arm above — a
+        // DISCARDED closure-typed CALL RESULT is a +1 closure cell that nobody
+        // released. The question is the same one #8506 asks ("did the
+        // statement's expression hand over a +1?"), and the answer is the
+        // classification's: a call whose result is a +1 closure. §28.9 puts a
+        // function value on the runtime-managed tier — "Runtime management
+        // governs the *function value itself* — the heap-allocated closure
+        // object that backs it" — so the statement must give the reference back,
+        // exactly as it must for a string.
+        //
+        // THE PRODUCERS. `isPlusOneClosureProducer` DELIBERATELY declines a
+        // closure-returning CALL ("the callee may hand back a function value
+        // WITHOUT a fresh +1 ... so caller-side release of a call result could
+        // free a value the callee still references (UAF)"), so the two narrow
+        // recognizers that DO know the callee mints exactly +1 are used here:
+        // `isUserMethodClosureReturnCall` (a call to a locally-compiled user
+        // method whose DECLARED return type is a function type — its return
+        // path retains, so the caller receives +1) and
+        // `isLambdaClosureReturnCall` (a call through a lambda-typed local or
+        // parameter whose declared result is a function type — the lambda body
+        // mints or transfers exactly +1). These are the SAME two recognizers
+        // #7803's console discharge uses for the unbound-owned-temporary
+        // argument (`Console.WriteLine(f())`), so the discard site and the
+        // console site agree on which calls mint a +1 closure.
+        //
+        // MEASURED on this fix's parent (r30-c1 @ cba27ac1f), the issue's own
+        // repro with the result DISCARDED instead of printed, 200 iterations:
+        //   var f := lambda() => d.Hi;   // the lambda's body is a METHOD
+        //                               // REFERENCE: it mints a fresh 64 B
+        //                               // closure cell + an 8 B env per call
+        //   f();
+        // ⇒ "Direct leak of 12800 byte(s) in 200 object(s)" + "Indirect leak
+        // of 1600 byte(s) in 200 object(s)", BOTH allocated in `lam$0` — the
+        // issue #7112 signature (64 B direct + 8 B indirect) and its allocation
+        // site. The bound twin (`var g := f();`) is clean: the local's scope-end
+        // release owns the +1 there.
+        //
+        // WHY IT CANNOT DOUBLE-FREE: the value the statement releases is the
+        // call's OWN result, which nothing else owns — the callee minted it and
+        // transferred it (#2691's transfer, not a retain), and no binding took
+        // it. The lambda's body returning a closure LOCAL (`lambda() => g`)
+        // transfers that local's +1 to the caller and the transfer machinery
+        // suppresses the local's scope-end release, so the single reference the
+        // caller holds is the only one; the console arm (#7803) already
+        // discharges exactly this value at the console's plain `Object`
+        // parameter, and that program is LSan-clean on the base.
+        if (es->expr && (isUserMethodClosureReturnCall(es->expr.get()) ||
+                         isLambdaClosureReturnCall(es->expr.get()))) {
+            llvm::Value* v = lowerExpr(*es->expr);
+            if (!diverged_ && v && v->getType()->isPointerTy())
+                emitClosureRelease(v);
+            return diverged_;
+        }
         // fix #6366 (§28.3 K8 *Unbound owned temporaries*, §28.9, §17.13, stdlib
         // §4.6/§4.7/§4.8, v0.338): a BARE COLLECTION-producer statement
         // (`f.Make();`, where `Make(): owned Array<int>` /
@@ -5819,6 +5872,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!diverged_ && v && v->getType()->isPointerTy() &&
                     isPlusOneStringProducer(ds->value.get()))
                     emitStringRelease(v);
+                // fix #7112 (§28.9, v0.359): the CLOSURE twin of #6421's
+                // string release above — `_ := f();` over a +1 CLOSURE
+                // producer. §17.13's discard is a discharge point ("no
+                // disposal is required, so the discard does nothing beyond
+                // the warning suppression" — that removes the `Dispose()`,
+                // not the runtime's own release), and §28.9 leaves the
+                // function value's lifetime to the runtime. The same two
+                // recognizers the expression-statement arm uses (and #7803's
+                // console discharge uses) decide the producer: a call whose
+                // result is a +1 closure. MEASURED on this fix's parent,
+                // 200 discards of the issue's own repro
+                // (`var f := lambda() => d.Hi; _ := f();`): "Direct leak of
+                // 12800 byte(s) in 200 object(s)" + "Indirect leak of 1600
+                // byte(s) in 200 object(s)", both allocated in `lam$0`.
+                if (!diverged_ && v && v->getType()->isPointerTy() &&
+                    (isUserMethodClosureReturnCall(ds->value.get()) ||
+                     isLambdaClosureReturnCall(ds->value.get())))
+                    emitClosureRelease(v);
                 // fix #2728 / §32.6 + §28.3 + §17.13 (v0.240): the same reclaim
                 // for a DISCARDED FFI-buffer factory (`_ := CString.From(s);`).
                 // Neither existing path covered it: the helper just above is a
