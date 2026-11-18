@@ -115,3 +115,39 @@ BEZEL_TEST(codegen_str_construct_release, string_producer_for_iterable_is_releas
         "end C;");
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
 }
+
+// #8655 (§29.7 / §28.9): an iterator abandoned while suspended inside a
+// `for` over a +1 string releases that string from its `Dispose`; a fully
+// consumed one releases it once. 200x.
+BEZEL_TEST(codegen_str_construct_release, string_producer_released_when_iterator_abandoned_8655_spec_29_7) {
+    auto r = runAotChecked(
+        "module M; "
+        "class H "
+        "  private _n: int; "
+        "  public constructor(n: int) _n := n; end constructor; "
+        "  public method Mint(): string return \"KM\" + _n.ToString(); end Mint; "
+        "  public method Long(): string return \"long-producer-string-no-\" + _n.ToString(); end Long; "
+        "  public method MintQ(): string? return \"KQ\" + _n.ToString(); end MintQ; "
+        "  public property P: string get => \"KP\" + _n.ToString(); end P; "
+        "end H; "
+        "class C "
+        "  public static method W(h: H): IEnumerable<int> "
+        "    for var c in h.Long() do "
+        "      yield return 1; "
+        "    end; "
+        "    yield return 100; "
+        "  end W; "
+        "  public static method Main(): int "
+        "    var i := 0; var tot := 0; "
+        "    var h := new H(7); "
+        "    while i < 200 do "
+        "      i := i + 1; "
+        "      for var v in C.W(h) do tot := tot + v; break; end; "
+        "      for var v in C.W(h) do tot := tot + v; end; "
+        "    end while; "
+        "    if tot = 200 * (1 + 125) then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
+}

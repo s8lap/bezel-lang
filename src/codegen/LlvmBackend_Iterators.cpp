@@ -423,6 +423,14 @@ void Emitter::collectSuspendLocals(
             if (forInBuiltinEnumeratorNeedsFrameSlot(*fs)) {
                 out.push_back({fs->iterable.get(), ptrTy()});  // enumerator
                 out.push_back({fs->iterable.get(), ptrTy()});  // source (+1)
+            } else if (fs->iterable && isStringExprType(*fs->iterable)) {
+                // fix #8655 (§29.7, §28.9, v0.357): a `for` over a string the
+                // loop itself owns (`lowerStringFor`, #8647) parks that
+                // string in a slot for the loop's duration. The field lets
+                // `backOwnedStringTempSlot` put the slot where the iterator's
+                // `Dispose` can reach it. Reserved for every string iterable
+                // and wired only for an owned one: an unwired field is inert.
+                out.push_back({fs->iterable.get(), ptrTy()});
             }
             // §29.3 / §16.4 (#6904): a range literal with a step expression
             // may need its (runtime) step to survive a yield; reserve an i64
