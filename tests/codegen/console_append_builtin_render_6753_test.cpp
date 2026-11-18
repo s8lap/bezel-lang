@@ -521,7 +521,8 @@ BEZEL_TEST(codegen_console_append_builtin_6753,
 // plain oracle because their program leaks AT THE BASE for a reason that is not
 // this path: a `StringBuilder` local declared inside a lambda body is never
 // released (#6061; 64 + 512 B from `bz_array_alloc`), and a lambda-valued local
-// in a constructor body leaks its closure (#6766; 64 + 8/16 B). The exact
+// in a constructor body leaked its closure (#6766; 64 + 8/16 B; fixed, the two
+// constructor rows are on the checked oracle now). The exact
 // stdout still pins the crash: on 66cd27fc each of those programs dies with
 // SEGV and prints nothing.
 // ---------------------------------------------------------------------------
@@ -606,7 +607,7 @@ BEZEL_TEST(codegen_console_append_builtin_6753,
 // §22.12 / §27.5 / stdlib §2.1: a STATIC CONSTRUCTOR body with a closure write.
 BEZEL_TEST(codegen_console_append_builtin_6753,
            static_constructor_closure_written_object_local_renders_its_string_22_12_27_5) {
-    BEZEL_EXPECT_EQ(out(std::string(
+    BEZEL_EXPECT_EQ(checkedOut(std::string(
                         "module M; class C "
                         "  static constructor() ") + kObjLocal +
                         "var f := lambda() => do o := \"instatic\"; end; f(); "
@@ -618,7 +619,7 @@ BEZEL_TEST(codegen_console_append_builtin_6753,
 // §22.7 / §27.5 / stdlib §2.1: a CONSTRUCTOR body with a closure write.
 BEZEL_TEST(codegen_console_append_builtin_6753,
            constructor_closure_written_object_local_renders_its_string_22_7_27_5) {
-    BEZEL_EXPECT_EQ(out(std::string(
+    BEZEL_EXPECT_EQ(checkedOut(std::string(
                         "module M; class C "
                         "  public constructor() ") + kObjLocal +
                         "var f := lambda() => do o := \"inctor\"; end; f(); "

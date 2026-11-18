@@ -12307,6 +12307,40 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
     // function (no `cd`) has no user body and declines.
     setOpaqueSlotScanRoot(cd ? &cd->body : nullptr, nullptr);
 
+    // fix #6766 (§22.12 / §27.5 / §28.9, v0.359): the closure-local analysis
+    // for the STATIC constructor body — the same gap emitConstructorBody had
+    // (see the comment there): no closure token was pinned, so a lambda-valued
+    // local's closure was never released (MEASURED 80 B / 3 allocations for
+    // the one run of `static constructor() var f := lambda() => ...; f();`).
+    // The synthesized field-init-only function (no `cd`) has no user body, so
+    // its sets are only cleared and the tokens pinned to it (inert).
+    closureReleaseEligible_.clear();
+    closureLocalCapturedCell_.clear();
+    closureLocalCapturedCellReassigned_.clear();
+    closureLocalCallCounts_.clear();
+    closureLocalCandidates_.clear();
+    closureBorrowAll_.clear();
+    closureBorrowRetainEligible_.clear();
+    closureReleaseEligibleFn_ = fn;
+    boxCaptureLocals_.clear();
+    singleCaptureLocals_.clear();
+    assignedCaptureVars_.clear();
+    returnedCaptureVars_.clear();
+    definitelyEscapingLambdas_.clear();
+    boxCaptureLocalsFn_ = fn;
+    cellFreeEligible_.clear();
+    unwindUnsafeCellFree_.clear();
+    sharedCellEnvdtorFreeOwner_.clear();
+    cellFreeEligibleFn_ = fn;
+    if (cd) {
+        collectCapturedCellClosureLocals(cd->body);
+        collectClosureReleaseEligible(cd->body);
+        collectBoxCaptureLocals(cd->body);
+        collectDefinitelyEscapingLambdas(cd->body);
+        // Must run AFTER collectClosureReleaseEligible (uses its result).
+        collectCellFreeEligible(cd->body);
+    }
+
     // fix #529 / §22.7 (part a): establish the entry block FIRST so that
     // builder_ has a valid insert point, then pre-seed propagateBB_ with a
     // custom block that wraps the escaping exception in TypeInitializationException
@@ -13629,12 +13663,51 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     // pure walk has no IR effect and the helper's per-cell soundness checks
     // (#966 owner-disposal deferral, #969/#3403 shallower-scope skip) gate
     // every actual free.
+    //
+    // fix #6766 (§27.5 / §28.9, v0.359): the `var` CLOSURE-LOCAL refcount
+    // analysis for the constructor body. EVERY consumer of the closure sets
+    // gates on `currentFn_ == closureReleaseEligibleFn_`, and this function
+    // set `currentFn_` but never pinned that token (nor ran
+    // collectClosureReleaseEligible), so the scope-end `bz_closure_release`
+    // of a lambda-valued local in a constructor body was never registered:
+    // `var f := lambda(): int => this.X;` leaked its closure + env on every
+    // construction (MEASURED 80 B in 3 allocations for one `new P(7)`, 8000 B
+    // over 100). The destructor-body site (Disposal.cpp, #2887) is the
+    // template: clear the sets the analysers' preconditions assume, classify
+    // the captured cells (function entry only, #4434), classify the closure
+    // locals, then run collectCellFreeEligible AFTER (it consumes
+    // closureReleaseEligible_'s result). The scope-end releases themselves
+    // are registered by lowerScopedBlock below, after §22.8 steps 1/2.
+    closureReleaseEligible_.clear();
+    closureLocalCapturedCell_.clear();
+    closureLocalCapturedCellReassigned_.clear();
+    closureLocalCallCounts_.clear();
+    closureLocalCandidates_.clear();
+    closureBorrowAll_.clear();
+    closureBorrowRetainEligible_.clear();
+    closureReleaseEligibleFn_ = fn;
+    boxCaptureLocals_.clear();
+    singleCaptureLocals_.clear();
+    assignedCaptureVars_.clear();
+    returnedCaptureVars_.clear();
+    definitelyEscapingLambdas_.clear();
+    boxCaptureLocalsFn_ = fn;
+    collectCapturedCellClosureLocals(cd->body);
+    collectClosureReleaseEligible(cd->body);
+    collectBoxCaptureLocals(cd->body);
+    collectDefinitelyEscapingLambdas(cd->body);
     cellFreeEligible_.clear();
     unwindUnsafeCellFree_.clear();      // fix #2334
     sharedCellEnvdtorFreeOwner_.clear();  // fix #3426
     cellFreeEligibleFn_ = fn;
+    // Must run AFTER collectClosureReleaseEligible (uses its result).
     collectCellFreeEligible(cd->body);
     bindParameters(fn, /*hasThis=*/true, &cs->params);
+    // fix #4174 follow-up: the closure twin of retainAssignedStringParams
+    // below, co-gated with the release the pin above arms (a function-typed
+    // parameter assigned in the body must own an independent +1, or the
+    // drop-on-overwrite release frees the CALLER's borrow).
+    retainAssignedClosureParams(cd->body, cs->params);
     // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §22.8 (v0.240): run the
     // `var` STRING-local refcount analysis for the COMPILED constructor body and
     // pin the token to this fn. EVERY consumer of the three string sets gates on
@@ -16385,6 +16458,54 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
     }
     retainAssignedStringParams(cd->body, cs->params);
 
+    // fix #6766 (§27.5 / §28.9, v0.359): the closure-local twin of the
+    // string analysis above, for the INLINED constructor body (a record or
+    // generic-class constructor is lowered into the CALLER's function, so the
+    // caller's closure sets describe the caller's own body and name none of
+    // this body's locals: MEASURED, `var f := lambda(): int => this.X;` in a
+    // record constructor leaked its closure per construction, 8000 B / 300
+    // allocations over 100, where the same body in a compiled class
+    // constructor was clean after emitConstructorBody's pin). The sets are
+    // keyed on `const ast::LocalDecl*`, unique per AST node, so the inlined
+    // body's verdicts cannot collide with the enclosing body's; the
+    // enclosing body's sets (and tokens) are saved here and restored on
+    // return by CaptureReclaimSetScope, the same scope the iterator and
+    // async emitters use for exactly this. ONLY when the enclosing body is
+    // already the analyzed one for BOTH the closure and the capture-cell
+    // families: otherwise the closure-local registration is inert in the
+    // enclosing function (an expression-bodied lambda, say) and pinning here
+    // would arm a scope-end release with no matching bind-time retain, so the
+    // bounded leak is left exactly as it is (the safe direction).
+    const bool analyzeInlinedCtorClosures =
+        currentFn_ == closureReleaseEligibleFn_ &&
+        currentFn_ == cellFreeEligibleFn_;
+    std::optional<CaptureReclaimSetScope> inlineCtorClosureScope;
+    std::unordered_set<const void*> savedInlineClosureLocalCapturedCell;
+    std::unordered_set<const void*> savedInlineClosureLocalCapturedCellReassigned;
+    if (analyzeInlinedCtorClosures) {
+        inlineCtorClosureScope.emplace(*this);
+        // collectCapturedCellClosureLocals clears these two (function entry
+        // only, #4434), and CaptureReclaimSetScope does not hold them.
+        savedInlineClosureLocalCapturedCell = closureLocalCapturedCell_;
+        savedInlineClosureLocalCapturedCellReassigned =
+            closureLocalCapturedCellReassigned_;
+        boxCaptureLocals_.clear();
+        singleCaptureLocals_.clear();
+        assignedCaptureVars_.clear();
+        returnedCaptureVars_.clear();
+        definitelyEscapingLambdas_.clear();
+        boxCaptureLocalsFn_ = currentFn_;
+        collectCapturedCellClosureLocals(cd->body);
+        collectClosureReleaseEligible(cd->body);
+        collectBoxCaptureLocals(cd->body);
+        collectDefinitelyEscapingLambdas(cd->body);
+        // Must run AFTER collectClosureReleaseEligible (uses its result).
+        collectCellFreeEligible(cd->body);
+        // The closure twin of retainAssignedStringParams above, co-gated with
+        // the release the analysis arms (#4174 follow-up).
+        retainAssignedClosureParams(cd->body, cs->params);
+    }
+
     // §22.9 step 1 (v0.181): run the leading chain (base/this) — recursively
     // inlining a generic base/sibling ctor — BEFORE installing this class's
     // own cleanup block below. An exception during the chain call itself
@@ -16476,6 +16597,13 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
     // fix #2817: restore the ENCLOSING body's string-refcount state (see the save
     // at the top). stringReleaseEligibleFn_ is untouched — an inlined body shares
     // the enclosing llvm::Function, so only the three sets (plus #2115's) move.
+    if (analyzeInlinedCtorClosures) {
+        closureLocalCapturedCell_ =
+            std::move(savedInlineClosureLocalCapturedCell);
+        closureLocalCapturedCellReassigned_ =
+            std::move(savedInlineClosureLocalCapturedCellReassigned);
+        inlineCtorClosureScope.reset();
+    }
     if (analyzeInlinedCtorBody) {
         stringReleaseEligible_ = std::move(savedInlineStringReleaseEligible);
         stringBorrowRetainEligible_ =

@@ -46,7 +46,6 @@
 using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
-using bezel::test::runAotCheckedLenient;
 
 namespace {
 
@@ -1335,19 +1334,16 @@ BEZEL_TEST(interp_this_class_tostring_8127, record_ctor_this_from_record_method_
 // §8.5 / §18.5 (v0.355): `this` is the receiver, of the OWNER's type. §27.5: a
 // lambda captures the enclosing member's `this`; an `async` lambda is a lambda.
 //
-// Oracles. The rows whose getter holds a LAMBDA-VALUED LOCAL use
-// `runAotCheckedLenient`: a lambda-valued local in a lazily emitted accessor
-// body leaks its closure on 8d5b8dd3 too (#6766's family, measured 72 B in 2
-// allocations with a control lambda that captures NOTHING — the leak is not
-// this fix's and does not depend on `this`), and the lenient oracle keeps the
-// generated-code ASan (a wrong-typed load still faults) while turning LSan off.
-// The rows without such a local use the full checked oracle.
+// Oracles. Every row uses the full checked oracle. The rows whose getter holds
+// a LAMBDA-VALUED LOCAL used `runAotCheckedLenient` while a lambda-valued local
+// in a lazily emitted accessor body leaked its closure (#6766, fixed): they are
+// back on `runAotChecked`, as the issue asked.
 
 // The review's e29: a class block getter forms a local async lambda capturing
 // `this`, read from a RECORD's sync method. cfd83413: IR verification failure.
 BEZEL_TEST(interp_this_class_tostring_8127,
            getter_local_async_lambda_this_from_record_sync) {
-    auto r = runAotCheckedLenient(
+    auto r = runAotChecked(
         "module M;\n"
         "public class B\n"
         "  public N: int := 4242;\n"
@@ -1384,7 +1380,7 @@ BEZEL_TEST(interp_this_class_tostring_8127,
 // `currentMethod_` is the record's, each the wrong answer for the lambda.
 BEZEL_TEST(interp_this_class_tostring_8127,
            getter_local_async_lambda_this_from_record_sync_async_and_iterator) {
-    auto r = runAotCheckedLenient(
+    auto r = runAotChecked(
         "module M;\n"
         "public class B\n"
         "  public N: int := 4242;\n"
@@ -1436,7 +1432,7 @@ BEZEL_TEST(interp_this_class_tostring_8127,
 // the getter is lowered from.
 BEZEL_TEST(interp_this_class_tostring_8127,
            getter_local_async_lambda_this_from_record_iterator) {
-    auto r = runAotCheckedLenient(
+    auto r = runAotChecked(
         "module M;\n"
         "public class B\n"
         "  public N: int := 4242;\n"
@@ -1572,11 +1568,10 @@ BEZEL_TEST(interp_this_class_tostring_8127,
 
 // A RECORD's block getter with a local async lambda, read from a CLASS: the
 // caller's `currentMethod_` is the class's, so cfd83413 failed IR verification
-// (no record load at all; 8d5b8dd3 and 6f894e53 too). Lenient: the getter's
-// lambda-valued local (#6766's family).
+// (no record load at all; 8d5b8dd3 and 6f894e53 too).
 BEZEL_TEST(interp_this_class_tostring_8127,
            record_getter_local_async_lambda_this_by_value_from_class) {
-    auto r = runAotCheckedLenient(
+    auto r = runAotChecked(
         "module M;\n"
         "public record R(K: int, Q: string)\n"
         "  public static method Pick(r: R): int => r.K + 1;\n"
@@ -1612,10 +1607,10 @@ BEZEL_TEST(interp_this_class_tostring_8127,
 // instantiation: on 8d5b8dd3, 6f894e53 AND cfd83413 this COMPILED and printed
 // garbage (a different number each build — `this` reached `Pick` unloaded).
 // The resume function's owner is now `R<T>` with its substitution live, so
-// the CG29 load happens. Lenient: the getter's lambda-valued local (#6766).
+// the CG29 load happens.
 BEZEL_TEST(interp_this_class_tostring_8127,
            generic_record_getter_local_async_lambda_this_by_value_from_class) {
-    auto r = runAotCheckedLenient(
+    auto r = runAotChecked(
         "module M;\n"
         "public record R<T>(K: int, V: T)\n"
         "  public static method Pick(r: R<T>): int => r.K + 1;\n"

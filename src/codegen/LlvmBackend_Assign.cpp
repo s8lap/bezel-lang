@@ -7429,10 +7429,68 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
     const bool savedStandalonePropBlockGetter = inStandalonePropBlockGetter_;
     inStandalonePropBlockGetter_ = true;
 
+    // fix #6766 (§27.5 / §28.9, v0.359): the closure-local and captured-cell
+    // analysis for THIS getter body. Every consumer of the closure sets gates
+    // on `currentFn_ == closureReleaseEligibleFn_` / `cellFreeEligibleFn_`,
+    // and a lazily emitted getter pinned neither, so the scope-end release of
+    // a lambda-valued local in a block getter never registered: MEASURED
+    // 3600 B / 100 allocations over 50 reads of `get => do var f :=
+    // lambda(): int => 8485; return f(); end;`. The getter is emitted in the
+    // MIDDLE of another body, so the enclosing body's sets and tokens are
+    // saved here and restored by CaptureReclaimSetScope (the same scope the
+    // iterator and async emitters use for a nested body), and the
+    // captured-cell classification, which that scope does not hold, is saved
+    // by hand. Mirrors emitFunctionBody / the destructor-body site (#2887).
+    //
+    // A getter whose own type is a function type is left unanalysed (the
+    // pre-fix behaviour): `return f;` of a local closure mints the caller's
+    // reference by the declared return type (ClosureEscapeWalker's
+    // coalesceReturnTransfers), and a getter has no `currentReturnTypeNode_`
+    // for that to read. The bounded leak stays there (the safe direction).
+    std::optional<CaptureReclaimSetScope> getterClosureScope;
+    std::unordered_set<const void*> savedGetterClosureCapturedCell;
+    std::unordered_set<const void*> savedGetterClosureCapturedCellReassigned;
+    const sema::TypeRef* getterRetTy =
+        pd->type ? ctx_.resolvedType(*pd->type) : nullptr;
+    const bool analyzeGetterClosures =
+        getterRetTy && getterRetTy->kind != sema::TypeRef::Kind::Function;
+    if (analyzeGetterClosures) {
+        getterClosureScope.emplace(*this);
+        savedGetterClosureCapturedCell = closureLocalCapturedCell_;
+        savedGetterClosureCapturedCellReassigned =
+            closureLocalCapturedCellReassigned_;
+        closureReleaseEligible_.clear();
+        closureLocalCallCounts_.clear();
+        closureReleaseEligibleFn_ = fn;
+        boxCaptureLocals_.clear();
+        singleCaptureLocals_.clear();
+        assignedCaptureVars_.clear();
+        returnedCaptureVars_.clear();
+        definitelyEscapingLambdas_.clear();
+        boxCaptureLocalsFn_ = fn;
+        cellFreeEligible_.clear();
+        unwindUnsafeCellFree_.clear();
+        sharedCellEnvdtorFreeOwner_.clear();
+        cellFreeEligibleFn_ = fn;
+        collectCapturedCellClosureLocals(acc->stmts);
+        collectClosureReleaseEligible(acc->stmts);
+        collectBoxCaptureLocals(acc->stmts);
+        collectDefinitelyEscapingLambdas(acc->stmts);
+        // Must run AFTER collectClosureReleaseEligible (uses its result).
+        collectCellFreeEligible(acc->stmts);
+    }
+
     // --- Emit body ---
     lowerScopedBlock(acc->stmts);
     if (!builder_.GetInsertBlock()->getTerminator())
         emitImplicitReturn(fn);
+    if (analyzeGetterClosures) {
+        closureLocalCapturedCell_ =
+            std::move(savedGetterClosureCapturedCell);
+        closureLocalCapturedCellReassigned_ =
+            std::move(savedGetterClosureCapturedCellReassigned);
+        getterClosureScope.reset();
+    }
 
     // --- Restore state ---
     thisRecvScope.close();  // fix-forward #8127

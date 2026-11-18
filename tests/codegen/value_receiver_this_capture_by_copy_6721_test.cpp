@@ -378,11 +378,11 @@ BEZEL_TEST(value_receiver_this_capture_by_copy_6721,
 // §22.7 rule 3 (v0.340): "the closure holding the value as of its
 // formation" — `X` is an `int` (defaultable, not a field §7.9 requires to be
 // explicitly initialized), so rule 1 admits the capture before `X := x`, and
-// the copy holds the default 0, not the later 7. runAot: a lambda formed in a
-// constructor body leaks its closure (#6766).
+// the copy holds the default 0, not the later 7. runAotChecked: the closure
+// the constructor body forms is released at its scope end (#6766).
 BEZEL_TEST(value_receiver_this_capture_by_copy_6721,
            record_ctor_capture_holds_value_as_of_formation_spec_22_7_rule_3) {
-    BEZEL_EXPECT_EQ(stdoutPlain(
+    BEZEL_EXPECT_EQ(stdoutChecked(
         "module M; "
         "public record P "
         "  public readonly property X: int; "

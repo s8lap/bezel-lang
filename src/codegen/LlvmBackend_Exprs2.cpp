@@ -14271,6 +14271,42 @@ llvm::Value* Emitter::buildRecordValue(
         // Folded in here rather than filed because it is literally this one call
         // and the alternative was leaving a proven use-after-free in the tree.
         retainAssignedStringParams(cd->body, cs->params);
+        // fix #6766 (§27.5 / §28.9, v0.359): a RECORD constructor body is
+        // lowered INTO the caller's function, so the caller's closure sets
+        // describe the caller's own body and name none of this body's locals
+        // (MEASURED: `var f := lambda(): int => this.X;` in a record
+        // constructor leaked its closure + env per construction, 8000 B / 300
+        // allocations over 100). Analyze the body for closure locals and
+        // captured cells here, with the enclosing body's sets saved and
+        // restored by CaptureReclaimSetScope — the same contract as
+        // inlineCtorBody (LlvmBackend_Setup.cpp), which has the full
+        // rationale. ONLY when the enclosing body is the analyzed one for
+        // both families; otherwise the bounded leak stays (the safe direction).
+        const bool analyzeRecordCtorClosures =
+            currentFn_ == closureReleaseEligibleFn_ &&
+            currentFn_ == cellFreeEligibleFn_;
+        std::optional<CaptureReclaimSetScope> recordCtorClosureScope;
+        std::unordered_set<const void*> savedRecCtorClosureCapturedCell;
+        std::unordered_set<const void*> savedRecCtorClosureCapturedCellReassigned;
+        if (analyzeRecordCtorClosures) {
+            recordCtorClosureScope.emplace(*this);
+            savedRecCtorClosureCapturedCell = closureLocalCapturedCell_;
+            savedRecCtorClosureCapturedCellReassigned =
+                closureLocalCapturedCellReassigned_;
+            boxCaptureLocals_.clear();
+            singleCaptureLocals_.clear();
+            assignedCaptureVars_.clear();
+            returnedCaptureVars_.clear();
+            definitelyEscapingLambdas_.clear();
+            boxCaptureLocalsFn_ = currentFn_;
+            collectCapturedCellClosureLocals(cd->body);
+            collectClosureReleaseEligible(cd->body);
+            collectBoxCaptureLocals(cd->body);
+            collectDefinitelyEscapingLambdas(cd->body);
+            // Must run AFTER collectClosureReleaseEligible (uses its result).
+            collectCellFreeEligible(cd->body);
+            retainAssignedClosureParams(cd->body, cs->params);
+        }
         // fix #4013 (§12.8 / §22.7 / §22.8, v0.294): a leading `this(...)` chain
         // call (§12.8 puts it in the body's first statement) was never
         // recognised here — unlike every OTHER constructor-body lowering path
@@ -14318,6 +14354,13 @@ llvm::Value* Emitter::buildRecordValue(
             }
         }
         lowerScopedBlock(cd->body, bodyStartIdx);
+        if (analyzeRecordCtorClosures) {
+            closureLocalCapturedCell_ =
+                std::move(savedRecCtorClosureCapturedCell);
+            closureLocalCapturedCellReassigned_ =
+                std::move(savedRecCtorClosureCapturedCellReassigned);
+            recordCtorClosureScope.reset();
+        }
         thisRecvScope.close();  // fix-forward #8127
         currentThis_ = savedThis;
         locals_ = std::move(savedLocals);
