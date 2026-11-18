@@ -42388,6 +42388,11 @@ void Emitter::collectClosureReleaseEligible(
                         joinInto(acc, catchEntry);
                         for (FlowState* outer : tryAccs)
                             if (outer != &acc) joinInto(*outer, catchEntry);
+                        // narrow #8824: a guard that is false (or a catch
+                        // that rethrows) leaves the method with the guard's
+                        // store kept, so the unwind state sees it too.
+                        // Over-joining only skips an unwind-path release.
+                        joinInto(unwindSt, catchEntry);
                     }
                     for (auto& c : ts->catches) {
                         FlowState cs2 = catchEntry;

@@ -96,6 +96,16 @@ end C;
 )BZL";
 }
 
+// narrow #8824: a catch guard's store (#8769's catch-entry state) must also
+// reach the unwind state. `Fill`'s exception leaves the method when the guard
+// is false.
+std::string guardExpected200() {
+    std::string e;
+    for (int i = 1; i < 200; i += 2) e += std::to_string(2 + 2 * i) + "\n";
+    e += "100\n";
+    return e;
+}
+
 }  // namespace
 
 // #8824's repro (c07), as filed.
@@ -204,4 +214,89 @@ BEZEL_TEST(closure_local_kept_throw_unwind_8824,
         "      b := g;\n"
         "    end for;\n")),
         expected200());
+}
+
+// narrow #8824: definition before the try; the false guard's `d.TryAdd(0, b)` kept `b`, and the
+// exception leaves Fill (§28.9, §31.1, v0.359).
+BEZEL_TEST(closure_local_kept_throw_unwind_8824, guard_false_keeps_single_stmt_arm_def_before_try_spec_28_9_31_1) {
+    BEZEL_EXPECT_EQ(runNoMemoryErrorOut(R"BZL(module M;
+type Fn := (int, int) -> int;
+public class C
+  public static method Boom(k: int)
+    if k mod 2 = 1 then
+      throw new InvalidOperationException("x");
+    end;
+  end Boom;
+  public static method Fill(d: Dictionary<int, Fn>, k: int)
+    var g: Fn := lambda(x: int, y: int) => 0;
+    var b: Fn := lambda(x: int, y: int) => x - y + k;
+    try
+      Boom(k);
+    catch
+      var e: InvalidOperationException when d.TryAdd(0, b) and k < 0 => b := g;
+    end try;
+    b := g;
+  end Fill;
+  public static method Main(): int
+    var n := 0;
+    for var i in 0..<200 do
+      var d: Dictionary<int, Fn> := new Dictionary<int, Fn>();
+      try
+        Fill(d, i);
+      catch
+        var e: InvalidOperationException => do n := n + 1; end
+      end try;
+      if d.ContainsKey(0) then
+        Console.WriteLine(d[0](1, 2) + d[0](4, 1));
+      end;
+    end for;
+    Console.WriteLine(n);
+    return 0;
+  end Main;
+end C;
+)BZL"),
+        guardExpected200());
+}
+
+// narrow #8824: definition inside the try body; the false guard's `d.TryAdd(0, b)` kept `b`, and the
+// exception leaves Fill (§28.9, §31.1, v0.359).
+BEZEL_TEST(closure_local_kept_throw_unwind_8824, guard_false_keeps_def_inside_try_body_spec_28_9_31_1) {
+    BEZEL_EXPECT_EQ(runNoMemoryErrorOut(R"BZL(module M;
+type Fn := (int, int) -> int;
+public class C
+  public static method Boom(k: int)
+    if k mod 2 = 1 then
+      throw new InvalidOperationException("x");
+    end;
+  end Boom;
+  public static method Fill(d: Dictionary<int, Fn>, k: int)
+    var g: Fn := lambda(x: int, y: int) => 0;
+    var b: Fn := g;
+    try
+      b := lambda(x: int, y: int) => x - y + k;
+      Boom(k);
+    catch
+      var e: InvalidOperationException when d.TryAdd(0, b) and k < 0 => b := g;
+    end try;
+    b := g;
+  end Fill;
+  public static method Main(): int
+    var n := 0;
+    for var i in 0..<200 do
+      var d: Dictionary<int, Fn> := new Dictionary<int, Fn>();
+      try
+        Fill(d, i);
+      catch
+        var e: InvalidOperationException => do n := n + 1; end
+      end try;
+      if d.ContainsKey(0) then
+        Console.WriteLine(d[0](1, 2) + d[0](4, 1));
+      end;
+    end for;
+    Console.WriteLine(n);
+    return 0;
+  end Main;
+end C;
+)BZL"),
+        guardExpected200());
 }
