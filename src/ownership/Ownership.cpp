@@ -1869,7 +1869,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // An UNSPENT query still rejects: it is in neither set.
             // // per §29.11, §29.7
             if (sawYield_ && spentImportedQueryRights.count(sym) != 0) continue;
-            ctx_.diagnostics().report(
+            report(
                 Severity::Error,
                 obligationDiagLoc(sym, st),
                 std::string("owned value in `") +
@@ -2068,6 +2068,54 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 (es->second.state == OwnershipState::Disposed ||
                  es->second.state == OwnershipState::MovedFrom))
                 continue;
+            // fix #8767 (§28.3.10 *Owned local discharge requirement*, §28.9,
+            // v0.359): the GETTER-BODY mode does NOT arm a scope-end disposal
+            // for a local whose scope-end value is not OWNED.
+            //
+            // §28.3.10's auto-drop applies to "an owned local — or an `owned`
+            // parameter — [that] reaches a *normal-exit* scope end without
+            // having reached a discharge point, and is not in moved-from
+            // state". A local that was REASSIGNED holds, at its scope end,
+            // whatever its LAST store put there; §28.7's drop-on-overwrite
+            // has already disposed the DISPLACED value at that store. If the
+            // last store put a BORROW there, the local owns NOTHING at its
+            // scope end — and arming the scope-end disposal would dispose
+            // the BORROW'S SOURCE: a heap-use-after-free of a value the
+            // getter body does not own. MEASURED: the METHOD path's arm (which
+            // this getter mode deliberately does not inherit) frees the
+            // borrowed instance at the getter's scope end, and the caller's
+            // next read of it is a heap-use-after-free under
+            // `scripts/agent_check.sh --probe --asan`.
+            //
+            // The same reading keeps §28.3.10's CLOSED suppression set
+            // intact: suppression 3 — "it is moved or returned (no implicit
+            // drop occurs)" — covers a local whose scope-end value is a
+            // borrow that was RETURNED, and a returned borrow leaves the
+            // scope-end state `Borrowed`, which the gate above does not skip.
+            // So in the getter mode there is no implicit drop at such a
+            // local's scope end, and the §28.3.10 must-use lint — which
+            // announces the implicit drop — must not fire for it either.
+            //
+            // A REASSIGNED local whose scope-end value IS owned is still
+            // disposed: the dataflow's endState says `Owned` for it, and the
+            // endState arm above (which runs BEFORE this loop) arms that
+            // disposal and reports the lint. This loop only ever sees the
+            // locals the endState arm did not.
+            if (getterScopeOnly_) {
+                const auto es = endState.find(sym);
+                if (es != endState.end()) {
+                    // A scope-end state other than `Owned` means the local
+                    // holds no owned value at its scope end.
+                    if (es->second.state != OwnershipState::Owned) continue;
+                } else if (reassignedLocals.count(sym) != 0) {
+                    // A NESTED-scope local has no endState entry (its scope
+                    // ended before the function exit). This loop's premise
+                    // is "a never-moved genuine owner" — a REASSIGNED one
+                    // holds an unknown value at its scope end, so it is
+                    // skipped rather than disposed on a guess.
+                    continue;
+                }
+            }
             // §28.3 (#1883, #1900): the nested-scope mirror of the function-
             // exit gate — the `!st.maybeConsumed` filter the function-exit
             // gate relies on isn't computed here (this loop iterates
@@ -4606,7 +4654,7 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                 // `const` binding, which by construction has no free path at
                 // all, and stops the lint from advertising it. // per §21.1,
                 // §28.3, §15.6, v0.240, #2749, #2753
-                ctx_.diagnostics().report(
+                report(
                     Severity::Error, lc->value->span.begin,
                     std::string("a `const` local (`") + std::string(lc->name) +
                     "`) must not take an owned production — a range slice "
@@ -4631,7 +4679,7 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                 // and the `using var` remedy the spec mandates, and names the
                 // `move` form so the diagnostic teaches the actual culprit.
                 // // per §21.1 v0.298, #4287
-                ctx_.diagnostics().report(
+                report(
                     Severity::Error, lc->value->span.begin,
                     std::string("a `const` local (`") +
                     std::string(lc->name) +
@@ -4640,7 +4688,7 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                     "source with `using var` and read it through the const, "
                     "or omit the `move` (§21.1 / §28.3)");
             } else if (producerState(*lc->value) == OwnershipState::Owned) {
-                ctx_.diagnostics().report(
+                report(
                     Severity::Error, lc->value->span.begin,
                     std::string("a `const` local (`") +
                     std::string(lc->name) +
@@ -4660,7 +4708,7 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                 // rejects it by name regardless — a drain view is an affine,
                 // single-consumption value no never-changing `const` binding
                 // may hold. // per §21.1 v0.201, §29.11, #2146
-                ctx_.diagnostics().report(
+                report(
                     Severity::Error, lc->value->span.begin,
                     std::string("a `const` local (`") + std::string(lc->name) +
                     "`) must not take a deferred-activation producer — "
@@ -4693,7 +4741,7 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                 // both spellings that DO bind it are already reclaimed
                 // correctly, so no disposal machinery changes here.
                 // // per §21.1 v0.201, stdlib §5 / §4.4 / §9.6, #2709
-                ctx_.diagnostics().report(
+                report(
                     Severity::Error, lc->value->span.begin,
                     std::string("a `const` local (`") + std::string(lc->name) +
                     "`) must not take an owned production — a collection "
@@ -4725,7 +4773,7 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                 // and `using var sub`) are already reclaimed by codegen
                 // correctly, so no disposal machinery changes here.
                 // // per §21.1 v0.286, stdlib §2.11 / §6.5, #3694
-                ctx_.diagnostics().report(
+                report(
                     Severity::Error, lc->value->span.begin,
                     std::string("a `const` local (`") + std::string(lc->name) +
                     "`) must not take an owned production — `.Subscribe(...)` "
@@ -4743,7 +4791,7 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                 // #2709 accept-and-leak failure mode restored by omission.
                 // Emitting §21.1's general wording keeps the gate and the
                 // messages jointly total. // per §21.1, #2709, #3694
-                ctx_.diagnostics().report(
+                report(
                     Severity::Error, lc->value->span.begin,
                     std::string("a `const` local (`") + std::string(lc->name) +
                     "`) must not take an owned production — the binding never "
@@ -20405,6 +20453,77 @@ static void runOwnedSetterBody(const ast::PropertyDecl& pd,
                !enclosingType->genericParams.empty());
 }
 
+// fix #8767 (§28.3.10 *Owned local discharge requirement*, §28.9, v0.359): a
+// GETTER accessor's block body never reached the ownership dataflow, so an
+// owned-state local declared in it got NO end-of-scope disposal obligation:
+// the §28.3.10 affine auto-drop never armed, the local's heap block was never
+// reclaimed, and every read of the property leaked it.
+//
+// MEASURED on the base (r30-c1 @ 80439bb9d), the issue's own repro verbatim:
+// "Direct leak of 16 byte(s) in 1 object(s) allocated from: #1 bz$prop$Item$get"
+// — one 16-byte `Cell` per property read.
+//
+// WHY THE GETTER EMITTER IS NOT THE GAP. The getter body's scope-end disposal
+// machinery already runs: `using var t: Cell? := new Cell(1);` in the SAME
+// getter body disposes correctly (MEASURED — the destructor runs, 0 leaked
+// bytes), because `registerUsingDisposal` -> `disposeStack_` ->
+// `lowerScopedBlock` -> `emitDisposals` are the method-body path's and the
+// getter body reaches them. What is missing is the OWNERSHIP pass's verdict:
+// codegen's `lowerStmt` LocalDecl arm gates the plain-`var` scope-end
+// disposal on `ld->autoDropAtScopeEnd`, and that flag is set by the
+// method-body dataflow's end-of-method scope-exit sweep — which a getter body
+// never reached.
+//
+// So the getter body runs the SAME dataflow (`MethodOwnership::run`): the
+// method-body path, reused verbatim. It computes the ownership state, the
+// discharge set (`everDischarged_`) and the auto-drop flag, so a local that IS
+// discharged — moved out, explicitly disposed, discarded — is NOT auto-dropped
+// and cannot be disposed twice.
+//
+// The getter mode (`setGetterScopeOnly`) keeps the §28.3.10 must-use lint at
+// the new implicit-drop site and suppresses every other diagnostic the
+// method-body pass would raise; see `getterScopeOnly_`'s own comment.
+//
+// The mode ALSO narrows the scope-end DISPOSAL itself — it arms the §28.3.10
+// free only where the local's scope-end value is OWNED, because a local
+// reassigned to a BORROW owns nothing at its scope end and disposing it would
+// dispose the borrow's SOURCE (a heap-use-after-free). The carve lives in
+// `MethodOwnership::run`'s nested-scope mirror; the measurement and the
+// pre-existing method-path counterpart are in that carve's own comment.
+//
+// §28.9 (v0.359): "**Accessor faces are uniform across type kinds.** ... the
+// two accessor body spellings of §23.3 (`get => e` and `get => do … end`) are
+// semantically indistinguishable at every read site." — the block form's scope
+// is a scope like any other, and §28.3.10's discharge requirement applies to
+// it. // per §28.3.10, §28.9, v0.359
+static void runGetterBody(const ast::PropertyDecl& pd,
+                          const ast::PropertyAccessor& acc,
+                          sema::SemaContext& ctx,
+                          const ast::TypeDecl* enclosingType) {
+    // An INDEXER getter's parameters are the index arguments — the body's own
+    // parameters for the dataflow's parameter classification (the `set(owned)`
+    // sibling above collects them the same way). A plain property has none.
+    const std::vector<sema::Symbol*>* idxParams = nullptr;
+    for (const auto& up : ctx.symbols()) {
+        sema::Symbol* s = up.get();
+        if (!s || s->decl != &pd) continue;
+        if (auto* ps = dynamic_cast<sema::PropertySymbol*>(s))
+            if (ps->isIndexer) idxParams = &ps->indexerParams;
+    }
+    std::vector<sema::Symbol*> params;
+    if (idxParams) params = *idxParams;
+    bool isStatic = false;
+    for (std::string_view mod : pd.modifiers)
+        if (mod == "static") isStatic = true;
+    MethodOwnership mo(ctx);
+    mo.setGetterScopeOnly();
+    mo.run(acc.stmts, &params, /*isAsync=*/false, /*isDestructor=*/false,
+           /*returnType=*/nullptr, /*returnOwned=*/false, isStatic,
+           /*genericCtx=*/nullptr,
+           /*isGenericBody=*/enclosingType &&
+               !enclosingType->genericParams.empty());
+}
+
 // fix #4011 / §7.9: forward-declared so checkMember's NestedTypeMember arm
 // (below) can run the same no-ctor screen checkTopDecl runs for a top-level
 // type — defined after checkOwnedFieldDA, further down this file.
@@ -20870,6 +20989,13 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
                     mo.checkGetterFreshOwnedReturn(*acc.exprBody);
                 } else if (acc.bodyKind ==
                            ast::PropertyAccessorBodyKind::Block) {
+                    // fix #8767 (§28.3.10, §28.9, v0.359): the getter body's
+                    // scope-end disposal — the owned local it declares is
+                    // disposed at the getter body's scope end, exactly as in a
+                    // method body. See `runGetterBody`'s own comment for the
+                    // measurement and for why the getter EMITTER was not the
+                    // gap.
+                    runGetterBody(*pd, acc, ctx, enclosingType);
                     // fix #6404 (§28.6, v0.338): the mint-announcing carve is
                     // keyed on the getter's OWN declared return type — the
                     // property's `type` — per §28.3's "The classification stays

@@ -592,6 +592,11 @@ public:
     void setOwnedAccessorValue(sema::Symbol* sym) {
         ownedAccessorValue_ = sym;
     }
+    // fix #8767 (§28.3.10 *Owned local discharge requirement*, §28.9, v0.359):
+    // the GETTER-BODY scope-exit mode — see `getterScopeOnly_`'s own comment
+    // for what it suppresses and what it keeps. Set by `runGetterBody` before
+    // the getter body's `run`.
+    void setGetterScopeOnly() { getterScopeOnly_ = true; }
     // fix #5252: does an owned borrow SOURCE (already classified owned by
     // `ownedLocalBorrowSource`) name a parameter rather than a local? True for
     // a ParameterSymbol and for the `set(owned)` accessor's `value`; selects
@@ -1681,8 +1686,46 @@ private:
     // diagnostic exactly once. Every transfer-function report routes
     // through `report()` so the flag is honoured in one place.
     bool suppressDiag_ = false;
+
+    // fix #8767 (§28.3.10 *Owned local discharge requirement*, §28.9, v0.359):
+    // the GETTER-BODY scope-exit mode. A property/indexer accessor body runs
+    // the ownership dataflow (so its owned locals get the §28.3.10 affine
+    // auto-drop and the scope-end free), but the METHOD-body-ONLY rules the
+    // dataflow also carries must not start firing in a getter body: the #926
+    // comment records that a getter body runs "a NARROW getter-return check,
+    // not the full pass, so existing getters/setters surface no unrelated new
+    // diagnostics", and the #5252 comment says the same about "bringing them
+    // under the full pass" — "a separate blast". So in this mode every
+    // diagnostic the pass would raise is SUPPRESSED, and the only one that
+    // still fires is the §28.3.10 must-use lint at the implicit-drop site —
+    // the lint is the rule's own announcement of the new drop site, and
+    // §28.3.10 makes the rule "uniform across body kinds". (The carve below
+    // narrows even that lint: it fires where the scope-end drop actually
+    // happens.)
+    //
+    // The convention that implements it: a diagnostic reported DIRECTLY
+    // (`ctx_.diagnostics().report`) is one this mode KEEPS (the §28.3.10
+    // must-use lints at the scope-exit sweep's implicit-drop sites are all
+    // reported that way), and a diagnostic reported through `report()` is one
+    // this mode SUPPRESSES (the §21.1 `const`-local rejections and the §28.3
+    // hard "would be dropped here without disposal" error were routed
+    // through `report()` for exactly this reason). A suppressed rejection
+    // leaves the pre-fix behaviour (a bounded leak) in place — the safe
+    // direction — and the auto-drop FLAGS the sweep sets are unaffected.
+    //
+    // The mode ALSO narrows the scope-end DISPOSAL itself: it arms the
+    // §28.3.10 scope-end free only where the local's scope-end value is
+    // OWNED. A local that was reassigned holds, at its scope end, whatever
+    // its last store put there — and a BORROW there is not owned at all, so
+    // disposing it would dispose the borrow's SOURCE (a heap-use-after-free
+    // of a value the getter body does not own). See the carve in
+    // `MethodOwnership::run`'s nested-scope mirror for the full argument and
+    // the measurement.
+    bool getterScopeOnly_ = false;
+
     void report(Severity sev, SourceLocation loc, std::string msg) {
         if (suppressDiag_) return;
+        if (getterScopeOnly_) return;
         ctx_.diagnostics().report(sev, loc, std::move(msg));
     }
 
