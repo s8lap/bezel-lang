@@ -4425,6 +4425,19 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         retainAssignedClosureParams(lam.stmts, *paramSyms);
     // Emit body.
     if (lam.exprBody) {
+        // fix #6480 / §28.3.11 *Unbound owned temporaries* (v0.359): the
+        // expression body is a FULL EXPRESSION (K8), and §28.3.11 disposes an
+        // unbound owned temporary "at the end of the full expression in which
+        // it is produced, after every use of it within that expression has
+        // completed". The BLOCK-bodied form gets that scope from
+        // `lowerScopedBlock` (which pushes one and calls `emitDisposals` at
+        // scope end); the EXPRESSION-bodied form had NO scope at all, so every
+        // registration that owes the discharge found an empty `disposeStack_`
+        // and declined it — the indexer-get receiver's (#6476) among them —
+        // and the temporary leaked forever. Open the scope here so the
+        // registrations have somewhere to land, and emit its disposals before
+        // the `ret` (below).
+        disposeStack_.emplace_back();
         llvm::Value* v = nullptr;
         // §15.4 (#1825): a lambda's expression body that is a collection literal
         // has no standalone type — lowerExpr returns null for a
@@ -4640,30 +4653,50 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                     !isUserMethodClosureReturnCall(lam.exprBody.get()) &&
                     !returnedClosureLocalOwnsPlusOne(lam.exprBody.get()))
                     emitClosureRetain(v);
-                builder_.CreateRet(v);
+                // fix #6480 / §28.3.11 (v0.359): the scope's disposals run
+                // AFTER the retains above, never before. A `string`-returning
+                // body retains the value it read out of the receiver, and a
+                // disposal that ran first would free the very pointer that
+                // retain reads (a use-after-free). §28.3.11 defers the
+                // disposal to "after every use of it within that expression
+                // has completed", and the retain IS such a use.
+                emitDisposals(disposeStack_.back());
+                // A disposal pass can leave the block terminated (it branches
+                // on a null slot); the `ret` belongs on the live edge only —
+                // the same guard `lowerScopedBlock`'s caller uses.
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateRet(v);
             } else {
-                // fix #1255 / §27.5 / §14.2: when the expression body lowered
-                // to null (e.g. `x.Val()` where x: T with T erased to i32 in
-                // the unspecialized generic template — the non-pointer receiver
-                // guard in emitMethodCall returns null) AND the declared return
-                // type is NON-VOID, emitting `ret void` produces malformed IR
-                // that the LLVM verifier rejects ("Function return type does
-                // not match operand type of return inst! ret void / i32").
-                // Mirror emitImplicitReturn and the block-body fall-through
-                // below: emit a zero-value stub for non-void return types.
-                // The unspecialized template stub is never called in practice
-                // (only the per-T specialization built by
-                // buildSpecializedMethodFn is called, and that re-lowers the
-                // lambda with the concrete T so lowerExpr(x.Val()) returns a
-                // real value); for a real codegen error the diagnostic system
-                // already reported it and any value is equally "wrong".
-                // per §27.5 / §14.2.
-                if (retTy->isVoidTy())
-                    builder_.CreateRetVoid();
-                else
-                    builder_.CreateRet(llvm::Constant::getNullValue(retTy));
+                // fix #6480: the same discharge on the void / null-result arm.
+                emitDisposals(disposeStack_.back());
+                if (!builder_.GetInsertBlock()->getTerminator()) {
+                    // fix #1255 / §27.5 / §14.2: when the expression body lowered
+                    // to null (e.g. `x.Val()` where x: T with T erased to i32 in
+                    // the unspecialized generic template — the non-pointer receiver
+                    // guard in emitMethodCall returns null) AND the declared return
+                    // type is NON-VOID, emitting `ret void` produces malformed IR
+                    // that the LLVM verifier rejects ("Function return type does
+                    // not match operand type of return inst! ret void / i32").
+                    // Mirror emitImplicitReturn and the block-body fall-through
+                    // below: emit a zero-value stub for non-void return types.
+                    // The unspecialized template stub is never called in practice
+                    // (only the per-T specialization built by
+                    // buildSpecializedMethodFn is called, and that re-lowers the
+                    // lambda with the concrete T so lowerExpr(x.Val()) returns a
+                    // real value); for a real codegen error the diagnostic system
+                    // already reported it and any value is equally "wrong".
+                    // per §27.5 / §14.2.
+                    if (retTy->isVoidTy())
+                        builder_.CreateRetVoid();
+                    else
+                        builder_.CreateRet(llvm::Constant::getNullValue(retTy));
+                }
             }
         }
+        // The scope is popped on every edge — the normal one (its disposals
+        // emitted above), the terminated one (the throw site's
+        // `emitUnwindDisposals` already fired them), and the null-result one.
+        disposeStack_.pop_back();
     } else {
         lowerScopedBlock(lam.stmts);
         // Fall-through terminator: must match the lambda's actual return type.
