@@ -4485,6 +4485,75 @@ sema::LocalSymbol* MethodOwnership::findForLoopVarSymbol(
     return nullptr;
 }
 
+// fix #8935 (§28.3.7, v0.359): the redundant-marker check for a store into
+// an `owned` field, factored out of visitStmt so the lambda-body pre-pass
+// (applyUsingVarBorrowPinInLambdaStmt) runs the SAME check on a lambda-body
+// store. A method-body store and a lambda-body store must get one verdict.
+void MethodOwnership::checkRedundantMoveOnOwnedFieldStore(
+        const ast::AssignmentStmt& as) {
+    // §28.3 K3.13 (marker economy) / K3.1 (store into an `owned` field /
+    // owning-collection slot): the declared slot announces the consume
+    // (consume table K3.1 row, Spelling column = "none — the declared slot
+    // announces (marker-free)"). A marker on the RHS of such a store is
+    // rejected as redundant. Limited to assignment (`:=`) — compound
+    // assignments (`+=`, `??=`, etc.) don't enter this consume position.
+    //
+    // Bounded to LOCAL or PARAMETER RHS sources. A field-to-field store
+    // `_ownedA := move _ownedB;` is NOT redundant — both fields' K9.2
+    // restoration rules need the explicit marker on the RHS to track the
+    // moved-from slot.
+    if (as.op == ":=" && as.target && as.value &&
+        exprIsOwnedFieldRead(*as.target)) {
+        if (auto* ue =
+                dynamic_cast<const ast::UnaryExpr*>(as.value.get())) {
+            if (ue->op == "move") {
+                // fix #5144 / §17.8 (v0.309): a `move x!` (a `move` of a
+                // postfix-null-forgiving PLACE) is the SAME redundant
+                // marker as `move x` — §17.8 makes the `!` transparent to
+                // the marker. The pre-fix check matched only a bare
+                // `IdentifierExpr` operand, so `move x!` slipped through
+                // (the bare-bang classifier at ownedArgSourceIsBorrow's
+                // PostfixBang arm treated `x!` as a borrow and rejected
+                // it before the field write could be reached; with #5144
+                // it now consumes x, and the redundant-marker check
+                // below fires). Peel a single `!` to the underlying
+                // identifier for the binding name.
+                const ast::IdentifierExpr* id = nullptr;
+                if (auto* idInner =
+                        dynamic_cast<const ast::IdentifierExpr*>(
+                            ue->operand.get())) {
+                    id = idInner;
+                } else if (auto* pb =
+                               dynamic_cast<const ast::PostfixBangExpr*>(
+                                   ue->operand.get())) {
+                    id = dynamic_cast<const ast::IdentifierExpr*>(
+                        pb->operand.get());
+                }
+                if (id) {
+                    auto* sym = ctx_.exprSymbol(*id);
+                    bool sourceIsLocalOrParam =
+                        sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
+                                dynamic_cast<sema::ParameterSymbol*>(sym));
+                    if (sourceIsLocalOrParam) {
+                        report(
+                            Severity::Error, ue->span.begin,
+                            std::string("the `move` marker is redundant "
+                                        "on the right-hand side of a "
+                                        "store into an `owned` field — "
+                                        "the declared field slot already "
+                                        "announces the ownership "
+                                        "transfer; write `") +
+                                std::string(id->name) +
+                                "` without `move` (§28.3 K3.13 marker "
+                                "economy; K3.1 owned-field store; §17.8 "
+                                "v0.309)");
+                    }
+                }
+            }
+        }
+    }
+}
+
 void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // §28.3 (v0.184, #1958): a captured owned binding is borrow-state inside any
     // closure — consuming it (marked transfer `M(owned x)` / `move x`, explicit
@@ -5403,67 +5472,7 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
-        // §28.3 K3.13 (marker economy) / K3.1 (store into an `owned` field /
-        // owning-collection slot): the declared slot announces the consume
-        // (consume table K3.1 row, Spelling column = "none — the declared slot
-        // announces (marker-free)"). A marker on the RHS of such a store is
-        // rejected as redundant. Limited to assignment (`:=`) — compound
-        // assignments (`+=`, `??=`, etc.) don't enter this consume position.
-        //
-        // Bounded to LOCAL or PARAMETER RHS sources. A field-to-field store
-        // `_ownedA := move _ownedB;` is NOT redundant — both fields' K9.2
-        // restoration rules need the explicit marker on the RHS to track the
-        // moved-from slot.
-        if (as->op == ":=" && as->target && as->value &&
-            exprIsOwnedFieldRead(*as->target)) {
-            if (auto* ue =
-                    dynamic_cast<const ast::UnaryExpr*>(as->value.get())) {
-                if (ue->op == "move") {
-                    // fix #5144 / §17.8 (v0.309): a `move x!` (a `move` of a
-                    // postfix-null-forgiving PLACE) is the SAME redundant
-                    // marker as `move x` — §17.8 makes the `!` transparent to
-                    // the marker. The pre-fix check matched only a bare
-                    // `IdentifierExpr` operand, so `move x!` slipped through
-                    // (the bare-bang classifier at ownedArgSourceIsBorrow's
-                    // PostfixBang arm treated `x!` as a borrow and rejected
-                    // it before the field write could be reached; with #5144
-                    // it now consumes x, and the redundant-marker check
-                    // below fires). Peel a single `!` to the underlying
-                    // identifier for the binding name.
-                    const ast::IdentifierExpr* id = nullptr;
-                    if (auto* idInner =
-                            dynamic_cast<const ast::IdentifierExpr*>(
-                                ue->operand.get())) {
-                        id = idInner;
-                    } else if (auto* pb =
-                                   dynamic_cast<const ast::PostfixBangExpr*>(
-                                       ue->operand.get())) {
-                        id = dynamic_cast<const ast::IdentifierExpr*>(
-                            pb->operand.get());
-                    }
-                    if (id) {
-                        auto* sym = ctx_.exprSymbol(*id);
-                        bool sourceIsLocalOrParam =
-                            sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
-                                    dynamic_cast<sema::ParameterSymbol*>(sym));
-                        if (sourceIsLocalOrParam) {
-                            report(
-                                Severity::Error, ue->span.begin,
-                                std::string("the `move` marker is redundant "
-                                            "on the right-hand side of a "
-                                            "store into an `owned` field — "
-                                            "the declared field slot already "
-                                            "announces the ownership "
-                                            "transfer; write `") +
-                                    std::string(id->name) +
-                                    "` without `move` (§28.3 K3.13 marker "
-                                    "economy; K3.1 owned-field store; §17.8 "
-                                    "v0.309)");
-                        }
-                    }
-                }
-            }
-        }
+        checkRedundantMoveOnOwnedFieldStore(*as);
         handleAssignment(*as);
         return;
     }
@@ -15943,6 +15952,10 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // fix #8935 (§28.3.7, v0.359): the lambda-body store into an `owned`
+        // field gets the same redundant-marker check as a method-body store
+        // (the helper is shared with visitStmt; no second copy of the rule).
+        checkRedundantMoveOnOwnedFieldStore(*as);
         // fix #3951 (§28.3 K1.3/K3.5, v0.295): the ASSIGNMENT-RHS sibling of
         // the ExpressionStmt fix above — `t := t + Sink.Take(move x);` inside
         // a lambda body. Deliberately NARROW: only `checkRead` (the read-

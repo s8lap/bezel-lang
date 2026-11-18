@@ -2231,6 +2231,10 @@ private:
                                        std::uint32_t useOffset) const;
 
     void handleAssignment(const ast::AssignmentStmt& as);
+    // fix #8935 (§28.3.7, v0.359): the `move`-marker-on-an-owned-field-store
+    // spelling error. Shared by visitStmt (method bodies) and
+    // applyUsingVarBorrowPinInLambdaStmt (lambda bodies) — one verdict.
+    void checkRedundantMoveOnOwnedFieldStore(const ast::AssignmentStmt& as);
 
     // fix #7856 (§28.3 *Producers* / §28.6, v0.353): is this expression a
     // BUILTIN owned-materializer call -- a call to a standard-library member
