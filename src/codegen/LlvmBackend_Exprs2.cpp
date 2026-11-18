@@ -2284,6 +2284,74 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             isSharedCellEnvdtorFreeOwner(static_cast<const void*>(sym), &lam)) {
             ce.freeCellInEnvdtor = true;
         }
+        // fix #7611 (§27.5 / §28.9, v0.359): #4509's refcounted cell for a
+        // captured PARAMETER, the shape that note below excluded because a
+        // parameter has no `declScopeDepth_` entry. Every route above declines
+        // a parameter captured by a lambda that may outlive the call without
+        // being DEFINITELY escaping (`new H(lambda(x) => x + i)`, a field
+        // store): one cell per call leaked. The decision is the captured
+        // locals' one, per symbol, sticky, taken at the first capture in the
+        // body that binds the parameter (that capture boxes it; a nested
+        // body sees it already boxed). The frame's release goes in that
+        // body's ROOT scope, which every exit drains after the last read of
+        // the parameter, so a parameter captured inside a loop or a nested
+        // block is released once per call, not per iteration.
+        //
+        // Declined where the root scope is not the last reader, or there is
+        // no root scope to hold it: an `ensures` clause reads the parameter
+        // after the body's disposals (§22.16), and `hasEnsuresClause` answers
+        // "yes" for a constructor or an unknown body; an async or iterator
+        // state machine re-enters its body per resume. A declined cell keeps
+        // leaking, the safe direction.
+        {
+            const void* pkey = static_cast<const void*>(sym);
+            if (!alreadyBoxed && !smStateStruct_ && !disposeStack_.empty() &&
+                !hasEnsuresClause(currentMethod_))
+                cellOwnerScope_[pkey] = {currentFn_, 0};
+            std::size_t pOwnerIdx = 0;
+            const bool pInDeclaringFrame =
+                cellOwnerScopeIndex(pkey, pOwnerIdx);
+            bool pArmed = refcountedCellDecls_.count(pkey) != 0;
+            if (!pArmed && pInDeclaringFrame &&
+                !cellRefcountDeclined_.count(pkey)) {
+                // The captured locals' `contentsAlsoManaged`: the envdtor or
+                // #2689's per-capture retain already accounts for a `string`
+                // or function-typed parameter's CONTENTS (the #2718 half
+                // #4509 leaves alone).
+                const bool pContentsAlsoManaged =
+                    ce.suppressContentRcInEnvdtor ||
+                    (ce.semaTy &&
+                     ((ce.semaTy->kind == sema::TypeRef::Kind::Primitive &&
+                       ce.semaTy->primitive == sema::PrimitiveType::String) ||
+                      ce.semaTy->kind == sema::TypeRef::Kind::Function));
+                pArmed = !pContentsAlsoManaged && !ce.freeCellInEnvdtor &&
+                         currentFn_ == cellFreeEligibleFn_ &&
+                         declsCapturedByEscaping_.count(pkey) &&
+                         !cellFreeEligible_.count(pkey) &&
+                         !sharedCellEnvdtorFreeOwner_.count(pkey) &&
+                         !(singleCaptureLocals_.count(pkey) &&
+                           definitelyEscapingLambdas_.count(
+                               static_cast<const void*>(&lam)));
+                if (!pArmed) cellRefcountDeclined_.insert(pkey);
+            }
+            if (pArmed) {
+                ce.retainCellInEnv = true;
+                refcountedCellDecls_.insert(pkey);
+                if (pInDeclaringFrame) {
+                    bool alreadyRegistered = false;
+                    for (const auto& existing : disposeStack_[pOwnerIdx])
+                        if (existing.slot == newSlot && existing.cellRelease) {
+                            alreadyRegistered = true;
+                            break;
+                        }
+                    if (!alreadyRegistered) {
+                        Disposal dcr{newSlot, nullptr};
+                        dcr.cellRelease = true;
+                        disposeStack_[pOwnerIdx].push_back(dcr);
+                    }
+                }
+            }
+        }
         captures.push_back(ce);
     }
     // #1207 / §27.5/§22.3: captured outer ref/out params.
@@ -3197,10 +3265,12 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // could never license the index.
         //
         // DELIBERATELY EXCLUDED, each a separate shape with its own reclaim
-        // story: a for-var (fresh cell per iteration, #4129/#4161), an inline
-        // owned array (the #747/#782 element-dispose-through-cell pairing), and
-        // a captured PARAMETER (`declScopeDepth_` holds LOCALS only, per
-        // #3403). A cell reached by the §27.5/#1135 NESTED-lambda widening is
+        // story: an inline owned array (the #747/#782 element-dispose-through-
+        // cell pairing). A for-var and a captured PARAMETER were excluded here
+        // too (`declScopeDepth_` records neither) and are NO LONGER (fix
+        // #7611): cellOwnerScope_ gives each a declaring scope — the
+        // for-var's per-iteration scope, the parameter's body root (armed in
+        // the captured-params loop above). A cell reached by the §27.5/#1135 NESTED-lambda widening is
         // NO LONGER excluded (fix #4523): its nested holder now announces
         // itself like any other env, which is what #4509's exclusion was
         // reaching for and could not express.
@@ -3275,8 +3345,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         //     cannot arm a cell an earlier sibling's env already holds
         //     uncounted, and an arm is sticky (`refcountedCellDecls_`) so a
         //     later site cannot decline one the frame is already counting.
-        // Params are absent from `declScopeDepth_` by construction (#3403), so
-        // a captured parameter never reaches (2) and is never armed.
+        // Params are absent from `declScopeDepth_` by construction (#3403);
+        // fix #7611 arms them in the captured-params loop above instead.
         const void* dkey = static_cast<const void*>(decl);
         // Is THIS body the one that declared the local, so that its recorded
         // depth indexes the `disposeStack_` we are holding right now?
@@ -3285,22 +3355,38 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // single accessor both halves go through, so the check and the index
         // are one operation and no site can take the index without the proof.
         std::size_t ownerIdx = 0;
-        const bool inDeclaringFrame = declScopeDisposeIndex(dkey, ownerIdx);
+        // fix #7611 (§27.5 / §28.9, v0.359): a FOR-VAR's declaring scope is
+        // the per-iteration scope lowerForBody opened for its fresh cell
+        // (cellOwnerScope_): §27.5's "each iteration produces a fresh binding"
+        // is one cell per iteration, so its frame reference dies with the
+        // iteration. `declScopeDepth_` never records a ForStmt.
+        const bool inDeclaringFrame =
+            isForVar ? cellOwnerScopeIndex(dkey, ownerIdx)
+                     : declScopeDisposeIndex(dkey, ownerIdx);
         bool armed = refcountedCellDecls_.count(dkey) != 0;
         if (!armed && inDeclaringFrame && !cellRefcountDeclined_.count(dkey)) {
             // The #4509 classification, unchanged except that
             // `nestedWidenedCellKeys_` is gone: a nested-widened cell is now
             // COUNTED by its nested holder rather than declined, which is what
             // that set existed to avoid.
-            armed = !isForVar && !isInlineOwnedArray && !contentsAlsoManaged &&
+            //
+            // fix #7611: a for-var is no longer excluded. Its two envdtor
+            // routes (#694's sole definitely-escaping holder, #3426's shared
+            // owner) are closed to it above (`!isForVar`: no single envdtor
+            // owns a cell made per iteration), so their sets say nothing
+            // about a for-var and are not consulted for one; its scope-end
+            // route is lowerForBody's #793 free, which `cellFreeEligible_`
+            // already gates.
+            armed = !isInlineOwnedArray && !contentsAlsoManaged &&
                     !ce.freeCellInEnvdtor &&
                     currentFn_ == cellFreeEligibleFn_ &&
                     declsCapturedByEscaping_.count(dkey) &&
                     !cellFreeEligible_.count(dkey) &&
-                    !sharedCellEnvdtorFreeOwner_.count(dkey) &&
-                    !(singleCaptureLocals_.count(dkey) &&
-                      definitelyEscapingLambdas_.count(
-                          static_cast<const void*>(&lam)));
+                    (isForVar ||
+                     (!sharedCellEnvdtorFreeOwner_.count(dkey) &&
+                      !(singleCaptureLocals_.count(dkey) &&
+                        definitelyEscapingLambdas_.count(
+                            static_cast<const void*>(&lam)))));
             // fix #8463 (§27.5 / §28.9 / §28.14, v0.359): the SECOND route —
             // the capture cell of a local captured by a `TaskScope.Spawn` child.
             //

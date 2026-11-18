@@ -2108,6 +2108,26 @@ private:
         auto fnIt = declScopeDepthFn_.find(declNode);
         return fnIt != declScopeDepthFn_.end() && fnIt->second != currentFn_;
     }
+    // fix #7611 (§27.5 / §28.9, v0.359): the declaring frame's scope for the
+    // two capture cells `declScopeDepth_` does not record, so that #4509's
+    // frame release (`Disposal::cellRelease`) has a scope to go in:
+    //   * a FOR-VAR (key: its ForStmt). lowerForBody boxes it into a fresh
+    //     cell per iteration and, when an escaping lambda captures it, opens a
+    //     per-iteration scope and records it here for the body's duration;
+    //   * a PARAMETER (key: its Symbol). Recorded at its first capture in the
+    //     body that binds it, as that body's root scope (index 0).
+    // Read only through cellOwnerScopeIndex, which applies the same
+    // same-body and range proof as declScopeDisposeIndex.
+    std::unordered_map<const void*, std::pair<llvm::Function*, std::size_t>>
+        cellOwnerScope_;
+    bool cellOwnerScopeIndex(const void* key, std::size_t& idxOut) const {
+        auto it = cellOwnerScope_.find(key);
+        if (it == cellOwnerScope_.end() || it->second.first != currentFn_)
+            return false;
+        if (it->second.second >= disposeStack_.size()) return false;
+        idxOut = it->second.second;
+        return true;
+    }
     // fix #4523 (§27.5 / §28.9, v0.306): #4509's per-DECL decision, made once
     // and obeyed everywhere.
     //

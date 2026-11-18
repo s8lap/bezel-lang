@@ -8373,6 +8373,7 @@ bool Emitter::lowerForBody(const ast::ForStmt& fs) {
     // the for-var is captured ONLY by non-escaping lambdas — eligible to free at
     // the end of each iteration's body.
     llvm::AllocaInst* forVarFreshCell = nullptr;
+    bool forVarRefcountCell = false;
     if (!smStateStruct_) {
         auto it = locals_.find(&fs);
         if (it != locals_.end()) {
@@ -8393,6 +8394,18 @@ bool Emitter::lowerForBody(const ast::ForStmt& fs) {
                 if (currentFn_ == cellFreeEligibleFn_ &&
                     cellFreeEligible_.count(static_cast<const void*>(&fs)))
                     forVarFreshCell = nb;
+                // fix #7611 (§27.5 / §28.9, v0.359): an ESCAPING capture of
+                // the for-var keeps this iteration's cell alive past the body,
+                // so nothing above may free it, and nothing did: one cell per
+                // iteration leaked. Open a per-iteration scope for #4509's
+                // refcount protocol instead; lowerLambda arms it (every env
+                // retains the cell, its envdtor releases it) and registers the
+                // frame's `Disposal::cellRelease` here, so the last of the
+                // iteration and the closures frees the cell.
+                else if (currentFn_ == cellFreeEligibleFn_ &&
+                         declsCapturedByEscaping_.count(
+                             static_cast<const void*>(&fs)))
+                    forVarRefcountCell = true;
             }
         }
     }
@@ -8503,7 +8516,19 @@ bool Emitter::lowerForBody(const ast::ForStmt& fs) {
     }
 
     bool terminated = false;
-    if (!forVarFreshCell) {
+    if (forVarRefcountCell) {
+        // fix #7611: the scope a `break`, `continue`, `return` or throw out of
+        // the body also unwinds (it sits above the loopStack_ depth the caller
+        // recorded), so the frame's release runs on every exit, once per
+        // iteration. Empty when no capture site armed the cell.
+        const void* key = static_cast<const void*>(&fs);
+        disposeStack_.emplace_back();
+        cellOwnerScope_[key] = {currentFn_, disposeStack_.size() - 1};
+        terminated = lowerScopedBlock(fs.body);
+        if (!terminated) emitDisposals(disposeStack_.back());
+        disposeStack_.pop_back();
+        cellOwnerScope_.erase(key);
+    } else if (!forVarFreshCell) {
         terminated = lowerScopedBlock(fs.body);
     } else {
         // #793: wrap the body in a scope holding the for-var cell free (inner
