@@ -30972,6 +30972,37 @@ MethodOwnership::SetErasingSourceSet MethodOwnership::setErasingSourceSet(
     }
     // `null` carries no function value at all.
     if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) return Set::Empty;
+    // fix #8897 (§28.3 closure bullet, *Provenance* clause 4, v0.359):
+    // "**Invoking** a function value yields a value carrying the invoked
+    // value's set (a lambda's body can return a closure only over what the
+    // lambda itself captures, its own locals being scope-bound; a method's
+    // function-typed return is capture-free under the sink rule, so a method
+    // call's result carries the empty set)". Only a FUNCTION-typed result is
+    // a function value at the position (`reg.Keep(g())` over `g: () -> int`
+    // passes an `int`). The invoked value is a function value when the
+    // callee is a local or parameter, a lambda literal, or a `!`,
+    // conditional, `??` or invocation form over one; a member-access callee
+    // is a method call (or a member read, clause 5) and a bare identifier
+    // naming a method is a method call: both stay untraced, as before.
+    {
+        const ast::Expr* invoked = nullptr;
+        bool isCall = false;
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+            invoked = ce->callee.get();
+            isCall = true;
+        } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+            invoked = nc->callee.get();
+            isCall = true;
+        }
+        if (isCall) {
+            const sema::TypeRef* rt = ctx_.exprType(e);
+            if (!invoked || !rt || rt->kind != sema::TypeRef::Kind::Function)
+                return Set::Untraced;
+            if (dynamic_cast<const ast::MemberAccessExpr*>(invoked))
+                return Set::Untraced;
+            return setErasingSourceSet(*invoked, direct, visited);
+        }
+    }
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
     if (!id) return Set::Untraced;
 

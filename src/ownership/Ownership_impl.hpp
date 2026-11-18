@@ -7603,8 +7603,8 @@ private:
                                const std::vector<SetErasingFlowDef>& defs) const;
     // The source set of a function-valued expression, as far as this body
     // traces it. `Untraced` is a form whose provenance the trace does not
-    // follow (a call result, a member read, an `out` argument, a `scoped`
-    // parameter's incoming value). // per §28.3
+    // follow (a method call's result, a member read, an `out` argument, a
+    // `scoped` parameter's incoming value). // per §28.3
     enum class SetErasingSourceSet { Empty, NonEmpty, Untraced };
     SetErasingSourceSet setErasingSourceSet(
         const ast::Expr& e, bool direct,
