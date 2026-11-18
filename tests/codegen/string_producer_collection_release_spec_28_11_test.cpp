@@ -205,3 +205,40 @@ BEZEL_TEST(codegen_str_collection_release, string_fill_constructor_takes_a_refer
         "end C;");
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
 }
+
+// #8654 / #8453 (§28.11 / §28.9, v0.357): inside a generic body at
+// `T = string`, `new Array<T>(n, x)` builds an `Array<T>` local, and such a
+// local takes and gives back no reference for its elements (#8453 is open).
+// The fill loop must not retain per slot there: keyed on the element type
+// seen through `T` it did, and every construction leaked the caller's
+// string (n = 1, 2, 3, and a fill through `G.Id(x)`; review F1 of the
+// first #8654 fix). Keyed on the WRITTEN element type the generic body
+// keeps its own model. 200x.
+BEZEL_TEST(codegen_str_collection_release, generic_body_fill_constructor_does_not_retain_at_t_string_8654_spec_28_11) {
+    auto r = runAotChecked(
+        "module M; "
+        "class G "
+        "  public static method Id<T>(x: T): T return x; end Id; "
+        "end G; "
+        "class C "
+        "  public static method GRun<T>(x: T): int "
+        "    var tot := 0; "
+        "    var f1 := new Array<T>(1, x); tot := tot + f1.Count; "
+        "    var f2 := new Array<T>(2, x); tot := tot + f2.Count; "
+        "    var f3 := new Array<T>(3, x); tot := tot + f3.Count; "
+        "    var f4 := new Array<T>(3, G.Id(x)); tot := tot + f4.Count; "
+        "    return tot; "
+        "  end GRun; "
+        "  public static method Main(): int "
+        "    var s := \"heap\" + 7.ToString(); "
+        "    var i := 0; var tot := 0; "
+        "    while i < 200 do "
+        "      i := i + 1; "
+        "      tot := tot + C.GRun(s); "
+        "    end while; "
+        "    if tot = 200 * 9 and s = \"heap7\" then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
+}

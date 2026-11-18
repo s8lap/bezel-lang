@@ -8403,11 +8403,18 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         // loop pattern at §4.14 / #778).
                         llvm::AllocaInst* fillSlot = entryAlloca(elemLlvmTy);
                         builder_.CreateStore(fillVal, fillSlot);
+                        // Keyed on the WRITTEN element type, not the one
+                        // `resolveTypeParamRef` sees through: an `Array<T>`
+                        // local to a generic body at `T = string` takes and
+                        // gives back no reference for its elements (#8453
+                        // is open), so a per-slot retain there would leak
+                        // the caller's string (review F1 of #8654). The
+                        // StringEscapeWalker arm for this constructor
+                        // (LlvmBackend_Setup.cpp) is keyed the same way.
                         const bool fillIsString =
                             fillVal->getType()->isPointerTy() &&
                             !rt->genericArgs.empty() &&
-                            isStringTypeRefNonNull(
-                                resolveTypeParamRef(rt->genericArgs[0]));
+                            isStringTypeRefNonNull(rt->genericArgs[0]);
                         // for i = 0 ..<  sizeArg: bz_array_set(buf, i, fillSlot, esz)
                         llvm::AllocaInst* iSlot = entryAlloca(i64());
                         builder_.CreateStore(builder_.getInt64(0), iSlot);
