@@ -6063,15 +6063,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // already-lowered receiver (the `?.Count` pattern below). The
         // SortedSet getter returns the bare `T`, which this arm lifts to the
         // present `T?`.
-        if ((nm->member == "First" || nm->member == "Last") &&
+        // fix #8759 (stdlib §4.17, v0.359): SortedDictionary `?.FirstKey` /
+        // `?.LastKey` take the SortedSet path (bare `K`, lifted to `K?`).
+        if ((nm->member == "First" || nm->member == "Last" ||
+             nm->member == "FirstKey" || nm->member == "LastKey") &&
             ctx_.exprSymbol(e) == nullptr) {
             const sema::TypeRef* ncLlRcvTy = ctx_.exprType(*nm->target);
             const sema::TypeRef* ncLlResTy = ctx_.exprType(e);
             const bool ncLlIsList =
                 ncLlRcvTy && isLinkedListTypeName(ncLlRcvTy);
+            const bool ncLlKeyed =
+                nm->member == "FirstKey" || nm->member == "LastKey";
             const bool ncLlIsSorted =
                 ncLlRcvTy && ncLlRcvTy->kind == sema::TypeRef::Kind::Named &&
-                !ncLlRcvTy->declaration && ncLlRcvTy->headName() == "SortedSet";
+                !ncLlRcvTy->declaration &&
+                ncLlRcvTy->headName() ==
+                    (ncLlKeyed ? "SortedDictionary" : "SortedSet");
             if (ncLlResTy && ncLlResTy->nullable &&
                 (ncLlIsList || ncLlIsSorted)) {
                 llvm::Value* ncLlRcv = lowerExpr(*nm->target);

@@ -29755,6 +29755,14 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
         if (isSortedDictStringKeyOrdering(ma->target.get(), ma->member))
             return true;
     }
+    // fix #8759 (§7.5, §28.9, stdlib §4.17, v0.359): the `?.` spelling
+    // (`d?.FirstKey`) lowers through the NullCondMemberExpr arm to the SAME
+    // `.` form read, so a non-null receiver yields the same fresh +1 string
+    // (a bare null on the null path, which every release tolerates).
+    if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(init)) {
+        if (isSortedDictStringKeyOrdering(ncm->target.get(), ncm->member))
+            return true;
+    }
     // CALL syntax: `d.FirstKey()` / `d.LastKey()` (LlvmBackend_Calls.cpp).
     if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
         if (call->args.empty() && call->callee) {

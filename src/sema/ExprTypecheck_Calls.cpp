@@ -49056,15 +49056,23 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     // call spelling (`l?.First()`) is left to the paths below.
     if (!member && recvTyForDiag && currentCallArity_ <= 0 &&
         &nm != calleeOfCallCtx_ &&
-        (nm.member == "First" || nm.member == "Last") &&
+        (nm.member == "First" || nm.member == "Last" ||
+         nm.member == "FirstKey" || nm.member == "LastKey") &&
         recvTyForDiag->kind == TypeRef::Kind::Named &&
         !recvTyForDiag->declaration &&
         ((recvTyForDiag->astNode && recvTyForDiag->astNode->name &&
           !recvTyForDiag->astNode->name->parts.empty()) ||
          (!recvTyForDiag->astNode && !recvTyForDiag->importedName.empty())) &&
-        (recvTyForDiag->headName() == "LinkedList" ||
-         recvTyForDiag->headName() == "OwningLinkedList" ||
-         recvTyForDiag->headName() == "SortedSet") &&
+        // fix #8759 (stdlib §4.17, v0.359): SortedDictionary's `FirstKey` /
+        // `LastKey` (`K`, InvalidOperationException if empty) are the same
+        // shape as SortedSet's `First` / `Last`; each member is paired with
+        // its own receiver head so `d?.First` stays untyped.
+        (((nm.member == "First" || nm.member == "Last") &&
+          (recvTyForDiag->headName() == "LinkedList" ||
+           recvTyForDiag->headName() == "OwningLinkedList" ||
+           recvTyForDiag->headName() == "SortedSet")) ||
+         ((nm.member == "FirstKey" || nm.member == "LastKey") &&
+          recvTyForDiag->headName() == "SortedDictionary")) &&
         !recvTyForDiag->genericArgs.empty() && recvTyForDiag->genericArgs[0]) {
         TypeRef* llElem = ctx_.makeTypeRef(*recvTyForDiag->genericArgs[0]);
         llElem->nullable = true;
