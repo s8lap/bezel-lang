@@ -1,0 +1,33 @@
+n 100 agree/kappa (0.77, 0.6578399285926808)
+rows=mine cols=note  a b c
+a [20, 2, 1]
+b [13, 22, 6]
+c [1, 0, 35]
+mine vs note4 {('a', 'B'): 2, ('a', 'D'): 1, ('a', 'L'): 20, ('b', 'B'): 22, ('b', 'F'): 6, ('b', 'L'): 13, ('c', 'D'): 24, ('c', 'F'): 11, ('c', 'L'): 1}
+
+Disagreements:
+T26c decode mine a note B | the settings file is malformed | user | name the line and exit; the user fixes it
+T30b decode mine b note F | page checksum mismatch | env | corruption: stop, tell the operator
+T08c dir-not-found mine b note L | the upload directory is missing at request time | env | recreate it
+T14e disk-full mine b note F | the target disk is full | env | stop
+T35c div-zero mine b note L | a test body divides by zero | hosted | record ERROR
+T45a div-zero mine b note L | the user's constant expression divides by zero | user | diagnostic
+T30c end-of-stream mine b note F | the file is shorter than its header says | env | corruption
+T15a file-not-found mine b note L | open a file from the recent list that no longer exists | user | dialog; remove it from the list
+T47b file-not-found mine b note L | a plugin file is missing | user | skip it, tell the user
+T43e index-out-of-range mine b note L | a packet declares a length beyond the buffer | peer | drop it; the peer chose the length
+T45c index-out-of-range mine b note L | the interpreted program indexes out of range | hosted | a guest-level error, not the interpreter's
+T47e invalid-argument mine b note L | a plugin calls a host function with a bad argument | hosted | return an error to the plugin
+T37d io-error mine b note L | the test server's port is in use | env | pick another port
+T11h key-missing mine b note F | a header name the code expects is absent from the feed | peer | the feed's layout changed: stop and tell the operator
+T25c net-refused mine b note F | the database server refuses the connection | env | bounded retry, then exit; the orchestrator restarts
+T27a net-refused mine b note F | the secrets store is unreachable | env | cannot run without credentials
+T05e net-reset mine a note B | the client disconnects while the response is written | peer | abandon the request, log at debug level
+T35b null-deref mine b note L | a test body hits a null dereference | hosted | record ERROR, run the next test
+T45d null-deref mine b note L | the interpreted program dereferences null | hosted | a guest-level error, not the interpreter's
+T18d out-of-memory mine b note L | allocation for a huge image fails | user | 'image too large'
+T42d overflow mine c note L | an integration step overflows | program | clamp, reset the body
+T04e parse-range mine b note L | the user types 99999999999999999999 | user | print 'number too large'
+T38g timeout mine a note D | the control loop misses its own deadline | program | bug: reset and log
+pass2 rows in sample 100
+bug-or-not n 100 agree 0.96 kappa 0.8904109589041095 {(False, False): 74, (True, True): 22, (False, True): 3, (True, False): 1}

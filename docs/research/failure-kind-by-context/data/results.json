@@ -1,0 +1,413 @@
+{
+ "rows": 272,
+ "tasks": 47,
+ "domains": 13,
+ "labels_pass1": {
+  "L": 120,
+  "B": 60,
+  "D": 49,
+  "F": 43
+ },
+ "labels_pass2": {
+  "L": 120,
+  "B": 61,
+  "D": 46,
+  "F": 45
+ },
+ "agreement_4_labels": {
+  "raw": 0.9853,
+  "cohen_kappa": 0.979
+ },
+ "agreement_3_bands": {
+  "raw": 0.9963,
+  "cohen_kappa": 0.9943
+ },
+ "disagreements": [
+  {
+   "id": "T14a",
+   "pass1": "D",
+   "pass2": "F"
+  },
+  {
+   "id": "T14d",
+   "pass1": "D",
+   "pass2": "F"
+  },
+  {
+   "id": "T16b",
+   "pass1": "D",
+   "pass2": "F"
+  },
+  {
+   "id": "T28e",
+   "pass1": "F",
+   "pass2": "B"
+  }
+ ],
+ "rows_with_a_kind": 261,
+ "rows_by_kind": {
+  "failure": 172,
+  "defect": 89
+ },
+ "kind_fit_pass1": {
+  "owner_reading": 170,
+  "owner_reading_share": 0.651,
+  "letter": 198,
+  "letter_share": 0.759
+ },
+ "kind_fit_pass2": {
+  "owner_reading": 171,
+  "owner_reading_share": 0.655,
+  "letter": 199,
+  "letter_share": 0.762
+ },
+ "kind_by_label_pass1": {
+  "failure": {
+   "L": 83,
+   "B": 44,
+   "F": 34,
+   "D": 11
+  },
+  "defect": {
+   "D": 37,
+   "B": 11,
+   "L": 35,
+   "F": 6
+  }
+ },
+ "mismatch_classes": {
+  "failure_class_for_a_bug_(D)": {
+   "n": 11,
+   "of_which_hosted": 0,
+   "ids": [
+    "T13f",
+    "T14a",
+    "T16b",
+    "T16c",
+    "T20f",
+    "T23d",
+    "T33c",
+    "T37a",
+    "T37b",
+    "T38g",
+    "T41c"
+   ]
+  },
+  "failure_class_fatal_here_(F)": {
+   "n": 34,
+   "of_which_hosted": 0,
+   "ids": [
+    "T02a",
+    "T02b",
+    "T02c",
+    "T03b",
+    "T06e",
+    "T08b",
+    "T09d",
+    "T12e",
+    "T13e",
+    "T14b",
+    "T14e",
+    "T16a",
+    "T24a",
+    "T24b",
+    "T24c",
+    "T24d",
+    "T24f",
+    "T25a",
+    "T25b",
+    "T25c",
+    "T25d",
+    "T25e",
+    "T25f",
+    "T27a",
+    "T28e",
+    "T29f",
+    "T30b",
+    "T30c",
+    "T32d",
+    "T37c",
+    "T39e",
+    "T40e",
+    "T41a",
+    "T41b"
+   ]
+  },
+  "defect_class_expected_here_(L,B)_query_form_exists": {
+   "n": 25,
+   "of_which_hosted": 5,
+   "ids": [
+    "T02d",
+    "T04d",
+    "T05c",
+    "T09b",
+    "T10d",
+    "T11d",
+    "T11e",
+    "T12d",
+    "T13a",
+    "T15e",
+    "T16d",
+    "T17e",
+    "T26e",
+    "T28a",
+    "T31b",
+    "T34a",
+    "T35b",
+    "T36c",
+    "T41f",
+    "T42a",
+    "T42b",
+    "T43e",
+    "T45c",
+    "T45d",
+    "T47a"
+   ]
+  },
+  "defect_class_expected_here_(L,B)_tester_only": {
+   "n": 5,
+   "of_which_hosted": 1,
+   "ids": [
+    "T04b",
+    "T13b",
+    "T35c",
+    "T42c",
+    "T45a"
+   ]
+  },
+  "defect_class_expected_here_(L,B)_no_query_form": {
+   "n": 16,
+   "of_which_hosted": 5,
+   "ids": [
+    "T04c",
+    "T05d",
+    "T09c",
+    "T11g",
+    "T13c",
+    "T18c",
+    "T23a",
+    "T23c",
+    "T35a",
+    "T36a",
+    "T36d",
+    "T36e",
+    "T38d",
+    "T42d",
+    "T45b",
+    "T47e"
+   ]
+  },
+  "defect_class_misconfiguration_(F)": {
+   "n": 6,
+   "of_which_hosted": 0,
+   "ids": [
+    "T11h",
+    "T14c",
+    "T23e",
+    "T24e",
+    "T27b",
+    "T29e"
+   ]
+  }
+ },
+ "best_rule_keyed_on_type_3_bands": 0.529,
+ "best_rule_keyed_on_type_4_labels": 0.515,
+ "best_rule_keyed_on_condition_3_bands": 0.548,
+ "best_rule_keyed_on_kind_3_bands": 0.493,
+ "best_rule_keyed_on_task_3_bands": 0.699,
+ "best_rule_keyed_on_operand_from_3_bands": 0.702,
+ "best_rule_keyed_on_type_3_bands_pass2": 0.529,
+ "failure_typed_rows_handled_at_the_call_(L)_by_query_form": {
+  "tester": 17,
+  "no": 43,
+  "yes": 17,
+  "partial": 6
+ },
+ "three_question_rule_4_labels_pass1": 0.919,
+ "three_question_rule_4_labels_pass2": 0.919,
+ "three_question_rule_misses_pass1": [
+  "T01d:F->B",
+  "T01e:F->B",
+  "T02d:F->B",
+  "T02e:F->B",
+  "T11a:F->B",
+  "T11f:F->B",
+  "T11g:F->B",
+  "T13c:F->B",
+  "T13d:F->B",
+  "T14a:F->D",
+  "T14d:F->D",
+  "T21f:D->B",
+  "T22a:B->D",
+  "T22b:B->D",
+  "T26c:F->B",
+  "T31f:F->B",
+  "T33b:D->B",
+  "T33f:F->B",
+  "T35e:F->B",
+  "T38f:D->F",
+  "T44a:F->B",
+  "T44f:F->B"
+ ],
+ "types_with_5_or_more_rows": {
+  "stable": [
+   "InvalidOperationException",
+   "DivideByZeroException"
+  ],
+  "leaning": [
+   "ParseRangeException",
+   "(allocation failure)",
+   "ContractViolationException"
+  ],
+  "contextual": [
+   "SerializationException",
+   "FileNotFoundException",
+   "FormatException",
+   "KeyNotFoundException",
+   "IOException",
+   "(network; not landed)",
+   "IndexOutOfRangeException",
+   "OverflowException",
+   "TimeoutException",
+   "ArgumentException",
+   "NullReferenceException",
+   "EndOfStreamException"
+  ]
+ },
+ "types_with_5_or_more_rows_pass2": {
+  "stable": [
+   "InvalidOperationException",
+   "DivideByZeroException"
+  ],
+  "leaning": [
+   "ParseRangeException",
+   "(allocation failure)",
+   "ContractViolationException"
+  ],
+  "contextual": [
+   "SerializationException",
+   "FileNotFoundException",
+   "FormatException",
+   "KeyNotFoundException",
+   "IOException",
+   "(network; not landed)",
+   "IndexOutOfRangeException",
+   "OverflowException",
+   "TimeoutException",
+   "ArgumentException",
+   "NullReferenceException",
+   "EndOfStreamException"
+  ]
+ },
+ "owner_reading_by_type": {
+  "mixed": [
+   "SerializationException",
+   "FileNotFoundException",
+   "FormatException",
+   "KeyNotFoundException",
+   "IOException",
+   "(network; not landed)",
+   "IndexOutOfRangeException",
+   "OverflowException",
+   "ArgumentException",
+   "NullReferenceException",
+   "EndOfStreamException",
+   "ContractViolationException"
+  ],
+  "one_sided": [
+   "TimeoutException",
+   "InvalidOperationException",
+   "ParseRangeException",
+   "DivideByZeroException"
+  ]
+ },
+ "letter_by_type": {
+  "mixed": [
+   "FormatException",
+   "KeyNotFoundException",
+   "IndexOutOfRangeException",
+   "OverflowException",
+   "ArgumentException",
+   "NullReferenceException",
+   "ContractViolationException"
+  ],
+  "one_sided": [
+   "SerializationException",
+   "FileNotFoundException",
+   "IOException",
+   "(network; not landed)",
+   "TimeoutException",
+   "InvalidOperationException",
+   "ParseRangeException",
+   "EndOfStreamException",
+   "DivideByZeroException"
+  ]
+ },
+ "most_favourable_reading": {
+  "rows_scored": 217,
+  "unfitted": 23,
+  "unfitted_share": 0.106,
+  "failure_class_for_a_bug": [
+   "T13f",
+   "T14a",
+   "T16b",
+   "T16c",
+   "T20f",
+   "T23d",
+   "T33c",
+   "T37a",
+   "T37b",
+   "T38g",
+   "T41c"
+  ],
+  "defect_class_for_a_condition_with_no_query_form": [
+   "T04c",
+   "T05d",
+   "T09c",
+   "T11g",
+   "T13c",
+   "T18c",
+   "T23a",
+   "T23c",
+   "T29e",
+   "T38d",
+   "T42d",
+   "T45b"
+  ]
+ },
+ "marker_arm_at_the_unit_boundary": {
+  "rows_a_boundary_should_answer_(B)": 55,
+  "of_those_failure_typed_(the_arm_takes_them)": 44,
+  "of_those_defect_typed_(the_arm_passes_them)": [
+   "T02d",
+   "T05c",
+   "T05d",
+   "T09b",
+   "T09c",
+   "T10d",
+   "T11g",
+   "T13c",
+   "T23c",
+   "T28a",
+   "T31b"
+  ],
+  "failure_typed_rows_labelled_F_or_D": 45,
+  "of_those_raised_at_the_top_(no_unit_boundary_above)": 36,
+  "of_those_raised_under_a_unit_boundary_(the_arm_answers_them_as_routine)": [
+   "T03b",
+   "T20f",
+   "T23d",
+   "T28e",
+   "T30b",
+   "T30c",
+   "T33c",
+   "T38g",
+   "T40e"
+  ],
+  "those_by_what_separates_them": {
+   "cause-value": 2,
+   "call-site": 4,
+   "class": 3
+  }
+ }
+}

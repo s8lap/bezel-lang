@@ -2,7 +2,7 @@
 //! doc: stdlib
 //! section: 3.3
 //! title: the indexer raises IndexOutOfRangeException outside 0..Length
-//! rule: span[i] throws IndexOutOfRangeException when i < 0 or i >= Length.
+//! rule: `span[i]` raises `IndexOutOfRangeException` when `i` is outside `0..<Length`.
 //! cites: 3.3
 //! expect: run
 //! stdout: caught

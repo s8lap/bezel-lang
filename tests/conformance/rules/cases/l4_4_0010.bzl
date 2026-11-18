@@ -2,9 +2,10 @@
 //! doc: stdlib
 //! section: 4.4
 //! title: structurally mutating an Array<T> inside its own sort comparer raises
-//! rule: Structurally mutating a collection from inside its own sort
-//!   comparer raises InvalidOperationException (the loud-failure
-//!   discipline, extended from enumerator invalidation to sort callbacks).
+//! rule: Structurally mutating a collection from inside its own sort comparer
+//!   raises InvalidOperationException, as the enumerator of a collection
+//!   mutated during iteration does (language spec §29.12), the rule extended
+//!   from enumerator invalidation to sort callbacks.
 //! cites: 4.4, 29.12
 //! expect: run
 //! stdout: caught

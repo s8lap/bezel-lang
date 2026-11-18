@@ -4,7 +4,7 @@
 //! title: opening a missing file raises a failure an IFailure arm takes
 //! rule: All derive from `IOException`, which derives from `Exception` and
 //!   implements `IFailure` (language spec §31.4), so every member of the family
-//!   is a failure.
+//!   is `IFailure`-marked.
 //! cites: 7.5
 //! expect: run
 //! stdout: True

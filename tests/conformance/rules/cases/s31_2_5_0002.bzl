@@ -1,13 +1,15 @@
 //! case: s31_2_5_0002
 //! doc: spec
 //! section: 31.2.5
-//! title: IFailure => () suppresses a failure and lets a defect propagate
-//! rule: To suppress expected failures only, name the marker — `IFailure => ()` —
-//!   and defects and cancellation still propagate (§31.4).
+//! title: IFailure => () suppresses an IFailure-marked exception and lets an unmarked exception propagate
+//! rule: To suppress only what the environment or a peer raised, name the
+//!   marker — `IFailure => ()` — and every other exception, cancellation
+//!   included, still propagates (§31.4); naming the classes to suppress is
+//!   narrower still.
 //! cites: 31.2.5, 31.4
 //! expect: run
 //! output: failure suppressed
-//!   defect propagated
+//!   unmarked propagated
 //! issue: 8414
 module Conf;
 
@@ -32,7 +34,7 @@ public class Program
     try
       Program.Run(2);
     catch
-      InvalidOperationException => Console.WriteLine("defect propagated")
+      InvalidOperationException => Console.WriteLine("unmarked propagated")
     end;
   end Main;
 end Program;

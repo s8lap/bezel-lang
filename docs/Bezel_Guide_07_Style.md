@@ -1,6 +1,6 @@
 # Bezel Guide 7: Style
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.326.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.359.*
 
 Nothing in this guide is enforced. The compiler checks none of the naming conventions — spec §1.3 states them and says in the same breath that it does not enforce them — no formatter ships with the toolchain, and every layout rule below compiles identically when it is ignored. What the conventions buy is that a reader recognizes a declaration's shape before reading its words, and that a diff shows the change rather than the reflow. Where a rule of style touches a rule of the language — the closers of §1.6, `_` as the reserved discard (§17.13), the no-hiding rule (§12.2), the field order that §28.4's reverse-order disposal makes load-bearing (§4) — the language rule is cited and never bent. The worked reference is the tour in `docs/proposals/0002-http-server.md` §2; the sections below generalize from it, and a formatter, when one exists, should encode them.
 
@@ -37,9 +37,9 @@ end IPostingRule;
 
 **Constants split by kind.** A class-level `const` and a compile-time `const` local are PascalCase — `const MaxUsers := 1000;` is spec §21.1's own example. A runtime `const` local (§21.1) is an ordinary local that happens not to be reassignable, and takes camelCase: `const openingBalance := account.Balance;`, matching §21.1's `const n := items.Count + 1;`.
 
-**The three access tiers have three names** — plain (`Parse`), `XOrNull` (`ParseOrNull`), `TryX` (`TryParse`) — and stdlib §1 defines what each name promises (taught in Guide 2 §2). Invent no fourth spelling — `GetSafe`, `MaybeGet`, `Get2` say nothing the tier names do not. Domain methods borrow the same vocabulary: the tour's store is `Find`/`Add`/`Update`/`Remove`, verbs a reader already knows from the collections.
+**The three access forms have three names** — the throwing form plain (`Parse`), and the two non-throwing forms `XOrNull` (`ParseOrNull`) and `TryX` (`TryParse`) — and stdlib §1 defines what each name promises (taught in [Guide 2](Bezel_Guide_02_Errors_and_Nullability.md) §2). An operation whose `bool` result reports a declined attempt takes the `Try` name as well — `TryAdd`, and `TryPost` below (stdlib §1's bool-only Try shape) — so a reader sees that `false` is an expected outcome to branch on, not an error code. Invent no fourth spelling — `GetSafe`, `MaybeGet`, `Get2` say nothing the form names do not. (Some stdlib members are non-throwing forms under a plain name where no throwing form exists — `Environment.Get(name): string?`, stdlib §2.4, and the collections' `Remove(item): bool` — so read the signature there.) Domain methods borrow the same vocabulary: the tour's store is `Find`/`Add`/`Update`/`Remove`, verbs a reader already knows from the collections.
 
-**`Async` marks a pair, not a signature.** The rule the stdlib actually follows (stdlib §1) is narrower than the habit: the suffix marks the asynchronous half of a **sync/async pair** — `Acquire`/`AcquireAsync`, `Send`/`SendAsync`, `ReadAll`/`ReadAllAsync`, `Lock`/`LockAsync`. An operation that exists only asynchronously carries no suffix at all: `Channel<T>.Receive`, `TaskScope.Join`, `Task.Delay`. `Receive` beside `SendAsync` on one endpoint pair is the rule working, not an inconsistency. So an `async method Post` with no synchronous sibling is named `Post`, and adding a synchronous sibling later is what renames it.
+**`Async` marks a pair, not a signature.** The rule the stdlib actually follows (stdlib §1) is narrower than the habit: the suffix marks the asynchronous half of a sync/async pair — `Acquire`/`AcquireAsync`, `Send`/`SendAsync`, `ReadAll`/`ReadAllAsync`, `Lock`/`LockAsync`. An operation that exists only asynchronously carries no suffix at all: `Channel<T>.Receive`, `TaskScope.Join`, `Task.Delay`. `Receive` beside `SendAsync` on one endpoint pair is the rule working, not an inconsistency. So an `async method Post` with no synchronous sibling is named `Post`, and adding a synchronous sibling later is what renames it.
 
 **Booleans read as predicates.** `IsEmpty`, `HasEntries`, `CanPost`, `Done` — or a verb the caller can read as a question: `Contains`, `TryAdd`, `Admits`. Never a noun that reads as data (`Status`, `Flag`).
 
@@ -55,19 +55,19 @@ using var settled := postings.Where(                              // anything mo
 
 **A name is never reused down an inheritance chain**, and here the language agrees: §12.2 forbids hiding, so a derived member whose name a visible inherited member already has is a compile error unless it is an `override`. The one exception is `Object`'s `Equals`, `GetHashCode` and `ToString` at another parameter list (`Equals(a: K, b: K)` for `IEqualityComparer<K>`, `ToString(format: string)` for `IFormattable`), which overload the inherited member rather than hide it; a class's `Equals(other: Point)` for `IEquatable<Point>` is not an overload but the `Object` slot's own-typed spelling, an override written with or without the word (§8.3). The style rule is only ever "pick the different name early".
 
-**Test names state the behavior asserted.** `CreateReturnsTheStoredTodo`, `GetByIdRejectsANonNumericId`, `PostRejectsAnUnknownAccount` — subject, verb, object, in ordinary member PascalCase. Never a status code (`Test404`), never "works" (`CreateWorks`), never a number (`PostTest3`). A test whose name cannot be written this way is usually asserting more than one thing.
+**Test names state the behavior asserted.** `CreateReturnsTheStoredTodo`, `GetByIdRejectsANonNumericId`, `TryPostDeclinesAnUnknownAccount` — subject, verb, object, in ordinary member PascalCase. Never a status code (`Test404`), never "works" (`CreateWorks`), never a number (`PostTest3`). A test whose name cannot be written this way is usually asserting more than one thing.
 
 ---
 
 ## 2. Layout
 
-**Two spaces per level, no tabs.** A member body is one level in from its declaration, a nested block one more.
+Two spaces per level, no tabs. A member body is one level in from its declaration, a nested block one more.
 
-**Close a declaration with its name.** `end Ledger;`, `end Post;`, `end constructor;`. Spec §1.6 admits a bare `end;` everywhere and §11.4 recommends the named form; this guide requires it on every *declaration* — class, interface, record, enum, choice, method, block property, constructor, destructor, operator — because after a long body the name is the reader's anchor, and the compiler verifies it matches. Inside a body, close statement blocks with the bare `end;`: `if`, `for`, `while`, `do`, `try`, `case`. Two closers are not a choice: an indexer block closes `end;` (an indexer has no name), and a labeled loop closes `end scan;` — the keyword closer is rejected once the loop is labeled (§1.6).
+Close a declaration with its name. `end Ledger;`, `end TryPost;`, `end constructor;`. Spec §1.6 admits a bare `end;` everywhere and §11.4 recommends the named form; this guide requires it on every *declaration* — class, interface, record, enum, choice, method, block property, constructor, destructor, operator — because after a long body the name is the reader's anchor, and the compiler verifies it matches. Inside a body, close statement blocks with the bare `end;`: `if`, `for`, `while`, `do`, `try`, `case`. Two closers follow from the language rather than from taste: an indexer block closes `end;` (an indexer has no name, so there is nothing to repeat), and a labeled loop closes `end scan;` — its label is its name, and the keyword closer `end for;` is rejected once the loop is labeled (§1.6).
 
-**One statement per line, and every `if` in block form** — the condition on its own line, the body indented, `end;` on the last, as §21.2's own examples are written. Never `if account = null then return false; end;`. The grammar admits it — every statement ends in `;`, so a block can be typed on one line — but a one-line conditional hides its own branch from a scan and from a diff. Brevity has its own form: the §20 `if` expression, `(if a > b then a else b)`, whose `else` is mandatory and which is an expression, not a squeezed statement.
+One statement per line, and every `if` in block form — the condition on its own line, the body indented, `end;` on the last, as §21.2's own examples are written. Never `if account = null then return false; end;`. The grammar admits it — every statement ends in `;`, so a block can be typed on one line — but a one-line conditional hides its own branch from a scan and from a diff. Brevity has its own form: the §20 `if` expression, `(if a > b then a else b)`, whose `else` is mandatory and which is an expression, not a squeezed statement.
 
-**A blank line between the logical steps of a body.** Acquire, compute, store, return; in a test, arrange, act, assert. A two-line body gets none.
+A blank line between the logical steps of a body. Acquire, compute, store, return; in a test, arrange, act, assert. A two-line body gets none.
 
 ```bezel
 module Ledger.Accounts.Tests;
@@ -75,19 +75,19 @@ import Ledger.Accounts;             // the module under test
 import System.Diagnostics;          // Debug.Assert (stdlib §8.2)
 
 public static class LedgerTests
-  public static method PostRejectsAnUnknownAccount()
+  public static method TryPostDeclinesAnUnknownAccount()
     using var ledger := new Ledger(["ada"]);                     // arrange
 
-    var posted := ledger.Post(new Posting("bob", 25m));          // act
+    var posted := ledger.TryPost(new Posting("bob", 25m));       // act
 
     Debug.Assert(not posted, "an unknown account is declined");  // assert
-  end PostRejectsAnUnknownAccount;
+  end TryPostDeclinesAnUnknownAccount;
 end LedgerTests;
 ```
 
 Blank lines separate members too, and separate a clause region from the body it guards — spec §22.16's own recommended style: the promises above the gap, the doing below it.
 
-**Continuations are indented past the statement they continue** — four columns (two levels), or aligned to the opening parenthesis when a parameter list wraps. One level is the column a nested block's body occupies, which is exactly the ambiguity the indent is there to remove.
+Continuations are indented past the statement they continue — four columns (two levels), or aligned to the opening parenthesis when a parameter list wraps. One level is the column a nested block's body occupies, which is exactly the ambiguity the indent is there to remove.
 
 ```bezel
 _accounts.Add(posting.Account,
@@ -99,9 +99,9 @@ public constructor(owners: Array<string>,
 end constructor;
 ```
 
-**Keep code within 110 columns.** The tour's longest code line is 103. A trailing-comment block picks one column for the whole block and may carry a line past the ceiling — the tour's comment blocks start at columns 76 and 77 and its longest line is 133. Align the comments; do not reflow working code to hide them.
+Keep code within 110 columns. The tour's longest code line is 103. A trailing-comment block picks one column for the whole block and may carry a line past the ceiling — the tour's comment blocks start at columns 76 and 77 and its longest line is 133. Align the comments; do not reflow working code to hide them.
 
-**Align a run, never a body.** Where consecutive lines have the same shape — a table of registrations, a run of `case` arms, a wrapped named-argument list — align the columns, so a wrong entry shows up as the ragged one:
+Align a run, never a body. Where consecutive lines have the same shape — a table of registrations, a run of `case` arms, a wrapped named-argument list — align the columns, so a wrong entry shows up as the ragged one:
 
 ```bezel
 public method Describe(outcome: PostOutcome): string =>
@@ -113,26 +113,26 @@ public method Describe(outcome: PostOutcome): string =>
 
 Do not align `:=` across ordinary, unrelated statements: the alignment is not information, and the next edit reflows every line in the group into the diff.
 
-**Expression bodies for one-expression members, block bodies otherwise.** `public property Balance: decimal => _balance;` and `public method Credit(amount: decimal) => _balance := _balance + amount;` are the right shape; an `=>` whose expression needs more than one continuation line is a block body written sideways.
+Expression bodies for one-expression members, block bodies otherwise. `public property Balance: decimal => _balance;` and `public method Credit(amount: decimal) => _balance := _balance + amount;` are the right shape; an `=>` whose expression needs more than one continuation line is a block body written sideways.
 
 ---
 
 ## 3. Comments
 
-**Trailing comments say what the reader cannot see.** The ownership fact, the spec section, the status a shape answers, the reason a line is where it is — not a paraphrase of the statement. `// increment the count` above `count++;` costs a line and earns nothing.
+Trailing comments say what the reader cannot see. The ownership fact, the spec section, the status a shape answers, the reason a line is where it is — not a paraphrase of the statement. `// increment the count` above `count++;` costs a line and earns nothing.
 
 ```bezel
 var account := _accounts.GetOrNull(posting.Account);   // a borrow, not a take (stdlib §4.9)
 if account = null then
-  return false;                                        // an outcome, not a fault (stdlib §1 band 2)
+  return false;                                        // declined: an expected outcome (stdlib §1, bool-only Try)
 end;
 ```
 
-**One comment column per block.** Pick a column past the longest code line in the run and hold it for that block; a continuation of a trailing comment indents under its own text, as the stdlib's own listings do. When the next block's code is wider, that block picks its own column — the alignment is local, and a single file-wide column would drag every comment right.
+One comment column per block. Pick a column past the longest code line in the run and hold it for that block; a continuation of a trailing comment indents under its own text, as the stdlib's own listings do. When the next block's code is wider, that block picks its own column — the alignment is local, and a single file-wide column would drag every comment right.
 
-**Cite the spec where the code derives from a rule** — `// per §28.3` in code, `(§28.3)` inside a sentence. Give the revision when the citation is load-bearing outside the file (a PR, a test name, an issue).
+Cite the spec where the code derives from a rule — `// per §28.3` in code, `(§28.3)` inside a sentence. Give the revision when the citation is load-bearing outside the file (a PR, a test name, an issue).
 
-**Banner comments only between top-level declarations.** `// ── Wire shapes ──────────` separates the sections of a file; inside a body it is decoration, and a body long enough to need one wants a private method instead.
+Banner comments only between top-level declarations. `// ── Wire shapes ──────────` separates the sections of a file; inside a body it is decoration, and a body long enough to need one wants a private method instead.
 
 ---
 
@@ -203,7 +203,7 @@ public class ledger                                          // 1 — a type is 
   public constructor(Owners: Array<string>)                  // 4 — a parameter is camelCase
     for var o in Owners do _accounts.Add(o, new Account(o)); end;
   end constructor;
-  public method post(P: Posting): bool                       // 5 — one-line blocks, no blank lines
+  public method tryPost(P: Posting): bool                    // 5 — one-line blocks, no blank lines
     var a := _accounts.GetOrNull(P.Account);
     if a = null then return false; end;
     a.Credit(P.Amount);                                      // add the amount to the account  ← §3
@@ -229,19 +229,19 @@ public sealed class Ledger
 
   public property Count: int => _accounts.Count;
 
-  public method Post(posting: Posting): bool
+  public method TryPost(posting: Posting): bool
     requires(posting.Amount > 0m)
 
     var account := _accounts.GetOrNull(posting.Account);   // a borrow, not a take (stdlib §4.9)
     if account = null then
-      return false;                                        // an outcome, not a fault (stdlib §1 band 2)
+      return false;                                        // declined: an expected outcome (stdlib §1, bool-only Try)
     end;
 
     account.Credit(posting.Amount);                        // narrowed by the early return (§7.4)
     Remember(account);
 
     return true;
-  end Post;
+  end TryPost;
 
   private method Remember(account: Account)
     if _recent.Count = MaxRecent then
@@ -257,4 +257,4 @@ end Ledger;
 
 ## 7. What this guide does not decide
 
-A **formatter**: none exists, and until one does, the rules above are applied by hand and reviewed like any other part of a change; when one lands, this document is its specification and its output settles the cases this text leaves open. **Display**: the file contains two-space indents and no tabs, and how an editor renders them is not a project matter. And **anything the specification decides** — which closers are admitted (§1.6), modifier order (§11.5), where `_` may appear (§17.13), visibility (§13), the disposal order §4 leans on (§28.4) — is a rule, not a convention, and this guide only cites it. Where this guide and the spec appear to disagree, the spec wins and the disagreement is a defect worth reporting.
+A formatter: none exists, and until one does, the rules above are applied by hand and reviewed like any other part of a change; when one lands, this document is its specification and its output settles the cases this text leaves open. Display: the file contains two-space indents and no tabs, and how an editor renders them is not a project matter. And anything the specification decides — which closers are admitted (§1.6), modifier order (§11.5), where `_` may appear (§17.13), visibility (§13), the disposal order §4 leans on (§28.4) — is a rule, not a convention, and this guide only cites it. Where this guide and the spec appear to disagree, the spec wins and the disagreement is a defect worth reporting.

@@ -2,9 +2,9 @@
 //! doc: stdlib
 //! section: 4.8
 //! title: dict[key] += 1 raises on an absent key; the compound form never inserts
-//! rule: dict[key] += 1 desugars to a getter plus a setter, and the getter
-//!   raises KeyNotFoundException on an absent key — the compound form
-//!   updates, it never inserts.
+//! rule: dict[key] += 1 desugars to a getter plus a setter, and the getter raises
+//!   KeyNotFoundException when the key is absent — the compound form updates,
+//!   it never inserts
 //! cites: 4.8
 //! expect: run
 //! stdout: caught

@@ -1,0 +1,100 @@
+T32b	cancellation	worker	scheduled job with a deadline	shutdown during the job
+T33b	channel-closed	worker	in-process pipeline over channels	send after the downstream stage died
+T33d	channel-full	worker	in-process pipeline over channels	non-blocking send on a full bounded channel
+T30f	contract	database	embedded database file	an in-memory tree invariant is violated
+T36d	contract	test	tests asserting that a function rejects bad input	expect a contract violation
+T46c	contract	compiler	compiler internals	an internal assertion fails
+T05a	decode	web	REST handler: decode the request, look up a record, respond	the request body is not valid JSON
+T06c	decode	web	gateway whose job is to call one upstream API	the upstream returns a malformed body
+T09a	decode	web	auth middleware validating a bearer token	the token is not valid base64 / JSON
+T16b	decode	desktop	application loading its own bundled resources	a bundled JSON resource does not decode
+T26c	decode	startup	tool reading an optional per-user settings file	the settings file is malformed
+T30b	decode	database	embedded database file	page checksum mismatch
+T34c	decode	worker	cache in front of a slow source	a cached blob written by an older build does not decode
+T37b	decode	test	integration test with fixture files	a fixture document does not decode
+T41b	decode	game	asset loading	a bundled asset is corrupt
+T08c	dir-not-found	web	file upload endpoint storing to disk	the upload directory is missing at request time
+T08a	disk-full	web	file upload endpoint storing to disk	disk full while storing the upload
+T14e	disk-full	batch	one-shot data migration script	the target disk is full
+T30d	disk-full	database	embedded database file	disk full during commit
+T21g	disposed-access	library	HTTP client library with a retry policy	the pool hands out a connection that was already disposed
+T35c	div-zero	test	unit-test runner (the host)	a test body divides by zero
+T42c	div-zero	game	per-frame update	normalise a zero-length vector
+T45a	div-zero	compiler	constant folder and interpreter for the user's program	the user's constant expression divides by zero
+T07c	dns	web	service that also emits optional telemetry	the telemetry host does not resolve at start-up
+T33e	domain-fault	worker	in-process pipeline over channels	a stage's domain ends with a bug
+T11e	duplicate-key	batch	nightly CSV import into a database	a row repeats an id already seen
+T04g	empty-collection	cli	interactive calculator (REPL)	the evaluator pops its own operator stack when empty
+T28f	empty-collection	database	fetch one row by a key from the request	take the first row after the code has checked that one exists
+T45e	empty-collection	compiler	constant folder and interpreter for the user's program	the interpreter pops its own value stack when empty
+T20f	encode	library	JSON parsing library (the author's view)	the caller serializes a type that was never registered
+T04f	end-of-stream	cli	interactive calculator (REPL)	input ends (EOF)
+T12b	end-of-stream	batch	log aggregation over rotated files	the last line of a file is cut short
+T30c	end-of-stream	database	embedded database file	the file is shorter than its header says
+T09d	file-not-found	web	auth middleware validating a bearer token	the signing key file is missing at start-up
+T13e	file-not-found	batch	report generator with numeric aggregation	the report template shipped with the tool is missing
+T15a	file-not-found	desktop	text editor: open and save documents the user picks	open a file from the recent list that no longer exists
+T16a	file-not-found	desktop	application loading its own bundled resources	a bundled icon or translation file is missing
+T17a	file-not-found	desktop	restore the last session at start-up	the state file is absent (first run)
+T24a	file-not-found	startup	service start-up: configuration and listening socket	the configuration file is missing
+T26a	file-not-found	startup	tool reading an optional per-user settings file	the settings file is missing
+T39e	file-not-found	embedded	device configuration at boot	the required calibration table is missing
+T47b	file-not-found	host	plugin / script host	a plugin file is missing
+T13f	format-spec	batch	report generator with numeric aggregation	a format specifier written in the code is invalid
+T11d	index-out-of-range	batch	nightly CSV import into a database	a row has too few fields
+T35f	index-out-of-range	test	unit-test runner (the host)	the runner indexes its own result table wrongly
+T43e	index-out-of-range	game	save files and network packets	a packet declares a length beyond the buffer
+T45c	index-out-of-range	compiler	constant folder and interpreter for the user's program	the interpreted program indexes out of range
+T22c	invalid-argument	library	collection / utility library	the caller passes a negative capacity
+T36a	invalid-argument	test	tests asserting that a function rejects bad input	expect an argument error from f(-1)
+T47e	invalid-argument	host	plugin / script host	a plugin calls a host function with a bad argument
+T22d	invalid-state	library	collection / utility library	the collection is modified during enumeration
+T20e	io-error	library	JSON parsing library (the author's view)	the caller's output stream fails during a write
+T37d	io-error	test	integration test with fixture files	the test server's port is in use
+T39d	io-error	embedded	device configuration at boot	a flash write fails
+T02f	key-missing	cli	deploy tool driven by its own configuration file	look up a built-in command by its enum value
+T06f	key-missing	web	gateway whose job is to call one upstream API	look up a response in the gateway's own cache right after inserting it
+T09b	key-missing	web	auth middleware validating a bearer token	the token names a signing key that is not in the key set
+T09e	key-missing	web	auth middleware validating a bearer token	read a claim the validator has already checked is present
+T11h	key-missing	batch	nightly CSV import into a database	a header name the code expects is absent from the feed
+T23e	key-missing	library	date arithmetic on user-entered values (a booking form)	the time-zone id from the configuration is unknown
+T26e	key-missing	startup	tool reading an optional per-user settings file	an unknown option name
+T46a	key-missing	compiler	compiler internals	symbol lookup for a name the resolver already bound
+T46b	match-failure	compiler	compiler internals	a node kind no match arm covers
+T06a	net-refused	web	gateway whose job is to call one upstream API	the upstream refuses the connection
+T07a	net-refused	web	service that also emits optional telemetry	the telemetry collector refuses the connection
+T25c	net-refused	startup	service start-up: the database it cannot run without	the database server refuses the connection
+T27a	net-refused	startup	secrets and feature flags at start-up	the secrets store is unreachable
+T05e	net-reset	web	REST handler: decode the request, look up a record, respond	the client disconnects while the response is written
+T11f	net-reset	batch	nightly CSV import into a database	the database connection drops mid-batch
+T28d	net-reset	database	fetch one row by a key from the request	the connection drops
+T05h	null-deref	web	REST handler: decode the request, look up a record, respond	the handler dereferences a field it assumed was set
+T35b	null-deref	test	unit-test runner (the host)	a test body hits a null dereference
+T45d	null-deref	compiler	constant folder and interpreter for the user's program	the interpreted program dereferences null
+T18d	out-of-memory	desktop	image viewer	allocation for a huge image fails
+T38f	out-of-memory	embedded	sensor polling loop on a microcontroller	allocation fails
+T42f	out-of-memory	game	per-frame update	frame allocation fails
+T09c	overflow	web	auth middleware validating a bearer token	expiry arithmetic overflows on a crafted timestamp
+T13c	overflow	batch	report generator with numeric aggregation	the sum of external amounts overflows
+T22f	overflow	library	collection / utility library	the growth computation overflows
+T42d	overflow	game	per-frame update	an integration step overflows
+T01d	parse-format	cli	grep-like filter over files named on the command line	the user's search pattern is malformed
+T16c	parse-format	desktop	application loading its own bundled resources	parse a version constant compiled into the binary
+T21d	parse-format	library	HTTP client library with a retry policy	the caller's URL string is malformed
+T23d	parse-format	library	date arithmetic on user-entered values (a booking form)	parse a date literal written in the code
+T24g	parse-format	startup	service start-up: configuration and listening socket	the optional LOG_LEVEL is garbled
+T28b	parse-format	database	fetch one row by a key from the request	the key parameter is not numeric
+T41c	parse-format	game	asset loading	a bundled shader source does not compile
+T04e	parse-range	cli	interactive calculator (REPL)	the user types 99999999999999999999
+T26d	parse-range	startup	tool reading an optional per-user settings file	a value is out of range
+T28c	parse-range	database	fetch one row by a key from the request	the key parameter is out of range
+T03d	path-too-long	cli	backup / copy tool	a path exceeds the OS limit
+T08b	permission-denied	web	file upload endpoint storing to disk	the upload directory cannot be created at start-up
+T25b	permission-denied	startup	service start-up: the database it cannot run without	the database file is not readable
+T44f	permission-denied	compiler	front end: read sources, report diagnostics	the output file is not writable
+T01c	text-decode	cli	grep-like filter over files named on the command line	a file is not valid UTF-8
+T29a	timeout	database	transactions and the connection pool	a lock wait times out
+T38a	timeout	embedded	sensor polling loop on a microcontroller	a bus read times out
+T38g	timeout	embedded	sensor polling loop on a microcontroller	the control loop misses its own deadline
+T40b	timeout	embedded	device publishing readings over a flaky link	a publish times out
+T06d	tls	web	gateway whose job is to call one upstream API	the upstream certificate fails validation

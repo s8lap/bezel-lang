@@ -1,8 +1,8 @@
 //! case: l3_2_0011
 //! doc: stdlib
 //! section: 3.2
-//! title: the span-source encode forms keep the strict fault model of the string forms
-//! rule: Stdlib §3.2: the span-source encode overloads carry "the same strict fault model, `FormatException` possible only
+//! title: the span-source encode forms keep the error model of the string forms
+//! rule: Stdlib §3.2: the span-source encode overloads carry "the same error model, `FormatException` possible only
 //!   for `ASCII`", and `GetBytes(s, destination)` raises `IndexOutOfRangeException` if the destination is too short.
 //!   The window `"aé"` holds U+00E9, which `ASCII` cannot represent; the one-byte destination cannot hold `é€`.
 //! cites: 3.2

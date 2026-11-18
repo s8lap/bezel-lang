@@ -3,8 +3,8 @@
 //! section: 2.18
 //! title: the intrinsic vocabulary has no C specifier
 //! rule: stdlib §2.18: "`C` (currency) deliberately does not exist — currency
-//!     formatting is culture by definition" and "An unrecognized specifier
-//!     raises `FormatException`". `C` is not in the intrinsic vocabulary, so it
+//!     formatting is culture by definition" and "`ToString(format)` raises
+//!     `FormatException` when the specifier is unrecognized". `C` is not in the intrinsic vocabulary, so it
 //!     is an unrecognized specifier.
 //! cites: 2.18
 //! expect: run

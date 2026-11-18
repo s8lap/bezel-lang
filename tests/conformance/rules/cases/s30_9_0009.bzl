@@ -1,7 +1,7 @@
 //! case: s30_9_0009
 //! doc: spec
 //! section: 30.9
-//! title: the WithCleanupAsync example -- await in a catch arm and in a finally, then a bare re-raise
+//! title: await in a catch arm and in a finally, then a bare re-raise, faults the task (the §30.9 shape)
 //! rule: `await` has no syntactic restrictions on its placement inside
 //!   `try`/`catch`/`finally` *bodies*. The state machine handles suspension
 //!   across exception-handling boundaries correctly. ... a bare `throw;`

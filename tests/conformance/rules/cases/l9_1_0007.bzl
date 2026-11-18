@@ -1,12 +1,11 @@
 //! case: l9_1_0007
 //! doc: stdlib
 //! section: 9.1
-//! title: int.Parse raises an OverflowException (ParseRangeException) on an out-of-range value
-//! rule: A `Parse` member — here, in §9.2 and §9.3, and through §2.3's
-//!   `Convert.To*` — whose input is well-formed and spells a value the type
-//!   cannot represent raises `ParseRangeException` … It derives from
-//!   `OverflowException` so that an `OverflowException` arm around a `Parse`
-//!   call matches as it always has
+//! title: int.Parse raises an OverflowException on an out-of-range value
+//! rule: any other input raises `FormatException`, a value outside the type's
+//!   range raising `OverflowException`. … The span overloads (#1810) accept
+//!   exactly the inputs the string forms accept — same
+//!   `FormatException`/`OverflowException` contract, no whitespace tolerance
 //! cites: 9.1, 1
 //! expect: run
 //! stdout: caught

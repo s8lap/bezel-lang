@@ -3,8 +3,10 @@
 //! section: 2.18
 //! title: an unrecognized specifier on an integer raises FormatException
 //! rule: The specifier vocabulary is invariant-culture only — Bezel has no culture
-//!   machinery, and formatted output is identical on every platform. An
-//!   unrecognized specifier raises `FormatException` (strict-fault, as everywhere).
+//!   machinery, and formatted output is identical on every platform.
+//!   `ToString(format)` raises `FormatException` when the specifier is
+//!   unrecognized, rather than returning a substitute rendering, as everywhere
+//!   in this document.
 //! cites: 2.18, 9.2
 //! expect: run
 //! issue: 7303

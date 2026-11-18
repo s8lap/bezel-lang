@@ -2,7 +2,7 @@
 //! doc: stdlib
 //! section: 2.18
 //! title: an unrecognized specifier in an interpolation hole raises FormatException
-//! rule: "An unrecognized specifier raises `FormatException`" ([stdlib §2.18]). `c` is the TimeSpan constant form ("`c` renders the span's magnitude behind at most one sign"), so the specifier `g` in the hole is unrecognized and the interpolation throws before the next statement runs.
+//! rule: "`ToString(format)` raises `FormatException` when the specifier is unrecognized" ([stdlib §2.18]). `c` is the TimeSpan constant form ("`c` renders the span's magnitude behind at most one sign"), so the specifier `g` in the hole is unrecognized and the interpolation throws before the next statement runs.
 //! expect: run
 //! output: FE-interp
 module Conf;

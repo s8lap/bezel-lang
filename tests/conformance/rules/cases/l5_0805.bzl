@@ -2,7 +2,8 @@
 //! doc: stdlib
 //! section: 5
 //! title: Min and Max with a selector throw InvalidOperationException on an empty source, also after Where
-//! rule: `Min`/`Max` — selector and no-selector forms alike — and `Average` throw `InvalidOperationException`
+//! rule: `Min`/`Max` — selector and no-selector forms alike — and `Average` raise
+//!   `InvalidOperationException`
 //! cites: 5
 //! expect: run
 //! stdout: True True True True

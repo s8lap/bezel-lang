@@ -1,6 +1,6 @@
 # Bezel Guide 4: Concurrency — Tasks, Domains, and Channels
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.331.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.359.*
 
 The syntax here is mainstream async: `async` methods, `await`, tasks, cancellation tokens. The model underneath is not, and the habits that come with the syntax elsewhere will fight you. Four ideas carry the whole chapter. A **domain** runs one continuation at a time, so most code needs no locks (§1). A task is a heap resource you own, like every other class instance (§2). No mutable state is ever reachable from two domains — data crosses by ownership transfer or as immutable copies (§5). And fan-out defaults to a structured scope, not loose tasks (§4). If you skim everything else, read the three sections headed How Bezel does it and the table in §10.
 
@@ -30,7 +30,7 @@ Two refinements keep this honest:
 - **Interleaving still happens — at `await`, and only there.** Other continuations of your domain run while you are suspended. An invariant must hold *before* you suspend, and a check made before an `await` may be stale after it. This is why the compiler never flow-narrows mutable fields at all — spec §7.4 names exactly this interleaving among its reasons — and why it re-widens a mutably-captured local at every `await` (Guide 2 §1 covers both). Partially-written memory is never observed; logical interleaving is the only hazard.
 - **No thread affinity, no contexts.** A domain is not a thread. The runtime may run successive continuations on different threads — never two at once — preserving visibility across the migration. There are no synchronization contexts and therefore no `ConfigureAwait`-style opt-out to remember — nothing is captured, nothing needs configuring (rationale §12.3).
 
-**Blocking is fenced off, deterministically.** Inside a domain, a continuation blocked in `Wait()`/`Result` — or a blocking `Mutex.Acquire()` — freezes the very domain that must advance to unblock it. So the blocking forms are a *compile error* lexically inside `async` bodies — `await` is strictly better there (spec §30.3, §30.12). Where the compiler cannot see it — a non-`async` helper reached from a continuation — the runtime raises `InvalidOperationException` instead of parking: a defined fault, not a mystery hang (spec §30.3, §30.12).
+**Blocking is fenced off, deterministically.** Inside a domain, a continuation blocked in `Wait()`/`Result` — or a blocking `Mutex.Acquire()` — freezes the very domain that must advance to unblock it. So the blocking forms are a *compile error* lexically inside `async` bodies — `await` is strictly better there (spec §30.3, §30.12). Where the compiler cannot see it — a non-`async` helper reached from a continuation — the runtime raises `InvalidOperationException` instead of parking: a defined exception, not a mystery hang (spec §30.3, §30.12).
 
 ```bezel
 var cfg := LoadAsync().Result;    // ERROR inside async code: blocks its own domain — await it
@@ -93,7 +93,7 @@ The two sanctioned spellings — the ones the diagnostic names: give each task a
 
 For value-typed, `string`, or no results, there is nothing to decide — `var n := await CountAsync();` works in any form. When the result is a class, the producer's return type picks one of two patterns (spec §30.5), and the consumer's obligations follow from the signature alone.
 
-`Task<T>` is **Pattern A**: any number of awaits, every awaiter borrowing the one result, whose lifetime is the task's. `OwningTask<T>` is **Pattern B**, the default: one await, which spends the task whatever its outcome, and the awaiter owns the result. The full consumer rules — which operands an await accepts and where its result may flow — are spec §30.5's, tabulated in the *Awaiting a task* table of the code-generation reference's §4.3 ([`Bezel_For_Code_Generation.md`](Bezel_For_Code_Generation.md)); this section walks through the two shapes.
+`Task<T>` is Pattern A: any number of awaits, every awaiter borrowing the one result, whose lifetime is the task's. `OwningTask<T>` is Pattern B, the default: one await, which spends the task whatever its outcome, and the awaiter owns the result. The full consumer rules — which operands an await accepts and where its result may flow — are spec §30.5's, tabulated in the *Awaiting a task* table of the code-generation reference's §4.3 ([`Bezel_For_Code_Generation.md`](Bezel_For_Code_Generation.md)); this section walks through the two shapes.
 
 **Pattern B** is the shape you will write most, and it is the one-liner:
 
@@ -120,7 +120,7 @@ var cfg  := await task;                 // borrow; source: task
 var cfg2 := await task;                 // fine — same instance, multi-award
 ```
 
-The one-line bind of a Pattern A await needs no pin of your own: the compiler writes it (spec §30.5's **scoped await-bind**). A fresh `var` (or `const`) bind whose initializer is exactly the await of a fresh producer desugars to the two-line form above, the task held in a hidden slot no code can name, disposed at the end of the enclosing block (the compiler does not yet apply the scoped await-bind by default, [#3048](https://github.com/s8lap/bezel-lang/issues/3048); the example's first line shows the specified behavior):
+The one-line bind of a Pattern A await needs no pin of your own: the compiler writes it (spec §30.5's scoped await-bind). A fresh `var` (or `const`) bind whose initializer is exactly the await of a fresh producer desugars to the two-line form above, the task held in a hidden slot no code can name, disposed at the end of the enclosing block (the compiler does not yet apply the scoped await-bind by default, [#3048](https://github.com/s8lap/bezel-lang/issues/3048); the example's first line shows the specified behavior):
 
 ```bezel
 var cfg := await FetchConfigAsync();    // works: the task is pinned to a
@@ -132,9 +132,9 @@ Render(await FetchConfigAsync());       // also fine: borrow confined to the sta
 
 One await is all the hidden slot gives you — it is unnameable, so to award twice (or hold the task) write the two-line form; it stays the shape to reach for whenever the *task itself* matters, and it is exactly what the one-liner desugars to. Two near-misses reject, each with a diagnostic that teaches (spec §30.5): `using var cfg := await …` (the await produces a *borrow*, which §30.5's may-not-flow list bars from a `using var` bind — you do not need to pin anything; the compiler pins it for you when you write `var`) and `cfg := await …` onto an existing local (`cfg` may outlive this block; bind the task first). The borrow flows like any other (Guide 1 §3): pass it, read it, but no `using var` over it, no store into an `owned` field, no owned return.
 
-**Choosing, as producer** (rationale §12.2): ask *"can a second consumer legitimately need this same result instance?"* If yes — `Task<T>`, and say why at the declaration. If no, or unsure — `OwningTask<T>`. A fan-out façade over a Pattern B core is one line later (`return await FetchOwnedAsync(url);` from a `Task<Config>`-returning body). The reverse migration breaks callers.
+Choosing, as producer (rationale §12.2): ask *"can a second consumer legitimately need this same result instance?"* If yes — `Task<T>`, and say why at the declaration. If no, or unsure — `OwningTask<T>`. A fan-out façade over a Pattern B core is one line later (`return await FetchOwnedAsync(url);` from a `Task<Config>`-returning body). The reverse migration breaks callers.
 
-**One declaration the compiler refuses outright:** a task over a move-only value — an owning `choice` such as `Result<Connection, string>` with a class payload, or an owning inline array — is rejected at the declaration (spec §30.5): multi-award would hand the same must-move-exactly-once value to every awaiter, and `OwningTask<T>` admits class types only. The idiomatic shape for a fallible async acquisition is `OwningTask<Connection>` plus a typed exception; an owned resource's failure payload is exception territory anyway (Guide 2 §7).
+**One declaration the compiler refuses outright:** a task over a move-only value — an owning `choice` such as `Result<Connection, string>` with a class payload, or an owning inline array — is rejected at the declaration (spec §30.5): multi-award would hand the same must-move-exactly-once value to every awaiter, and `OwningTask<T>` admits class types only. The idiomatic shape for a fallible async acquisition is `OwningTask<Connection>` plus a typed exception, handled at a boundary: a choice whose payload owns a resource cannot be the task's result, so the throwing form is where such an acquisition belongs anyway (Guide 2 §7).
 
 Faults are ordinary: an exception in the async body faults the task, and each await of a `Task<T>` re-raises it, as does the first await of an `OwningTask<T>` (a second raises `InvalidOperationException`, spec §30.4). The caught binding is a borrow, per Guide 2 §5 (spec §30.9).
 
@@ -166,7 +166,7 @@ The mechanics worth knowing:
 
 Captures have their own admission test. Child captures are admitted when their sources are declared *before* the scope (parameters always qualify) or derive from the scope itself (`scope.Token`). A class- or interface-typed local declared after the scope is rejected at the `Spawn` call, and so is a span or a record holding a borrow whose source is declared after it: such a capture counts by the sources of the borrows it carries. Value-typed captures that carry no borrow are exempt from the declared-before test, so an `int` loop index is fine (spec §28.14). This is the `scoped` admission: `Spawn`'s `body` parameter is declared `scoped`, the scope is the bounding object, and the captured sources stay frozen until it is disposed — the same storage-bounded contract Guide 1 §9 teaches for your own callback-holding classes. For per-element fan-out, declare the source collection *before* the scope and capture a value-typed index, or reach for `Parallel`.
 
-**`Parallel`** is the uniform-work tool: the same capture-free function over every element of a collection, on a process-wide team of worker domains (stdlib §6.12; spec §30.14). It is also your second rehearsal of the Pattern A consumer shape (`Parallel` is not yet implemented, [#3557](https://github.com/s8lap/bezel-lang/issues/3557); the example shows the specified surface):
+`Parallel` is the uniform-work tool: the same capture-free function over every element of a collection, on a process-wide team of worker domains (stdlib §6.12; spec §30.14). It is also your second rehearsal of the Pattern A consumer shape (`Parallel` is not yet implemented, [#3557](https://github.com/s8lap/bezel-lang/issues/3557); the example shows the specified surface):
 
 ```bezel
 using var job := Parallel.Map(paths, ComputeSize);   // ComputeSize: static (string) -> int;
@@ -174,9 +174,9 @@ var sizes := await job;                              //   inputs chunk-copied at
                                                      //   results in input order
 ```
 
-First fault cancels remaining work and surfaces at the await as `DomainFaultedException` — as its subclass `DomainFailedException` when that fault was a failure, so that an `IFailure` arm takes it (stdlib §6.12). `Reduce`'s combiner must be associative with the seed as its identity (stdlib §6.12).
+First fault cancels remaining work and surfaces at the await as `DomainFaultedException` — as its subclass `DomainFailedException` when the exception raised was `IFailure`-marked, so that an `IFailure` arm takes it (stdlib §6.12). `Reduce`'s combiner must be associative with the seed as its identity (stdlib §6.12).
 
-**Free-range tasks** — start several, settle them together — are the exception, and the §2 holder discipline is the whole trick: name every task.
+Free-range tasks — start several, settle them together — are the exception, and the §2 holder discipline is the whole trick: name every task.
 
 ```bezel
 using var t1 := File.WriteAllTextAsync(pathA, report);   // both start now — named holders
@@ -216,7 +216,7 @@ The compiler enforces two things at every `Spawn` call site (stdlib §6.8):
 
 - **The entry is capture-free** — a static method reference or a non-capturing lambda. Captures are borrows of the origin domain's scopes and cannot cross. Data enters *only* through the explicit argument (aggregate several values into one sendable class, an `OwningArray`, or send the rest over a channel).
 - **Argument and result types are sendable** — the derived property that answers "may this value cross?" (spec §30.14). The rules you actually hit:
-  - **Value types** are sendable iff two independent conditions both hold (spec §30.14) — the *classification* condition, that the type is neither **borrow-bearing** (no field of a non-runtime-managed reference type anywhere, spec §9.7; `string`-, `Type`- and function-typed fields are exempt from that predicate) nor move-only (spec §15.3), and the *per-component* condition, applied recursively: every field's type and every inline-array element type is itself sendable. Neither implies the other, and the second is what rejects a record with a function-typed field, which the first admits — a function value is never sendable, its closure being one heap cell every copy shares. So: primitives, enums, and those records and value-like choices whose fields and payloads are themselves sendable (§35.12 for choices). They cross as *copies*. `string` and `Type` cross as shared immutable references.
+  - **Value types** are sendable iff two independent conditions both hold (spec §30.14) — the *classification* condition, that the type is neither borrow-bearing (no field of a non-runtime-managed reference type anywhere, spec §9.7; `string`-, `Type`- and function-typed fields are exempt from that predicate) nor move-only (spec §15.3), and the *per-component* condition, applied recursively: every field's type and every inline-array element type is itself sendable. Neither implies the other, and the second is what rejects a record with a function-typed field, which the first admits — a function value is never sendable, its closure being one heap cell every copy shares. So: primitives, enums, and those records and value-like choices whose fields and payloads are themselves sendable (§35.12 for choices). They cross as *copies*. `string` and `Type` cross as shared immutable references.
   - **A class is sendable iff it is transfer-closed**: `sealed` (or `closed`, every class of its module-closed hierarchy itself transfer-closed), and every field is a sendable value, `string`, `Type`, an `owned` sendable class, an owning inline array of sendable classes, or an owning-choice field that holds no borrows (spec §35.4's holds-borrows property — no plain class- or interface-typed payload, borrow-bearing record payload, or reference-element inline-array payload, at any depth) and whose every payload of every case is transfer-compatible — obligation-bearing payloads recursively: `owned` class payloads by their class's sendability, `owned` interface payloads never, owning-inline-array payloads by their element class (interface elements never), nested owning choices recursively; every other payload by its own type's sendability, so a function-typed payload disqualifies (spec §35.12) — no interface-, `Object`-, or function-typed fields, and no plain (non-`owned`) class fields other than `Type` ones, because a back-reference aliases something another domain owns. Such an instance crosses as an owned transfer of its whole ownership tree.
   - **Never sendable**: open classes, interfaces, function values, tasks, lock guards, `CancellationToken` (§9), and a class deriving from a library class — `sealed class MyError: Exception` included — whose inherited state no library section states transfer-compatible (spec §30.14 rule 2). Most library classes cannot be derived from at all: only `Encoding`, `Stream`, `TextReader`, `TextWriter` and the exceptions are open (spec §12.4). An owning choice does not cross directly (it is move-only, §3) but rides inside a transfer-closed owner's field — provided it carries no borrows and every payload is transfer-compatible (spec §35.4/§35.12).
 
@@ -233,7 +233,7 @@ using var j3 := Domain.Spawn(Bump, counter);             // ERROR: a class argum
 
 The diagnostics name the failing rule. The fixes are always the same two moves: own what crosses (`OwningDictionary`, an `owned` field) or copy value-shaped data.
 
-Joins are ordinary tasks of the spawning domain: a class result crosses as a Pattern B award, a value result as a copy. A fault in the entry surfaces at the join as `DomainFaultedException` carrying the original message and stack-trace *text* — exception objects themselves do not cross (spec §30.14). Its kind does cross: a failure in the child is joined as `DomainFailedException`, a `DomainFaultedException` that an `IFailure` arm also takes, and a bug in the child is joined as the plain class, which that arm lets pass (Guide 2 §4). Async entries are the natural form: the runtime awaits the entry's task inside the spawned domain, exactly as it drives an `async Main`.
+Joins are ordinary tasks of the spawning domain: a class result crosses as a Pattern B award, a value result as a copy. A fault in the entry surfaces at the join as `DomainFaultedException` carrying the original message and stack-trace *text* — exception objects themselves do not cross (spec §30.14). The failure marker does cross: an `IFailure`-marked exception in the child is joined as `DomainFailedException`, a `DomainFaultedException` that an `IFailure` arm also takes, and any other exception in the child is joined as the plain class, which that arm lets pass (Guide 2 §4). Cancellation is among the others: a child that ends in `OperationCanceledException` is joined as a plain `DomainFaultedException`, so an `OperationCanceledException` arm above the join never takes it (stdlib §6.8; §9). Async entries are the natural form: the runtime awaits the entry's task inside the spawned domain, exactly as it drives an `async Main`.
 
 ---
 
@@ -241,7 +241,7 @@ Joins are ordinary tasks of the spawning domain: a class result crosses as a Pat
 
 A channel moves sendable values between domains with ownership transfer at both ends: `Send` consumes the item in the sending domain, awaiting `Receive` produces it owned in the receiving domain (spec §30.15; stdlib §6.9). The shape is multiple-producer, single-consumer. The `Channel<T>` object *is* the receiving end — keep it in one domain — and `NewSender()` mints independently-owned, sendable sender endpoints to move wherever producing happens.
 
-The **actor idiom** — a domain that owns its state outright and serializes everything through an inbox — is the shape to reach for when lock *ordering* gets complicated (stdlib §6.11). It is a placement decision, not a default: rationale §12.14's error-kernel doctrine warns that state entangled enough to want serializing is often exactly the state whose loss is unrecoverable, so keep the fallible work out of the unit that holds it:
+The actor idiom — a domain that owns its state outright and serializes everything through an inbox — is the shape to reach for when lock *ordering* gets complicated (stdlib §6.11). It is a placement decision, not a default: rationale §12.14's error-kernel doctrine warns that state entangled enough to want serializing is often exactly the state whose loss is unrecoverable, so keep the fallible work out of the unit that holds it:
 
 ```bezel
 public record Transfer(From: string, To: string, Amount: decimal);   // sendable payload
@@ -310,23 +310,25 @@ The rest of the toolbox, in one breath: `Mutex` for a critical section that isn'
 
 Static state is process-global — one instance across *all* domains — which makes an unrestricted mutable static a side door through §5's no-shared-mutable-state rule. Bezel closes the door at the declaration (spec §22.12): immutable content is free, synchronized handles are free, and everything else is warned or rejected.
 
-The type-keyed half of the taxonomy is four per-type stdlib **facts** — **synchronized**, **immutable**, **self-distributing**, **displacement-unbounded** — and three one-line derivations (spec §22.12/§28.13; stdlib §1): form (i) is warning-free when its type is *synchronized and not displacement-unbounded*; the `static readonly` warning is suppressed when it is *synchronized or immutable*; and `Shared<T>` is sendable when its payload is *(synchronized or immutable) and not self-distributing*. One Facts line at the type's stdlib section answers all three questions.
+The type-keyed half of the taxonomy is four per-type stdlib facts — synchronized, immutable, self-distributing, displacement-unbounded — and three one-line derivations (spec §22.12/§28.13; stdlib §1): form (i) is warning-free when its type is *synchronized and not displacement-unbounded*; the `static readonly` warning is suppressed when it is *synchronized or immutable*; and `Shared<T>` is sendable when its payload is *(synchronized or immutable) and not self-distributing*. One Facts line at the type's stdlib section answers all three questions.
 
-- **`static readonly` of sendable-value-category value types, `string`, enums**, and **`const` of a primitive value type or `string`**: unrestricted — shared-immutable.
+- **`static readonly` of sendable-value-category value types, `string`, enums**, and `const` of a primitive value type or `string`: unrestricted — shared-immutable.
 - **`static readonly` of a class type**: admitted with a warning — the singleton is reachable from every domain, and confining it to one (or ensuring its own synchronization) is your obligation. The warning is suppressed exactly where the type's own fact line carries the guarantee — synchronized or immutable: the synchronized handles below, the data-owning locks, `FrozenArray<T>`, `CancellationTokenSource`, the process-global shutdown source, and `Type`, the interned type token (spec §22.12 rule 4's machine-checked set).
-- **A mutable static** is a compile error unless it is one of four admitted forms: (i) an internally-synchronized handle — a type declaring synchronized and not displacement-unbounded: `Mutex`, `Semaphore`, the atomics, `ChannelSender<T>`, `SharedEventSource<T>`; (ii) the `Task?`/`Task<T>?` lazy cache (below); (iii) a value static of primitive or enum type — or the nullable form of either, or a plain (non-`owned`) inline array of those — admitted *with a warning* and no cross-domain promises; (iv) the owning-inline-array slot pool, likewise warned. (`Channel<T>` declares no facts — the channel is the single-consumer receiving end — publish a `ChannelSender<T>` static instead. The locks, `FrozenArray<T>`, and `CancellationTokenSource` are kept out of form (i) by displacement-unbounded: a mutable static's overwrite never disposes what it displaces, and stranding a lock's whole interior — or a whole frozen array — is the cost the fact names.)
+- **A mutable static** is a compile error unless it is one of three admitted forms: (i) an internally-synchronized handle — a type declaring synchronized and not displacement-unbounded: `Mutex`, `Semaphore`, the atomics, `ChannelSender<T>`, `SharedEventSource<T>`; (ii) the `Task?`/`Task<T>?` lazy cache (below); (iii) a value static of primitive or enum type — or the nullable form of either, or a plain (non-`owned`) inline array of those — admitted *with a warning* and no cross-domain promises. (An owning-inline-array slot pool is a `static readonly` field instead: warned, its slots fixed, disposed at exit.) (`Channel<T>` declares no facts — the channel is the single-consumer receiving end — publish a `ChannelSender<T>` static instead. The locks, `FrozenArray<T>`, and `CancellationTokenSource` are kept out of form (i) by displacement-unbounded: a mutable static's overwrite never disposes what it displaces, and stranding a lock's whole interior — or a whole frozen array — is the cost the fact names.)
 
 **The `Task?` cache** is the one admitted warning-free mutable static that holds a value your own code computes — form (i)'s members are all internally-synchronized handles. It exists because async values do not belong in static initializers (`await` is illegal there). Cache the *task*, not the value, and let every consumer await it — Pattern A fan-out through process-lived storage (spec §22.13):
 
 ```bezel
 private static _cfg: Task<Config>? := null;              // §22.12 rule 2(ii)
 public static async method GetConfig(): Task<Config>
-  if _cfg = null then _cfg := LoadConfigAsync(); end;
+  if _cfg = null then
+    _cfg := LoadConfigAsync();
+  end;
   return await _cfg!;                                    // every caller borrows through the cache
 end GetConfig;
 ```
 
-The caveat is in the check-then-store: it is *not* atomic across domains, so racing first uses may each start the work. Last store wins, every stored task remains awaitable, and work is duplicated — but nothing is unsound. When exactly-once matters, assign the cache eagerly in `Main` before any spawn (spec §22.13 pattern (a)). And the **blocking-wrapper trap**: a synchronous wrapper that waits on the cached task is admitted only in code outside any domain — startup code — and never from a lazily-triggered initializer. From a continuation it is §1's deterministic error (spec §22.13).
+The caveat is in the check-then-store: it is *not* atomic across domains, so racing first uses may each start the work. Last store wins, every stored task remains awaitable, and work is duplicated — but nothing is unsound. When exactly-once matters, assign the cache eagerly in `Main` before any spawn (spec §22.13 pattern (a)). And the blocking-wrapper trap: a synchronous wrapper that waits on the cached task is admitted only in code outside any domain — startup code — and never from a lazily-triggered initializer. From a continuation it is §1's deterministic error (spec §22.13).
 
 **The value-static trap** — branching on a domain's flag without synchronization:
 
@@ -338,7 +340,7 @@ private static owned readonly _ready: Atomic<bool>
     := new Atomic<bool>(false);         // warning-free: the synchronized spelling
 ```
 
-**The process-wide publication point** is a typed static, not a member kind: `SharedEventSource<T>` — internally synchronized, subscribable from any domain, admitted warning-free as a `static owned readonly` field (spec §22.12 rule 5; stdlib §6.5):
+The process-wide publication point is a typed static, not a member kind: `SharedEventSource<T>` — internally synchronized, subscribable from any domain, admitted warning-free as a `static owned readonly` field (spec §22.12 rule 5; stdlib §6.5):
 
 ```bezel
 public static class App
@@ -376,10 +378,28 @@ await SyncAll(paths, cts.Token);              // awaited inside the source's sco
 Three rules keep it sound:
 
 - **The source outlives its tokens.** A token is a borrow-bearing record observing its `CancellationTokenSource`. It is the *single* stdlib-certified borrow allowed into an async frame, on one normative condition: the source must outlive the settlement of every task observing it (spec §30.1, §30.8). Awaiting inside the source's `using var` scope, as above, discharges it. Disposing a source *cancels* it (cancel-on-dispose), so `using var cts := …WithCancelAfter(d);` is a cancellation scope (stdlib §6.1).
-- **Compose with linked sources**: "cancel when the caller cancels *or* my deadline fires" is `CancellationTokenSource.CreateLinked(callerToken, timeoutSrc.Token)` — bind both sources, reverse-order disposal does the rest (stdlib §6.1).
+- Compose with linked sources: "cancel when the caller cancels *or* my deadline fires" is `CancellationTokenSource.CreateLinked(callerToken, timeoutSrc.Token)` — bind both sources, reverse-order disposal does the rest (stdlib §6.1).
 - **Tokens do not cross domains; the *source* does, behind a handle.** `CancellationToken` is a borrow-bearing record and is never sendable, and a bare `CancellationTokenSource` is not sendable either — but the source carries the synchronized fact, so `Shared<CancellationTokenSource>` is sendable (spec §28.13's `Shared`-payload set; §30.14): clone a handle, move the clone, and the receiving domain reads its own token through it and polls at its safe points. The handle, not the borrow, keeps the source alive, which is how the source-outlives obligation above is discharged across domains (stdlib §6.1, §6.8). A **published** source — one consumed by `new Shared<CancellationTokenSource>(…)`, held in a `static readonly`/`static owned readonly` field of the type, or linked as the child of a published parent — is **signal-only**: `Register` on it raises `InvalidOperationException`, and publishing a source that already holds live registrations raises at the publishing operation, so polling (`IsCancellationRequested`/`ThrowIfCancellationRequested`) is the cross-domain idiom (stdlib §6.1). Where no source is shared, cross-domain cancellation is a message on a channel. Intra-domain, `TaskScope.Token` is the structured spelling (§4).
 
-Deadline-shaped stdlib operations signal timeout by returning `null` (`TryAcquireAsync`, `TryLockAsync`), not by throwing — cancellation faults, timeout is a value (stdlib §6.1).
+**Never swallow cancellation.** Cancellation is the answer to a request your own program made — *stop* — so it must reach the code that made the request. A handler that takes `OperationCanceledException` and then completes normally turns *stop* into *carry on*: the loop takes the next item, the caller's `await` returns as if the work were done. So a handler names the exceptions it can answer and lets cancellation propagate; an `IFailure` arm never takes it (spec §31.4). The arm that does is a broad `Exception` arm, and that arm belongs only at a boundary that must keep running — a request loop, a job runner, `Main` or a supervisor — where cancellation gets its own arm ahead of it:
+
+```bezel
+public async method RunAll(jobs: Array<Job>, token: CancellationToken): Task
+  for var job in jobs do
+    try
+      await job.RunAsync(token);
+    catch
+      OperationCanceledException => throw,                   // stop means stop: let it through first
+      var f: IFailure => Log($"{job.Name}: {f.Message}"),    // the outside world failed: next job
+      var ex: Exception => ReportBug(ex)                     // a supervisor reports the rest
+    end;
+  end;
+end RunAll;
+```
+
+Without the `Exception` arm no cancellation arm is needed: the `IFailure` arm lets cancellation pass, as does every arm naming a class outside `OperationCanceledException`'s tree. Elsewhere cancellation travels like any other exception — re-raised at the `await` of a cancelled task, by `WhenAll` (a cancelled input counts as `OperationCanceledException`, spec §30.10) and by a `TaskScope`'s `Join` (§4) — with one difference at a domain join, where it arrives as a plain `DomainFaultedException` (§5). A supervisor over domains that must tell a cancellation it requested from a child's own fault checks its own source's `IsCancellationRequested` before reading the join's exception as a bug. Guide 2 teaches the catch style this follows.
+
+Deadline-shaped stdlib operations signal timeout by returning `null` (`TryAcquireAsync`, `TryLockAsync`), not by throwing — cancellation raises, while a timeout is an expected absence, returned as a value (stdlib §6.1).
 
 ---
 
@@ -399,6 +419,6 @@ Deadline-shaped stdlib operations signal timeout by returning `null` (`TryAcquir
 | A process-wide notification | a `SharedEventSource<T>` static, capture-free handlers (§8) |
 | A lazily-computed process-wide value | the `Task<T>?` static cache, awaited by every consumer (§8) |
 | Background work nobody waits for | `Task.FireAndForget(call())` — and only with owned/copied inputs (§2) |
-| To stop something | a `CancellationToken` threaded through; across domains a `Shared<CancellationTokenSource>` handle, polled (§9) |
+| To stop something | a `CancellationToken` threaded through; across domains a `Shared<CancellationTokenSource>` handle, polled — and no handler that swallows the `OperationCanceledException` it raises (§9) |
 
 A few habits carry most of it. Trust the domain: inside one, state is just state, and the lock you reach for by reflex is usually noise. Name your tasks: `using var` for anything you will await below. Treat "who settles this task?" as seriously as Guide 1 treats "who disposes this object?" — because it is the same question. Fan out inside a `TaskScope` unless you can say why not. And when state must genuinely be shared, make the sharing carry its own guarantee — a channel, a data-owning lock, an atomic, a shared event — rather than a convention. The compiler rejects most of the shortcuts — blocking waits in async code, capturing spawn entries, non-sendable arguments, mutable statics among them. The few obligations it leaves to you are settlement of abandoned tasks and source-outlives-token, both backstopped in checked disposal mode, and reader purity through a read guard, which no mode detects (spec §30.12). The concurrency chapter is Guide 1's chapter, run in parallel.

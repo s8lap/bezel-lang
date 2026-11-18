@@ -1,0 +1,61 @@
+{
+ "document_lines_naming": {
+  "Bezel_Language_Spec.md": {
+   "IFailure": 17,
+   "ParseRangeException": 2,
+   "DomainFailedException": 2
+  },
+  "Bezel_Standard_Library.md": {
+   "IFailure": 12,
+   "ParseRangeException": 9,
+   "DomainFailedException": 5
+  },
+  "Bezel_Design_Rationale.md": {
+   "IFailure": 4,
+   "ParseRangeException": 0,
+   "DomainFailedException": 0
+  },
+  "Bezel_Guide_02_Errors_and_Nullability.md": {
+   "IFailure": 11,
+   "ParseRangeException": 1,
+   "DomainFailedException": 0
+  },
+  "Bezel_Guide_04_Concurrency.md": {
+   "IFailure": 2,
+   "ParseRangeException": 0,
+   "DomainFailedException": 2
+  },
+  "Bezel_Guide_06_Contracts_and_Purity.md": {
+   "IFailure": 4,
+   "ParseRangeException": 1,
+   "DomainFailedException": 0
+  },
+  "Bezel_For_Code_Generation.md": {
+   "IFailure": 7,
+   "ParseRangeException": 4,
+   "DomainFailedException": 2
+  },
+  "Bezel_Tour.md": {
+   "IFailure": 1,
+   "ParseRangeException": 0,
+   "DomainFailedException": 0
+  }
+ },
+ "document_lines_naming_total": {
+  "IFailure": 58,
+  "ParseRangeException": 17,
+  "DomainFailedException": 11
+ },
+ "rule_corpus_cases": 5970,
+ "rule_corpus": {
+  "cases_naming_IFailure": 44,
+  "names_the_marker_without_either": 8,
+  "relies_on_a_library_class_being_a_failure": 18,
+  "uses_only_classes_the_case_declares": 18
+ },
+ "rule_corpus_cases_naming": {
+  "ParseRangeException": 12,
+  "DomainFailedException": 5
+ },
+ "compiler_source_files_naming_IFailure": 0
+}

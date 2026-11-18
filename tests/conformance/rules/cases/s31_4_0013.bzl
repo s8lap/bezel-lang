@@ -1,10 +1,10 @@
 //! case: s31_4_0013
 //! doc: spec
 //! section: 31.4
-//! title: a subclass of a marked class is a failure without listing IFailure
-//! rule: A class implements it by listing it, and a class deriving from one that
-//!   implements it implements it too (§14.2 rule 1), so a kind is inherited and
-//!   cannot be shed.
+//! title: a subclass of a marked class is IFailure-marked without listing IFailure
+//! rule: A class implements it by listing it, and a class deriving from one
+//!   that implements it implements it too (§14.2 rule 1), so the marker is
+//!   inherited and cannot be shed.
 //! cites: 31.4, 14.2
 //! expect: run
 //! stdout: inherited failure

@@ -2,7 +2,8 @@
 //! doc: stdlib
 //! section: 5
 //! title: no-selector Min on an empty Array of generic records throws InvalidOperationException
-//! rule: `Min`/`Max` — selector and no-selector forms alike — and `Average` throw `InvalidOperationException`
+//! rule: `Min`/`Max` — selector and no-selector forms alike — and `Average` raise
+//!   `InvalidOperationException`
 //! cites: 5, 5.1
 //! expect: run
 //! stdout: ioe

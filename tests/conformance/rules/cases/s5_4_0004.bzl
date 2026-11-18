@@ -2,10 +2,11 @@
 //! doc: spec
 //! section: 5.4
 //! title: FromUnderlyingOrNull returns null where the checked cast would fault
-//! rule: Boundary code for which an undeclared value is an expected input
-//!   branches instead of catching: every enum carries a compiler-provided
-//!   static member E.FromUnderlyingOrNull(value: U): E?, which returns null
-//!   where the cast would fault.
+//! rule: Code for which an undeclared value is an expected input — a decoder
+//!   reading values from outside the program — branches instead of catching:
+//!   every enum carries a compiler-provided static member
+//!   `E.FromUnderlyingOrNull(value: U): E?` (§10.4), the non-throwing form,
+//!   which returns `null` where the cast would raise.
 //! cites: 5.4
 //! expect: run
 //! stdout: [null]

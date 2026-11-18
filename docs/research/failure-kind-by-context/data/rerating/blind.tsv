@@ -1,0 +1,273 @@
+id	domain	task	operation	condition
+T01a	cli	grep-like filter over files named on the command line	open a file the user named	file-not-found
+T01b	cli	grep-like filter over files named on the command line	read a file the user named without permission	permission-denied
+T01c	cli	grep-like filter over files named on the command line	a file is not valid UTF-8	text-decode
+T01d	cli	grep-like filter over files named on the command line	the user's search pattern is malformed	parse-format
+T01e	cli	grep-like filter over files named on the command line	stdout closed by the reader (piped to head)	io-error
+T01f	cli	grep-like filter over files named on the command line	index into the tool's own match-offset array	index-out-of-range
+T02a	cli	deploy tool driven by its own configuration file	read the tool's configuration file	file-not-found
+T02b	cli	deploy tool driven by its own configuration file	decode the configuration document	decode
+T02c	cli	deploy tool driven by its own configuration file	configuration value port = "80a"	parse-format
+T02d	cli	deploy tool driven by its own configuration file	look up the target name given on the command line	key-missing
+T02e	cli	deploy tool driven by its own configuration file	connect to the target host	net-refused
+T02f	cli	deploy tool driven by its own configuration file	look up a built-in command by its enum value	key-missing
+T03a	cli	backup / copy tool	a source file vanished between listing and copy	file-not-found
+T03b	cli	backup / copy tool	destination disk full	disk-full
+T03c	cli	backup / copy tool	one source file is unreadable	permission-denied
+T03d	cli	backup / copy tool	a path exceeds the OS limit	path-too-long
+T03e	cli	backup / copy tool	the total byte count overflows its counter	overflow
+T03f	cli	backup / copy tool	the destination directory does not exist	dir-not-found
+T04a	cli	interactive calculator (REPL)	the user types "12a +"	parse-format
+T04b	cli	interactive calculator (REPL)	the user types 1/0	div-zero
+T04c	cli	interactive calculator (REPL)	the user's result exceeds the integer range	overflow
+T04d	cli	interactive calculator (REPL)	the user names an undefined variable	key-missing
+T04e	cli	interactive calculator (REPL)	the user types 99999999999999999999	parse-range
+T04f	cli	interactive calculator (REPL)	input ends (EOF)	end-of-stream
+T04g	cli	interactive calculator (REPL)	the evaluator pops its own operator stack when empty	empty-collection
+T05a	web	REST handler: decode the request, look up a record, respond	the request body is not valid JSON	decode
+T05b	web	REST handler: decode the request, look up a record, respond	the field "age" is "abc"	parse-format
+T05c	web	REST handler: decode the request, look up a record, respond	the record id from the URL is not in the store	key-missing
+T05d	web	REST handler: decode the request, look up a record, respond	quantity x price from the request overflows	overflow
+T05e	web	REST handler: decode the request, look up a record, respond	the client disconnects while the response is written	net-reset
+T05f	web	REST handler: decode the request, look up a record, respond	the request is cancelled (client gone)	cancellation
+T05g	web	REST handler: decode the request, look up a record, respond	the handler indexes route parameters by a constant position	index-out-of-range
+T05h	web	REST handler: decode the request, look up a record, respond	the handler dereferences a field it assumed was set	null-deref
+T06a	web	gateway whose job is to call one upstream API	the upstream refuses the connection	net-refused
+T06b	web	gateway whose job is to call one upstream API	the upstream times out	timeout
+T06c	web	gateway whose job is to call one upstream API	the upstream returns a malformed body	decode
+T06d	web	gateway whose job is to call one upstream API	the upstream certificate fails validation	tls
+T06e	web	gateway whose job is to call one upstream API	the upstream host name does not resolve, at the start-up check	dns
+T06f	web	gateway whose job is to call one upstream API	look up a response in the gateway's own cache right after inserting it	key-missing
+T07a	web	service that also emits optional telemetry	the telemetry collector refuses the connection	net-refused
+T07b	web	service that also emits optional telemetry	a telemetry send times out	timeout
+T07c	web	service that also emits optional telemetry	the telemetry host does not resolve at start-up	dns
+T07d	web	service that also emits optional telemetry	the telemetry buffer is full	channel-full
+T07e	web	service that also emits optional telemetry	a metric value is NaN and cannot be encoded	encode
+T08a	web	file upload endpoint storing to disk	disk full while storing the upload	disk-full
+T08b	web	file upload endpoint storing to disk	the upload directory cannot be created at start-up	permission-denied
+T08c	web	file upload endpoint storing to disk	the upload directory is missing at request time	dir-not-found
+T08d	web	file upload endpoint storing to disk	the client-supplied file name is not a legal path	io-error
+T08e	web	file upload endpoint storing to disk	the body is shorter than the declared length	end-of-stream
+T09a	web	auth middleware validating a bearer token	the token is not valid base64 / JSON	decode
+T09b	web	auth middleware validating a bearer token	the token names a signing key that is not in the key set	key-missing
+T09c	web	auth middleware validating a bearer token	expiry arithmetic overflows on a crafted timestamp	overflow
+T09d	web	auth middleware validating a bearer token	the signing key file is missing at start-up	file-not-found
+T09e	web	auth middleware validating a bearer token	read a claim the validator has already checked is present	key-missing
+T10a	web	chat server broadcasting to connected clients	write to a client whose connection closed	net-reset
+T10b	web	chat server broadcasting to connected clients	a slow client's outbound queue is full	channel-full
+T10c	web	chat server broadcasting to connected clients	a client sends an undecodable frame	decode
+T10d	web	chat server broadcasting to connected clients	a client addresses a room id that does not exist	key-missing
+T10e	web	chat server broadcasting to connected clients	a room lists a member that is not in the connection table	key-missing
+T11a	batch	nightly CSV import into a database	today's input file has not arrived	file-not-found
+T11b	batch	nightly CSV import into a database	a row has a malformed number	parse-format
+T11c	batch	nightly CSV import into a database	a row has a number out of range	parse-range
+T11d	batch	nightly CSV import into a database	a row has too few fields	index-out-of-range
+T11e	batch	nightly CSV import into a database	a row repeats an id already seen	duplicate-key
+T11f	batch	nightly CSV import into a database	the database connection drops mid-batch	net-reset
+T11g	batch	nightly CSV import into a database	the running total overflows	overflow
+T11h	batch	nightly CSV import into a database	a header name the code expects is absent from the feed	key-missing
+T12a	batch	log aggregation over rotated files	a file is rotated away between listing and open	file-not-found
+T12b	batch	log aggregation over rotated files	the last line of a file is cut short	end-of-stream
+T12c	batch	log aggregation over rotated files	a line's timestamp does not parse	parse-format
+T12d	batch	log aggregation over rotated files	first occurrence of a key in the counter table	key-missing
+T12e	batch	log aggregation over rotated files	the output directory is not writable	permission-denied
+T13a	batch	report generator with numeric aggregation	average of an empty group	empty-collection
+T13b	batch	report generator with numeric aggregation	share = part / total with total 0	div-zero
+T13c	batch	report generator with numeric aggregation	the sum of external amounts overflows	overflow
+T13d	batch	report generator with numeric aggregation	the period's data file is missing	file-not-found
+T13e	batch	report generator with numeric aggregation	the report template shipped with the tool is missing	file-not-found
+T13f	batch	report generator with numeric aggregation	a format specifier written in the code is invalid	format-spec
+T14a	batch	one-shot data migration script	a legacy date string is in an unexpected format	parse-format
+T14b	batch	one-shot data migration script	the target database is unreachable	net-refused
+T14c	batch	one-shot data migration script	a foreign key is absent from the reference map	key-missing
+T14d	batch	one-shot data migration script	a column assumed non-null is null	null-deref
+T14e	batch	one-shot data migration script	the target disk is full	disk-full
+T15a	desktop	text editor: open and save documents the user picks	open a file from the recent list that no longer exists	file-not-found
+T15b	desktop	text editor: open and save documents the user picks	save without permission	permission-denied
+T15c	desktop	text editor: open and save documents the user picks	disk full on save	disk-full
+T15d	desktop	text editor: open and save documents the user picks	the file is not valid UTF-8	text-decode
+T15e	desktop	text editor: open and save documents the user picks	'go to line' beyond the last line	index-out-of-range
+T15f	desktop	text editor: open and save documents the user picks	allocation fails opening a 4 GB file	out-of-memory
+T15g	desktop	text editor: open and save documents the user picks	undo with an empty undo stack	empty-collection
+T16a	desktop	application loading its own bundled resources	a bundled icon or translation file is missing	file-not-found
+T16b	desktop	application loading its own bundled resources	a bundled JSON resource does not decode	decode
+T16c	desktop	application loading its own bundled resources	parse a version constant compiled into the binary	parse-format
+T16d	desktop	application loading its own bundled resources	a translation key is missing for one language	key-missing
+T16e	desktop	application loading its own bundled resources	an optional theme file in the user's folder is missing	file-not-found
+T17a	desktop	restore the last session at start-up	the state file is absent (first run)	file-not-found
+T17b	desktop	restore the last session at start-up	the state file is corrupt (crash during the last write)	decode
+T17c	desktop	restore the last session at start-up	the state names a document that no longer exists	file-not-found
+T17d	desktop	restore the last session at start-up	the state was written by a newer version	decode
+T17e	desktop	restore the last session at start-up	the stored monitor index exceeds the monitor count	index-out-of-range
+T18a	desktop	image viewer	the image data is corrupt	decode
+T18b	desktop	image viewer	the file is truncated	end-of-stream
+T18c	desktop	image viewer	width x height x 4 from the header overflows	overflow
+T18d	desktop	image viewer	allocation for a huge image fails	out-of-memory
+T18e	desktop	image viewer	the decoder writes past its own buffer	index-out-of-range
+T19a	desktop	auto-updater	no network	net-refused
+T19b	desktop	auto-updater	the update manifest does not decode	decode
+T19c	desktop	auto-updater	the version string in the manifest does not parse	parse-format
+T19d	desktop	auto-updater	the server certificate fails validation	tls
+T19e	desktop	auto-updater	the install directory is not writable	permission-denied
+T20a	library	JSON parsing library (the author's view)	the input document is malformed	decode
+T20b	library	JSON parsing library (the author's view)	a number does not fit the target type	parse-range
+T20c	library	JSON parsing library (the author's view)	nesting exceeds the depth limit	decode
+T20d	library	JSON parsing library (the author's view)	the caller passes a negative depth limit	invalid-argument
+T20e	library	JSON parsing library (the author's view)	the caller's output stream fails during a write	io-error
+T20f	library	JSON parsing library (the author's view)	the caller serializes a type that was never registered	encode
+T20g	library	JSON parsing library (the author's view)	the internal state machine reaches an impossible state	invalid-state
+T21a	library	HTTP client library with a retry policy	connection refused	net-refused
+T21b	library	HTTP client library with a retry policy	the request times out	timeout
+T21c	library	HTTP client library with a retry policy	the host name does not resolve	dns
+T21d	library	HTTP client library with a retry policy	the caller's URL string is malformed	parse-format
+T21e	library	HTTP client library with a retry policy	the response body does not decode	decode
+T21f	library	HTTP client library with a retry policy	the caller cancels	cancellation
+T21g	library	HTTP client library with a retry policy	the pool hands out a connection that was already disposed	disposed-access
+T22a	library	collection / utility library	the caller indexes past the end	index-out-of-range
+T22b	library	collection / utility library	the caller asks for the first element of an empty sequence	empty-collection
+T22c	library	collection / utility library	the caller passes a negative capacity	invalid-argument
+T22d	library	collection / utility library	the collection is modified during enumeration	invalid-state
+T22e	library	collection / utility library	an internal probe-sequence invariant is broken	contract
+T22f	library	collection / utility library	the growth computation overflows	overflow
+T23a	library	date arithmetic on user-entered values (a booking form)	the user enters 30 February	invalid-argument
+T23b	library	date arithmetic on user-entered values (a booking form)	the date string from the form does not parse	parse-format
+T23c	library	date arithmetic on user-entered values (a booking form)	'add N days' with N from the request leaves the date range	overflow
+T23d	library	date arithmetic on user-entered values (a booking form)	parse a date literal written in the code	parse-format
+T23e	library	date arithmetic on user-entered values (a booking form)	the time-zone id from the configuration is unknown	key-missing
+T24a	startup	service start-up: configuration and listening socket	the configuration file is missing	file-not-found
+T24b	startup	service start-up: configuration and listening socket	PORT is "80a"	parse-format
+T24c	startup	service start-up: configuration and listening socket	PORT is 99999	parse-range
+T24d	startup	service start-up: configuration and listening socket	the configuration document does not decode	decode
+T24e	startup	service start-up: configuration and listening socket	a required key is absent from the parsed configuration	key-missing
+T24f	startup	service start-up: configuration and listening socket	the port is already in use	io-error
+T24g	startup	service start-up: configuration and listening socket	the optional LOG_LEVEL is garbled	parse-format
+T25a	startup	service start-up: the database it cannot run without	the required database file is missing	file-not-found
+T25b	startup	service start-up: the database it cannot run without	the database file is not readable	permission-denied
+T25c	startup	service start-up: the database it cannot run without	the database server refuses the connection	net-refused
+T25d	startup	service start-up: the database it cannot run without	the database file header is cut short	end-of-stream
+T25e	startup	service start-up: the database it cannot run without	the schema-version record does not decode	decode
+T25f	startup	service start-up: the database it cannot run without	the credentials value does not parse	parse-format
+T26a	startup	tool reading an optional per-user settings file	the settings file is missing	file-not-found
+T26b	startup	tool reading an optional per-user settings file	the settings file is unreadable	permission-denied
+T26c	startup	tool reading an optional per-user settings file	the settings file is malformed	decode
+T26d	startup	tool reading an optional per-user settings file	a value is out of range	parse-range
+T26e	startup	tool reading an optional per-user settings file	an unknown option name	key-missing
+T27a	startup	secrets and feature flags at start-up	the secrets store is unreachable	net-refused
+T27b	startup	secrets and feature flags at start-up	a required secret is absent	key-missing
+T27c	startup	secrets and feature flags at start-up	the flag service times out	timeout
+T27d	startup	secrets and feature flags at start-up	the flag payload does not decode	decode
+T27e	startup	secrets and feature flags at start-up	the code asks for a flag name that is defined nowhere	key-missing
+T28a	database	fetch one row by a key from the request	no such row	key-missing
+T28b	database	fetch one row by a key from the request	the key parameter is not numeric	parse-format
+T28c	database	fetch one row by a key from the request	the key parameter is out of range	parse-range
+T28d	database	fetch one row by a key from the request	the connection drops	net-reset
+T28e	database	fetch one row by a key from the request	a column does not decode into the record type	decode
+T28f	database	fetch one row by a key from the request	take the first row after the code has checked that one exists	empty-collection
+T29a	database	transactions and the connection pool	a lock wait times out	timeout
+T29b	database	transactions and the connection pool	use a connection after it was closed	invalid-state
+T29c	database	transactions and the connection pool	the pool is exhausted within the wait budget	timeout
+T29d	database	transactions and the connection pool	return a connection to the pool twice	invalid-state
+T29e	database	transactions and the connection pool	the pool size from the configuration is zero	invalid-argument
+T29f	database	transactions and the connection pool	the connection string does not parse	parse-format
+T30a	database	embedded database file	the file is missing	file-not-found
+T30b	database	embedded database file	page checksum mismatch	decode
+T30c	database	embedded database file	the file is shorter than its header says	end-of-stream
+T30d	database	embedded database file	disk full during commit	disk-full
+T30e	database	embedded database file	the file is locked by another process	io-error
+T30f	database	embedded database file	an in-memory tree invariant is violated	contract
+T31a	worker	queue consumer	a message does not decode (poison message)	decode
+T31b	worker	queue consumer	reference data for the message is missing	key-missing
+T31c	worker	queue consumer	the broker connection is lost	net-reset
+T31d	worker	queue consumer	the handler has a null dereference on one message	null-deref
+T31e	worker	queue consumer	acknowledging on a channel the broker closed	channel-closed
+T31f	worker	queue consumer	shutdown requested	cancellation
+T32a	worker	scheduled job with a deadline	the job exceeds its deadline	timeout
+T32b	worker	scheduled job with a deadline	shutdown during the job	cancellation
+T32c	worker	scheduled job with a deadline	the lock file is held by the previous run	io-error
+T32d	worker	scheduled job with a deadline	the schedule expression in the configuration is invalid	parse-format
+T32e	worker	scheduled job with a deadline	the result directory is missing	dir-not-found
+T33a	worker	in-process pipeline over channels	receive after the upstream stage closed the channel	channel-closed
+T33b	worker	in-process pipeline over channels	send after the downstream stage died	channel-closed
+T33c	worker	in-process pipeline over channels	send on a channel this same stage closed earlier	channel-closed
+T33d	worker	in-process pipeline over channels	non-blocking send on a full bounded channel	channel-full
+T33e	worker	in-process pipeline over channels	a stage's domain ends with a bug	domain-fault
+T33f	worker	in-process pipeline over channels	a stage's domain ends on a bad input file	domain-fault
+T34a	worker	cache in front of a slow source	the key is not in the cache	key-missing
+T34b	worker	cache in front of a slow source	the cache server is down	net-refused
+T34c	worker	cache in front of a slow source	a cached blob written by an older build does not decode	decode
+T34d	worker	cache in front of a slow source	the warm-up file is missing at start-up	file-not-found
+T34e	worker	cache in front of a slow source	a computed entry size is negative	invalid-argument
+T35a	test	unit-test runner (the host)	a test's assertion fails	contract
+T35b	test	unit-test runner (the host)	a test body hits a null dereference	null-deref
+T35c	test	unit-test runner (the host)	a test body divides by zero	div-zero
+T35d	test	unit-test runner (the host)	a test exceeds its time limit	timeout
+T35e	test	unit-test runner (the host)	the test list file is missing	file-not-found
+T35f	test	unit-test runner (the host)	the runner indexes its own result table wrongly	index-out-of-range
+T36a	test	tests asserting that a function rejects bad input	expect an argument error from f(-1)	invalid-argument
+T36b	test	tests asserting that a function rejects bad input	expect a format error from Parse("x")	parse-format
+T36c	test	tests asserting that a function rejects bad input	expect a missing-key error from the indexer	key-missing
+T36d	test	tests asserting that a function rejects bad input	expect a contract violation	contract
+T36e	test	tests asserting that a function rejects bad input	expect an overflow	overflow
+T37a	test	integration test with fixture files	a fixture file is missing	file-not-found
+T37b	test	integration test with fixture files	a fixture document does not decode	decode
+T37c	test	integration test with fixture files	the temporary directory is not writable	permission-denied
+T37d	test	integration test with fixture files	the test server's port is in use	io-error
+T37e	test	integration test with fixture files	the service under test refuses the connection	net-refused
+T38a	embedded	sensor polling loop on a microcontroller	a bus read times out	timeout
+T38b	embedded	sensor polling loop on a microcontroller	frame checksum mismatch	decode
+T38c	embedded	sensor polling loop on a microcontroller	an optional sensor is not fitted	io-error
+T38d	embedded	sensor polling loop on a microcontroller	fixed-point scaling overflows	overflow
+T38e	embedded	sensor polling loop on a microcontroller	ring-buffer index out of range	index-out-of-range
+T38f	embedded	sensor polling loop on a microcontroller	allocation fails	out-of-memory
+T38g	embedded	sensor polling loop on a microcontroller	the control loop misses its own deadline	timeout
+T39a	embedded	device configuration at boot	the stored configuration fails its checksum	decode
+T39b	embedded	device configuration at boot	a stored value is out of range	parse-range
+T39c	embedded	device configuration at boot	the configuration was stored by a newer firmware	decode
+T39d	embedded	device configuration at boot	a flash write fails	io-error
+T39e	embedded	device configuration at boot	the required calibration table is missing	file-not-found
+T40a	embedded	device publishing readings over a flaky link	the broker refuses the connection	net-refused
+T40b	embedded	device publishing readings over a flaky link	a publish times out	timeout
+T40c	embedded	device publishing readings over a flaky link	the local buffer is full	channel-full
+T40d	embedded	device publishing readings over a flaky link	the host name does not resolve	dns
+T40e	embedded	device publishing readings over a flaky link	the device certificate has expired	tls
+T40f	embedded	device publishing readings over a flaky link	a reading is NaN and cannot be encoded	encode
+T41a	game	asset loading	a bundled asset is missing	file-not-found
+T41b	game	asset loading	a bundled asset is corrupt	decode
+T41c	game	asset loading	a bundled shader source does not compile	parse-format
+T41d	game	asset loading	a user mod's asset is missing	file-not-found
+T41e	game	asset loading	a user mod's script has a syntax error	parse-format
+T41f	game	asset loading	a user mod names an unknown entity type	key-missing
+T42a	game	per-frame update	look up an entity destroyed earlier this frame	key-missing
+T42b	game	per-frame update	tile index outside the map at the edge	index-out-of-range
+T42c	game	per-frame update	normalise a zero-length vector	div-zero
+T42d	game	per-frame update	an integration step overflows	overflow
+T42e	game	per-frame update	a required component is null	null-deref
+T42f	game	per-frame update	frame allocation fails	out-of-memory
+T43a	game	save files and network packets	the save file is missing	file-not-found
+T43b	game	save files and network packets	the save file is corrupt or from another version	decode
+T43c	game	save files and network packets	disk full on save	disk-full
+T43d	game	save files and network packets	a malformed packet from a peer	decode
+T43e	game	save files and network packets	a packet declares a length beyond the buffer	index-out-of-range
+T43f	game	save files and network packets	a peer disconnects	net-reset
+T44a	compiler	front end: read sources, report diagnostics	a source file named on the command line is missing	file-not-found
+T44b	compiler	front end: read sources, report diagnostics	an imported module file is missing	file-not-found
+T44c	compiler	front end: read sources, report diagnostics	a syntax error	parse-format
+T44d	compiler	front end: read sources, report diagnostics	an integer literal is out of range	parse-range
+T44e	compiler	front end: read sources, report diagnostics	a source file is not valid UTF-8	text-decode
+T44f	compiler	front end: read sources, report diagnostics	the output file is not writable	permission-denied
+T45a	compiler	constant folder and interpreter for the user's program	the user's constant expression divides by zero	div-zero
+T45b	compiler	constant folder and interpreter for the user's program	the user's constant expression overflows	overflow
+T45c	compiler	constant folder and interpreter for the user's program	the interpreted program indexes out of range	index-out-of-range
+T45d	compiler	constant folder and interpreter for the user's program	the interpreted program dereferences null	null-deref
+T45e	compiler	constant folder and interpreter for the user's program	the interpreter pops its own value stack when empty	empty-collection
+T46a	compiler	compiler internals	symbol lookup for a name the resolver already bound	key-missing
+T46b	compiler	compiler internals	a node kind no match arm covers	match-failure
+T46c	compiler	compiler internals	an internal assertion fails	contract
+T46d	compiler	compiler internals	a type index beyond the type table	index-out-of-range
+T46e	compiler	compiler internals	arena allocation fails	out-of-memory
+T47a	host	plugin / script host	a plugin hits a null dereference	null-deref
+T47b	host	plugin / script host	a plugin file is missing	file-not-found
+T47c	host	plugin / script host	a plugin manifest does not decode	decode
+T47d	host	plugin / script host	a plugin exceeds its time budget	timeout
+T47e	host	plugin / script host	a plugin calls a host function with a bad argument	invalid-argument
+T47f	host	plugin / script host	the host's own registry lookup fails	key-missing

@@ -2,8 +2,8 @@
 //! doc: spec
 //! section: 18.5
 //! title: an unrecognized format specifier raises FormatException at runtime
-//! rule: "An unrecognized specifier at runtime raises `FormatException` (the
-//!   defined-fault rule, stdlib §2.18)."
+//! rule: "An unrecognized specifier at runtime raises `FormatException` (stdlib
+//!   §2.18's raise-on-unknown-specifier rule)."
 //! cites: 18.5
 //! expect: run
 //! stdout: format

@@ -1,12 +1,13 @@
 //! case: s31_4_0009
 //! doc: spec
 //! section: 31.4
-//! title: a user class listing IFailure is a failure an IFailure arm takes
+//! title: a user class listing IFailure is IFailure-marked and an IFailure arm takes it
 //! rule: User code chooses per class: `class ConfigError(message: string):
-//!   Exception(message), IFailure` declares a failure, and a class that does
-//!   not list the marker declares a defect report. … A catch arm that names the
-//!   marker selects on it: an `IFailure` arm takes every failure and lets
-//!   defects and cancellation pass
+//!   Exception(message), IFailure` declares an `IFailure`-marked class, and a
+//!   class that does not list the marker makes no statement. … The marker is
+//!   read in two places. A catch arm that names it selects on it: an `IFailure`
+//!   arm takes every `IFailure`-marked exception and lets every other
+//!   exception, cancellation included, pass
 //! cites: 31.4, 31.2.1
 //! expect: run
 //! stdout: failure
