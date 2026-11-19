@@ -156,7 +156,17 @@ BEZEL_TEST(lambda_body_branch_join_discards_move_4117,
         "end C;";
     OwnershipResult r = parseAndCheckOwnership(src);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kMaybeConsumedMsg));
+    // fix #8940 (§28.3, §28.8.1, v0.359): the message is now the METHOD
+    // twin's "already moved out", not "may have already been consumed". The
+    // catch arm is entered on the exception edge out of the `try` body, and
+    // §28.8.1 fixes that edge's state: "the transfer completes at call
+    // entry, the binding is still moved-from in the `catch` arm" — so the
+    // arm's exit state carries the move, and the post-`try` join is
+    // MovedFrom, not Owned ⊓ MovedFrom. The byte-identical METHOD body
+    // spells the same program and draws the same "already moved out"
+    // diagnostic (measured on the fix's branch).
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kAlreadyMovedMsg));
+    BEZEL_EXPECT_FALSE(hasErrorMessage(r, kMaybeConsumedMsg));
 }
 
 // Row 3: `for` — ASan-confirmed by the issue. `move x` inside the loop body,
@@ -393,7 +403,16 @@ BEZEL_TEST(lambda_body_branch_join_discards_move_4117,
         "end C;";
     JitResult r = runAotChecked(src);
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kMaybeConsumedMsg.c_str()));
+    // fix #8940 (§28.3, §28.8.1, v0.359): the METHOD twin's "already moved
+    // out" diagnostic — the catch arm's entry state is the try body's exit
+    // state (§28.8.1: "the transfer completes at call entry, the binding is
+    // still moved-from in the `catch` arm"), so the post-`try` join is
+    // MovedFrom and the second `move x` is the definite one. The
+    // byte-identical METHOD body spells the same program and draws the same
+    // diagnostic (measured on the fix's branch).
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kAlreadyMovedMsg.c_str()));
+    BEZEL_EXPECT_FALSE(
+        diagnosticMessageContains(r, kMaybeConsumedMsg.c_str()));
 }
 
 // Row 10: the `for` shape, real execution. Mirrors Row 8.

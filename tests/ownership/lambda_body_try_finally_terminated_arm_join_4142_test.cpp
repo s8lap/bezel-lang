@@ -35,9 +35,14 @@
 //          soundness pin (a sloppy filter accidentally excludes the body
 //          from BOTH views would silently re-accept the double-move).
 //   Row 3: try body ends in `return`, catch arm does nothing, post-`try`
-//          `move x` — body excluded, catch kept. Post-`try` join sees
-//          only catch's Owned. `move x` ACCEPTED. Pre-fix: rejected
-//          (body's MovedFrom ⊓ catch's Owned = maybeConsumed).
+//          `move x` — body excluded, catch kept. The post-`try` join sees
+//          the catch arm's exit state, and since #8940 the arm runs with
+//          the try body's exit state (the exception edge's state, §28.8.1),
+//          so `x` is moved-from in the arm and the post-`try` `move x` is a
+//          DOUBLE move: REJECTED, with the METHOD twin's "already moved
+//          out" diagnostic. Before #8940 the arm ran over the pre-try
+//          snapshot and this row read "accepted"; the byte-identical METHOD
+//          body always rejected it.
 //   Row 4: try/catch/finally where BOTH body and catch end in `return`,
 //          finally does nothing, post-`try` `move x` — both operands
 //          excluded (post-`try` code unreachable on every path), post-`try`
@@ -49,9 +54,12 @@
 //          shape — try body consumes `x` (no terminator), catch arm
 //          does nothing, post-`try` `move x` again. BOTH paths reach
 //          post-`try` code (body normal-completion OR body throws into
-//          catch), so the join must remain `maybeConsumed`. This is the
-//          SAME shape as lambda_body_branch_join_discards_move_4117
-//          Row 2. My filter must NOT over-relax this join.
+//          catch), so the join must remain a REJECTION of the second
+//          `move x`. This is the SAME shape as
+//          lambda_body_branch_join_discards_move_4117 Row 2. My filter must
+//          NOT over-relax this join. Since #8940 the rejection is the
+//          METHOD twin's "already moved out" (the catch arm's exit state
+//          carries the transfer, §28.8.1).
 //
 // §21.7 (try/catch/finally semantics), §28.3 K1.4 (branch join), §28.8.1
 // (exception path discharge), v0.298.
@@ -149,11 +157,22 @@ BEZEL_TEST(lambda_body_try_finally_terminated_arm_join_4142,
 // (which always returned) but reachable via the catch arm's `;` (which
 // falls through). With my fix the body is excluded (return) and the catch
 // is kept (no terminator) — the post-`try` join sees ONLY the catch's
-// Owned state, so the post-`try` `move x` is ACCEPTED.
-// FAIL-WITHOUT: rejected with maybe-consumed (body's MovedFrom ⊓ catch's
-// Owned = maybeConsumed). PASS-WITH: accepted.
+// exit state.
+//
+// fix #8940 (§28.3, §28.8.1, v0.359): the catch arm's EXIT state is no
+// longer the arm's own state over the PRE-TRY snapshot — the arm is entered
+// on the exception edge out of the `try` body, and §28.8.1 fixes that
+// edge's state ("the transfer completes at call entry, the binding is still
+// moved-from in the `catch` arm"), so the arm runs with `x` moved-from and
+// its exit state says so. The post-`try` `move x` is therefore a DOUBLE
+// move and is REJECTED — which is what the byte-identical METHOD body
+// already did (measured on the fix's branch: the method spelling of this
+// exact program draws "owned value in `x` was already moved out at this
+// point (§28.3)"). The lambda form was the weaker one; #8940 closes that
+// gap, so this row's expectation flips from "accepted" to the method
+// twin's rejection.
 BEZEL_TEST(lambda_body_try_finally_terminated_arm_join_4142,
-           try_catch_return_body_post_try_move_accepted_28_3) {
+           try_catch_return_body_post_try_move_rejected_like_method_28_3) {
     std::string src =
         std::string(kRes) +
         "class C "
@@ -174,7 +193,8 @@ BEZEL_TEST(lambda_body_try_finally_terminated_arm_join_4142,
         "  end Main; "
         "end C;";
     OwnershipResult r = parseAndCheckOwnership(src);
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kAlreadyMovedMsg));
 }
 
 // Row 4: try/catch/finally where BOTH the body AND a catch arm end in
@@ -217,14 +237,21 @@ BEZEL_TEST(lambda_body_try_finally_terminated_arm_join_4142,
 // Row 5 (accept-side regression guard, §15): the existing working
 // shape — try body normal-completion `move x`, catch arm `;`, post-`try`
 // `move x` again. BOTH paths reach post-`try` code (body normal-
-// completion OR body throws into catch), so the join must remain
-// `maybeConsumed`. This is the SAME shape as lambda_body_branch_join
-// _discards_move_4117 Row 2. My filter must NOT over-relax this join.
-// FAIL-WITHOUT: rejected with maybe-consumed (matches #4117 Row 2).
-// PASS-WITH: same rejection — this row pins the FIX did not break the
-// working shape, distinct from Rows 1/3/4 which pin NEW accept behavior.
+// completion OR body throws into catch), so the join must remain a
+// REJECTION of the second `move x`. This is the SAME shape as
+// lambda_body_branch_join_discards_move_4117 Row 2. My filter must NOT
+// over-relax this join.
+//
+// fix #8940 (§28.3, §28.8.1, v0.359): the rejection is still there, but it
+// is now the METHOD twin's "already moved out" rather than "may have already
+// been consumed": the catch arm is entered on the exception edge out of the
+// `try` body, and §28.8.1 fixes that edge's state ("the transfer completes
+// at call entry, the binding is still moved-from in the `catch` arm"), so
+// the arm's exit state carries the move and the post-`try` join is
+// MovedFrom. The byte-identical METHOD body draws the same diagnostic
+// (measured on the fix's branch).
 BEZEL_TEST(lambda_body_try_finally_terminated_arm_join_4142,
-           try_catch_normal_body_post_try_move_still_maybe_consumed_28_3) {
+           try_catch_normal_body_post_try_move_still_rejected_28_3) {
     std::string src =
         std::string(kRes) +
         "class C "
@@ -245,7 +272,8 @@ BEZEL_TEST(lambda_body_try_finally_terminated_arm_join_4142,
         "end C;";
     OwnershipResult r = parseAndCheckOwnership(src);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kMaybeConsumedMsg));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kAlreadyMovedMsg));
+    BEZEL_EXPECT_FALSE(hasErrorMessage(r, kMaybeConsumedMsg));
 }
 
 // ===========================================================================

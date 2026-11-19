@@ -16874,6 +16874,42 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         BlockState savedTryStates = states_;
         for (const auto& bs : trys->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        // fix #8940 (§28.3 K1.3/K3.3, §28.8.1, §22.9, v0.359): the CATCH
+        // ARM's entry state. #3951 (above) restored the PRE-try snapshot
+        // before each catch arm, on the reasoning that "a `try` body may
+        // throw and unwind to a catch arm at ANY statement inside it, so a
+        // move recorded partway through the body is not a reliable fact for a
+        // catch arm to see". That is strictly weaker than the METHOD body's
+        // own dataflow, which rejects the byte-identical method spelling:
+        //   `try k := Sink.Take(move x); catch e: Exception => k := x.tag; end;`
+        // draws "owned value in `x` was already moved out at this point
+        // (§28.3)" in a method body, and NOTHING in a lambda body.
+        //
+        // The method body's verdict is the CFG's, and the CFG's exception
+        // edge into a catch dispatch carries the state AS OF THE RAISE POINT
+        // — §28.8.1 / §22.9 ("A call that raises does not give the argument
+        // back: the transfer completes at call entry, the binding is still
+        // moved-from in the `catch` arm"). This pre-pass is flow-INsensitive,
+        // so the body's EXIT state is its closest approximation of that
+        // per-point state: it is the state every statement of the body sees,
+        // and the state the `finally` walk ALREADY used (the body's exit
+        // state is `tryEndsForFinally`'s first entry, below). The catch arm
+        // now starts from the SAME state the `finally` body starts from, so
+        // the two are consistent with each other.
+        //
+        // MEASURED against the method twin on this lane (base 9356d0a6a,
+        // `build/bezelc -c`): the method body rejects the straight-line
+        // spelling, the `var y := move x;` binding-transfer spelling, the
+        // "raise first, then move" spelling and the "move, then raise"
+        // spelling, all with "owned value in `x` was already moved out at
+        // this point (§28.3)", and admits the "no move at all" spelling.
+        // The conditional-move spelling draws the method's OWN join
+        // diagnostic ("local `x` may have already been consumed on another
+        // branch ... (maybe-consumed join, §28.3)") — the pre-pass's IfStmt
+        // arm joins its arms with the same `joinInto` (see #4117 above), so
+        // the lambda form now draws that one too. The lambda body drew
+        // NOTHING for any of these before this fix.
+        const BlockState tryBodyExitStates = states_;
         // fix #4142: track whether the body's normal-completion path is
         // reachable to the post-try code. `armNeverFallsThrough` returns true
         // when the body's last reachable stmt is `return`/`throw` — that path
@@ -16894,7 +16930,14 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         if (!bodyNeverFallsThrough)
             tryEndsForJoin.push_back(states_);
         for (const auto& arm : trys->catches) {
-            states_ = savedTryStates;
+            // fix #8940 (§28.3, §28.8.1, §22.9, v0.359): the catch arm
+            // starts from the try BODY's exit state, not from the pre-try
+            // snapshot — the method body's own dataflow sees the transfer as
+            // completed (§28.8.1: "the transfer completes at call entry, the
+            // binding is still moved-from in the `catch` arm"), so the lambda
+            // form must see it too or the two forms disagree. See the
+            // `tryBodyExitStates` comment above for the measurements.
+            states_ = tryBodyExitStates;
             if (arm.guard) {
                 std::vector<const ast::LambdaExpr*> nestedLambdas;
                 collectBodyLambdasExpr(*arm.guard, nestedLambdas);
