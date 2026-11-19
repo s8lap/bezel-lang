@@ -15440,6 +15440,30 @@ private:
     llvm::BasicBlock* closureArgUnwindCleanup(
         const std::vector<llvm::Value*>& closures);
 
+    // fix #8980 (§27.5 / §28.3 / §28.9, v0.359): the EXCEPTION-edge discharge of
+    // a non-escaping lambda's CAPTURE CELLS. Builds a cleanup block that frees
+    // the cells (`cells` — one `boxedCellFree` Disposal per cell, as
+    // `consumeLastLambdaCapturedCells`'s exception-edge mode collects them) and
+    // then continues to the CURRENT enclosing unwind (`unwindBB()`, captured
+    // before the caller overrides `unwindTarget_`).
+    //
+    // WHY IT IS A SEPARATE BLOCK, INSTALLED UNDER `closureArgUnwindCleanup`:
+    // the cell free must run AFTER the closure release, because the closure's
+    // envdtor reads the captured content THROUGH the cell (a `string` capture
+    // releases its +1 there). The scope's own unwind disposal pass runs BEFORE
+    // the closure-argument cleanup block (the pending check emits it and then
+    // branches to the cleanup), so a cell free registered as a scope-end
+    // disposal would free the cell BEFORE the envdtor read it — a
+    // heap-use-after-free. Installing this block UNDER the closure cleanup
+    // makes the chain: closure release → cell free → enclosing unwind.
+    //
+    // EXACTLY-ONCE, like `closureArgUnwindCleanup`: the block is installed as
+    // `unwindTarget_` ONLY across the call, its only predecessors are that
+    // call's unwind edges, and the normal-return edge carries the scope-end
+    // `boxedCellFree` instead — the two are mutually exclusive.
+    llvm::BasicBlock* captureCellUnwindCleanup(
+        const std::vector<Disposal>& cells);
+
     // fix #8624 (§7.5 / §28.14 / §28.9, v0.359): the closure-ARGUMENT
     // discharge of a call to a USER method — the ONE definition the `.`
     // call path (`lowerCallDispatch`) and the `?.` call path
@@ -21270,7 +21294,21 @@ private:
     // to drive the consumption, but its lowered lambda populates the vector the
     // same way. Clears lastLambdaCapturedCells_ (owned by the most recent
     // lowerLambda call).
-    void consumeLastLambdaCapturedCells();
+    //
+    // fix #8980 (§27.5 / §28.3 / §28.9, v0.359): `unwindFreeNow` non-null
+    // selects the EXCEPTION-edge mode. The consuming call's capture cells are
+    // consumed at the CALL SITE, which is AFTER the call — so when the call
+    // THROWS, the normal-edge consume never runs and the cell's scope-end
+    // `boxedCellFree` is never registered: the cell leaked (4 B per call, 8 B
+    // for a `string` capture) on every propagating call. In the exception-edge
+    // mode the cell frees are COLLECTED into `*unwindFreeNow` instead of being
+    // registered as scope-end disposals, and the pending entries are NOT erased
+    // (the normal-edge consume still needs them). The caller emits the
+    // collected frees in the call's unwind cleanup block — AFTER the closure
+    // release that runs the envdtor, because the envdtor reads the captured
+    // content THROUGH the cell. The two edges are mutually exclusive at runtime
+    // (a given exit goes one way only), so exactly one of them frees the cell.
+    void consumeLastLambdaCapturedCells(std::vector<Disposal>* unwindFreeNow = nullptr);
 
     // CG13: register a `using var`'s scope-based disposal (§28.3). The
     // local is disposed at the end of its enclosing block in reverse

@@ -3621,6 +3621,59 @@ llvm::BasicBlock* Emitter::closureArgUnwindCleanup(
 }
 
 
+// fix #8980 (§27.5 / §28.3 / §28.9, v0.359): the EXCEPTION-edge half of the
+// capture-cell reclaim. See the declaration in LlvmBackend_impl.hpp for the
+// full argument; the short version:
+//
+// A lambda's capture cells are consumed at the site that OWNS them — for a
+// lambda passed to a call-bounded formal, that is the CALL SITE, and the
+// consumption (which registers the scope-end `boxedCellFree`) runs AFTER the
+// call returns. So when the call THROWS, the consumption never happens and
+// the cell leaks: MEASURED on r30-c1 @ 329a1d5ef, 800 byte(s) leaked in
+// 200 allocation(s) — 4 B per call for an `int` capture, 8 B for a
+// `string` capture (the cell holds a pointer). §28.3's Exception-path
+// discharge is the rule it violates: "the compiler treats every owned local
+// and owned parameter as if it were wrapped in an implicit try/finally …
+// Exceptions therefore do not produce leaks."
+//
+// The free runs HERE, in the cleanup block, and NOT as a scope-end disposal,
+// for the ORDER reason the declaration gives: the scope's unwind disposal
+// pass runs BEFORE this block (the pending check emits it and then branches
+// here), so a scope-end free would free the cell before the closure release
+// that runs the envdtor — and the envdtor reads the captured content THROUGH
+// the cell (a `string` capture releases its +1 there). The caller installs
+// this block UNDER `closureArgUnwindCleanup`, so the chain is: closure
+// release → cell free → enclosing unwind.
+//
+// `emitDisposals(..., isUnwind=true)` is the `boxedCellFree` arm verbatim —
+// the free, the nulling of the holder (so a re-entered guarded cell allocates
+// a fresh one), the #4165 DictionaryEntry Key release and the #8463
+// counted-cell decline — and `isUnwind=true` also arms the #2334
+// `skipCellFreeOnUnwind` guard, which is exactly right here: this IS the
+// unwind edge.
+//
+// EXACTLY-ONCE, like `closureArgUnwindCleanup`: the block is installed as
+// `unwindTarget_` ONLY across the call, its only predecessors are that call's
+// unwind edges (each a `CreateCondBr` whose other side is the pending-check
+// continuation carrying the normal-path release), and an exception edge never
+// rejoins that continuation — so the cell is freed on the unwind edge OR at
+// the scope end on the normal edge, never both.
+llvm::BasicBlock* Emitter::captureCellUnwindCleanup(
+    const std::vector<Disposal>& cells) {
+    // The argument is in the header comment above.
+    if (cells.empty()) return unwindBB();
+    auto* savedInsert = builder_.GetInsertBlock();
+    llvm::BasicBlock* enclosingUnwind = unwindBB();
+    auto* cleanupBB =
+        llvm::BasicBlock::Create(llvm_, "cell.throw.cleanup", currentFn_);
+    builder_.SetInsertPoint(cleanupBB);
+    emitDisposals(cells, /*isUnwind=*/true);
+    builder_.CreateBr(enclosingUnwind);
+    if (savedInsert) builder_.SetInsertPoint(savedInsert);
+    return cleanupBB;
+}
+
+
 // fix-forward #5262-ff (§4.6 / §28.3 "Exception-path discharge" / §28.9,
 // v0.313): the EXCEPTION-edge half of #5262's borrowed-string-argument pin.
 // The pin mints a +1 per admissible argument and the call site released it on

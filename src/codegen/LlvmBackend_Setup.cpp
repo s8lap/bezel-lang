@@ -21729,11 +21729,26 @@ void Emitter::attachOwningTaskResultDisposer(Disposal& d,
 // inline at this site (the comments document the #966/#969/#1017/#782 cases);
 // the only change is the unconditional clear at the end (the caller no longer
 // clears — the helper owns the vector's lifetime).
-void Emitter::consumeLastLambdaCapturedCells() {
+void Emitter::consumeLastLambdaCapturedCells(
+    std::vector<Disposal>* unwindFreeNow) {
     // fix #4261 (§28.3, v0.298): drain only entries whose push scope depth is at
     // or below the current scope. Entries pushed at a SHALLOWER scope belong to an
     // OUTER lambda and must be PRESERVED for that lambda's later consume call.
     const std::size_t currentScopeDepth = disposeStack_.size();
+    // fix #8980 (§27.5 / §28.3 / §28.9, v0.359): the EXCEPTION-edge mode. A
+    // capture cell is consumed at the site that OWNS it, and for a lambda
+    // passed to a call-bounded formal that site is the CALL SITE — whose
+    // consumption runs AFTER the call. So a call that THROWS never consumed
+    // the cell and never registered its scope-end `boxedCellFree`: the cell
+    // leaked (4 B per call; 8 B for a `string` capture) on every propagating
+    // call. In this mode the cell frees are COLLECTED into `*unwindFreeNow`
+    // (the caller emits them in the call's unwind cleanup block, AFTER the
+    // closure release that runs the envdtor) instead of being registered as
+    // scope-end disposals, and the pending entries are NOT erased — the
+    // normal-edge consume still needs them. The two edges are mutually
+    // exclusive at runtime (a given exit goes one way only), so exactly one of
+    // them frees the cell.
+    const bool unwindMode = unwindFreeNow != nullptr;
     for (const auto& ce : lastLambdaCapturedCells_) {
         // fix #4261 (§28.3, v0.300): skip entries from outer lambdas
         // (shallower pushScopeDepth). Entries at the CURRENT scope are
@@ -21792,6 +21807,27 @@ void Emitter::consumeLastLambdaCapturedCells() {
             if (hasOwnerDisposal) break;
         }
         if (hasOwnerDisposal) {
+            // fix #8980 (§27.5 / §28.3 / §28.9, v0.359): the EXCEPTION edge.
+            // The owner's reads-through-cell disposal has ALREADY run by the
+            // time the call's unwind cleanup block is entered (the pending
+            // check emits the scopes' unwind disposals and THEN branches to
+            // the cleanup), so the cell has no live reader left and can be
+            // freed HERE — after the closure release, which the cleanup block
+            // runs first. If the owner's scope is disposed LATER (an enclosing
+            // `try` in this frame keeps it live past the cleanup block), the
+            // cell must OUTLIVE it: the normal-edge consume registers the
+            // deferred free in that scope, and it fires when the scope is
+            // disposed. So this mode registers NOTHING and frees only the
+            // cells whose owner scope is already behind us.
+            if (unwindMode) {
+                if (ownerScopeIdx >= unwindScopeDepth_) {
+                    Disposal dcu{ce.newSlot, nullptr};
+                    dcu.boxedCellFree = true;
+                    dcu.skipCellFreeOnUnwind = ce.unwindUnsafe;  // fix #2334
+                    unwindFreeNow->push_back(dcu);
+                }
+                continue;
+            }
             // #1017: the plain boxedCellFree is unsafe (the owner disposal in
             // disposeStack_[ownerScopeIdx] reads the object through the cell,
             // and LIFO order would free it first → UAF). Instead register a
@@ -21916,6 +21952,29 @@ void Emitter::consumeLastLambdaCapturedCells() {
                 if (hasOuterBoxedCellFree) break;
             }
             if (hasOuterBoxedCellFree) continue;
+            // fix #8980 (§27.5 / §28.3 / §28.9, v0.359): the EXCEPTION edge.
+            // The captured local is declared in an ENCLOSING scope, so the cell
+            // must outlive that scope — the local is still read through the
+            // cell after this scope exits. On the unwind edge the declaring
+            // scope has already been disposed (the pending check emitted the
+            // scopes' unwind disposals before branching to the cleanup block)
+            // exactly when its index is at or above `unwindScopeDepth_`; then
+            // the cell has no live reader left and can be freed HERE. If the
+            // declaring scope is disposed LATER (an enclosing `try` in this
+            // frame), the cell must outlive it: the normal-edge consume
+            // registers the deferred free in that scope, and it fires when the
+            // scope is disposed. This mode registers NOTHING.
+            if (unwindMode) {
+                std::size_t declOwnerIdx = 0;
+                if (declScopeDisposeIndex(ce.key, declOwnerIdx) &&
+                    declOwnerIdx >= unwindScopeDepth_) {
+                    Disposal dcu{ce.newSlot, nullptr};
+                    dcu.boxedCellFree = true;
+                    dcu.skipCellFreeOnUnwind = ce.unwindUnsafe;  // fix #2334
+                    unwindFreeNow->push_back(dcu);
+                }
+                continue;
+            }
             auto* keyNode = static_cast<const ast::Node*>(ce.key);
             bool patternBinding =
                 dynamic_cast<const ast::BindingPattern*>(keyNode) != nullptr;
@@ -22074,7 +22133,22 @@ void Emitter::consumeLastLambdaCapturedCells() {
         // is handled separately in the envdtor body via freeCellInEnvdtor.
         if (ce.dictEntryKeyReleaseDeferred)
             dc.dictEntryKeyReleaseDeferred = true;
-        disposeStack_.back().push_back(dc);
+        // fix #8980 (§27.5 / §28.3 / §28.9, v0.359): the EXCEPTION edge takes
+        // the free into the call's unwind cleanup block instead of registering
+        // it as a scope-end disposal — the scope's unwind disposal pass runs
+        // BEFORE the closure-argument cleanup block, so a scope-end free would
+        // free the cell before the closure release that runs the envdtor (which
+        // reads the captured content THROUGH the cell). The #4165
+        // DictionaryEntry-Key release is NOT propagated into the unwind edge:
+        // that release's GEP reads the cell, and the cell is freed here — so
+        // the Key's +1 is left to the normal-edge registration (which does not
+        // fire on this edge). A bounded leak in that exotic shape, the safe
+        // direction.
+        if (unwindMode) {
+            unwindFreeNow->push_back(dc);
+        } else {
+            disposeStack_.back().push_back(dc);
+        }
         // #782: a captured move-only OWNING inline-array's elements live in the
         // boxed cell. Dispose each non-null element THROUGH the cell, then null
         // the slot — pushed AFTER boxedCellFree so it fires BEFORE it (reverse
@@ -22088,7 +22162,10 @@ void Emitter::consumeLastLambdaCapturedCells() {
             Disposal da{ce.newSlot, nullptr};
             da.inlineOwnedArrayCell = true;
             da.inlineSlotCount = ce.inlineArrayN;
-            disposeStack_.back().push_back(da);
+            if (unwindMode)
+                unwindFreeNow->push_back(da);
+            else
+                disposeStack_.back().push_back(da);
         }
     }
     // Erase entries that were processed in this call: nested lambdas (deeper scope)
@@ -22101,6 +22178,15 @@ void Emitter::consumeLastLambdaCapturedCells() {
     // to an outer lambda) is handled by the skip block above using declScopeDepth_
     // (the #969 guard); that entry is NOT erased here — the outer lambda's consume
     // fires at the same depth and erases it then.
+    //
+    // fix #8980 (§27.5 / §28.3 / §28.9, v0.359): the EXCEPTION-edge mode does
+    // NOT erase. Its frees live in the call's unwind cleanup block, and the
+    // NORMAL-edge consume (which runs after the call) still needs the entries:
+    // it registers the scope-end `boxedCellFree` for the same cells. The two
+    // edges are mutually exclusive at runtime, so exactly one of them frees
+    // the cell — and a cell freed by the unwind edge has its holder nulled, so
+    // the scope-end free that may still be registered for it is a no-op.
+    if (unwindMode) return;
     lastLambdaCapturedCells_.erase(
         std::remove_if(lastLambdaCapturedCells_.begin(), lastLambdaCapturedCells_.end(),
                        [currentScopeDepth](const LastCellEntry& ce) {

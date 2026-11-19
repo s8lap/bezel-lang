@@ -20439,6 +20439,39 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
         allClosureArgs.insert(allClosureArgs.end(),
                               rel.scoped.begin(),
                               rel.scoped.end());
+        // fix #8980 (§27.5 / §28.3 / §28.9, v0.359): the CAPTURE-CELL half of
+        // the unwind edge. The lambda's capture cells are consumed at the CALL
+        // SITE (the site that owns them — `consumeLastLambdaCapturedCells`,
+        // called from `releaseCallClosureArgs` on the normal-return edge), and
+        // that consumption runs AFTER the call returns. So a call that THROWS
+        // never consumed the cells and never registered their scope-end
+        // `boxedCellFree`: every cell leaked on every propagating call
+        // (MEASURED on r30-c1 @ 329a1d5ef: 800 byte(s) leaked in 200
+        // allocation(s) — 4 B per call for an `int` capture, 8 B for a
+        // `string` capture; the block-bodied and arrow-bodied twins leak
+        // identically). §28.3's Exception-path discharge is the rule that
+        // leak violates.
+        //
+        // The cell free is emitted in its OWN cleanup block, installed UNDER
+        // `closureArgUnwindCleanup` — so it runs AFTER the closure release,
+        // which is what runs the envdtor, and the envdtor reads the captured
+        // content THROUGH the cell (a `string` capture releases its +1 there).
+        // The scope's own unwind disposal pass runs BEFORE the cleanup block
+        // (the pending check emits it and then branches to the cleanup), so a
+        // scope-end free would have freed the cell first — a
+        // heap-use-after-free.
+        //
+        // ONLY the `callBounded` vector qualifies: the other three arms do not
+        // consume the cells at all (an iterator's frame retains the closure
+        // across the call; a plain async callee's frame holds it; a `scoped`
+        // callee borrows it) — the cells must outlive the call there, so
+        // freeing them on the unwind edge would be wrong.
+        if (!rel.callBounded.empty()) {
+            std::vector<Disposal> cellFrees;
+            consumeLastLambdaCapturedCells(&cellFrees);
+            if (!cellFrees.empty())
+                unwindTarget_ = captureCellUnwindCleanup(cellFrees);
+        }
         unwindTarget_ = closureArgUnwindCleanup(allClosureArgs);
     }
     return rel;
