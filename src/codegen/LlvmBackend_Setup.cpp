@@ -38736,7 +38736,9 @@ bool Emitter::lowerClosureLocalReassign(const ast::Expr& target,
     llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slotAddr, "clol.old");
     // fix #4422 (cluster-revert, §27.5 / §28.9, v0.298): CONDITIONAL retain —
     // only retain when the assigned expression is NOT a +1 producer (a lambda,
-    // method reference, or user-defined closure-returning call). The always-
+    // method reference, user-defined closure-returning call, or — since
+    // #8969 — a call through a lambda-typed local / parameter or an
+    // immediately-invoked lambda literal). The always-
     // retain discipline from #4422 first-pass (#64a9c41f / #add529f7) was
     // incorrect for the +1 producer case: a producer transfers its +1 into
     // the slot (no retain needed), but always-retain adds a spurious +1 that
@@ -38767,8 +38769,25 @@ bool Emitter::lowerClosureLocalReassign(const ast::Expr& target,
     // skips the call-site release when scope-end is armed for a reassigned
     // local — the cell stays alive across calls, scope-end fires once at
     // function exit.
+    // fix #8969 (§27.5 / §28.9, v0.359): the LAMBDA-CALLEE producer arm.
+    // `isLambdaClosureReturnCall` (#2714, widened by #8870 / #8893) recognises
+    // the closure-returning call whose callee is a LAMBDA-typed local or
+    // parameter, or an IMMEDIATELY-INVOKED lambda literal. Such a call mints
+    // exactly one +1 for the closure cell (the callee's body TRANSFERS a
+    // producer's +1, or MINTS one), and the CALLER owns that single reference
+    // — the same contract `isUserMethodClosureReturnCall` states for a
+    // user-defined method. Without this arm the assignment path RETAINED the
+    // call's result a second time (rc 1 -> 2) and the slot's single release
+    // dropped only one, stranding the other: 64 B per call, forever
+    // (issue #8969; the DECLARATION path `var f := make();` has admitted this
+    // producer since #2714 — `collectClosureReleaseEligible`'s producer walk
+    // reads `isPlusOneClosureProducer || isUserMethodClosureReturnCall ||
+    // isLambdaClosureReturnCall || isAwaitedClosureReturnCall` — which is why
+    // only the REASSIGNMENT spelling leaked).
     bool isProducer = isPlusOneClosureProducer(valueExpr) ||
-                      isUserMethodClosureReturnCall(valueExpr);
+                      isUserMethodClosureReturnCall(valueExpr) ||
+                      isLambdaClosureReturnCall(valueExpr) ||
+                      isAwaitedClosureReturnCall(valueExpr);
     if (!isProducer)
         emitClosureRetain(newVal);
     builder_.CreateStore(newVal, slotAddr);
