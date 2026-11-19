@@ -4435,6 +4435,31 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // expr body never reaches this point with non-empty stmts to collect
     // over, so the clear is what matters).
     CaptureReclaimSetScope captureReclaimScopeSync(*this);
+    // fix #8903 (§28.9 / §28.11 / §28.3.1, v0.359): the BORROWING-COLLECTION
+    // reclaim half for the SYNC lambda's OWN body. The closure-capture family
+    // above was re-established for this body, but the §28.9 borrowing-collection
+    // family (`borrowingArrayFreeEligible_` and its nine siblings) was NOT:
+    // `collectBorrowingArrayFreeEligible` was never asked about this body, so
+    // `borrowingArrayFreeEligible_` still held the ENCLOSING function's
+    // verdicts while `lowerLocalDecl`'s registration sites gate on
+    // `currentFn_ == borrowingArrayFreeEligibleFn_` — and `currentFn_` is this
+    // lambda's own `fn` for the whole body emission. The gate was therefore
+    // false for every local of this body, so a plain `var ys: Array<int> :=
+    // [1, 2];` declared in the lambda body was never reclaimed at the lambda's
+    // scope end (the `bz_array_t` header + its data block, 160 B in 2
+    // allocations, per call — issue #8903's measured 32000 B / 400 allocations
+    // over 200 calls). The METHOD twin of the same two lines is clean because
+    // `emitFunctionBody` runs this very pass for its own body.
+    //
+    // The scope is the borrowing twin of `CaptureReclaimSetScope` above (the
+    // same header type the iterator / async / async-iterator emitters use):
+    // a lambda body is emitted in the MIDDLE of the enclosing body, so the
+    // enclosing body's sets and fn tokens must be saved here and restored when
+    // control returns — otherwise the enclosing body's own reclaims would be
+    // tested against THIS lambda's verdicts (a leak) or this lambda's
+    // verdicts would be tested against the enclosing body's fn token.
+    // // per §28.9, §28.11
+    BorrowingReclaimSetScope borrowingReclaimScopeSync(*this);
     boxCaptureLocals_.clear();
     // fix #3823 / §27.5 / §28.9 (v0.287): for an EXPR-body lambda whose body is
     // itself a LambdaExpr (Shape B/C: a closure-returning lambda whose expr body
@@ -4527,6 +4552,41 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // LAMBDA's own re-scan, which may not elect a #3426 shared-cell owner
         // for a key it does not itself bind — see the parameter's comment.
         collectCellFreeEligible(lam.stmts, &lam);
+        // fix #8903 (§28.9 / §28.11 / §28.3.1, v0.359): the borrowing-collection
+        // scope-end reclaim eligibility for the SYNC lambda's OWN body — the
+        // counterpart of the `collectBorrowingArrayFreeEligible` call
+        // `emitFunctionBody` / `emitConstructorBody` make for a method / a
+        // constructor body (LlvmBackend_Setup.cpp). A plain `var ys: Array<int>
+        // := [1, 2];` declared in a lambda body and only READ is an owned atom
+        // (K1.5) whose backing storage is reclaimed with the instance at the
+        // owner's scope end (§28.9 / §28.11); without this pass the lambda's own
+        // `lowerLocalDecl` never registered that reclaim, so the array leaked
+        // once per call (issue #8903). The METHOD twin of the same two lines is
+        // clean — this call is what makes the lambda body behave like it.
+        //
+        // ORDERING: the walk consults `cellFreeEligible_`, so this must run
+        // AFTER `collectCellFreeEligible` — the same order the method and
+        // constructor venues use (and the order fix #7558 moved
+        // `emitFunctionBody`'s call to). `lambdaCaptureBorrow` is FALSE here:
+        // the tracked local of this pass is a local of THIS lambda's body, and
+        // the conservative "a capture is an escape" rule is what keeps a
+        // captured local out of the eligible set until fix #8831 turns the
+        // predicate on for this venue.
+        collectBorrowingArrayFreeEligible(lam.stmts,
+                                          /*yieldIsBorrowIterYield=*/false,
+                                          /*lambdaCaptureBorrow=*/false);
+        // fix #8903: key the family to the LAMBDA's own function — the
+        // registration sites in `lowerLocalDecl` gate on
+        // `currentFn_ == <set>Fn_`, and the body lowers with `currentFn_` ==
+        // this lambda's `fn`.
+        borrowingArrayFreeEligibleFn_ = fn;
+        dictMaterializerFreeEligibleFn_ = fn;      // #1028
+        groupingFreeEligibleFn_ = fn;              // #1930
+        dictEntryKeyReleaseEligibleFn_ = fn;       // #3720
+        dictEntryValueReleaseEligibleFn_ = fn;     // fix #6470
+        setLiteralFreeEligibleFn_ = fn;            // #2142
+        dictLiteralFreeEligibleFn_ = fn;           // #2143
+        takeCurrentDictFreeEligibleFn_ = fn;       // #3880
     } else {
         closureReleaseEligible_.clear();
         // fix #3757 follow-up: closureLocalCandidates_ must clear alongside
