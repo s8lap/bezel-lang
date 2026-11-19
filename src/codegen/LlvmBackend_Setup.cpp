@@ -41129,6 +41129,18 @@ struct ClosureEscapeWalker {
     // reaching-definition analysis checks that it visited every one of them
     // before it trusts its own verdict.
     std::vector<const ast::Stmt*>* keptSiteStmts = nullptr;
+    // fix-forward #8847 (§17.1 / §22.5, v0.359): the INVOCATION that
+    // performed each keep, with the statement it happened in. The donor
+    // pass's reaching-definition analysis joins the kept state into an unwind
+    // edge only when that invocation is the FIRST one the statement evaluates
+    // (§22.5's call-site textual order), so it must know WHICH one kept the
+    // value.
+    std::vector<std::pair<const ast::Stmt*, const ast::Expr*>>*
+        keptSiteCalls = nullptr;
+    // The INVOCATION whose ARGUMENT the walk is currently in (null outside an
+    // argument list). A keep is a read of the target in an argument position,
+    // so this names the invocation that keeps it.
+    const ast::Expr* curCall_ = nullptr;
     std::vector<const ast::Stmt*>* targetAssignStmts = nullptr;
     const ast::Stmt* curStmt_ = nullptr;
     // fix-forward #8479 (§7.7 / §28.9, v0.357): set by the #6176 arm of
@@ -41875,6 +41887,9 @@ struct ClosureEscapeWalker {
                     keptWithoutReference_ = true;
                     // fix #8753 / #8769: see keptSiteStmts.
                     if (keptSiteStmts) keptSiteStmts->push_back(curStmt_);
+                    // fix-forward #8847: see keptSiteCalls.
+                    if (keptSiteCalls)
+                        keptSiteCalls->push_back({curStmt_, curCall_});
                 }
             }
             // fix #4434 (§27.5 / §28.9, v0.298): a target reference observed
@@ -42132,7 +42147,13 @@ struct ClosureEscapeWalker {
                     argIsTarget(c->args[ai].value.get()) &&
                     callBoundedArg(*c, ai))
                     inReferenceTakingSite_ = true;
+                // fix-forward #8847: see curCall_ — a keep is a read of the
+                // target in an ARGUMENT position, so the invocation being
+                // walked is the one that keeps the value.
+                const ast::Expr* savedCall = curCall_;
+                curCall_ = c;
                 expr(c->args[ai].value.get(), /*safeRead=*/safeArg);
+                curCall_ = savedCall;
                 inReferenceTakingSite_ = savedSite;
             }
             return;
@@ -42141,7 +42162,11 @@ struct ClosureEscapeWalker {
             // `f?(...)` null-conditional call (§27.7): callee is a read.
             scanCalleePosition(c->callee.get());  // fix #3805 (+ follow-up)
             exprCallee(c->callee.get());  // fix #8058 (member-access receiver)
+            // fix-forward #8847: see curCall_.
+            const ast::Expr* savedCall = curCall_;
+            curCall_ = c;
             for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
+            curCall_ = savedCall;
             return;
         }
         // `f!` forwards f onward — inherit the parent position.
@@ -42213,7 +42238,11 @@ struct ClosureEscapeWalker {
             expr(th->operand.get(), /*safeRead=*/false); return;
         }
         if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            // fix-forward #8847: see curCall_.
+            const ast::Expr* savedCall = curCall_;
+            curCall_ = n;
             for (auto& a : n->args) expr(a.value.get(), /*safeRead=*/false);
+            curCall_ = savedCall;
             return;
         }
         if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
@@ -43004,6 +43033,281 @@ void Emitter::collectCapturedCellClosureLocals(
     };
     for (auto& s : body) scan(s.get());
 }
+
+
+// fix-forward #8847 (§17.1 / §22.5, v0.359): the FIRST invocation a
+// statement evaluates, in evaluation order.
+//
+// §22.5 (v0.359) "Evaluation order": "A call's supplied argument expressions
+// are evaluated in call-site textual order — left to right as written, for
+// positional and named arguments alike; naming an argument changes which
+// parameter it binds to, never when it runs". §17.1 (v0.359) gives the
+// operators left-to-right associativity. A node's OWN evaluation — the call,
+// the constructor, a property getter, an indexer — happens AFTER the
+// expressions it reads, so the walk registers a node after its children: the
+// arguments of `d.TryAdd(Key(k), b)` run before the `TryAdd` call itself, so
+// `Key(k)` is the FIRST invocation of that statement and `TryAdd` is not.
+//
+// The walk is CONSERVATIVE in the direction that matters: an expression shape
+// it does not model sets `unknown`, and the caller then answers "the first
+// invocation is not the keep" — the direction that can only cost the #8847
+// fix (the scope-end release still runs on the unwind edge, so a kept closure
+// the collection holds may dangle) and never ADD a leak (a keep the analysis
+// does not join leaks nothing).
+namespace {
+
+struct FirstInvocation {
+    const ast::Expr* node = nullptr;
+    bool unknown = false;
+};
+
+void firstInvocationInExpr(const ast::Expr* e, const sema::SemaContext& ctx,
+                            FirstInvocation& out);
+
+void firstInvocationInStmt(const ast::Stmt* s, const sema::SemaContext& ctx,
+                            FirstInvocation& out);
+
+void firstInvocationInStmts(
+    const std::vector<std::unique_ptr<ast::Stmt>>& v,
+    const sema::SemaContext& ctx, FirstInvocation& out) {
+    for (const auto& s : v) firstInvocationInStmt(s.get(), ctx, out);
+}
+
+// A PROPERTY read runs its getter, and §19.5 (v0.359) says a getter that
+// throws propagates out of the `case` construct — so a property read is an
+// invocation. A method reference (`d.TryAdd` used as a callee) runs nothing.
+template <typename M>
+bool isPropertyRead(const M& m, const sema::SemaContext& ctx) {
+    return dynamic_cast<const sema::PropertySymbol*>(ctx.exprSymbol(m)) !=
+           nullptr;
+}
+
+void firstInvocationInExpr(const ast::Expr* e, const sema::SemaContext& ctx,
+                            FirstInvocation& out) {
+    if (!e || out.node || out.unknown) return;
+    if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+        firstInvocationInExpr(c->callee.get(), ctx, out);
+        for (const auto& a : c->args)
+            firstInvocationInExpr(a.value.get(), ctx, out);
+        if (!out.node && !out.unknown) out.node = e;
+        return;
+    }
+    if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        firstInvocationInExpr(c->callee.get(), ctx, out);
+        for (const auto& a : c->args)
+            firstInvocationInExpr(a.value.get(), ctx, out);
+        if (!out.node && !out.unknown) out.node = e;
+        return;
+    }
+    if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+        for (const auto& a : n->args)
+            firstInvocationInExpr(a.value.get(), ctx, out);
+        if (!out.node && !out.unknown) out.node = e;
+        return;
+    }
+    if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+        firstInvocationInExpr(m->target.get(), ctx, out);
+        if (!out.node && !out.unknown && isPropertyRead(*m, ctx)) out.node = e;
+        return;
+    }
+    if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+        firstInvocationInExpr(m->target.get(), ctx, out);
+        if (!out.node && !out.unknown && isPropertyRead(*m, ctx)) out.node = e;
+        return;
+    }
+    if (auto* i = dynamic_cast<const ast::IndexExpr*>(e)) {
+        firstInvocationInExpr(i->target.get(), ctx, out);
+        for (const auto& a : i->indices)
+            firstInvocationInExpr(a.value.get(), ctx, out);
+        // An indexer GETTER runs at the read (§23.3).
+        if (!out.node && !out.unknown) out.node = e;
+        return;
+    }
+    if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+        firstInvocationInExpr(p->operand.get(), ctx, out);
+        return;
+    }
+    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+        firstInvocationInExpr(b->left.get(), ctx, out);
+        firstInvocationInExpr(b->right.get(), ctx, out);
+        return;
+    }
+    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        firstInvocationInExpr(u->operand.get(), ctx, out);
+        firstInvocationInExpr(u->replacement.get(), ctx, out);
+        // `await` on a faulted task raises (§30.5).
+        if (!out.node && !out.unknown && u->op == "await") out.node = e;
+        return;
+    }
+    if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+        firstInvocationInExpr(t->operand.get(), ctx, out);
+        return;
+    }
+    if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        // §20 (v0.359): the CONDITION runs first, then the selected branch.
+        firstInvocationInExpr(c->condition.get(), ctx, out);
+        firstInvocationInExpr(c->thenValue.get(), ctx, out);
+        firstInvocationInExpr(c->elseValue.get(), ctx, out);
+        return;
+    }
+    if (auto* t = dynamic_cast<const ast::ThrowExpr*>(e)) {
+        firstInvocationInExpr(t->operand.get(), ctx, out);
+        return;
+    }
+    if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+        firstInvocationInExpr(r->lo.get(), ctx, out);
+        firstInvocationInExpr(r->hi.get(), ctx, out);
+        firstInvocationInExpr(r->step.get(), ctx, out);
+        return;
+    }
+    if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+        firstInvocationInExpr(w->source.get(), ctx, out);
+        for (const auto& a : w->assigns)
+            firstInvocationInExpr(a.value.get(), ctx, out);
+        return;
+    }
+    if (auto* c = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        for (const auto& k : c->keys) firstInvocationInExpr(k.get(), ctx, out);
+        for (const auto& v : c->elements)
+            firstInvocationInExpr(v.get(), ctx, out);
+        return;
+    }
+    if (auto* s = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        for (const auto& p : s->parts)
+            firstInvocationInExpr(p.expr.get(), ctx, out);
+        return;
+    }
+    if (auto* c = dynamic_cast<const ast::CaseExpr*>(e)) {
+        firstInvocationInExpr(c->scrutinee.get(), ctx, out);
+        for (const auto& arm : c->arms) {
+            firstInvocationInExpr(arm.guard.get(), ctx, out);
+            firstInvocationInExpr(arm.exprBody.get(), ctx, out);
+        }
+        return;
+    }
+    if (auto* b = dynamic_cast<const ast::BindExpr*>(e)) {
+        for (const auto& cl : b->clauses)
+            firstInvocationInExpr(cl->initializer.get(), ctx, out);
+        firstInvocationInExpr(b->body.get(), ctx, out);
+        return;
+    }
+    if (dynamic_cast<const ast::LambdaExpr*>(e)) {
+        // A lambda LITERAL evaluates nothing here: its body runs later, if
+        // ever (§27.3).
+        return;
+    }
+    // Leaves: literals, a bare name, `typeof` / `nameof` / `default`, the
+    // unit value, the `owned` marker.
+    if (dynamic_cast<const ast::IntLiteralExpr*>(e) ||
+        dynamic_cast<const ast::FloatLiteralExpr*>(e) ||
+        dynamic_cast<const ast::CharLiteralExpr*>(e) ||
+        dynamic_cast<const ast::StringLiteralExpr*>(e) ||
+        dynamic_cast<const ast::VerbatimStringExpr*>(e) ||
+        dynamic_cast<const ast::BoolLiteralExpr*>(e) ||
+        dynamic_cast<const ast::NullLiteralExpr*>(e) ||
+        dynamic_cast<const ast::UnitExpr*>(e) ||
+        dynamic_cast<const ast::IdentifierExpr*>(e) ||
+        dynamic_cast<const ast::TypeOfExpr*>(e) ||
+        dynamic_cast<const ast::NameOfExpr*>(e) ||
+        dynamic_cast<const ast::DefaultExpr*>(e) ||
+        dynamic_cast<const ast::MarkedTransferExpr*>(e))
+        return;
+    // A shape this walk does not model: the caller must not join.
+    out.unknown = true;
+}
+
+void firstInvocationInStmt(const ast::Stmt* s, const sema::SemaContext& ctx,
+                            FirstInvocation& out) {
+    if (!s || out.node || out.unknown) return;
+    if (auto* d = dynamic_cast<const ast::LocalDecl*>(s)) {
+        firstInvocationInExpr(d->initializer.get(), ctx, out);
+        return;
+    }
+    if (auto* d = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+        firstInvocationInExpr(d->value.get(), ctx, out);
+        return;
+    }
+    if (dynamic_cast<const ast::LocalTypeDecl*>(s)) return;
+    if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+        firstInvocationInExpr(r->value.get(), ctx, out);
+        return;
+    }
+    if (auto* e = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+        firstInvocationInExpr(e->expr.get(), ctx, out);
+        return;
+    }
+    if (auto* a = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+        firstInvocationInExpr(a->target.get(), ctx, out);
+        firstInvocationInExpr(a->value.get(), ctx, out);
+        return;
+    }
+    if (auto* t = dynamic_cast<const ast::ThrowStmt*>(s)) {
+        firstInvocationInExpr(t->value.get(), ctx, out);
+        return;
+    }
+    if (auto* i = dynamic_cast<const ast::IfStmt*>(s)) {
+        firstInvocationInExpr(i->ifBranch.condition.get(), ctx, out);
+        firstInvocationInStmts(i->ifBranch.body, ctx, out);
+        for (const auto& br : i->elifBranches) {
+            firstInvocationInExpr(br.condition.get(), ctx, out);
+            firstInvocationInStmts(br.body, ctx, out);
+        }
+        firstInvocationInStmts(i->elseBody, ctx, out);
+        return;
+    }
+    if (auto* w = dynamic_cast<const ast::WhileStmt*>(s)) {
+        firstInvocationInExpr(w->condition.get(), ctx, out);
+        firstInvocationInStmts(w->body, ctx, out);
+        return;
+    }
+    if (auto* f = dynamic_cast<const ast::ForStmt*>(s)) {
+        firstInvocationInExpr(f->iterable.get(), ctx, out);
+        firstInvocationInExpr(f->withExpr.get(), ctx, out);
+        firstInvocationInStmts(f->body, ctx, out);
+        return;
+    }
+    if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+        firstInvocationInStmts(d->body, ctx, out);
+        return;
+    }
+    if (auto* t = dynamic_cast<const ast::TryStmt*>(s)) {
+        firstInvocationInStmts(t->body, ctx, out);
+        for (const auto& c : t->catches) {
+            firstInvocationInExpr(c.guard.get(), ctx, out);
+            firstInvocationInStmt(c.body.get(), ctx, out);
+        }
+        firstInvocationInStmts(t->finallyBody, ctx, out);
+        return;
+    }
+    if (auto* c = dynamic_cast<const ast::CaseStmt*>(s)) {
+        firstInvocationInExpr(c->scrutinee.get(), ctx, out);
+        for (const auto& arm : c->arms) {
+            firstInvocationInExpr(arm.guard.get(), ctx, out);
+            firstInvocationInExpr(arm.exprBody.get(), ctx, out);
+            firstInvocationInStmts(arm.stmts, ctx, out);
+        }
+        return;
+    }
+    if (auto* i = dynamic_cast<const ast::IncrementStmt*>(s)) {
+        firstInvocationInExpr(i->target.get(), ctx, out);
+        return;
+    }
+    if (auto* d = dynamic_cast<const ast::DiscardStmt*>(s)) {
+        firstInvocationInExpr(d->value.get(), ctx, out);
+        return;
+    }
+    if (auto* y = dynamic_cast<const ast::YieldStmt*>(s)) {
+        firstInvocationInExpr(y->value.get(), ctx, out);
+        return;
+    }
+    if (dynamic_cast<const ast::BreakStmt*>(s) ||
+        dynamic_cast<const ast::ContinueStmt*>(s))
+        return;
+    // A statement shape this walk does not model: the caller must not join.
+    out.unknown = true;
+}
+
+}  // namespace
 
 
 void Emitter::collectClosureReleaseEligible(
@@ -44268,6 +44572,13 @@ void Emitter::collectClosureReleaseEligible(
         // fix #8753 / #8769: where each walk met its target (keptSiteStmts).
         std::unordered_map<const void*, std::vector<const ast::Stmt*>>
             keptSitesOf, assignsOf;
+        // fix-forward #8847 (§17.1 / §22.5, v0.359): the CALL that performed
+        // each keep, with the statement it happened in. The order-aware join
+        // needs it: the kept state reaches an unwind edge only when the keep
+        // is the FIRST invocation the statement evaluates.
+        std::unordered_map<
+            const void*, std::vector<std::pair<const ast::Stmt*, const ast::Expr*>>>
+            keptCallSitesOf;
         for (const ast::Node* c : candidates) {
             const void* key = static_cast<const void*>(c);
             closureKeptCaptureLocals_.erase(key);
@@ -44289,8 +44600,12 @@ void Emitter::collectClosureReleaseEligible(
                 return isCallBoundedClosureArgPosition(call, ai);
             };
             kw.keptSiteStmts = &keptSitesOf[key];
+            std::vector<std::pair<const ast::Stmt*, const ast::Expr*>>
+                keepCalls;
+            kw.keptSiteCalls = &keepCalls;
             kw.targetAssignStmts = &assignsOf[key];
             for (auto& s : body) kw.stmt(s.get());
+            if (!keepCalls.empty()) keptCallSitesOf[key] = std::move(keepCalls);
             if (kw.keptWithoutReference_) kept.insert(key);
             if (kw.isCapturedCellSlot_) captured.insert(key);
             for (const ast::Stmt* a : assignsOf[key])
@@ -44418,6 +44733,46 @@ void Emitter::collectClosureReleaseEligible(
             auto useHere = [&](const FlowState& st) {
                 if (st.live) out.usedDefs.insert(st.reach.begin(), st.reach.end());
             };
+            // fix-forward #8847 (§17.1 / §22.5, v0.359): the ORDER-AWARE
+            // guard on the kept-state join into the unwind edge.
+            //
+            // The kept state may reach an unwind edge only for a throw that
+            // happens AFTER the keep: §22.5 (v0.359) "Evaluation order" —
+            // "A call's supplied argument expressions are evaluated in
+            // call-site textual order — left to right as written" — puts a
+            // statement's invocations in a definite order, and §17.1 (v0.359)
+            // gives the operators left-to-right associativity. A throw from an
+            // invocation evaluated BEFORE the keep leaves the value NOT kept
+            // (`b := (if d.TryAdd(Key(k), b) then g else g);` — `Key(k)`
+            // throws before `TryAdd` stores anything), so the scope-end
+            // release must still run there.
+            //
+            // The guard is per STATEMENT: the keep must be the FIRST
+            // invocation that statement evaluates. Then every invocation the
+            // statement can throw from is evaluated after the keep, and the
+            // kept state is right on all of them. A statement whose first
+            // invocation is not the keep is left unjoined — the base's
+            // behaviour, which releases the value on the unwind edge.
+            auto keepIsFirstInvocation = [&](const ast::Stmt* s) -> bool {
+                auto kit = keptCallSitesOf.find(b);
+                if (kit == keptCallSitesOf.end()) return false;
+                bool anyKeep = false;
+                for (const auto& pr : kit->second) {
+                    if (pr.first != s) continue;
+                    anyKeep = true;
+                    // A keep that is NOT a call (a field store) has no
+                    // invocation order to reason about: no join.
+                    if (!pr.second) return false;
+                }
+                if (!anyKeep) return false;
+                FirstInvocation fi;
+                firstInvocationInStmt(s, ctx_, fi);
+                if (fi.unknown || !fi.node) return false;
+                // The statement's first invocation must be one of its keeps.
+                for (const auto& pr : kit->second)
+                    if (pr.first == s && pr.second == fi.node) return true;
+                return false;
+            };
             auto reads = [&](const ast::Expr* e) {
                 return e && bw.containsTargetAnywhere(e);
             };
@@ -44522,7 +44877,39 @@ void Emitter::collectClosureReleaseEligible(
                 // walker walks a guard under the TryStmt), which run at a
                 // catch entry, after the protected body: kept there, below.
                 const bool isTry = dynamic_cast<const ast::TryStmt*>(s) != nullptr;
-                if (sites.count(sk) && !ws && !selfPass && !isTry) keepHere(st);
+                if (sites.count(sk) && !ws && !selfPass && !isTry) {
+                    keepHere(st);
+                    // fix #8847 (§28.9 / §27.5, v0.359): the keep and the
+                    // exception can be in the SAME statement — an assignment
+                    // to the kept local itself, whose right-hand side stores
+                    // the local and then throws
+                    // (`b := (if d.TryAdd(0, b) then Mk(k) else g);`). The
+                    // keep is then invisible at every statement boundary:
+                    // the one before the statement has the slot not yet
+                    // kept, the one after it has only the new definition.
+                    // Neither `unwindSt` nor a `try`'s catch entry therefore
+                    // saw the kept definition, so the scope-end release ran
+                    // on the unwind path and freed the closure the
+                    // collection still holds. Join the kept state into both
+                    // BEFORE the statement's own effect (the assignment's
+                    // kill), the shape `narrow #8824` (ba64bb9c7) used for a
+                    // catch guard's kept store.
+                    //
+                    // fix-forward #8847 (§17.1 / §22.5, v0.359): the join is
+                    // ORDER-AWARE. It may mark the local kept only for a
+                    // throw that happens AFTER the keep: a statement whose
+                    // FIRST invocation is not the keep has an invocation
+                    // evaluated BEFORE it (`b := (if d.TryAdd(Key(k), b) then
+                    // g else g);` — `Key(k)` throws before `TryAdd` stores
+                    // anything), and the value is NOT kept on that edge, so
+                    // the scope-end release must still run there. The
+                    // statement keeps the base's behaviour instead — the
+                    // #5866 leak class, not a use-after-free.
+                    if (keepIsFirstInvocation(s)) {
+                        for (FlowState* acc : tryAccs) joinInto(*acc, st);
+                        joinInto(unwindSt, st);
+                    }
+                }
                 if (ws) {
                     loopFixpoint(ws->body, st, sites.count(sk) != 0,
                                  reads(ws->condition.get()));
