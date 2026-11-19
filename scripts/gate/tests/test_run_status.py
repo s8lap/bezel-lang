@@ -36,7 +36,7 @@ class RunStatusTest(unittest.TestCase):
             "BEZEL_GATE_DONEFILE": str(self.d / "scratch" / "gate.done"),
             "BEZEL_AOT_FAST_ROOT": str(self.d / "fast"),
             "BEZEL_MEMINFO": str(self.d / "meminfo"),
-            "BEZEL_STATUS_SKIP": "jobserver builders lanes",
+            "BEZEL_STATUS_SKIP": "jobserver builders lanes agents",
         })
 
     def tearDown(self):
@@ -115,7 +115,7 @@ class RunStatusTest(unittest.TestCase):
         (fake / "systemctl").write_text("#!/bin/sh\necho inactive\nexit 3\n")
         (fake / "systemctl").chmod(0o755)
         self.env["PATH"] = str(fake) + os.pathsep + self.env["PATH"]
-        self.env["BEZEL_STATUS_SKIP"] = "builders lanes"
+        self.env["BEZEL_STATUS_SKIP"] = "builders lanes agents"
         out = self.status()
         js = self.row(out, "jobserver")
         self.assertIn(" INFO ", js)
@@ -141,7 +141,7 @@ class RunStatusTest(unittest.TestCase):
                 time.sleep(0.05)
             self.env["PATH"] = str(fake) + os.pathsep + self.env["PATH"]
             self.env["BEZEL_JOBSERVER_DIR"] = str(jdir)
-            self.env["BEZEL_STATUS_SKIP"] = "builders lanes"
+            self.env["BEZEL_STATUS_SKIP"] = "builders lanes agents"
             js = self.row(self.status(), "jobserver")
         finally:
             daemon.terminate()
@@ -232,6 +232,30 @@ class RunStatusTest(unittest.TestCase):
         self.assertIn(" INFO ", self.row(out, "pool"))
         self.assertIn("0 live lane(s) of 7", self.row(out, "pool"))
         self.assertNotIn("ACTION: pool", out)
+
+    def test_pool_counts_measured_agents_and_flags_a_phantom(self):
+        # R42 2026-11-19: the ledger said 28 live lanes while 3 agents ran.
+        # With the `agents` measurement on, the count is live_lanes.py's and
+        # a ledger row naming a dead agent is an ACTION.
+        proc = self.d / "proc"
+        (proc / "40").mkdir(parents=True)
+        (proc / "40" / "cmdline").write_bytes(b"opencode\0run\0--session\0ses_LIVE\0")
+        (proc / "40" / "stat").write_text("40 (opencode) " + " ".join(["S"] + ["0"] * 30) + "\n")
+        (self.d / "claude" / "sessions").mkdir(parents=True)
+        self.env.update({"BEZEL_STATUS_SKIP": "jobserver builders lanes",
+                         "BEZEL_PROC_ROOT": str(proc),
+                         "BEZEL_CLAUDE_HOME": str(self.d / "claude")})
+        c = self.claims(
+            ("#1", "laneA", "b1", "/w/a", "f", "t", "live:producing:ses_LIVE"),
+            ("#2", "laneB", "b2", "/w/b", "f", "t", "live:reviewing:ses_DEAD"),
+        )
+        out = self.status("--claims", c, "--pool", "1")
+        pool = self.row(out, "pool")
+        self.assertIn("1 live lane(s) of 1, measured (claude 0, opencode 1)", pool)
+        self.assertIn("phantom 1", pool)
+        self.assertIn("FLAG", pool)
+        self.assertIn("ACTION: pool: the ledger disagrees", out)
+        self.assertNotIn("refill a slot", out)
 
     def test_missing_claims_file_is_info_not_a_crash(self):
         out = self.status("--claims", str(self.d / "nope.tsv"), "--pool", "7")

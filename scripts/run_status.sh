@@ -43,7 +43,11 @@
 #              (a lane is live while it holds a `live` claim). FLAG: a PARTIAL
 #              pool (0 < live < --pool) — the rule is "refilled in the same
 #              turn a slot frees". INFO: 0 lanes (a drained pool is gate-ready),
-#              or no claims file to count.
+#              or no claims file to count. The live count is MEASURED by
+#              scripts/live_lanes.py (Claude Code subagents of live sessions +
+#              `opencode run` processes) and the ledger is shown beside it;
+#              FLAG with an ACTION when they disagree (PHANTOM / UNRECORDED).
+#              Omit the measurement with BEZEL_STATUS_SKIP=agents.
 #   stale      dry-run count of stale dev processes/waiters (scripts/reap_stale.sh).
 #              INFO, never FLAG and never an ACTION line: a non-zero count is
 #              NORMAL between sweeps and just means "reap_stale.sh --kill".
@@ -273,12 +277,30 @@ probe_pool() {
            print n + 0 }' "$CLAIMS")"
   [ -n "$lanes" ] || lanes=0
   detail="$lanes live lane(s) of $POOL"
+  # THE LEDGER IS A CLAIM, THE PROCESS TABLE IS THE MEASUREMENT. Measured
+  # 2026-11-19 (R42): this row said "28 live lane(s)" while 3 agents ran,
+  # because live rows under old (lane, issue) keys are never superseded. So
+  # the count that decides a refill is live_lanes.py's, and the ledger count
+  # is shown beside it; a disagreement is its own ACTION (fix the ledger).
+  local meas="" mrc=0 mlive=""
+  if want agents; then
+    meas="$(python3 "$HERE/live_lanes.py" --claims "$CLAIMS" --summary 2>/dev/null)"; mrc=$?
+    mlive="$(printf '%s' "$meas" | sed -n 's/^measured \([0-9]*\) live.*/\1/p')"
+  fi
+  if [ -n "$mlive" ]; then
+    detail="$mlive live lane(s) of $POOL, measured ${meas#measured $mlive live }"
+    lanes="$mlive"
+    if [ "$mrc" -eq 3 ]; then
+      st=FLAG
+      ACTIONS+=("pool: the ledger disagrees with the measured agents — scripts/live_lanes.py --claims $CLAIMS lists each PHANTOM / UNRECORDED row to close or record")
+    fi
+  fi
   if [ "$GATE_RUNNING" -eq 1 ]; then
     row pool OK "$detail — a gate is running, and the pool is zero by rule"
     return 0
   fi
   if [ "$lanes" -eq 0 ]; then
-    row pool INFO "$detail — the pool is drained (gate-ready?)"
+    row pool "$([ "$st" = FLAG ] && echo FLAG || echo INFO)" "$detail — the pool is drained (gate-ready?)"
   elif [ "$lanes" -lt "$POOL" ]; then
     st=FLAG
     ACTIONS+=("pool: $lanes live lane(s) of a $POOL-lane pool — refill a slot in the SAME turn it frees")
