@@ -11,12 +11,23 @@
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 namespace {
 
 int runProg(const std::string& program) {
     auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
+}
+
+// The `?.` rows below pin a VALUE, so they read the program's stdout (the
+// channel the harness documents for observables that do not fit an 8-bit exit
+// code). The checked oracle is the strict one: it also verifies that the
+// closure reference the getter handed the reader is given back.
+std::string stdoutChecked(const std::string& program) {
+    auto r = runAotChecked(program);
+    return (r.ran && r.exitCode == 0) ? r.stdoutText
+                                      : std::string("<did-not-run>");
 }
 
 } // namespace
@@ -207,4 +218,139 @@ BEZEL_TEST(null_cond_call, void_function_value_present_runs_747) {
         "  none?(99); "  // skipped
         "  return b.total; "  // 12
         "end Main; end C;"), 12);
+}
+
+// fix #8979 (§7.5 / §27.1 / §28.9, v0.359): a null-conditional CALL of a
+// function-typed PROPERTY — `hn?.P()` where `P` is `property P: () -> int`.
+//
+// THE DEFECT. §7.5: "`x?.M` returns null if `x` is null; otherwise it
+// performs the access." The member is resolved as `x.M` is, so the `?.`
+// spelling of a function-typed property INVOKES the property's function value
+// (§27.1: a property of function type is a callable value), exactly as
+// `x.M(args)` does.
+//
+// MEASURED on the base: the call compiled with two `warning: internal:`
+// lines — the #2477 "codegen cannot dispatch member 'P'" note and the
+// #2434 "initializer expression failed to lower to a value" note — and the
+// program's `P` slot was a ZERO value: the non-null receiver produced
+// `P=null` (the property's function value, which returns 5, was never
+// invoked), at exit 0. The `.` spelling `h.P()` printed 5 and the `?.`
+// spelling of a METHOD (`hn?.M()`) printed 7, so only the `?.` + invoke-a-
+// function-typed-property shape was broken.
+//
+// ROOT CAUSE: the `?.` call lowering lowers a synthetic `.` TWIN call through
+// the `.` spelling's OWN dispatch, but the twin's callee carried NO SYMBOL
+// (the member symbol rides on the NullCondMemberExpr), so the twin reached
+// `lowerCall` with no callee symbol, missed every symbol-based dispatch arm
+// — including the PropertySymbol arm fix #2589 added for `obj.P(args)` — and
+// fell through to the #2477 zero-init fallback.
+//
+// THE ROW prints the invoked value for the non-null receiver and the null
+// case, so the null case is pinned by the SAME row (the base prints
+// "P=null" for BOTH, so the row is red on the base).
+BEZEL_TEST(codegen_cg42, safenav_call_of_function_typed_property_8979) {
+    BEZEL_EXPECT_EQ(stdoutChecked(
+        "module M; "
+        "public class H "
+        "  private f: () -> int; "
+        "  public constructor() f := lambda(): int => 5; end; "
+        "  public property P: () -> int "
+        "    get => do return f; end; "
+        "  end; "
+        "end H; "
+        "public static class Program "
+        "  public static method Main(args: Array<string>): int "
+        "    using var h := new H(); "
+        "    var hn: H? := h; "
+        "    var r := hn?.P(); "
+        "    if r = null then Console.WriteLine(\"P=null\"); "
+        "    else Console.WriteLine($\"P={r!}\"); end; "
+        "    var hn2: H? := null; "
+        "    var r2 := hn2?.P(); "
+        "    if r2 = null then Console.WriteLine(\"P2=null\"); "
+        "    else Console.WriteLine($\"P2={r2!}\"); end; "
+        "    return 0; "
+        "  end; "
+        "end Program;"),
+        "P=5\nP2=null\n");
+}
+
+// fix #8979 (§7.5 / §27.1, v0.359): the AUTO-property spelling of the same
+// shape, with an ARGUMENT — `hn?.AP(10)` invokes the property's function
+// value with 10 and yields its result (11), not the property's value. The
+// base degraded the slot to zero and printed "AP=null".
+BEZEL_TEST(codegen_cg42, safenav_call_of_function_typed_auto_property_8979) {
+    BEZEL_EXPECT_EQ(stdoutChecked(
+        "module M; "
+        "public class H "
+        "  public property AP: (int) -> int := lambda(x: int) => x + 1; "
+        "end H; "
+        "public static class Program "
+        "  public static method Main(args: Array<string>): int "
+        "    using var h := new H(); "
+        "    var hn: H? := h; "
+        "    var r := hn?.AP(10); "
+        "    if r = null then Console.WriteLine(\"AP=null\"); "
+        "    else Console.WriteLine($\"AP={r!}\"); end; "
+        "    return 0; "
+        "  end; "
+        "end Program;"),
+        "AP=11\n");
+}
+
+// fix #8979 (§7.5 / §27.1, v0.359): the FUNCTION-TYPED FIELD sibling — the
+// same root cause (the `?.` twin carried no symbol, so lowerCall's
+// FieldSymbol arm — fix #2300 — never fired), the same one-hunk fix. The
+// base degraded the slot to zero and printed "F=null"; the `.` spelling
+// `h.F(10)` printed 110.
+BEZEL_TEST(codegen_cg42, safenav_call_of_function_typed_field_8979) {
+    BEZEL_EXPECT_EQ(stdoutChecked(
+        "module M; "
+        "public class H "
+        "  public F: (int) -> int := lambda(x: int) => x + 100; "
+        "end H; "
+        "public static class Program "
+        "  public static method Main(args: Array<string>): int "
+        "    using var h := new H(); "
+        "    var hn: H? := h; "
+        "    var r := hn?.F(10); "
+        "    if r = null then Console.WriteLine(\"F=null\"); "
+        "    else Console.WriteLine($\"F={r!}\"); end; "
+        "    return 0; "
+        "  end; "
+        "end Program;"),
+        "F=110\n");
+}
+
+// fix #8979 (§7.5 / §27.1, v0.359): the same call through an INTERFACE-typed
+// receiver, where the property read dispatches through the itable
+// (`lowerVirtualPropertyGet`) rather than to a concrete getter. The `.`
+// spelling is the positive control inside the same program: it reads 9 on
+// the base and on the tip, while the `?.` spelling degraded to null on the
+// base.
+BEZEL_TEST(codegen_cg42, safenav_call_of_function_typed_property_via_interface_8979) {
+    BEZEL_EXPECT_EQ(stdoutChecked(
+        "module M; "
+        "public interface I "
+        "  readonly property P: () -> int; "
+        "end I; "
+        "public class C : I "
+        "  private f: () -> int; "
+        "  public constructor() f := lambda(): int => 9; end; "
+        "  public property P: () -> int "
+        "    get => do return f; end; "
+        "  end; "
+        "end C; "
+        "public static class Program "
+        "  public static method Main(args: Array<string>): int "
+        "    using var c := new C(); "
+        "    var ic: I? := c; "
+        "    Console.WriteLine($\"dot={ic!.P()!}\"); "
+        "    var r := ic?.P(); "
+        "    if r = null then Console.WriteLine(\"safenav=null\"); "
+        "    else Console.WriteLine($\"safenav={r!}\"); end; "
+        "    return 0; "
+        "  end; "
+        "end Program;"),
+        "dot=9\nsafenav=9\n");
 }

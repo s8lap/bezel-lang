@@ -26639,10 +26639,66 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
         dotted->target = std::move(placeholder);
     }
     ast::MemberAccessExpr* dottedRaw = dotted.get();
-    // fix #8501 (§7.5, v0.357): a UNIT twin carries NO type -- the `.`
-    // spelling's own procedure call is untyped (#2756), and the twin must
-    // look exactly like it.
-    if (innerTy) ctx_.setExprType(dotted.get(), innerTy);
+    // fix #8979 (§7.5 / §27.1 / §28.9, v0.359): a `?.` CALL of a member whose
+    // VALUE IS A FUNCTION -- `h?.P()` where `P` is `property P: () -> int`
+    // (and the sibling `h?.F()` where `F` is a function-typed FIELD).
+    //
+    // THE DEFECT. The `?.` spelling's call lowering builds a `.` TWIN (the
+    // synthetic `.` call over a placeholder receiver, below) and lowers it
+    // through the `.` spelling's OWN dispatch -- so the two spellings of ONE
+    // member cannot disagree. But the twin's callee is a FRESH
+    // MemberAccessExpr, and it carried NO SYMBOL: the `?.` node's member
+    // symbol (sema's resolveNullCondMember sets it -- ExprTypecheck_Calls.cpp
+    // ~L50303) lives on the NullCondMemberExpr, not on the twin. So the twin
+    // reached `lowerCall` with `calleeSym == nullptr`, missed EVERY
+    // symbol-based dispatch arm -- including the PropertySymbol arm fix
+    // #2589 added for `obj.P(args)` and the FieldSymbol arm #2300 added for
+    // `obj.F(args)` -- and fell through to the #2477 "cannot dispatch member
+    // 'P'" zero-init fallback. The enclosing local then DEGRADED to a ZERO
+    // value behind an `internal:` note (#2434), and the program answered
+    // wrongly at exit 0.
+    //
+    // MEASURED (issue #8979's repro, on this base): `hn?.P()` printed
+    // `P=null` where §7.5 requires the property's function value to be
+    // INVOKED (5), with the two `warning: internal:` lines above it; the
+    // byte-identical `.` spelling `h.P()` printed 5, and the `?.` spelling of
+    // a METHOD (`hn?.M()`) printed 7. The AUTO-property and the
+    // EXPRESSION-bodied property spellings degraded identically, and so did
+    // the function-typed FIELD (`hn?.F(10)`).
+    //
+    // §7.5 (v0.359): "`x?.M` returns null if `x` is null; otherwise it
+    // performs the access." The member is resolved as `x.M` is, so the `?.`
+    // spelling of a function-typed property INVOKES the property's function
+    // value, exactly as `x.M(args)` does (§27.1: "a property of function
+    // type" is a callable value). §28.9 is the closure-reference protocol
+    // the `.` spelling's OWN dispatch runs -- the getter mints the reader's
+    // reference and the call site gives it back -- so the `?.` spelling now
+    // leaks nothing (MEASURED under ASan, 200 iterations).
+    //
+    // THE FIX: give the twin the SAME symbol and the SAME type the `.`
+    // spelling's callee carries, so the `.` spelling's OWN dispatch arm
+    // fires -- and only that arm: no new dispatch, no second spelling of the
+    // closure call, just the twin finally carrying the member it names.
+    {
+        const sema::TypeRef* ncMemberTy = ctx_.exprType(*call.callee);
+        sema::Symbol* ncMemberSym = ctx_.exprSymbol(*call.callee);
+        if (ncMemberSym && ncMemberTy &&
+            ncMemberTy->kind == sema::TypeRef::Kind::Function) {
+            ctx_.setExprSymbol(dotted.get(), ncMemberSym);
+            // The `.` spelling's callee carries the member's DECLARED type
+            // (the function type), not the `?.` node's §7.5-lifted
+            // nullable form: the twin must look exactly like the `.` spelling,
+            // because the `.` spelling's own dispatch is what now runs.
+            sema::TypeRef* ncFnTy = ctx_.makeTypeRef(*ncMemberTy);
+            ncFnTy->nullable = false;
+            ctx_.setExprType(dotted.get(), ncFnTy);
+        } else if (innerTy) {
+            // fix #8501 (§7.5, v0.357): a UNIT twin carries NO type -- the `.`
+            // spelling's own procedure call is untyped (#2756), and the twin
+            // must look exactly like it.
+            ctx_.setExprType(dotted.get(), innerTy);
+        }
+    }
     auto synth = std::make_unique<ast::CallExpr>();
     synth->span = call.span;
     synth->callee = std::move(dotted);
