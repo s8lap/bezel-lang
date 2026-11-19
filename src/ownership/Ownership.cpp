@@ -15835,7 +15835,22 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             // (`checkRead` + `recordMovesIn`), not the full `handleReturn`.
             if (!isTopLevelConsumingForm(*rs->value))
                 checkRead(*rs->value, /*selfTarget=*/false);
+            // fix #8994 (§28.3.10, §28.3, v0.359): a `return` ENDS its path, so
+            // the move it records must not outlive that path. `states_` is
+            // already per-path (the If/While arms above drop an arm that never
+            // falls through), but `markMovedByName` also inserts the local
+            // into the PERSISTENT `everDischarged_` set, which the §28.3
+            // scope-end auto-drop gate reads for the WHOLE lambda body: a
+            // `return Take(move u)` under an `if` made `u` look discharged on
+            // the fall-through path too, and its disposal there was skipped
+            // (`if k mod 2 = 0 then return await Take(move u); end; return
+            // u.value;` leaked `u` on every odd `k`). Restore the set after
+            // the call: the read-after-move rejection (#8902) needs only the
+            // `states_` walk, and the pre-#8902 walk never recorded this move.
+            // The method body's `handleReturn` is per-path by construction.
+            const auto savedEverDischarged = everDischarged_;
             recordMovesIn(*rs->value);
+            everDischarged_ = savedEverDischarged;
             std::vector<const ast::LambdaExpr*> nestedLambdas;
             collectBodyLambdasExpr(*rs->value, nestedLambdas);
             for (const ast::LambdaExpr* nested : nestedLambdas)
