@@ -21465,6 +21465,32 @@ struct FormalInvocationOnlyWalk {
     // fix #8933: the depth of the forwarding chain already walked (a cycle
     // in the call graph must not recurse forever; the limit fails closed).
     int forwardDepth = 0;
+    // fix #8972 (§28.14 / §28.9, v0.359): the callee-locals that are PURE
+    // ALIASES of the formal — bound once from the formal and never
+    // reassigned, stored, returned or captured. §28.14 (v0.359) admits
+    // "bound to locals" among the uses of a call-bounded callback, so
+    // `var h := g;` in the callee is a legal use; a use of `h` that is a
+    // FORWARD to another call-bounded parameter is the same forward the
+    // formal's own use would be.
+    //
+    // The list is the walk's OWN record of the aliases it admitted; every
+    // other use of an alias name fails the walk closed (a bare read, an
+    // assignment, a store, a return, a capture), so an alias can only ever
+    // be a forward. A name already on the list may not be bound again (a
+    // re-binding breaks the "bound once" half of the purity), which also
+    // covers a nested scope that shadows an alias.
+    std::vector<std::string_view> aliasNames{};
+    // fix #8972: is `n` one of the walk's admitted aliases?
+    bool isAliasName(std::string_view n) const {
+        for (std::string_view a : aliasNames)
+            if (a == n) return true;
+        return false;
+    }
+    // fix #8972: is `e` a bare read of one of the walk's admitted aliases?
+    bool isAliasIdentifier(const ast::Expr* e) const {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        return id && isAliasName(id->name);
+    }
     bool isNullTestOfName(const ast::BinaryExpr& be) const {
         if (be.op != "=" && be.op != "<>") return false;
         auto isNull = [](const ast::Expr* e) {
@@ -21491,13 +21517,18 @@ struct FormalInvocationOnlyWalk {
     // target, when that method's own body keeps nothing past ITS call: the
     // SAME proof, recursively). Every other use of the formal in an argument
     // position still fails the walk closed.
+    //
+    // fix #8972 (§28.14 / §28.9, v0.359): an ADMITTED ALIAS (a callee-local
+    // bound once from the formal) is a forward too — it names the same
+    // callback, and §28.14's "bound to locals" admits the binding. The
+    // forwarded position is proved exactly as the formal's own forward is.
     void callArgs(const ast::CallExpr& c) {
         for (std::size_t i = 0; i < c.args.size(); ++i) {
             if (!ok) return;
             const ast::CallArgument& a = c.args[i];
             if (!a.value) continue;
             if (allowForwarding && ctx && lambdaDepth == 0 &&
-                isName(a.value.get()) &&
+                (isName(a.value.get()) || isAliasIdentifier(a.value.get())) &&
                 forwardedArgPositionIsCallBounded(*ctx, c, i, forwardDepth))
                 continue;  // #8933: the formal is forwarded to a
                            // call-bounded position
@@ -21508,6 +21539,31 @@ struct FormalInvocationOnlyWalk {
         if (!ok || !s) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
             if (ld->name == name) { ok = false; return; }  // shadowing
+            // fix #8972: re-binding a name the walk already admitted as an
+            // ALIAS breaks its purity (the local may name another value
+            // after the re-binding) — and a nested scope that shadows an
+            // alias is the same shape. Fail closed.
+            if (isAliasName(ld->name)) { ok = false; return; }
+            // fix #8972 (§28.14 / §28.9, v0.359): §28.14 admits "bound to
+            // locals" among the uses of a call-bounded callback, so
+            // `var h := g;` in the callee is a legal use of the formal. The
+            // local is a PURE ALIAS: it is bound ONCE, from the formal, and
+            // the walk fails closed on every use of it that is not a forward
+            // to a call-bounded position (a bare read, an assignment, a
+            // store, a return, a capture) — so the only thing the callee can
+            // do with it is hand the callback on, exactly as it could with
+            // the formal itself.
+            //
+            // The `using var` spelling is DECLINED: a `using var` local of
+            // function type is disposed at scope end as a no-op (§28.9) and
+            // the borrow-initialized arm of the release scan excludes that
+            // spelling (LlvmBackend_Setup.cpp), so the alias's own reference
+            // story differs from a plain `var`'s. A plain `var` only.
+            if (allowForwarding && lambdaDepth == 0 && !ld->isUsing &&
+                !ld->isAwaitUsing && isName(ld->initializer.get())) {
+                aliasNames.push_back(ld->name);
+                return;
+            }
             expr(ld->initializer.get());
             return;
         }
@@ -21550,6 +21606,9 @@ struct FormalInvocationOnlyWalk {
         }
         if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
             if (fs->varName == name) { ok = false; return; }  // shadowing
+            // fix #8972: a loop variable that shadows an ADMITTED ALIAS
+            // breaks its purity — fail closed.
+            if (isAliasName(fs->varName)) { ok = false; return; }
             expr(fs->iterable.get());
             expr(fs->withExpr.get());
             stmts(fs->body);
@@ -21574,6 +21633,9 @@ struct FormalInvocationOnlyWalk {
             stmts(tr->body);
             for (const auto& c : tr->catches) {
                 if (c.hasBinding && c.varName == name) { ok = false; return; }
+                // fix #8972: a catch binding that shadows an ADMITTED ALIAS
+                // breaks its purity — fail closed.
+                if (c.hasBinding && isAliasName(c.varName)) { ok = false; return; }
                 expr(c.guard.get());
                 stmt(c.body.get());
             }
@@ -21590,6 +21652,13 @@ struct FormalInvocationOnlyWalk {
             // A bare read in any position other than the callee of a direct
             // call (handled in the CallExpr arm) is a retention hazard.
             if (id->name == name) ok = false;
+            // fix #8972 (§28.14 / §28.9, v0.359): a bare read of an ADMITTED
+            // ALIAS is the same hazard: the local names the callback, and a
+            // read that is not a forward to a call-bounded position may keep
+            // it (an argument to a storing position, a collection element, a
+            // field store). The alias's ONLY admitted use is the forward
+            // (callArgs above), which does not come through here.
+            if (isAliasName(id->name)) ok = false;
             return;
         }
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
@@ -21669,6 +21738,10 @@ struct FormalInvocationOnlyWalk {
         }
         if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
             expr(we->source.get());
+            // fix #8972: a `with` binding that shadows an ADMITTED ALIAS
+            // breaks its purity — fail closed.
+            for (const auto& a : we->assigns)
+                if (isAliasName(a.name)) { ok = false; return; }
             for (const auto& a : we->assigns) expr(a.value.get());
             return;
         }
@@ -21679,6 +21752,9 @@ struct FormalInvocationOnlyWalk {
         }
         if (auto* mt = dynamic_cast<const ast::MarkedTransferExpr*>(e)) {
             if (mt->name == name) ok = false;  // `move x`
+            // fix #8972: `move` of an ADMITTED ALIAS moves the callback out
+            // of the alias — the alias is no longer a pure alias — fail closed.
+            if (isAliasName(mt->name)) ok = false;
             return;
         }
         if (dynamic_cast<const ast::IntLiteralExpr*>(e) ||
@@ -21704,6 +21780,10 @@ struct FormalInvocationOnlyWalk {
         if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
             for (const auto& lp : lam->params)
                 if (lp.name == name) { ok = false; return; }
+            // fix #8972: a lambda parameter that shadows an ADMITTED ALIAS
+            // breaks its purity — fail closed.
+            for (const auto& lp : lam->params)
+                if (isAliasName(lp.name)) { ok = false; return; }
             ++lambdaDepth;
             if (lam->isBlockBody) stmts(lam->stmts);
             else if (lam->exprBody) expr(lam->exprBody.get());
@@ -21770,6 +21850,18 @@ bool calleeBodyUsesFormalOnlyByInvocationOrInspection(
 // the escape walker's method-callee relief declined, and the CALLER's closure
 // local was never released (one closure cell + its env per call — the
 // issue's repro: 15200 byte(s) in 600 allocation(s) over 200 iterations).
+//
+// fix #8972 (§28.14 / §28.9, v0.359): the OTHER half of the same sentence —
+// "BOUND TO LOCALS". A callee that binds its formal to a local of its own
+// (`var h := g;`) and then forwards THAT LOCAL holds nothing past its call
+// either, so the same relief must apply. The walk now admits such a local as
+// a PURE ALIAS of the formal: bound once from the formal, never reassigned,
+// never stored, returned or captured, and used only as a forward at a
+// call-bounded position (the SAME recursive proof the formal's own forward
+// uses). Every other use of the alias — a bare read, an assignment, a store,
+// a return, a capture, a re-binding of its name, a `using var` or `const`
+// spelling, a binding inside a lambda — fails the walk closed, so a declined
+// shape keeps leaking: a leak, never an early release.
 //
 // THE PROOF IS RECURSIVE, and it fails closed at every step (see the
 // declaration comment above for the clause-by-clause list):

@@ -963,6 +963,15 @@ bool calleeBodyUsesFormalOnlyByInvocationOrInspection(
 // parameter holds nothing past its own call, so the caller's closure local
 // may still be released at ITS scope end.
 //
+// fix #8972 (§28.14 / §28.9, v0.359): the same walk, PLUS §28.14's "bound to
+// locals" — a callee-local that is a PURE ALIAS of the formal (`var h := g;`,
+// bound once, never reassigned, never stored, returned or captured) may be
+// forwarded at the same call-bounded position the formal's own forward uses.
+// The alias's ONLY admitted use is that forward: every other use of it (a
+// bare read, an assignment, a store, a return, a capture, a re-binding of
+// its name) fails the walk closed, so a declined shape keeps leaking — a
+// leak, never an early release.
+//
 // The proof is RECURSIVE and needs the sema context (the forwarded callee's
 // signature and, for a method target, its body):
 //   * a forwarded ARGUMENT is admitted only at a PLAIN function-typed
