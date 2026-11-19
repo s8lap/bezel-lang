@@ -6433,6 +6433,65 @@ const ast::LambdaExpr* MethodOwnership::lambdaOwnerOfParameter(
     return nullptr;
 }
 
+// fix #8937 (§28.3 *Captured owned bindings*, §28.8.1, v0.359). The
+// MARKED-TRANSFER sibling of `reportEnclosingLambdaOwnedThrow` above (the
+// `throw` operand). §28.3: "Inside a closure, a captured owned binding — an
+// owned local or `owned` parameter of the enclosing body — is uniformly in
+// borrow state: reads borrow (the producers rows above), and assignment to it,
+// a marked transfer from it, an explicit `Dispose()` or discard of it, and
+// every other owned-consuming use of it are compile errors — a closure cannot
+// consume, reassign, or dispose a captured owned binding". The "enclosing
+// body" of a NESTED closure is the enclosing LAMBDA's body, so a marked
+// transfer out of an enclosing lambda's owned local, written in a nested
+// lambda, is the same shape #8873 closed for `throw` — and the METHOD twin
+// (the same transfer where the binding is a local of the METHOD body) is
+// rejected by `reportCapturedOwnedConsume(..., "transfer")`.
+//
+// TWO spellings of the marked transfer reach here, and BOTH have the same
+// method twin with the same diagnostic text:
+//   * `move c` — the `ast::UnaryExpr` arm of `scanCapturedOwnedConsumeExpr`;
+//   * `owned c` — the `ast::MarkedTransferExpr` arm (A.7 MarkedTransfer, the
+//     K3.4 marker as a PrimaryAtom: an if-expression branch or an
+//     expression-`case` arm result).
+// The binding arrives already resolved (`sym`), because the two arms resolve
+// it differently: the `move` arm through `ctx_.exprSymbol(*id)`, the marked
+// arm through `ctx_.exprSymbol(*mt)`.
+//
+// The local is tracked in no frame (`isCapturedOwnedBinding` reads the METHOD
+// frame's `states_`), so the binding's owner is resolved with
+// `lambdaOwnerOfDeclaringLambda` (the ONE owner resolution this file has for
+// a local — the same helper `reportEnclosingLambdaOwnedThrow` reads since
+// #8926): the binding is CAPTURED iff its owner is not the transferring
+// (innermost) lambda, and it is OWNED iff every binding of it that precedes
+// the transfer is an owned production (the same one-sided source-order rule,
+// so an ambiguous history is never rejected). The diagnostic is the METHOD
+// twin's OWN — `reportCapturedOwnedConsume` with the verb "transfer" — so the
+// two arms cannot drift apart in wording. Returns true when it reported.
+//
+// SCOPE: the OWNED LOCAL half of §28.3's rule. The `owned` PARAMETER half of
+// the marked-transfer form is a separate defect, filed as #8975.
+//
+// per §28.3, §28.8.1, v0.359
+bool MethodOwnership::reportEnclosingLambdaOwnedTransfer(sema::Symbol* sym,
+                                                         std::string_view name,
+                                                         SourceLocation loc) {
+    if (closureScanStack_.size() < 2) return false;
+    if (!sym) return false;
+    if (name == "this" || name == "base") return false;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls || isCatchBorrow(sym)) return false;
+    const ast::LambdaExpr* owner = lambdaOwnerOfDeclaringLambda(sym);
+    // Not declared by any enclosing lambda (the method-body case: #7920's own
+    // arm, already reported above), or declared by the transferring lambda
+    // itself (its own local: admitted — a closure may consume what it owns).
+    if (!owner || owner == closureScanStack_.back()) return false;
+    if (!lambdaBodyLocalHoldsBorrow(ls, *owner, loc.offset,
+                                    OwnershipState::Owned))
+        return false;
+    reportCapturedOwnedConsume(name, loc, "transfer");
+    return true;
+}
+
 void MethodOwnership::reportCapturedOwnedConsume(std::string_view name,
                                                  SourceLocation loc,
                                                  const char* verb) {
@@ -7033,11 +7092,28 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
     }
     if (const auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
         // Marked transfer via `move r`.
-        if (insideLambda && un->op == "move" && un->operand &&
-            isCapturedOwnedBinding(*un->operand)) {
-            const auto* oid =
-                dynamic_cast<const ast::IdentifierExpr*>(un->operand.get());
-            reportCapturedOwnedConsume(oid->name, oid->span.begin, "transfer");
+        if (insideLambda && un->op == "move" && un->operand) {
+            if (isCapturedOwnedBinding(*un->operand)) {
+                const auto* oid =
+                    dynamic_cast<const ast::IdentifierExpr*>(un->operand.get());
+                reportCapturedOwnedConsume(oid->name, oid->span.begin,
+                                           "transfer");
+            } else {
+                // fix #8937 (§28.3 *Captured owned bindings*, §28.8.1,
+                // v0.359): the MARKED-TRANSFER sibling of the `throw` form
+                // #8873 closed (`reportEnclosingLambdaOwnedThrow`). The
+                // predicate above resolves the binding against the METHOD
+                // frame's `states_`, so it cannot see an owned local of an
+                // ENCLOSING LAMBDA — and §28.3's "enclosing body" of a
+                // nested closure IS the enclosing lambda's body. Same
+                // resolution, same one-sided owned-history rule, same
+                // diagnostic as the method twin.
+                const auto* mid =
+                    dynamic_cast<const ast::IdentifierExpr*>(un->operand.get());
+                if (mid)
+                    reportEnclosingLambdaOwnedTransfer(
+                        ctx_.exprSymbol(*mid), mid->name, mid->span.begin);
+            }
         }
         // fix #3755 (review follow-up): `move p` ANYWHERE in this statement
         // (an argument, an initializer, a return operand) consumes `p`, so a
@@ -7070,9 +7146,19 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
                     }
                 }
             }
-            if (consumedCaptured)
+            if (consumedCaptured) {
                 reportCapturedOwnedConsume(mt->name, mt->span.begin,
                                            "transfer");
+            } else {
+                // fix #8937 (§28.3 *Captured owned bindings*, §28.8.1,
+                // v0.359): the `owned c` SPELLING of the same marked transfer,
+                // with the same method twin and the same diagnostic. The
+                // frame test above reads the METHOD frame's `states_`, so an
+                // owned local of an ENCLOSING LAMBDA is invisible to it.
+                reportEnclosingLambdaOwnedTransfer(ctx_.exprSymbol(*mt),
+                                                   mt->name,
+                                                   mt->span.begin);
+            }
         } else if (stmtHasLambda_) {
             // fix #3755 (review follow-up): the marked transfer `owned r` in
             // an ordinary (non-closure) position of this statement is a

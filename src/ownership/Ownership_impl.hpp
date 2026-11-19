@@ -5304,6 +5304,18 @@ private:
     // parameter then belongs to the method body, #7920's own arm).
     const ast::LambdaExpr* lambdaOwnerOfParameter(sema::ParameterSymbol* ps);
 
+    // fix #8937 (§28.3, §28.8.1, v0.359): a MARKED TRANSFER (`move c` or
+    // `owned c`) of an OWNED local of an ENCLOSING lambda, written in a
+    // nested lambda; true when it reported. The MARKED-TRANSFER sibling of
+    // `reportEnclosingLambdaOwnedThrow` above -- same owner resolution
+    // (`lambdaOwnerOfDeclaringLambda`), same one-sided owned-history rule,
+    // and the METHOD twin's own diagnostic
+    // (`reportCapturedOwnedConsume(..., "transfer")`). `sym` is the already
+    // resolved binding (the two spellings resolve it differently).
+    bool reportEnclosingLambdaOwnedTransfer(sema::Symbol* sym,
+                                             std::string_view name,
+                                             SourceLocation loc);
+
     // fix #8895 (§31.1, v0.359): the innermost ENCLOSING lambda whose own
     // source range declares `sym` (null when none does -- the symbol then
     // belongs to the method body, whose bindings live in `states_`).
