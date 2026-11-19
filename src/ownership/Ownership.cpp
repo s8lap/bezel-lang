@@ -387,110 +387,15 @@ bool ownedParamIsFrameDisposable(const sema::ParameterSymbol& ps,
 // removes the syntactic proxy rather than keeping it alongside a second,
 // drifting spelling of the same decision. // per §19.6, v0.298, #4139
 
-bool armNeverFallsThrough(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
-
-// fix #4138 (§19/§19.6/§28.2/§28.3, v0.295): does the LAST reachable
-// top-level statement of an arm provably divert control away from the
-// point directly after the ENCLOSING case/if/while/for construct, so this
-// arm's (or loop body's) end state must be EXCLUDED from that construct's
-// own join (#4116, #4117) rather than folded into it?
-//
-// ONLY `return` and `throw` are recognized here — NOT `break`/`continue`,
-// despite both being equally "does not fall through to this exact merge
-// point" in the abstract. That asymmetry is deliberate, and was reached by
-// MEASURING a regression this predicate's first draft introduced, not by
-// design up front:
-//
-// `return`/`throw` leave the ENCLOSING CALLABLE outright. Nothing else in
-// the callable can ever observe a state that only exists on a path that
-// already left it, so dropping that operand from a join is always safe —
-// the state has nowhere else it needs to go.
-//
-// `break`/`continue` do NOT leave the callable — they reach a different,
-// but very much still-live, merge point (the nearest enclosing loop's own
-// post-loop merge, or its header, respectively). A first draft of this fix
-// excluded them too, on the theory that "doesn't reach THIS merge" was the
-// right test; measured counter-example: `while cond do if flag then move x;
-// break; end; end; move x;` — the `if`'s own join excluded the `break`-arm
-// (correct: `break` never reaches the `if`'s merge), but excluding it
-// DISCARDED the move information entirely instead of forwarding it to the
-// enclosing `while`'s own join, where it very much still belongs (a
-// `break` inside an `if` inside a `while` is exactly how a real program
-// exits a loop early) — silently un-rejecting a genuine double-move this
-// same batch's #3951/#4117 exists to catch. This walker has no general
-// mechanism to forward a "diverted" operand to a DIFFERENT construct's
-// join several levels up (that would need real inter-procedural plumbing,
-// well beyond this narrow fix), so the safe, correct, and properly-scoped
-// choice is: leave `break`/`continue` OUT of this predicate entirely, and
-// accept that the over-conservative false-reject #4138 filed for
-// `return`/`throw` remains UNFIXED for `break`/`continue` (filed as a
-// follow-up, #4141) — a known limitation, not a silent gap: excluding
-// nothing is exactly the pre-#4138 (safe-direction-only) behavior these
-// two terminators already had.
-//
-// Deliberately NOT `sema::ExprTC::stmtAlwaysExits` (ExprTypecheck.cpp):
-// that helper answers "does control leave the ENCLOSING CALLABLE" for the
-// unrelated §21.7 always-returns-a-value check, which is in fact exactly
-// what THIS predicate ended up needing too (once break/continue were
-// dropped) — but it is a private, `ctx_`-bound member of a different
-// translation unit's sema pass, unreachable from here for the same reason
-// this file's CaseStmt exhaustiveness fix (#4139, a few hundred lines below)
-// reads a cached AST field rather than calling `sema::ExprTC` members
-// directly — `stmtAlwaysExits` is `ctx_`-bound to a different translation
-// unit's pass and not itself cached — and it additionally covers
-// non-terminating `while true` and exhaustive-case/try shapes this narrow
-// fix does not need.
-//
-// A syntactic, non-CFG check only: recurses into a fully-covered nested
-// `if` (every branch, including a required `else`) and a `do … end` block,
-// the two shapes most likely to end an arm written with an early
-// return/throw threaded through nested control flow, but does not attempt
-// a `while`/`for`/`try`/`case` as the arm's OWN last statement —
-// under-approximating "never falls through" is always the SAFE direction
-// (it just leaves the pre-existing over-conservative join as-is for that
-// shape), so an exotic shape this misses degrades to the pre-existing,
-// safe-direction-only false-reject rather than ever masking a real hazard.
-bool stmtNeverFallsThrough(const ast::Stmt& s) {
-    if (dynamic_cast<const ast::ReturnStmt*>(&s)) return true;
-    if (dynamic_cast<const ast::ThrowStmt*>(&s)) return true;
-    // §31.2.2 (mirrors stmtAlwaysExits, ExprTypecheck.cpp ~601): an
-    // expression-form rethrow (`throw;` / `throw expr` with no disambiguating
-    // statement keyword — reachable as a case-arm single-statement body,
-    // Parser_Stmts.cpp parseCaseStmtArm's form-3 fallthrough) parses as an
-    // ExpressionStmt wrapping a ThrowExpr, not a ThrowStmt.
-    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s))
-        return es->expr &&
-               dynamic_cast<const ast::ThrowExpr*>(es->expr.get()) != nullptr;
-    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s))
-        return armNeverFallsThrough(dob->body);
-    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-        if (!ifs->hasElse) return false;  // the false edge falls through
-        if (!armNeverFallsThrough(ifs->ifBranch.body)) return false;
-        for (const auto& el : ifs->elifBranches)
-            if (!armNeverFallsThrough(el.body)) return false;
-        return armNeverFallsThrough(ifs->elseBody);
-    }
-    return false;
-}
-
-// The arm-level predicate this fix's join sites actually call: does this
-// statement list, taken as a whole, never fall through? An empty body
-// falls through by definition (there is nothing to divert control). Used
-// for a case/if ARM (excluded from that construct's own join) and,
-// identically, for a while/for loop BODY (excluded from the loop's own
-// "ran the body" ∪ "0 iterations" join, this file's While/For arms in
-// `applyUsingVarBorrowPinInLambdaStmt`) — since only return/throw are
-// recognized (see the header comment above), there is no longer any
-// semantic difference between the two call sites that would justify a
-// second, loop-specific spelling of this predicate (an earlier draft had
-// one, keyed on treating `break` differently; it was removed once
-// break/continue stopped being excluded at all).
-bool armNeverFallsThrough(const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
-    for (auto it = stmts.rbegin(); it != stmts.rend(); ++it) {
-        if (*it) return stmtNeverFallsThrough(**it);
-    }
-    return false;
-}
+// fix #8768 (fix-forward, §28.3, v0.359): the `return`/`throw` divergence
+// predicate that decides a branch's contribution to a join now LIVES IN
+// `ownership/Ownership_impl.hpp` (`armNeverFallsThrough` /
+// `stmtNeverFallsThrough`), SHARED with the getter-body state walk in
+// Ownership_Checks.cpp — ONE spelling of the rule, reused, not re-derived
+// (the method body and the getter body must answer a program the same way,
+// and the getter walk's joins are the method walk's joins). The definitions
+// were moved out of this file's anonymous namespace unchanged; see the
+// header for their full rationale.
 
 // fix #4141 (§21.5/§28.3, v0.298): the companion predicate to
 // `armNeverFallsThrough` for `break`/`continue`. Does the LAST reachable

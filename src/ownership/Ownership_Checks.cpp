@@ -23248,6 +23248,19 @@ void MethodOwnership::scanGetterSelfAssignments(
 // does: a store that happens on EVERY path REPLACES the state, and a store on
 // only SOME path MEETS it with the path that did not store.
 //
+// AND A DIVERGING EXIT IS NOT AN EXIT. fix #8768 (fix-forward, §28.3, §28.9,
+// v0.359): a branch that ENDS in `return`/`throw` leaves the CALLABLE
+// outright, so it never reaches the point after the construct it sits in, and
+// its end state is not one of that construct's EXITS — it must not be folded
+// into the join. The METHOD body already excludes exactly such a branch
+// (`armNeverFallsThrough` / `stmtNeverFallsThrough`, now REUSED here: one
+// rule, one spelling — §28.9 makes the two accessor bodies semantically
+// indistinguishable and this walk names the method body as the oracle).
+// Without the exclusion the returning branch's state survives the meet, the
+// local still looks OWNED at the assignment that follows the construct, and
+// the getter REJECTS four programs the method twin ADMITS — the blocking
+// finding of the review lane r42-rev-m98 on #8768.
+//
 // per §28.3, §28.9, §28.7, §15.3, v0.359
 void MethodOwnership::scanGetterSelfAssignStmts(
         const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
@@ -23291,23 +23304,47 @@ void MethodOwnership::scanGetterSelfAssignStmt(
         // branch, and the `else` branch — or, with no `else`, the
         // fall-through path, which leaves the state unchanged. Every branch
         // is walked from the state that entered the `if`.
+        //
+        // fix #8768 (fix-forward, §28.3, §28.9, v0.359): a branch that ENDS
+        // in `return`/`throw` never reaches the point directly after this
+        // `if` — it leaves the CALLABLE outright — so its end state is NOT an
+        // exit of this `if` and must not be folded into the join. The METHOD
+        // body already excludes exactly such a branch (`armNeverFallsThrough`,
+        // the predicate this walk now REUSES: one rule, one spelling, because
+        // §28.9 makes the getter body and the method body semantically
+        // indistinguishable and the commit that introduced this walk names
+        // the method body as the oracle). Without the exclusion the
+        // RETURNING branch's state survives the meet, the local still looks
+        // OWNED at the assignment that follows, and the getter REJECTS four
+        // programs the method twin ADMITS — the blocking finding of the
+        // review lane r42-rev-m98 on #8768.
         std::vector<GetterLocalStates> branches;
         {
             GetterLocalStates branch = states;
             scanGetterSelfAssignStmts(ifs->ifBranch.body, branch);
-            branches.push_back(std::move(branch));
+            if (!armNeverFallsThrough(ifs->ifBranch.body))
+                branches.push_back(std::move(branch));
         }
         for (const auto& el : ifs->elifBranches) {
             GetterLocalStates branch = states;
             scanGetterSelfAssignStmts(el.body, branch);
-            branches.push_back(std::move(branch));
+            if (!armNeverFallsThrough(el.body))
+                branches.push_back(std::move(branch));
         }
         if (ifs->hasElse) {
             GetterLocalStates branch = states;
             scanGetterSelfAssignStmts(ifs->elseBody, branch);
-            branches.push_back(std::move(branch));
+            if (!armNeverFallsThrough(ifs->elseBody))
+                branches.push_back(std::move(branch));
         } else {
             branches.push_back(states);  // the fall-through path
+        }
+        if (branches.empty()) {
+            // EVERY arm leaves the callable: the code after this `if` is
+            // UNREACHABLE. The method body's own `if` join falls back to the
+            // pre-`if` snapshot in that case (Ownership.cpp's IfStmt arm);
+            // `states` still holds exactly that snapshot here.
+            return;
         }
         states = getterMeetBranches(branches);
         return;
@@ -23316,15 +23353,26 @@ void MethodOwnership::scanGetterSelfAssignStmt(
         // A loop may run ZERO times, so the loop's exit state is K7's meet of
         // the state that entered the loop and the body's exit state (the
         // method body's loop-header join).
+        //
+        // fix #8768 (fix-forward, §28.3, §28.9, v0.359): a body that ends in
+        // `return`/`throw` never reaches the point directly after this loop,
+        // so its end state is not an exit of the loop — the only live exit is
+        // the zero-trip edge. The method body's loop join does exactly this
+        // (`armNeverFallsThrough`, Ownership.cpp's While/For arms).
         GetterLocalStates body = states;
         scanGetterSelfAssignStmts(ws->body, body);
-        getterJoinStateMaps(states, body);
+        if (!armNeverFallsThrough(ws->body))
+            getterJoinStateMaps(states, body);
         return;
     }
     if (const auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        // fix #8768 (fix-forward, §28.3, §28.9, v0.359): the identical
+        // exclusion the `while` arm above carries — a body that ends in
+        // `return`/`throw` does not reach the point after the loop.
         GetterLocalStates body = states;
         scanGetterSelfAssignStmts(fs->body, body);
-        getterJoinStateMaps(states, body);
+        if (!armNeverFallsThrough(fs->body))
+            getterJoinStateMaps(states, body);
         return;
     }
     if (const auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
@@ -23341,19 +23389,34 @@ void MethodOwnership::scanGetterSelfAssignStmt(
         // The try BODY runs; each CATCH arm is an alternative exit (the body
         // may throw); the FINALLY body runs on every exit, so its stores are
         // unconditional relative to the try's exit.
+        //
+        // fix #8768 (fix-forward, §28.3, §28.9, v0.359): the body's
+        // NORMAL-COMPLETION path that ends in `return`/`throw` leaves the
+        // callable, and a catch arm that ends in `return`/`throw` leaves it
+        // too — neither reaches the point directly after the `try`, so
+        // neither contributes to the join. The METHOD body already excludes
+        // both (`armNeverFallsThrough` for the body, `stmtNeverFallsThrough`
+        // for an arm — the same two predicates this walk now REUSES).
         std::vector<GetterLocalStates> branches;
         {
             GetterLocalStates body = states;
             scanGetterSelfAssignStmts(ts->body, body);
-            branches.push_back(std::move(body));
+            if (!armNeverFallsThrough(ts->body))
+                branches.push_back(std::move(body));
         }
         for (const auto& arm : ts->catches) {
             if (!arm.body) continue;
             GetterLocalStates branch = states;
             scanGetterSelfAssignStmt(*arm.body, branch);
-            branches.push_back(std::move(branch));
+            if (!stmtNeverFallsThrough(*arm.body))
+                branches.push_back(std::move(branch));
         }
-        states = getterMeetBranches(branches);
+        if (!branches.empty())
+            states = getterMeetBranches(branches);
+        // else: EVERY exit leaves the callable, so the code after this `try`
+        // is UNREACHABLE — the method body's try join falls back to the
+        // pre-try snapshot in that case (Ownership.cpp's TryStmt arm), and
+        // `states` still holds exactly that snapshot here.
         if (ts->hasFinally)
             scanGetterSelfAssignStmts(ts->finallyBody, states);
         return;
@@ -23362,11 +23425,17 @@ void MethodOwnership::scanGetterSelfAssignStmt(
         // The arms are alternatives; the no-match fall-through edge leaves the
         // state unchanged — the method body's case-arm join folds the
         // pre-case snapshot in as a stand-in for that edge.
+        //
+        // fix #8768 (fix-forward, §28.3, §28.9, v0.359): an arm that ends in
+        // `return`/`throw` never reaches the point directly after this `case`,
+        // so its end state is not an exit of the `case` — the method body's
+        // case join excludes it (`armNeverFallsThrough`).
         std::vector<GetterLocalStates> branches;
         for (const auto& arm : cs->arms) {
             GetterLocalStates branch = states;
             scanGetterSelfAssignStmts(arm.stmts, branch);
-            branches.push_back(std::move(branch));
+            if (!armNeverFallsThrough(arm.stmts))
+                branches.push_back(std::move(branch));
         }
         branches.push_back(states);  // the no-match fall-through edge
         states = getterMeetBranches(branches);

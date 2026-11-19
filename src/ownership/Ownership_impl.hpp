@@ -514,6 +514,137 @@ struct GenericReturnContext {
 // owned return + owned-param seeding. // per §28.1 v0.196
 bool isValueSubstitutionErased(const sema::TypeRef* rt);
 
+// fix #8768 (fix-forward, §28.3, §28.9, v0.359): the DIVERGENCE PREDICATE
+// that decides a branch's contribution to a control-flow join.
+//
+// It used to live in `src/ownership/Ownership.cpp`'s anonymous namespace, where
+// only the METHOD body's lambda-walk join sites could reach it. The GETTER
+// body's own state walk (`MethodOwnership::scanGetterSelfAssignStmt`,
+// Ownership_Checks.cpp) has the SAME join sites and the SAME question — "does
+// this arm's end state reach the point after this construct?" — and it was
+// answering it with a SECOND, weaker spelling (every arm contributed its end
+// state to the join, whatever the arm ended with). That divergence is what
+// made the getter walk reject four programs the method body admits (the
+// review lane r42-rev-m98's blocking finding on #8768).
+//
+// §28.9 makes a getter accessor body and a method body "semantically
+// indistinguishable at every read site", and the commit that introduced the
+// getter walk names the METHOD body as the oracle — so the rule that decides
+// an arm's contribution to a join must be ONE rule, in ONE place, REUSED by
+// both walks. It now lives here, next to the `MethodOwnership` class whose
+// two implementations (Ownership.cpp's method body, Ownership_Checks.cpp's
+// getter body) share it.
+//
+// The definitions are UNCHANGED from Ownership.cpp; only their home moved.
+// See the full rationale (why `return`/`throw` and NOT `break`/`continue`,
+// why it is a SYNTACTIC check and not the CFG's) on `stmtNeverFallsThrough`
+// below. // per §28.3, §28.9, §19, §21.7, v0.359, #8768
+
+bool armNeverFallsThrough(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
+
+// fix #4138 (§19/§19.6/§28.2/§28.3, v0.295): does the LAST reachable
+// top-level statement of an arm provably divert control away from the
+// point directly after the ENCLOSING case/if/while/for construct, so this
+// arm's (or loop body's) end state must be EXCLUDED from that construct's
+// own join (#4116, #4117) rather than folded into it?
+//
+// ONLY `return` and `throw` are recognized here — NOT `break`/`continue`,
+// despite both being equally "does not fall through to this exact merge
+// point" in the abstract. That asymmetry is deliberate, and was reached by
+// MEASURING a regression this predicate's first draft introduced, not by
+// design up front:
+//
+// `return`/`throw` leave the ENCLOSING CALLABLE outright. Nothing else in
+// the callable can ever observe a state that only exists on a path that
+// already left it, so dropping that operand from a join is always safe —
+// the state has nowhere else it needs to go.
+//
+// `break`/`continue` do NOT leave the callable — they reach a different,
+// but very much still-live, merge point (the nearest enclosing loop's own
+// post-loop merge, or its header, respectively). A first draft of this fix
+// excluded them too, on the theory that "doesn't reach THIS merge" was the
+// right test; measured counter-example: `while cond do if flag then move x;
+// break; end; end; move x;` — the `if`'s own join excluded the `break`-arm
+// (correct: `break` never reaches the `if`'s merge), but excluding it
+// DISCARDED the move information entirely instead of forwarding it to the
+// enclosing `while`'s own join, where it very much still belongs (a
+// `break` inside an `if` inside a `while` is exactly how a real program
+// exits a loop early) — silently un-rejecting a genuine double-move this
+// same batch's #3951/#4117 exists to catch. This walker has no general
+// mechanism to forward a "diverted" operand to a DIFFERENT construct's
+// join several levels up (that would need real inter-procedural plumbing,
+// well beyond this narrow fix), so the safe, correct, and properly-scoped
+// choice is: leave `break`/`continue` OUT of this predicate entirely, and
+// accept that the over-conservative false-reject #4138 filed for
+// `return`/`throw` remains UNFIXED for `break`/`continue` (filed as a
+// follow-up, #4141) — a known limitation, not a silent gap: excluding
+// nothing is exactly the pre-#4138 (safe-direction-only) behavior these
+// two terminators already had.
+//
+// Deliberately NOT `sema::ExprTC::stmtAlwaysExits` (ExprTypecheck.cpp):
+// that helper answers "does control leave the ENCLOSING CALLABLE" for the
+// unrelated §21.7 always-returns-a-value check, which is in fact exactly
+// what THIS predicate ended up needing too (once break/continue were
+// dropped) — but it is a private, `ctx_`-bound member of a different
+// translation unit's sema pass, unreachable from here for the same reason
+// this file's CaseStmt exhaustiveness fix (#4139, a few hundred lines below)
+// reads a cached AST field rather than calling `sema::ExprTC` members
+// directly — `stmtAlwaysExits` is `ctx_`-bound to a different translation
+// unit's pass and not itself cached — and it additionally covers
+// non-terminating `while true` and exhaustive-case/try shapes this narrow
+// fix does not need.
+//
+// A syntactic, non-CFG check only: recurses into a fully-covered nested
+// `if` (every branch, including a required `else`) and a `do … end` block,
+// the two shapes most likely to end an arm written with an early
+// return/throw threaded through nested control flow, but does not attempt
+// a `while`/`for`/`try`/`case` as the arm's OWN last statement —
+// under-approximating "never falls through" is always the SAFE direction
+// (it just leaves the pre-existing over-conservative join as-is for that
+// shape), so an exotic shape this misses degrades to the pre-existing,
+// safe-direction-only false-reject rather than ever masking a real hazard.
+inline bool stmtNeverFallsThrough(const ast::Stmt& s) {
+    if (dynamic_cast<const ast::ReturnStmt*>(&s)) return true;
+    if (dynamic_cast<const ast::ThrowStmt*>(&s)) return true;
+    // §31.2.2 (mirrors stmtAlwaysExits, ExprTypecheck.cpp ~601): an
+    // expression-form rethrow (`throw;` / `throw expr` with no disambiguating
+    // statement keyword — reachable as a case-arm single-statement body,
+    // Parser_Stmts.cpp parseCaseStmtArm's form-3 fallthrough) parses as an
+    // ExpressionStmt wrapping a ThrowExpr, not a ThrowStmt.
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s))
+        return es->expr &&
+               dynamic_cast<const ast::ThrowExpr*>(es->expr.get()) != nullptr;
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s))
+        return armNeverFallsThrough(dob->body);
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (!ifs->hasElse) return false;  // the false edge falls through
+        if (!armNeverFallsThrough(ifs->ifBranch.body)) return false;
+        for (const auto& el : ifs->elifBranches)
+            if (!armNeverFallsThrough(el.body)) return false;
+        return armNeverFallsThrough(ifs->elseBody);
+    }
+    return false;
+}
+
+// The arm-level predicate this fix's join sites actually call: does this
+// statement list, taken as a whole, never fall through? An empty body
+// falls through by definition (there is nothing to divert control). Used
+// for a case/if ARM (excluded from that construct's own join) and,
+// identically, for a while/for loop BODY (excluded from the loop's own
+// "ran the body" ∪ "0 iterations" join, this file's While/For arms in
+// `applyUsingVarBorrowPinInLambdaStmt`) — since only return/throw are
+// recognized (see the header comment above), there is no longer any
+// semantic difference between the two call sites that would justify a
+// second, loop-specific spelling of this predicate (an earlier draft had
+// one, keyed on treating `break` differently; it was removed once
+// break/continue stopped being excluded at all).
+inline bool armNeverFallsThrough(const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    for (auto it = stmts.rbegin(); it != stmts.rend(); ++it) {
+        if (*it) return stmtNeverFallsThrough(**it);
+    }
+    return false;
+}
+
 class MethodOwnership {
 public:
     MethodOwnership(sema::SemaContext& ctx) : ctx_(ctx) {}
