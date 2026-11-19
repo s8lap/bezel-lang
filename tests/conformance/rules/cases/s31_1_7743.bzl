@@ -22,7 +22,7 @@ public class Program
       try
         var b := new Box(j);
         t := t + Program.M(b);
-      catch e: Exception =>
+      catch var e: Exception =>
         t := t + 1;
       end try;
     end;

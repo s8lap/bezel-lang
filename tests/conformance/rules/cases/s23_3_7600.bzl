@@ -25,7 +25,7 @@ public class Program
     var tot := 0;
     using var h := new H();
     while i < 200 do
-      try h.P := i; catch e: InvalidOperationException => tot := tot + 1; end;
+      try h.P := i; catch var e: InvalidOperationException => tot := tot + 1; end;
       tot := tot + h.P;
       i := i + 1;
     end;

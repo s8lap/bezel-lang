@@ -17,7 +17,7 @@ public class Program
     for var j in 0..<3 do
       try
         t := t + Program.M(j);
-      catch e: Exception =>
+      catch var e: Exception =>
         t := t + 1;
       end try;
     end;

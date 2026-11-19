@@ -16,7 +16,7 @@ public class Program
     var r := 0;
     try
       r := Apply(lambda() => q + Boom(q));
-    catch e: Exception =>
+    catch var e: Exception =>
       r := q;
     end try;
     return r;

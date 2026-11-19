@@ -21,7 +21,7 @@ public class C
     var total := 0;
     for var j in 0 ..< 200 do
       var g := C.Make();
-      try total := total + g(); catch e: InvalidOperationException => total := total + 1; end try;
+      try total := total + g(); catch var e: InvalidOperationException => total := total + 1; end try;
     end;
     Console.WriteLine(total);
     return 0;
