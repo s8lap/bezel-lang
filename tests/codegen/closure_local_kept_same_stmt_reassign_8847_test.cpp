@@ -40,8 +40,8 @@
 // `b := (if Thr(k) > 0 and d.TryAdd(0, b) then g else g);` the `Thr(k)` call
 // is evaluated BEFORE `d.TryAdd(0, b)` stores anything, so the value is NOT
 // kept when that exception leaves the frame and the scope-end release must
-// still run there. The last row below is that shape: it is GREEN on the base
-// (a control) and RED under a join that ignores the order.
+// still run there. The throw-before-the-keep row below is that shape: it is
+// GREEN on the base (a control) and RED under a join that ignores the order.
 //
 // THE PATH-SENSITIVE RULE (this fix-forward). EVERY node the spec says can
 // raise is a raise point — not only the calls: §6.1 (v0.359) checked `+ - *
@@ -50,10 +50,32 @@
 // §25 (v0.359) a user-defined operator, §23.3 (v0.359) a property read
 // (including a bare implicit-`this` one). And the keep must be reached on
 // EVERY path: a short-circuit (`and` / `or` / `??`) or an unselected branch
-// that skips it is a decline too. The last three rows below are the
-// MUST-NOT-LEAK rows for that rule — each leaks 15200 B (16800 B for the
-// property row) under a join that ignores it, so LeakSanitizer is ON and the
-// leak IS the failure.
+// that skips it is a decline too. The last row below is the MUST-NOT-LEAK row
+// for that rule — it leaks 15200 B under a join that ignores it, so
+// LeakSanitizer is ON and the leak IS the failure.
+//
+// THE TWO BASE-GREEN CONTROLS (owner, 2026-11-12). A gtest row must be RED
+// on the base: a row that is green on the base pins nothing, so a suite may
+// keep at most TWO boundary controls — the ones a corpus case cannot express.
+// This suite keeps exactly those two, and they cover the two independent
+// halves of the fix's predicate (`!eff.raiseUnkept && eff.ownMust`):
+//   * `throw_evaluated_before_the_keep_in_the_same_statement_spec_28_9` — the
+//     ORDER half: a raise evaluated BEFORE the keep leaves the value NOT
+//     kept, so the scope-end release must still run there. Red under a join
+//     that ignores the evaluation order (the statement-granular join of
+//     cbf9aed39).
+//   * `short_circuit_skips_the_keep_before_the_raise_spec_17_2` — the REACH
+//     half: a path that SKIPS the keep leaves the value NOT kept, so the
+//     scope-end release must still run there. Red under a join that treats
+//     the statement as kept without checking that the keep was reached on
+//     that path (e41f31956's `keepIsFirstInvocation`).
+// The two base-green shapes this suite used to carry as well — a division by
+// zero before the keep (§6.1) and a null-forgiving `!` before the keep
+// (§17.8) — are GREEN on the base, so they pin nothing as gtest rows: they
+// moved to the conformance corpus with their deciding spec sentences, in
+// /var/tmp/bezel-scratch/r42-m120-8847/corpus-candidates/. The corpus runner
+// has no ASan/LSan leg, so the leak oracle of those two shapes is the reason
+// the two kept controls stay in gtest.
 
 #include <string>
 
@@ -136,6 +158,11 @@ end C;
 // when the exception leaves `Fill` — and the scope-end release must still run
 // there. The frame's reference is then the closure's only one, so the
 // program must leak NOTHING: LeakSanitizer is ON (`runAotChecked`).
+//
+// `z` and `n` are the operands the moved corpus candidates use (a division by
+// zero and a null-forgiving `!`); the row that stayed in gtest uses `flag`.
+// The parameters stay so that the corpus-candidate programs and the gtest row
+// are the same program shape.
 std::string leakOracleProgram(const std::string& fillBody) {
     return R"BZL(
 module M;
@@ -232,9 +259,10 @@ BEZEL_TEST(closure_local_kept_same_stmt_reassign_8847,
 // This row is GREEN on the base (it is a control, not a fix row: the base
 // already releases the value) and RED under a join that ignores the order —
 // the statement-granular join of cbf9aed39, which marked the local kept on
-// the unwind edge and leaked the closure (MEASURED: 15200 B in 600
-// allocations over the 200 iterations). LeakSanitizer is ON here, so the
-// leak is the failure the row catches.
+// the unwind edge and leaked the closure. MEASURED by this lane against
+// cbf9aed39's Setup.cpp: "LeakSanitizer: detected memory leaks" — "Direct leak
+// of 12800 byte(s) in 200 object(s)" — and the row's exit code is 99.
+// LeakSanitizer is ON here, so the leak is the failure the row catches.
 BEZEL_TEST(closure_local_kept_same_stmt_reassign_8847,
            throw_evaluated_before_the_keep_in_the_same_statement_spec_28_9) {
     const std::string prog = R"BZL(
@@ -278,35 +306,21 @@ end C;
 }
 
 // ---------------------------------------------------------------------------
-// THE MUST-NOT-LEAK ROWS (fix-forward #8847). A raise evaluated BEFORE the
-// keep — or a path that SKIPS the keep — leaves the value NOT kept, so the
-// scope-end release must still run on the unwind edge. A join that ignores
-// this marks the local kept there and leaks the closure: MEASURED 15200 B in
-// 600 allocations over the 200 iterations (16800 B for the property row).
-// LeakSanitizer is ON in every row below, so the leak IS the failure.
+// THE MUST-NOT-LEAK CONTROL (fix-forward #8847). A path that SKIPS the keep
+// leaves the value NOT kept, so the scope-end release must still run on the
+// unwind edge. A join that ignores this marks the local kept there and leaks
+// the closure: MEASURED 15200 B in 600 allocations over the 200 iterations.
+// LeakSanitizer is ON, so the leak IS the failure.
+//
+// MOVED TO THE CORPUS (they are GREEN on the base, so they pin nothing as
+// gtest rows, and the cap is two base-green controls per suite):
+//   * divide_by_zero_before_the_keep_in_the_same_statement_spec_6_1 — a
+//     division by zero before the keep (§6.1, v0.359);
+//   * null_forgiving_bang_before_the_keep_in_the_same_statement_spec_17_8 —
+//     a null-forgiving `!` before the keep (§7.8 / §17.8, v0.359).
+// Both programs, with the spec sentence that decides each verdict, are in
+// /var/tmp/bezel-scratch/r42-m120-8847/corpus-candidates/.
 // ---------------------------------------------------------------------------
-
-// §6.1 (v0.359): "Division and `mod` raise `DivideByZeroException` when the
-// right operand is zero." The division is the LEFT operand of the `and`, so
-// it is evaluated BEFORE `d.TryAdd(0, b)` stores anything (§22.5, v0.359:
-// call-site textual order; §17.1, v0.359: the operators are left-to-right
-// associative). The closure is therefore not kept when the exception leaves
-// `Fill`, and the scope-end release must run there.
-BEZEL_TEST(closure_local_kept_same_stmt_reassign_8847,
-           divide_by_zero_before_the_keep_in_the_same_statement_spec_6_1) {
-    expectNoLeak(leakOracleProgram(
-        "    b := (if 10 / z > 0 and d.TryAdd(0, b) then g else g);\n"));
-}
-
-// §7.8 / §17.8 (v0.359): "`x!` asserts non-nullness. If `x` is null at
-// runtime, `NullReferenceException` is raised." The null-forgiving operator
-// is evaluated BEFORE the keep, so the value is not kept when the exception
-// leaves `Fill`.
-BEZEL_TEST(closure_local_kept_same_stmt_reassign_8847,
-           null_forgiving_bang_before_the_keep_in_the_same_statement_spec_17_8) {
-    expectNoLeak(leakOracleProgram(
-        "    b := (if n! > 0 and d.TryAdd(0, b) then g else g);\n"));
-}
 
 // §17.2 (v0.359): "`and` and `or` short-circuit: the right operand is not
 // evaluated if the result is determined by the left." `flag` is FALSE, so the
@@ -314,6 +328,16 @@ BEZEL_TEST(closure_local_kept_same_stmt_reassign_8847,
 // The value is not kept when the exception leaves `Fill` — the frame's
 // reference is the closure's only one, so the scope-end release must run
 // there and the program must leak nothing.
+//
+// THE SECOND OF THE SUITE'S TWO BASE-GREEN CONTROLS. It is GREEN on the base
+// (the base already releases the value on the unwind edge) and RED under a
+// join that treats the statement as kept without checking that the keep was
+// REACHED on the path — e41f31956's `keepIsFirstInvocation`, which walks the
+// keep as the first CALL and so joins it even when a short-circuit skips it
+// (MEASURED on e41f31956's Setup.cpp: "LeakSanitizer: detected memory leaks"
+// — "Direct leak of 12800 byte(s) in 200 object(s)" — and the row's exit code
+// is 99). LeakSanitizer is ON here, so the leak is the failure the row
+// catches.
 BEZEL_TEST(closure_local_kept_same_stmt_reassign_8847,
            short_circuit_skips_the_keep_before_the_raise_spec_17_2) {
     expectNoLeak(leakOracleProgram(
