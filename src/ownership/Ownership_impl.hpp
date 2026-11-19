@@ -669,19 +669,21 @@ public:
     void scanGetterSelfAssignments(
         const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
     // fix #8768: the state-tracked walk. `states` maps a local's DECLARATION
-    // node to the bitmask of the §28.3 states the local can hold at the
-    // current program point (one bit per `OwnershipState`); the mask is an
-    // OVER-APPROXIMATION, so a conditional store widens it.
+    // node to the ONE §28.3 ownership state the local holds at the current
+    // program point. The walk joins at every control-flow construct the way
+    // the METHOD body's dataflow does (K7's meet, `joinInto`), so a store
+    // that happens on EVERY path REPLACES the state, and a store on only SOME
+    // path MEETS it with the path that did not store.
     // per §28.3, §28.9, v0.359
+    using GetterLocalStates =
+        std::unordered_map<const ast::Node*, OwnershipState>;
     void scanGetterSelfAssignStmts(
         const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
-        std::unordered_map<const ast::Node*, std::uint32_t>& states);
+        GetterLocalStates& states);
     void scanGetterSelfAssignStmt(
-        const ast::Stmt& s,
-        std::unordered_map<const ast::Node*, std::uint32_t>& states);
+        const ast::Stmt& s, GetterLocalStates& states);
     void scanGetterSelfAssignAssignment(
-        const ast::AssignmentStmt& as, int depth,
-        std::unordered_map<const ast::Node*, std::uint32_t>& states);
+        const ast::AssignmentStmt& as, GetterLocalStates& states);
 
     // #1484 / #2168 / §23.1 / §28.6: declaration initializers that store a
     // freshly-produced owned value (producerState == Owned) into NON-`owned`

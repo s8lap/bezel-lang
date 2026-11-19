@@ -183,35 +183,68 @@ std::string selfAssignOwnedLocalMessage(const std::string& name) {
            "explicitly with `move`";
 }
 
-// fix #8768 (§28.3 *State match on reassignment*, v0.359): the §28.3
-// ownership-state lattice of the locals of ONE getter accessor body (or of ONE
-// lambda body nested in it), as a bitmask — one bit per `OwnershipState`.
-// The mask is an OVER-APPROXIMATION of the states a local can hold at a
-// program point, so a conditional store widens it instead of guessing which
-// path ran. Declared here (file-local) because only the getter scan reads it.
-static constexpr std::uint32_t getterStateBit(OwnershipState s) {
-    return std::uint32_t(1) << static_cast<unsigned>(s);
+// fix #8768 (§28.3 *State match on reassignment*, v0.359): K7's MEET over the
+// §28.3 ownership states of ONE local, as `MethodOwnership::joinInto` (below)
+// implements it for the states a getter accessor body can produce.
+//
+//   * the same state on both edges meets to itself;
+//   * POLY-NULL ABSORBS — `joinInto`'s own words: "PolyNull ⊓ X = X" — so a
+//     poly-null edge joins an owned edge to OWNED, and a poly-null edge joins
+//     a poly-null edge to poly-null;
+//   * every other pair is a MIXED MERGE: K7.3 rejects Owned ⊓ Borrowed, and
+//     the Owned ⊓ Uninitialized merge is POISONED (silently) in the method
+//     body. A mixed merge is NOT an owned state, and the method body answers
+//     such a program with a DIFFERENT diagnostic, so the scan must not claim
+//     the self-assignment — POISONED is that "do not claim" state.
+//
+// Declared here (file-local) because only the getter scan reads it.
+// per §28.3, K7, v0.359
+static OwnershipState getterStateMeet(OwnershipState a, OwnershipState b) {
+    if (a == OwnershipState::Poisoned || b == OwnershipState::Poisoned)
+        return OwnershipState::Poisoned;
+    if (a == b) return a;
+    if (a == OwnershipState::PolyNull) return b;
+    if (b == OwnershipState::PolyNull) return a;
+    return OwnershipState::Poisoned;
 }
 
-// The OWNED bit: the state §28.3's state match asks about.
-static constexpr std::uint32_t kGetterOwnedStateBit =
-    getterStateBit(OwnershipState::Owned);
+// fix #8768: the join of two BRANCH state maps — K7's meet, per local. A
+// local that is in scope on only ONE of the two paths (a binding declared
+// inside a branch) is block-scoped and cannot be referenced after the join at
+// all, so its joined state is POISONED ("do not claim") — the safe answer.
+// per §28.3, K7, v0.359
+static void getterJoinStateMaps(
+        MethodOwnership::GetterLocalStates& into,
+        const MethodOwnership::GetterLocalStates& other) {
+    for (auto& kv : into) {
+        auto it = other.find(kv.first);
+        kv.second = (it == other.end())
+                        ? OwnershipState::Poisoned
+                        : getterStateMeet(kv.second, it->second);
+    }
+    for (const auto& kv : other) {
+        if (into.find(kv.first) == into.end())
+            into.emplace(kv.first, OwnershipState::Poisoned);
+    }
+}
 
-// The states that CONFLICT with an owned-state LHS: a path holding one of
-// them is NOT the method body's "Owned" state, so the scan must not claim the
-// self-assignment is a state-match violation (the method body answers such a
-// program with a different diagnostic — §28.3's borrow-into-owned-state rule,
-// §28.2's use-after-dispose, §7.9's definite-assignment).
-//
-// POLY-NULL is NOT here: K7.5 has the `null` arm absorb to the other arm's
-// state, so a poly-null path joins an owned path to owned, and the method body
-// rejects the self-assignment there. per §28.3, v0.359
-static constexpr std::uint32_t kGetterConflictingStateMask =
-    getterStateBit(OwnershipState::Borrowed) |
-    getterStateBit(OwnershipState::MovedFrom) |
-    getterStateBit(OwnershipState::Disposed) |
-    getterStateBit(OwnershipState::Poisoned) |
-    getterStateBit(OwnershipState::Uninitialized);
+// fix #8768: the meet of a construct's EXITS — the list of branch state maps
+// every path that reaches the statement AFTER the construct leaves behind.
+// The state that ENTERED the construct is one of those exits only when the
+// construct can be left without taking a branch: an `if` with no `else` (the
+// fall-through path), a loop's zero-trip edge, a `case`'s no-match edge.
+// For an `if`/`else` whose branches cover every path, the incoming state is
+// NOT an exit — meeting it in would keep the pre-construct state alive and
+// re-introduce the over-rejection this fix removes.
+// per §28.3, K7, v0.359
+static MethodOwnership::GetterLocalStates getterMeetBranches(
+        const std::vector<MethodOwnership::GetterLocalStates>& branches) {
+    if (branches.empty()) return {};
+    MethodOwnership::GetterLocalStates joined = branches.front();
+    for (std::size_t i = 1; i < branches.size(); ++i)
+        getterJoinStateMaps(joined, branches[i]);
+    return joined;
+}
 
 // fix #8782 (§28.3 *State match on reassignment*, v0.359): the single text of
 // the other-binding state-match rejection `u := v;` (an unmarked read of
@@ -23157,8 +23190,8 @@ void MethodOwnership::checkAutoPropertyInitializer(
 // initializer had to be a fresh owned producer and EVERY store to it had to be
 // a self-assignment, so it could not see a local that BECOMES owned by a
 // later store — `var t: Cell? := null; t := new Cell(1);` — and it never
-// crossed into a lambda body.) The state track, its over-approximating mask
-// and the conflicting-state rule are documented at
+// crossed into a lambda body.) The state track, the MEET at every
+// control-flow join and the conflicting-state rule are documented at
 // `scanGetterSelfAssignStmts` below. The same exclusions as the method-body
 // arm hold: a move-only VALUE type keeps §15.3's whole-value no-op, and a
 // marked RHS (`t := move t`) is the sanctioned transfer.
@@ -23166,7 +23199,7 @@ void MethodOwnership::checkAutoPropertyInitializer(
 void MethodOwnership::scanGetterSelfAssignments(
         const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
     // fix #8768: the getter body's own locals.
-    std::unordered_map<const ast::Node*, std::uint32_t> states;
+    GetterLocalStates states;
     scanGetterSelfAssignStmts(stmts, states);
     // fix #8768: a LAMBDA nested in the getter body is its OWN scope, and the
     // lambda-body arm that carries the rule in a METHOD body
@@ -23179,7 +23212,7 @@ void MethodOwnership::scanGetterSelfAssignments(
     for (const auto& s : stmts)
         if (s) collectBodyLambdas(*s, lambdas);
     for (const ast::LambdaExpr* lam : lambdas) {
-        std::unordered_map<const ast::Node*, std::uint32_t> lambdaStates;
+        GetterLocalStates lambdaStates;
         for (const auto& s : lam->stmts)
             if (s) scanGetterSelfAssignStmt(*s, lambdaStates);
     }
@@ -23204,66 +23237,155 @@ void MethodOwnership::scanGetterSelfAssignments(
 // site". The compiler's method body, which runs the real §28.3 dataflow, is
 // the reference for the answer, and it rejects these programs.
 //
-// The track is an OVER-APPROXIMATION: each local carries a bitmask of the
-// states it can hold at the current point (one bit per `OwnershipState`).
-// A store at the body's top level REPLACES the mask (the store always
-// happens); a store inside a nested scope-introducer (if / while / for /
-// do-end / try / case — `forEachNestedStmt`'s depth) WIDENS it (the other
-// path keeps the old state). A rejection needs "Owned" on every path, so the
-// mask must carry Owned AND carry no state that CONFLICTS with an owned-state
-// LHS: poly-null does not conflict (K7.5 — the `null` arm absorbs to the
-// other arm's state, so a poly-null path joins an owned path to owned), while
-// borrow / moved-from / disposed / uninitialized does (the method body answers
-// such a program with a DIFFERENT diagnostic — §28.3's
-// borrow-into-owned-state rule, §28.2's use-after-dispose, §7.9's
-// definite-assignment — so this scan must not claim the self-assignment).
+// ONE STATE PER LOCAL, AND A MEET AT EVERY JOIN. The first attempt at this
+// fix tracked a BITMASK of the states a local can hold and WIDENED it (`|=`)
+// at a store inside a nested scope, so a store that happens on EVERY path
+// still left the stale initial Owned bit in the mask: `var t: Cell? := new
+// Cell(1); do t := null; end; t := t;` was REJECTED, while the METHOD twin
+// ADMITS it (MEASURED — the method body tracks ONE §28.3 state per local and
+// meets at every control-flow join, `joinInto`, with "PolyNull ⊓ X = X"). So
+// THIS walk tracks one state per local and joins the way the method body
+// does: a store that happens on EVERY path REPLACES the state, and a store on
+// only SOME path MEETS it with the path that did not store.
 //
 // per §28.3, §28.9, §28.7, §15.3, v0.359
 void MethodOwnership::scanGetterSelfAssignStmts(
         const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
-        std::unordered_map<const ast::Node*, std::uint32_t>& states) {
+        GetterLocalStates& states) {
     for (const auto& s : stmts)
         if (s) scanGetterSelfAssignStmt(*s, states);
 }
 
-// fix #8768: one statement (and its nested statements) of the tracked walk.
-// The walk is `forEachNestedStmt`'s STATEFUL form, so the grammar stays in the
-// one place that owns it; the DEPTH it threads is what tells an unconditional
-// store (depth 0) from a conditional one (a nested scope-introducer).
+// fix #8768: one statement of the tracked walk. Each CONTROL-FLOW construct
+// is walked branch by branch and the branches are MEET (`getterJoinStateMaps`)
+// the way the method body's dataflow meets them at the same join, so the
+// state a local holds after the construct is the state it holds on EVERY
+// path that reaches the following statement.
 void MethodOwnership::scanGetterSelfAssignStmt(
-        const ast::Stmt& s,
-        std::unordered_map<const ast::Node*, std::uint32_t>& states) {
-    forEachNestedStmt(
-        s,
-        [&](const ast::Stmt& cur, const StmtVisitState& st) {
-            if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
-                // A LOCAL DECLARATION: the local's state at its declaration.
-                // A marked initializer (`var x := owned y;`) is a transfer
-                // (Owned); a plain one takes the RHS's producer state (§28.3's
-                // "var x := expr; takes the ownership state of expr"), and a
-                // declaration with no initializer is uninitialized (§28.3).
-                OwnershipState init = OwnershipState::Uninitialized;
-                if (ld->initializer)
-                    init = ld->initializerHasOwnedMarker
-                               ? OwnershipState::Owned
-                               : producerState(*ld->initializer);
-                states[ld] = getterStateBit(init);
-                return;
-            }
-            if (const auto* as =
-                    dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
-                scanGetterSelfAssignAssignment(*as, st.depth, states);
-                return;
-            }
-        },
-        StmtVisitState{});
+        const ast::Stmt& s, GetterLocalStates& states) {
+    // A LOCAL DECLARATION: the local's state at its declaration. A marked
+    // initializer (`var x := owned y;`) is a transfer (Owned); a plain one
+    // takes the RHS's producer state (§28.3's "var x := expr; takes the
+    // ownership state of expr"), and a declaration with no initializer is
+    // uninitialized (§28.3).
+    //
+    // LOCALDECL-ONLY: this walk tracks the `var` locals of ONE accessor body
+    // for the §28.3 self-assignment rule, and §21.1 forbids assigning to a
+    // `const` local ("cannot assign to const local"), so a `const` binding
+    // can never be the TARGET of that rule and its state is never read.
+    if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        OwnershipState init = OwnershipState::Uninitialized;
+        if (ld->initializer)
+            init = ld->initializerHasOwnedMarker
+                       ? OwnershipState::Owned
+                       : producerState(*ld->initializer);
+        states[ld] = init;
+        return;
+    }
+    if (const auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        scanGetterSelfAssignAssignment(*as, states);
+        return;
+    }
+    if (const auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        // K7's MEET over the `if`'s EXITS: the `then` branch, each `elif`
+        // branch, and the `else` branch — or, with no `else`, the
+        // fall-through path, which leaves the state unchanged. Every branch
+        // is walked from the state that entered the `if`.
+        std::vector<GetterLocalStates> branches;
+        {
+            GetterLocalStates branch = states;
+            scanGetterSelfAssignStmts(ifs->ifBranch.body, branch);
+            branches.push_back(std::move(branch));
+        }
+        for (const auto& el : ifs->elifBranches) {
+            GetterLocalStates branch = states;
+            scanGetterSelfAssignStmts(el.body, branch);
+            branches.push_back(std::move(branch));
+        }
+        if (ifs->hasElse) {
+            GetterLocalStates branch = states;
+            scanGetterSelfAssignStmts(ifs->elseBody, branch);
+            branches.push_back(std::move(branch));
+        } else {
+            branches.push_back(states);  // the fall-through path
+        }
+        states = getterMeetBranches(branches);
+        return;
+    }
+    if (const auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        // A loop may run ZERO times, so the loop's exit state is K7's meet of
+        // the state that entered the loop and the body's exit state (the
+        // method body's loop-header join).
+        GetterLocalStates body = states;
+        scanGetterSelfAssignStmts(ws->body, body);
+        getterJoinStateMaps(states, body);
+        return;
+    }
+    if (const auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        GetterLocalStates body = states;
+        scanGetterSelfAssignStmts(fs->body, body);
+        getterJoinStateMaps(states, body);
+        return;
+    }
+    if (const auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        // A `do … end` BLOCK (A.6: "Statement-sequencing block of type `()`")
+        // is NOT a loop: its statements RUN, in order, so a store inside it
+        // is unconditional — it REPLACES the state, exactly as a store at the
+        // body's top level does. (The first attempt at this fix treated every
+        // `do … end` as a scope-introducer and WIDENED the state at its
+        // stores, which over-rejected `do t := null; end;`.)
+        scanGetterSelfAssignStmts(db->body, states);
+        return;
+    }
+    if (const auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        // The try BODY runs; each CATCH arm is an alternative exit (the body
+        // may throw); the FINALLY body runs on every exit, so its stores are
+        // unconditional relative to the try's exit.
+        std::vector<GetterLocalStates> branches;
+        {
+            GetterLocalStates body = states;
+            scanGetterSelfAssignStmts(ts->body, body);
+            branches.push_back(std::move(body));
+        }
+        for (const auto& arm : ts->catches) {
+            if (!arm.body) continue;
+            GetterLocalStates branch = states;
+            scanGetterSelfAssignStmt(*arm.body, branch);
+            branches.push_back(std::move(branch));
+        }
+        states = getterMeetBranches(branches);
+        if (ts->hasFinally)
+            scanGetterSelfAssignStmts(ts->finallyBody, states);
+        return;
+    }
+    if (const auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        // The arms are alternatives; the no-match fall-through edge leaves the
+        // state unchanged — the method body's case-arm join folds the
+        // pre-case snapshot in as a stand-in for that edge.
+        std::vector<GetterLocalStates> branches;
+        for (const auto& arm : cs->arms) {
+            GetterLocalStates branch = states;
+            scanGetterSelfAssignStmts(arm.stmts, branch);
+            branches.push_back(std::move(branch));
+        }
+        branches.push_back(states);  // the no-match fall-through edge
+        states = getterMeetBranches(branches);
+        return;
+    }
+    // SAFETY NET: a statement kind this walk does not know about.
+    // `forEachNestedStmt` owns the statement grammar and every container kind
+    // is handled above, so this visits nothing today; if a new kind brings
+    // nested statements, they are walked as stores on SOME path (the meet),
+    // which can only UNDER-reject.
+    forEachNestedStmt(s, [&](const ast::Stmt& cur) {
+        if (&cur != &s) scanGetterSelfAssignStmt(cur, states);
+    });
 }
 
 // fix #8768: one assignment of the tracked walk — the §28.3 self-assignment
 // check, then the target local's state transition.
 void MethodOwnership::scanGetterSelfAssignAssignment(
-        const ast::AssignmentStmt& as, int depth,
-        std::unordered_map<const ast::Node*, std::uint32_t>& states) {
+        const ast::AssignmentStmt& as, GetterLocalStates& states) {
     const auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as.target.get());
     const sema::Symbol* tsym = tid ? ctx_.exprSymbol(*tid) : nullptr;
     const auto* ls =
@@ -23276,15 +23398,17 @@ void MethodOwnership::scanGetterSelfAssignAssignment(
     auto it = states.find(ld);
     if (it == states.end()) return;  // not a local of THIS body
 
-    // (1) the §28.3 self-assignment rule.
+    // (1) the §28.3 self-assignment rule: the LHS must hold the OWNED state
+    // at this program point. A local in any other state (poly-null, borrowed,
+    // uninitialized, or a mixed merge) is not the rule's case — the method
+    // body answers such a program with a DIFFERENT diagnostic — so the scan
+    // must not claim it.
     bool rejected = false;
     if (as.op == ":=" && !as.valueHasOwnedMarker && !ld->isUsing && as.value) {
         const auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
             lookThroughForceUnwrap(as.value.get()));
         if (rid && ctx_.exprSymbol(*rid) == tsym) {
-            const std::uint32_t mask = it->second;
-            if ((mask & kGetterOwnedStateBit) &&
-                !(mask & kGetterConflictingStateMask)) {
+            if (it->second == OwnershipState::Owned) {
                 // (3-exclusion) a move-only VALUE type keeps §15.3's no-op —
                 // the same exclusion the method-body arm (`handleAssignment`)
                 // and the #7109 getter scan keep.
@@ -23304,16 +23428,11 @@ void MethodOwnership::scanGetterSelfAssignAssignment(
     // reason (#8328), and a second `t := t;` after the first is therefore
     // rejected too.
     if (rejected) return;
-    const OwnershipState next =
+    it->second =
         as.valueHasOwnedMarker
             ? OwnershipState::Owned
             : (as.value ? producerState(*as.value)
                         : OwnershipState::Uninitialized);
-    const std::uint32_t bit = getterStateBit(next);
-    if (depth == 0)
-        it->second = bit;  // unconditional: the local now holds exactly this
-    else
-        it->second |= bit;  // conditional: widen — the other path keeps the old
 }
 
 void MethodOwnership::scanGetterReturnsStmt(const ast::Stmt* s,
