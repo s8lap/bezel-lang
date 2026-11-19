@@ -21830,9 +21830,14 @@ private:
     // treat a SAFE READ of the tracked local inside a lambda body as a borrow
     // when `captureCellFreeNonEscaping` holds for it. Passed true ONLY by the
     // call sites that run collectCellFreeEligible FIRST (the method and
-    // constructor bodies in LlvmBackend_Setup.cpp), because that predicate
-    // reads `cellFreeEligible_`; every other site leaves it false and keeps
-    // the conservative "a capture is an escape" verdict.
+    // constructor bodies in LlvmBackend_Setup.cpp, and — fix #8831 — the
+    // lambda / async-method / async-lambda / iterator / async-iterator /
+    // getter bodies), because that predicate reads `cellFreeEligible_`; every
+    // other site leaves it false and keeps the conservative "a capture is an
+    // escape" verdict. The rule is SAFE only because the predicate's oracle
+    // proves every lambda capturing the local is non-escaping: the closure is
+    // then released BEFORE this body's scope end, so the closure environment's
+    // alias of the backing never outlives the scope-end free.
     void collectBorrowingArrayFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         bool yieldIsBorrowIterYield = false,

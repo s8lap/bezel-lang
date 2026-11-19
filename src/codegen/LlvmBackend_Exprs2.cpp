@@ -4567,14 +4567,29 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // ORDERING: the walk consults `cellFreeEligible_`, so this must run
         // AFTER `collectCellFreeEligible` — the same order the method and
         // constructor venues use (and the order fix #7558 moved
-        // `emitFunctionBody`'s call to). `lambdaCaptureBorrow` is FALSE here:
-        // the tracked local of this pass is a local of THIS lambda's body, and
-        // the conservative "a capture is an escape" rule is what keeps a
-        // captured local out of the eligible set until fix #8831 turns the
-        // predicate on for this venue.
+        // `emitFunctionBody`'s call to).
+        //
+        // fix #8831 (§27.5 / §28.9, v0.359): `lambdaCaptureBorrow` is TRUE at
+        // this venue. The #7558 predicate lets the Array-literal candidates
+        // loop (and the safe-view-alias walk it feeds) treat a SAFE READ of
+        // the tracked local inside a NESTED lambda body as a borrow rather
+        // than an escape, when `captureCellFreeNonEscaping` holds for it —
+        // i.e. when the `collectCellFreeEligible(lam.stmts, &lam)` call above
+        // proved every lambda capturing the local is non-escaping, so the
+        // closure is released before this body's scope end and the env's alias
+        // of the backing never outlives the scope-end free. The predicate was
+        // enabled only for method and constructor bodies; the lambda body was
+        // one of the venues #7558's candidate fix left out (issue #8831).
+        //
+        // The guards are inherited unchanged: the lift covers only a read whose
+        // chain reaches a VALUE COPY (a `string` step is not a copy, and a
+        // receiver read whose result is itself a borrow of the array —
+        // `a.GetEnumerator()`, `a.AsReadOnlySpan()` — is not one), and a
+        // NESTED ASYNC lambda's body is never lifted (its task may run after
+        // the call that started it has returned).
         collectBorrowingArrayFreeEligible(lam.stmts,
                                           /*yieldIsBorrowIterYield=*/false,
-                                          /*lambdaCaptureBorrow=*/false);
+                                          /*lambdaCaptureBorrow=*/true);  // fix #8831
         // fix #8903: key the family to the LAMBDA's own function — the
         // registration sites in `lowerLocalDecl` gate on
         // `currentFn_ == <set>Fn_`, and the body lowers with `currentFn_` ==

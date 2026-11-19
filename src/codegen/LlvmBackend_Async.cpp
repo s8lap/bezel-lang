@@ -1938,7 +1938,35 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // registered in ANY eligibility set, entry or resume). One call
         // populates all five sets; re-pin all five fn keys to resumeFn. Mirrors
         // the closure/unwind/cell re-establishment above. // per §28.9, §28.11
-        collectBorrowingArrayFreeEligible(*ci.stmts);
+        //
+        // fix #8831 (§27.5 / §28.9, v0.359): the #7558 PREDICATE is enabled
+        // here. `lambdaCaptureBorrow` lets the Array-literal candidates loop
+        // (and the safe-view-alias walk it feeds) treat a SAFE READ of the
+        // tracked local inside a lambda body as a borrow rather than an escape,
+        // when `captureCellFreeNonEscaping` holds for it — i.e. when
+        // collectCellFreeEligible (run immediately above, and AFTER
+        // collectClosureReleaseEligible as that pass requires) proved every
+        // lambda capturing the local is non-escaping, so the closure is
+        // released before the owner's scope end and the env's alias of the
+        // backing never outlives the scope-end free. The predicate is FALSE at
+        // every other call site, which is why a method body reclaimed this
+        // shape and an async-method body did not (issue #8831).
+        //
+        // The ORDER is load-bearing and already holds here: the walk consults
+        // `cellFreeEligible_`, so collectBorrowingArrayFreeEligible must run
+        // AFTER collectCellFreeEligible, and `currentFn_` is resumeFn here —
+        // the same function the body lowers in — so the predicate's
+        // `currentFn_ == cellFreeEligibleFn_` guard is satisfied.
+        //
+        // The fix-forward guards of #7558 are inherited unchanged: only a read
+        // whose chain reaches a VALUE COPY is lifted (a `string` step is not a
+        // copy, and a receiver read whose result is itself a borrow of the
+        // array — `a.GetEnumerator()`, `a.AsReadOnlySpan()` — is not one), and
+        // an async lambda's body is never lifted (its task may run after the
+        // call that started it has returned).
+        collectBorrowingArrayFreeEligible(*ci.stmts,
+                                          /*yieldIsBorrowIterYield=*/false,
+                                          /*lambdaCaptureBorrow=*/true);  // fix #8831
         borrowingArrayFreeEligibleFn_ = resumeFn;
         dictMaterializerFreeEligibleFn_ = resumeFn;
         groupingFreeEligibleFn_ = resumeFn;
@@ -2739,8 +2767,27 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         // lambda's async return edge — its backing leaks. Expression-bodied lambdas
         // have no stmts (and no such local); clear the (enclosing method's) set so
         // its entries cannot misapply under this resume fn's key.
+        //
+        // fix #8831 (§27.5 / §28.9, v0.359): the #7558 PREDICATE is enabled
+        // here, exactly as in emitAsyncMethod above: a SAFE READ of the tracked
+        // local inside a nested lambda body is a borrow rather than an escape
+        // when `captureCellFreeNonEscaping` holds for it. The predicate reads
+        // `cellFreeEligible_`, which the collectCellFreeEligible(lam.stmts,
+        // &lam) call above (after collectClosureReleaseEligible, as that pass
+        // requires) has just populated for THIS body, with
+        // `cellFreeEligibleFn_` pinned to resumeFn — the function the body
+        // lowers in — so the predicate's `currentFn_ == cellFreeEligibleFn_`
+        // guard is satisfied.
+        //
+        // The async-lambda body's OWN reads are never lifted: the walker's
+        // `asyncLambdaDepth` guard is what keeps a read inside an async
+        // lambda's body conservative, and the fix-forward guards of #7558 (a
+        // read must reach a VALUE COPY; a `string` step is not a copy) apply
+        // unchanged.
         if (!lam.exprBody)
-            collectBorrowingArrayFreeEligible(lam.stmts);
+            collectBorrowingArrayFreeEligible(lam.stmts,
+                                              /*yieldIsBorrowIterYield=*/false,
+                                              /*lambdaCaptureBorrow=*/true);  // fix #8831
         else {
             borrowingArrayFreeEligible_.clear();
             dictMaterializerFreeEligible_.clear();
@@ -4146,15 +4193,25 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         // soundness argument. `isOwningIter` is already computed above
         // (this same fn, ~L2553) from the SAME retName the TakeCurrent/
         // owning-contract logic reads.
-        collectBorrowingArrayFreeEligible(*ci.stmts, /*yieldIsBorrowIterYield=*/!isOwningIter);
-        borrowingArrayFreeEligibleFn_ = resumeFn;
-        dictMaterializerFreeEligibleFn_ = resumeFn;   // #1028
-        groupingFreeEligibleFn_ = resumeFn;           // #1930
-        dictEntryKeyReleaseEligibleFn_ = resumeFn;    // fix #3720
-        dictEntryValueReleaseEligibleFn_ = resumeFn;    // fix #6470
-        setLiteralFreeEligibleFn_ = resumeFn;         // #2142
-        dictLiteralFreeEligibleFn_ = resumeFn;        // #2143
-        takeCurrentDictFreeEligibleFn_ = resumeFn;    // fix #3880
+        //
+        // fix #8831 (§27.5 / §28.9, v0.359): this CALL MOVED DOWN, to just
+        // after `collectCellFreeEligible(*ci.stmts)` further down, and the
+        // #7558 PREDICATE is enabled here (`lambdaCaptureBorrow` = true).
+        // WHY: the predicate's oracle is `captureCellFreeNonEscaping`, which
+        // reads `cellFreeEligible_` — the set `collectCellFreeEligible`
+        // populates — and requires `currentFn_ == cellFreeEligibleFn_`. At
+        // this site's OLD position that pass had not run yet for this body, so
+        // the oracle could never have held and the #7558 shape leaked in every
+        // async-iterator body (issue #8831). The new position is after that
+        // pass, with `cellFreeEligibleFn_` pinned to resumeFn — the function
+        // the body lowers in.
+        //
+        // NOTHING BETWEEN THE OLD AND THE NEW POSITION READS THE SETS THIS
+        // CALL POPULATES (`collectStringReleaseEligible`,
+        // `collectClosureReleaseEligible` and the box-capture / cell passes
+        // read the string and closure families, not this one); the
+        // registration sites in `lowerLocalDecl` run during the body
+        // emission, i.e. after both positions.
         // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §30.7 (v0.240): the
         // `var` STRING-local refcount analysis must describe the async-ITERATOR
         // resume fn too — the same re-establishment #1896/#1897 made just above
@@ -4261,6 +4318,43 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         collectDefinitelyEscapingLambdas(*ci.stmts);
         // Must run AFTER collectClosureReleaseEligible (uses its result).
         collectCellFreeEligible(*ci.stmts);
+        // fix #8831 (§27.5 / §28.9, v0.359): the borrowing-collection reclaim
+        // eligibility for the ASYNC-ITERATOR resume body, re-established here
+        // (it used to be established ABOVE, before the string and closure
+        // families — see that site's comment for why the call MOVED). Two
+        // changes ride on the move:
+        //
+        //   * the ORDER. The walk consults `cellFreeEligible_`, so it must run
+        //     AFTER `collectCellFreeEligible` — the same order every other
+        //     venue uses, and the order fix #7558 moved `emitFunctionBody`'s
+        //     call to.
+        //   * the PREDICATE. `lambdaCaptureBorrow` = true turns on the #7558
+        //     rule: a SAFE READ of the tracked local inside a lambda body is a
+        //     borrow rather than an escape when `captureCellFreeNonEscaping`
+        //     holds for it — i.e. when the collectCellFreeEligible call just
+        //     above proved every lambda capturing the local is non-escaping,
+        //     so the closure is released before this body's scope end and the
+        //     env's alias of the backing never outlives the scope-end free.
+        //     The predicate was enabled only for method and constructor
+        //     bodies; the async-iterator body was one of the venues #7558's
+        //     candidate fix left out (issue #8831).
+        //
+        // The fix-forward guards of #7558 are inherited unchanged: the lift
+        // covers only a read whose chain reaches a VALUE COPY (a `string` step
+        // is not a copy; a receiver read whose result is itself a borrow of
+        // the array — `a.GetEnumerator()`, `a.AsReadOnlySpan()` — is not one),
+        // and a nested ASYNC lambda's body is never lifted.
+        collectBorrowingArrayFreeEligible(*ci.stmts,
+                                          /*yieldIsBorrowIterYield=*/!isOwningIter,
+                                          /*lambdaCaptureBorrow=*/true);  // fix #8831
+        borrowingArrayFreeEligibleFn_ = resumeFn;
+        dictMaterializerFreeEligibleFn_ = resumeFn;   // #1028
+        groupingFreeEligibleFn_ = resumeFn;           // #1930
+        dictEntryKeyReleaseEligibleFn_ = resumeFn;    // fix #3720
+        dictEntryValueReleaseEligibleFn_ = resumeFn;    // fix #6470
+        setLiteralFreeEligibleFn_ = resumeFn;         // #2142
+        dictLiteralFreeEligibleFn_ = resumeFn;        // #2143
+        takeCurrentDictFreeEligibleFn_ = resumeFn;    // fix #3880
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", resumeFn);
         builder_.SetInsertPoint(entry);
 

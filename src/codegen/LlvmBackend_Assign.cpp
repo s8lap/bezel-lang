@@ -7645,6 +7645,27 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
         getterRetTy->kind == sema::TypeRef::Kind::Function &&
         blockGetterMintsClosureRef(ps ? ps : psKey);
     if (publishGetterReturnType) currentReturnTypeNode_ = pd->type.get();
+    // fix #8831 (§27.5 / §28.9 / §28.11, v0.359): the BORROWING-COLLECTION
+    // reclaim half for THIS getter body — the counterpart of the
+    // `collectBorrowingArrayFreeEligible` call `emitFunctionBody` /
+    // `emitConstructorBody` make for a method / a constructor body. The
+    // scope-end reclaim of a borrowing-`Array<T>` literal local is registered
+    // by `lowerLocalDecl` only when the escape walk proved the local never
+    // escapes, and the registration is gated on `currentFn_ ==
+    // borrowingArrayFreeEligibleFn_` — the function the walk analysed. A
+    // lazily emitted block getter ran NEITHER, so a plain `var a: Array<int>
+    // := [1,2,3];` in a getter body was never reclaimed at the getter's scope
+    // end (the `bz_array_t` header + its data block, 160 B in 2 allocations,
+    // per call — issue #8831's measured 32000 B / 400 allocations over 200
+    // reads).
+    //
+    // The scope is the borrowing twin of `getterClosureScope` below: a getter
+    // is emitted in the MIDDLE of another body, so the enclosing body's sets
+    // and fn tokens must be saved here and restored when control returns —
+    // otherwise the enclosing body's own reclaims would be tested against
+    // THIS getter's verdicts (a leak).
+    std::optional<BorrowingReclaimSetScope> getterBorrowingScope;
+    getterBorrowingScope.emplace(*this);
     if (analyzeGetterClosures) {
         getterClosureScope.emplace(*this);
         savedGetterClosureCapturedCell = closureLocalCapturedCell_;
@@ -7670,6 +7691,56 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
         // Must run AFTER collectClosureReleaseEligible (uses its result).
         collectCellFreeEligible(acc->stmts);
     }
+    // fix #8831 (§27.5 / §28.9 / §28.11, v0.359): the borrowing-collection
+    // reclaim eligibility for THIS getter body, established for EVERY getter
+    // (not only the ones whose closure analysis ran above — the array reclaim
+    // does not depend on the closure analysis).
+    //
+    // ORDERING: the walk consults `cellFreeEligible_`, so this must run AFTER
+    // `collectCellFreeEligible` — the same order the method and constructor
+    // venues use (and the order fix #7558 moved `emitFunctionBody`'s call to).
+    // When the closure analysis DID run, `cellFreeEligible_` holds THIS
+    // getter's verdicts and `cellFreeEligibleFn_` names THIS getter's
+    // function, so the #7558 predicate's `currentFn_ == cellFreeEligibleFn_`
+    // guard is satisfied. Since #8763 the analysis runs for EVERY getter
+    // whose return type resolves (`analyzeGetterClosures` is
+    // `getterRetTy != nullptr`), a FUNCTION-TYPED getter included — so the
+    // predicate is armed there too, and the getter's own array reclaim
+    // follows the same rule a method body's does. When it did NOT run (no
+    // resolved return type), the set still holds the ENCLOSING body's
+    // verdicts under the ENCLOSING body's fn token, so the predicate is
+    // inert there — the conservative verdict, which is the safe direction.
+    //
+    // The #7558 PREDICATE (`lambdaCaptureBorrow` = true) is what makes the
+    // #7558 shape reclaimable: a SAFE READ of the tracked local inside a
+    // lambda body is a borrow rather than an escape when
+    // `captureCellFreeNonEscaping` holds for it — i.e. when
+    // `collectCellFreeEligible` proved every lambda capturing the local is
+    // non-escaping, so the closure is released before the getter's scope end
+    // and the env's alias of the backing never outlives the scope-end free.
+    // The predicate was enabled only for method and constructor bodies; the
+    // getter body was one of the venues #7558's candidate fix left out (issue
+    // #8831).
+    //
+    // The fix-forward guards of #7558 are inherited unchanged: the lift covers
+    // only a read whose chain reaches a VALUE COPY (a `string` step is not a
+    // copy; a receiver read whose result is itself a borrow of the array —
+    // `a.GetEnumerator()`, `a.AsReadOnlySpan()` — is not one), and a nested
+    // ASYNC lambda's body is never lifted.
+    collectBorrowingArrayFreeEligible(acc->stmts,
+                                      /*yieldIsBorrowIterYield=*/false,
+                                      /*lambdaCaptureBorrow=*/true);  // fix #8831
+    // fix #8831: key the family to the GETTER's own function — the
+    // registration sites in `lowerLocalDecl` gate on `currentFn_ == <set>Fn_`,
+    // and the body lowers with `currentFn_` == this getter's `fn`.
+    borrowingArrayFreeEligibleFn_ = fn;
+    dictMaterializerFreeEligibleFn_ = fn;      // #1028
+    groupingFreeEligibleFn_ = fn;              // #1930
+    dictEntryKeyReleaseEligibleFn_ = fn;       // #3720
+    dictEntryValueReleaseEligibleFn_ = fn;     // fix #6470
+    setLiteralFreeEligibleFn_ = fn;            // #2142
+    dictLiteralFreeEligibleFn_ = fn;           // #2143
+    takeCurrentDictFreeEligibleFn_ = fn;       // #3880
 
     // --- Emit body ---
     lowerScopedBlock(acc->stmts);
@@ -7684,6 +7755,11 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
             std::move(savedGetterClosureCapturedCellReassigned);
         getterClosureScope.reset();
     }
+    // fix #8831: restore the ENCLOSING body's borrowing-reclaim sets and fn
+    // tokens — the getter is emitted in the middle of another body, so the
+    // enclosing body's own reclaims must be tested against the enclosing
+    // body's verdicts again once control returns.
+    getterBorrowingScope.reset();
 
     // --- Restore state ---
     thisRecvScope.close();  // fix-forward #8127
@@ -8330,8 +8406,49 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                 // slot face of the block getter, the twin of the standalone
                 // `ensurePropertyBlockGetter` site's #6766 block. The body is
                 // its own function, so the fn tokens are pinned to it.
+                //
+                // fix #8831 (§27.5 / §28.9 / §28.11, v0.359): the
+                // BORROWING-COLLECTION reclaim half for this body, the twin of
+                // the same block at the standalone getter site. The scope is
+                // constructed FIRST so it saves the ENCLOSING body's sets and
+                // fn tokens (this accessor is emitted in the middle of another
+                // body) and restores them when the block ends.
+                BorrowingReclaimSetScope borrowingReclaimScope(*this);
                 AccessorClosureScope accessorClosureScope(*this, blockGet->stmts,
                                                           fn);
+                // fix #8831: the borrowing-collection reclaim eligibility for
+                // THIS accessor body. The ORDER is load-bearing — the walk
+                // consults `cellFreeEligible_`, which the AccessorClosureScope
+                // above has just populated for this body (with
+                // `cellFreeEligibleFn_` pinned to this accessor's own
+                // function), so the call must come after it. The #7558
+                // PREDICATE (`lambdaCaptureBorrow` = true) is what makes the
+                // #7558 shape reclaimable: a SAFE READ of the tracked local
+                // inside a lambda body is a borrow rather than an escape when
+                // `captureCellFreeNonEscaping` holds for it — i.e. when
+                // `collectCellFreeEligible` proved every lambda capturing the
+                // local is non-escaping, so the closure is released before
+                // this body's scope end and the env's alias of the backing
+                // never outlives the scope-end free. The predicate was enabled
+                // only for method and constructor bodies; the accessor bodies
+                // were among the venues #7558's candidate fix left out (issue
+                // #8831). The fix-forward guards of #7558 are inherited
+                // unchanged (the lift covers only a read whose chain reaches a
+                // VALUE COPY; a `string` step is not a copy; a receiver read
+                // whose result is itself a borrow of the array — `a.
+                // GetEnumerator()`, `a.AsReadOnlySpan()` — is not one; a
+                // nested ASYNC lambda's body is never lifted).
+                collectBorrowingArrayFreeEligible(blockGet->stmts,
+                                                  /*yieldIsBorrowIterYield=*/false,
+                                                  /*lambdaCaptureBorrow=*/true);  // fix #8831
+                borrowingArrayFreeEligibleFn_ = fn;
+                dictMaterializerFreeEligibleFn_ = fn;      // #1028
+                groupingFreeEligibleFn_ = fn;              // #1930
+                dictEntryKeyReleaseEligibleFn_ = fn;       // #3720
+                dictEntryValueReleaseEligibleFn_ = fn;     // fix #6470
+                setLiteralFreeEligibleFn_ = fn;            // #2142
+                dictLiteralFreeEligibleFn_ = fn;           // #2143
+                takeCurrentDictFreeEligibleFn_ = fn;       // #3880
                 lowerScopedBlock(blockGet->stmts);
             }
             if (!builder_.GetInsertBlock()->getTerminator())
@@ -8695,7 +8812,33 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
         // analysis for THIS indexer-getter body — the INDEXER spelling of the
         // #6766 block-getter fix in `ensurePropertyBlockGetter`. The body is
         // its own function, so the fn tokens are pinned to it.
+        //
+        // fix #8831 (§27.5 / §28.9 / §28.11, v0.359): the BORROWING-COLLECTION
+        // reclaim half for this body, the twin of the same block at the
+        // standalone getter and at the vtable/itable slot face. The scope is
+        // constructed FIRST so it saves the ENCLOSING body's sets and fn
+        // tokens (this accessor is emitted in the middle of another body) and
+        // restores them when the block ends.
+        BorrowingReclaimSetScope borrowingReclaimScope(*this);
         AccessorClosureScope accessorClosureScope(*this, acc->stmts, fn);
+        // fix #8831: the borrowing-collection reclaim eligibility for THIS
+        // accessor body — see the vtable/itable slot face's site for the full
+        // argument (the ORDER is load-bearing: the walk consults
+        // `cellFreeEligible_`, which the AccessorClosureScope above has just
+        // populated for this body; and the #7558 PREDICATE
+        // (`lambdaCaptureBorrow` = true) is what makes the #7558 shape
+        // reclaimable, with the fix-forward guards inherited unchanged).
+        collectBorrowingArrayFreeEligible(acc->stmts,
+                                          /*yieldIsBorrowIterYield=*/false,
+                                          /*lambdaCaptureBorrow=*/true);  // fix #8831
+        borrowingArrayFreeEligibleFn_ = fn;
+        dictMaterializerFreeEligibleFn_ = fn;      // #1028
+        groupingFreeEligibleFn_ = fn;              // #1930
+        dictEntryKeyReleaseEligibleFn_ = fn;       // #3720
+        dictEntryValueReleaseEligibleFn_ = fn;     // fix #6470
+        setLiteralFreeEligibleFn_ = fn;            // #2142
+        dictLiteralFreeEligibleFn_ = fn;           // #2143
+        takeCurrentDictFreeEligibleFn_ = fn;       // #3880
         lowerScopedBlock(acc->stmts);
     }
     if (!builder_.GetInsertBlock()->getTerminator())

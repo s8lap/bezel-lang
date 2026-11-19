@@ -2622,15 +2622,31 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // pass does not attempt — so the flag stays false there and the
         // pre-existing (leaky-but-safe) conservative-escape treatment is
         // unchanged.
-        collectBorrowingArrayFreeEligible(*ci.stmts, /*yieldIsBorrowIterYield=*/!isOwningIter);
-        borrowingArrayFreeEligibleFn_ = moveNextFn;
-        dictMaterializerFreeEligibleFn_ = moveNextFn;
-        groupingFreeEligibleFn_ = moveNextFn;
-        dictEntryKeyReleaseEligibleFn_ = moveNextFn;  // fix #3720
-        dictEntryValueReleaseEligibleFn_ = moveNextFn;  // fix #6470
-        setLiteralFreeEligibleFn_ = moveNextFn;   // #2142
-        dictLiteralFreeEligibleFn_ = moveNextFn;  // #2143
-        takeCurrentDictFreeEligibleFn_ = moveNextFn;  // fix #3880
+        //
+        // fix #8831 (§27.5 / §28.9, v0.359): this CALL MOVED DOWN, to just
+        // after `collectCellFreeEligible(*ci.stmts)` further down, and the
+        // #7558 PREDICATE is enabled here (`lambdaCaptureBorrow` = true).
+        //
+        // WHY IT MOVED. The predicate's oracle is `captureCellFreeNonEscaping`,
+        // which reads `cellFreeEligible_` — the set `collectCellFreeEligible`
+        // populates — and requires `currentFn_ == cellFreeEligibleFn_`. At
+        // this site's OLD position `collectCellFreeEligible` had not run yet
+        // for this body, so `cellFreeEligible_` still held the ENCLOSING
+        // function's verdicts and `cellFreeEligibleFn_` named a different
+        // function: the predicate could never have held, and the #7558 shape
+        // leaked in every iterator body (issue #8831). The new position is
+        // after that pass (which itself must run after
+        // collectClosureReleaseEligible, as it consumes that pass's result),
+        // with `cellFreeEligibleFn_` pinned to moveNextFn — the function the
+        // body lowers in — so the predicate's fn guard is satisfied.
+        //
+        // NOTHING BETWEEN THE OLD AND THE NEW POSITION READS THE SETS THIS
+        // CALL POPULATES: `collectStringReleaseEligible` and
+        // `collectClosureReleaseEligible` (and the box-capture / cell passes)
+        // read the string and closure families, not this one — MEASURED by
+        // grep over the four collectors' bodies. The registration sites in
+        // `lowerLocalDecl` run during the body emission, i.e. after both
+        // positions.
         // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §29.2 (v0.240): the
         // `var` STRING-local refcount analysis must describe the MOVENEXT fn too
         // — the same re-establishment #1897 made just above for the unwind sets
@@ -2719,7 +2735,45 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         cellFreeEligibleFn_ = moveNextFn;
         collectBoxCaptureLocals(*ci.stmts);
         collectDefinitelyEscapingLambdas(*ci.stmts);
+        // Must run AFTER collectClosureReleaseEligible (uses its result).
         collectCellFreeEligible(*ci.stmts);
+        // fix #8831 (§27.5 / §28.9, v0.359): the borrowing-collection reclaim
+        // eligibility for the MOVENEXT body, re-established here (it used to
+        // be established ABOVE, before the string and closure families — see
+        // that site's comment for why the call MOVED). Two changes ride on
+        // the move:
+        //
+        //   * the ORDER. The walk consults `cellFreeEligible_`, so it must run
+        //     AFTER `collectCellFreeEligible` — the same order every other
+        //     venue uses, and the order fix #7558 moved `emitFunctionBody`'s
+        //     call to.
+        //   * the PREDICATE. `lambdaCaptureBorrow` = true turns on the #7558
+        //     rule: a SAFE READ of the tracked local inside a lambda body is a
+        //     borrow rather than an escape when `captureCellFreeNonEscaping`
+        //     holds for it — i.e. when the collectCellFreeEligible call just
+        //     above proved every lambda capturing the local is non-escaping,
+        //     so the closure is released before this body's scope end and the
+        //     env's alias of the backing never outlives the scope-end free.
+        //     The predicate was enabled only for method and constructor
+        //     bodies; the iterator body was one of the venues #7558's
+        //     candidate fix left out (issue #8831).
+        //
+        // The fix-forward guards of #7558 are inherited unchanged: the lift
+        // covers only a read whose chain reaches a VALUE COPY (a `string` step
+        // is not a copy; a receiver read whose result is itself a borrow of
+        // the array — `a.GetEnumerator()`, `a.AsReadOnlySpan()` — is not one),
+        // and a nested ASYNC lambda's body is never lifted.
+        collectBorrowingArrayFreeEligible(*ci.stmts,
+                                          /*yieldIsBorrowIterYield=*/!isOwningIter,
+                                          /*lambdaCaptureBorrow=*/true);  // fix #8831
+        borrowingArrayFreeEligibleFn_ = moveNextFn;
+        dictMaterializerFreeEligibleFn_ = moveNextFn;
+        groupingFreeEligibleFn_ = moveNextFn;
+        dictEntryKeyReleaseEligibleFn_ = moveNextFn;  // fix #3720
+        dictEntryValueReleaseEligibleFn_ = moveNextFn;  // fix #6470
+        setLiteralFreeEligibleFn_ = moveNextFn;   // #2142
+        dictLiteralFreeEligibleFn_ = moveNextFn;  // #2143
+        takeCurrentDictFreeEligibleFn_ = moveNextFn;  // fix #3880
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", moveNextFn);
         builder_.SetInsertPoint(entry);
 
