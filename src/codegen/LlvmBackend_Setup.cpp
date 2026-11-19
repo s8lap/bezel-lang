@@ -12178,6 +12178,42 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
 
     bool terminated = false;
     if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {
+        // fix #8905 (§27.5 / §28.9, v0.359): open the function-body ROOT
+        // dispose scope around the arrow-body lowering.
+        //
+        // The capture-cell pre-scan above now runs for an arrow body, so the
+        // pre-scan's NON-escaping route fires for a lambda that captures a
+        // parameter and does not escape — and that route registers the
+        // scope-end `boxedCellFree` in `disposeStack_.back()`
+        // (`consumeLastLambdaCapturedCells`). The arrow body had NO scope, so
+        // that write read `.back()` of an EMPTY vector: undefined behaviour,
+        // MEASURED as a `bezelc` SIGSEGV on
+        //
+        //     method Run1(p: int): int    => Apply(lambda() => p + 1);
+        //     method Run1(p: string): int => (lambda() => p.Length)();
+        //     method Show(p: int)          => Console.WriteLine(Apply(lambda() => p + 1));
+        //
+        // (backtrace: consumeLastLambdaCapturedCells <- lowerCallDispatch <-
+        // lowerCall <- lowerExpr <- emitFunctionBody). The block-bodied twin
+        // of each shape has the scope `lowerScopedBlock` opens, so the two
+        // spellings must agree: same pre-scan verdict, same registration,
+        // same scope-end free.
+        //
+        // The scope's disposals are emitted just before the return, in the
+        // ReturnStmt arm's order (`emitAllDisposals(); emitReturn(...)`): the
+        // returned value is computed first, then the in-scope values are
+        // disposed (§28.3), then control leaves.
+        disposeStack_.emplace_back();
+        const std::size_t arrowBodyScopeDepth = disposeStack_.size() - 1;
+        // fix #633 / §33.4: the same root-scope drain `lowerScopedBlock`
+        // performs — Main's args-array disposal is queued in the prolog,
+        // before any scope exists. Draining it here gives the array the same
+        // scope-end free the block body gives it, and keeps the arrow body
+        // from leaving a STALE pending disposal for a later body to pick up.
+        if (pendingArgsDisposal_) {
+            disposeStack_.back().push_back(std::move(*pendingArgsDisposal_));
+            pendingArgsDisposal_.reset();
+        }
         llvm::Value* v = nullptr;
         // fix #6325 (§15.4 *Collection literals*, v0.338): an arrow body whose
         // whole expression is a collection literal lowers against the
@@ -12206,6 +12242,12 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         // ended — skip emitReturn (and boxForTarget, which must not add
         // instructions to a terminated block).
         if (diverged_) {
+            // The body already branched to the unwind/propagate target, and
+            // that edge discharged the scope. Nothing to emit here — the
+            // block is terminated, and emitting into it would give it two
+            // terminators.
+            while (disposeStack_.size() > arrowBodyScopeDepth)
+                disposeStack_.pop_back();
             terminated = true;
         } else {
             // §8.6: box a value-typed `=> expr` result returned through an
@@ -12345,6 +12387,15 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
                     Severity::Warning, ci.exprBody->span.begin,
                     "internal: return-value expression failed to lower to a "
                     "value (degraded to a zero/null return value) — #2491");
+            }
+            // fix #8905 (§27.5 / §28.9, v0.359): dispose the root scope
+            // opened above, THEN return — the ReturnStmt arm's order, so the
+            // returned value reflects pre-disposal state (§28.3). The scopes
+            // are discharged innermost-first, exactly as `lowerScopedBlock`
+            // discharges its own.
+            while (disposeStack_.size() > arrowBodyScopeDepth) {
+                emitDisposals(disposeStack_.back());
+                disposeStack_.pop_back();
             }
             terminated = emitReturn(fn, v);
         }
