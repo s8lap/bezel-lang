@@ -50,6 +50,31 @@
 // Each is RED on 721f6c54c and GREEN with this fix, and each is ADMITTED by
 // the METHOD twin of the same shape (the oracle).
 //
+// ROWS 10-13 are the THIRD fix-forward's rows (the review lane r42-rev-m111
+// REJECTED cbbe641f4+721f6c54c+bd353efee: the getter walk's `case` arm
+// ALWAYS folded the no-match fall-through edge into the join, so a getter
+// whose `case` is EXHAUSTIVE and whose every arm stores null was REJECTED
+// ("cannot self-assign") while the tip admitted it and the METHOD twin — the
+// oracle this walk names — admits it). §19.6: "In statement position, an
+// unmatched value falls through with no action" — with an exhaustive `case`
+// there IS no unmatched value, so there is no no-match edge to fold in. The
+// AST carries the compiler's own exhaustiveness verdict
+// (`CaseStmt::noMatchEdgeStaticallyDead`), and the method body's CFG adds
+// that edge only when the verdict says it is live. ROW 10 is an `int`
+// scrutinee whose arms are a value and a wildcard; ROW 11 a `bool` scrutinee
+// whose arms cover `true` and `false`; ROW 12 a wildcard-only `case`; ROW 13
+// a `case` whose FIRST arm ends in `return` and whose second arm is the
+// wildcard — the diverging arm contributes no state to the join, and the
+// wildcard leaves no no-match edge. Each is RED on bd353efee and GREEN with
+// this fix, and each is ADMITTED by the METHOD twin of the same shape.
+//
+// ROW 14 is the THIRD fix-forward's must-still-REJECT row: a `case` that is
+// NOT exhaustive (an `int` scrutinee with no wildcard) DOES have the
+// no-match fall-through edge, so the pre-case OWNED state is one of the
+// `case`'s exits and the §28.3 state match still applies. The METHOD twin
+// REJECTS it (MEASURED), so the getter twin must reject it too — this row is
+// the control against a fix that drops the no-match edge unconditionally.
+//
 // ROWS 1-3 are red on the base (r30-c1) and green with the fix. ROWS 4-5 are
 // the suite's two boundary controls: they are green on r30-c1 (the base
 // admits them, as it must) and red on the rejected commit — the wrong fix each
@@ -58,7 +83,7 @@
 // never becomes owned, the `try`/`catch` and the nested-lambda spellings of
 // ROW 4) are corpus candidates, not gtest rows.
 //
-// per §28.3, §28.9, §15.3, §28.7, v0.359, #8768
+// per §28.3, §28.9, §19.6, §15.3, §28.7, v0.359, #8768
 
 #include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
@@ -414,6 +439,199 @@ end Program;
     auto r = runAotChecked(src);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ROW 10 — the THIRD fix-forward's row 1: an EXHAUSTIVE `case` over an `int`
+// scrutinee — a value arm and the wildcard arm — whose every arm stores null.
+// §19.6 proves the exhaustiveness ("Any scrutinee — irrefutable arm: some arm
+// is irrefutable — an unguarded `_`"), so the no-match fall-through edge is
+// statically DEAD: there is no unmatched value to fall through with no action.
+// Every path that reaches the self-assignment stored null, so the local is
+// POLY-NULL there and the §28.3 state match does not apply.
+//
+// The METHOD twin of the same shape is ADMITTED (MEASURED) and the rejected
+// bd353efee REJECTED it ("cannot self-assign"), because its getter walk
+// folded the pre-case OWNED state in as the no-match edge whatever the
+// `case`'s exhaustiveness.
+BEZEL_TEST(self_assignment_getter_nested_lambda_nullable_8768,
+           getter_body_case_exhaustive_int_accepted_spec_28_3_v0_359) {
+    std::string src = std::string(kCellCtor) + R"(
+class H
+  public property Item: Cell?
+    get => do
+      var t: Cell? := new Cell(1);
+      var k := 1;
+      case k of
+        1 => t := null,
+        _ => t := null,
+      end case;
+      t := t;
+      return null;
+    end;
+  end Item;
+end H;
+class Program
+  public static method Main(): int
+    var h := new H();
+    if h.Item = null then return 0; end;
+    return 1;
+  end Main;
+end Program;
+)";
+    auto r = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ROW 11 — the THIRD fix-forward's row 2: the same fact with a `bool`
+// scrutinee whose arms cover `true` and `false`. §19.6's "Bool scrutinee:
+// both `true` and `false` are covered" proves the exhaustiveness, so the
+// no-match edge is statically dead. The METHOD twin is ADMITTED (MEASURED);
+// the rejected bd353efee REJECTED it.
+BEZEL_TEST(self_assignment_getter_nested_lambda_nullable_8768,
+           getter_body_case_exhaustive_bool_accepted_spec_28_3_v0_359) {
+    std::string src = std::string(kCellCtor) + R"(
+class H
+  public property Item: Cell?
+    get => do
+      var t: Cell? := new Cell(1);
+      var b := true;
+      case b of
+        true => t := null,
+        false => t := null,
+      end case;
+      t := t;
+      return null;
+    end;
+  end Item;
+end H;
+class Program
+  public static method Main(): int
+    var h := new H();
+    if h.Item = null then return 0; end;
+    return 1;
+  end Main;
+end Program;
+)";
+    auto r = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ROW 12 — the THIRD fix-forward's row 3: a WILDCARD-ONLY `case`. The
+// wildcard is irrefutable, so the `case` matches every value of the
+// scrutinee and the no-match fall-through edge is statically dead. The METHOD
+// twin is ADMITTED (MEASURED); the rejected bd353efee REJECTED it.
+BEZEL_TEST(self_assignment_getter_nested_lambda_nullable_8768,
+           getter_body_case_wildcard_only_accepted_spec_28_3_v0_359) {
+    std::string src = std::string(kCellCtor) + R"(
+class H
+  public property Item: Cell?
+    get => do
+      var t: Cell? := new Cell(1);
+      var k := 1;
+      case k of
+        _ => t := null,
+      end case;
+      t := t;
+      return null;
+    end;
+  end Item;
+end H;
+class Program
+  public static method Main(): int
+    var h := new H();
+    if h.Item = null then return 0; end;
+    return 1;
+  end Main;
+end Program;
+)";
+    auto r = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ROW 13 — the THIRD fix-forward's row 4: a `case` whose FIRST arm ends in
+// `return` and whose second arm is the wildcard. The returning arm leaves
+// the callable, so it never reaches the point after the `case` and its end
+// state (OWNED, it stored `new Cell(4)`) is not an exit of the `case`; and
+// the wildcard leaves no no-match edge. The only exit is the wildcard arm,
+// which stored null, so the local is POLY-NULL at the self-assignment.
+//
+// The scrutinee is 0, so the returning arm does NOT run: the program is
+// leak-free (the owned value the returning arm would abandon is the #8767
+// getter-local disposal family, a pre-existing and separate defect), while
+// the compile-time walk still sees the arm and its divergence.
+BEZEL_TEST(self_assignment_getter_nested_lambda_nullable_8768,
+           getter_body_case_diverging_arm_wildcard_accepted_spec_28_3_v0_359) {
+    std::string src = std::string(kCellCtor) + R"(
+class H
+  public property Item: Cell?
+    get => do
+      var t: Cell? := new Cell(1);
+      var k := 0;
+      case k of
+        1 => do
+          t := new Cell(4);
+          return null;
+        end,
+        _ => t := null,
+      end case;
+      t := t;
+      return null;
+    end;
+  end Item;
+end H;
+class Program
+  public static method Main(): int
+    var h := new H();
+    if h.Item = null then return 0; end;
+    return 1;
+  end Main;
+end Program;
+)";
+    auto r = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ROW 14 — the THIRD fix-forward's must-still-REJECT row: a `case` that is
+// NOT exhaustive. The scrutinee is an `int` and no arm is irrefutable, so
+// §19.6 leaves the no-match fall-through edge LIVE ("an unmatched value
+// falls through with no action") and the pre-case OWNED state is one of the
+// `case`'s exits: the arm that stores null and the fall-through that does not
+// meet at OWNED, so the §28.3 state match applies and the self-assignment is
+// rejected. The METHOD twin REJECTS the same shape (MEASURED), so the getter
+// twin must reject it — this is the control against a fix that drops the
+// no-match edge unconditionally.
+BEZEL_TEST(self_assignment_getter_nested_lambda_nullable_8768,
+           getter_body_case_non_exhaustive_rejected_spec_28_3_v0_359) {
+    std::string src = std::string(kCellCtor) + R"(
+class H
+  public property Item: Cell?
+    get => do
+      var t: Cell? := new Cell(1);
+      var k := 1;
+      case k of
+        1 => t := null,
+        2 => t := null,
+      end case;
+      t := t;
+      return null;
+    end;
+  end Item;
+end H;
+class Program
+  public static method Main(): int
+    var h := new H();
+    if h.Item = null then return 0; end;
+    return 1;
+  end Main;
+end Program;
+)";
+    auto r = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kSelfAssign));
 }
 
 }  // namespace

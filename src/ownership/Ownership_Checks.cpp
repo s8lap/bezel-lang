@@ -23430,6 +23430,23 @@ void MethodOwnership::scanGetterSelfAssignStmt(
         // `return`/`throw` never reaches the point directly after this `case`,
         // so its end state is not an exit of the `case` — the method body's
         // case join excludes it (`armNeverFallsThrough`).
+        //
+        // fix #8768 (fix-forward 3, §19.6, §28.3, §28.9, v0.359): the no-match
+        // fall-through edge exists ONLY when the `case` is not exhaustive. The
+        // AST carries the compiler's own §19.6 exhaustiveness verdict
+        // (`CaseStmt::noMatchEdgeStaticallyDead`, set by `ExprTC::caseArms-
+        // Exhaustive`), and the METHOD body's CFG adds that edge only when the
+        // verdict says the edge is live (`src/flow/CFG.cpp`: `if (!s.noMatch-
+        // EdgeStaticallyDead) cfg_.addEdge(from, merge);`) — the same gate the
+        // lambda-body pre-pass applies at `src/ownership/Ownership.cpp`'s own
+        // case join. Folding the pre-case snapshot in UNCONDITIONALLY kept the
+        // pre-case OWNED state alive at the join, so a getter whose `case` is
+        // exhaustive (a wildcard arm, or every value of a closed value space)
+        // and whose every arm stores null was REJECTED ("cannot self-assign")
+        // while the tip admitted it and the METHOD twin — the oracle this walk
+        // names — admits it. §19.6: "In statement position, an unmatched value
+        // falls through with no action" — with an exhaustive `case` there IS no
+        // unmatched value, so there is no such edge to join.
         std::vector<GetterLocalStates> branches;
         for (const auto& arm : cs->arms) {
             GetterLocalStates branch = states;
@@ -23437,7 +23454,15 @@ void MethodOwnership::scanGetterSelfAssignStmt(
             if (!armNeverFallsThrough(arm.stmts))
                 branches.push_back(std::move(branch));
         }
-        branches.push_back(states);  // the no-match fall-through edge
+        if (!cs->noMatchEdgeStaticallyDead)
+            branches.push_back(states);  // the no-match fall-through edge
+        if (branches.empty()) {
+            // EVERY arm leaves the callable and the no-match edge is dead:
+            // the code after this `case` is UNREACHABLE. The method body's own
+            // case join falls back to the pre-case snapshot in that case; and
+            // `states` still holds exactly that snapshot here.
+            return;
+        }
         states = getterMeetBranches(branches);
         return;
     }
