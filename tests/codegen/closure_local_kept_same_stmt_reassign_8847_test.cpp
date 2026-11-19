@@ -42,6 +42,18 @@
 // kept when that exception leaves the frame and the scope-end release must
 // still run there. The last row below is that shape: it is GREEN on the base
 // (a control) and RED under a join that ignores the order.
+//
+// THE PATH-SENSITIVE RULE (this fix-forward). EVERY node the spec says can
+// raise is a raise point — not only the calls: §6.1 (v0.359) checked `+ - *
+// / mod` and unary `-`, §7.8 / §17.8 (v0.359) `x!`, §17.12 (v0.359) a
+// `throw` expression, §18.5 (v0.359) an interpolation hole's `ToString()`,
+// §25 (v0.359) a user-defined operator, §23.3 (v0.359) a property read
+// (including a bare implicit-`this` one). And the keep must be reached on
+// EVERY path: a short-circuit (`and` / `or` / `??`) or an unselected branch
+// that skips it is a decline too. The last three rows below are the
+// MUST-NOT-LEAK rows for that rule — each leaks 15200 B (16800 B for the
+// property row) under a join that ignores it, so LeakSanitizer is ON and the
+// leak IS the failure.
 
 #include <string>
 
@@ -117,6 +129,59 @@ public class C
   end Main;
 end C;
 )BZL";
+}
+
+// The program for the MUST-NOT-LEAK rows: the operation that raises is
+// evaluated BEFORE the keep, in the SAME statement, so the value is NOT kept
+// when the exception leaves `Fill` — and the scope-end release must still run
+// there. The frame's reference is then the closure's only one, so the
+// program must leak NOTHING: LeakSanitizer is ON (`runAotChecked`).
+std::string leakOracleProgram(const std::string& fillBody) {
+    return R"BZL(
+module M;
+type Fn := (int, int) -> int;
+public class C
+  public static method Mk(k: int): Fn
+    throw new InvalidOperationException("x");
+  end Mk;
+  public static method Fill(d: Dictionary<int, Fn>, k: int, z: int, n: int?, flag: bool)
+    var g: Fn := lambda(x: int, y: int) => 0;
+    var b: Fn := lambda(x: int, y: int) => x - y + k;
+)BZL" + fillBody + R"BZL(
+  end Fill;
+  public static method Main(): int
+    for var i in 0..<200 do
+      var d: Dictionary<int, Fn> := new Dictionary<int, Fn>();
+      try
+        Fill(d, i, 0, null, false);
+      catch
+        var e: Exception => do var z := 0; end
+      end try;
+    end for;
+    Console.WriteLine("DONE");
+    return 0;
+  end Main;
+end C;
+)BZL";
+}
+
+// The LEAK ORACLE: the program must exit 0, print "DONE", and leak nothing.
+// LeakSanitizer makes a leak a non-zero exit, so `exitCode == 0` IS the
+// leak assertion.
+void expectNoLeak(const std::string& prog) {
+    auto r = runAotChecked(prog);
+    if (!r.ran || r.exitCode != 0 || r.stdoutText != "DONE\n") {
+        std::cout << "    expected exit 0 and \"DONE\" (LeakSanitizer on, so "
+                     "a leak is a non-zero exit); ran="
+                  << (r.ran ? "yes" : "no")
+                  << " exit=" << r.exitCode << " out=\""
+                  << r.stdoutText.substr(0, 120) << "\"\n";
+        for (const auto& d : r.diagnostics.diagnostics())
+            std::cout << "    diagnostic: " << d.message.substr(0, 600) << "\n";
+    }
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "DONE\n");
 }
 
 }  // namespace
@@ -210,4 +275,47 @@ end C;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "DONE\n");
+}
+
+// ---------------------------------------------------------------------------
+// THE MUST-NOT-LEAK ROWS (fix-forward #8847). A raise evaluated BEFORE the
+// keep — or a path that SKIPS the keep — leaves the value NOT kept, so the
+// scope-end release must still run on the unwind edge. A join that ignores
+// this marks the local kept there and leaks the closure: MEASURED 15200 B in
+// 600 allocations over the 200 iterations (16800 B for the property row).
+// LeakSanitizer is ON in every row below, so the leak IS the failure.
+// ---------------------------------------------------------------------------
+
+// §6.1 (v0.359): "Division and `mod` raise `DivideByZeroException` when the
+// right operand is zero." The division is the LEFT operand of the `and`, so
+// it is evaluated BEFORE `d.TryAdd(0, b)` stores anything (§22.5, v0.359:
+// call-site textual order; §17.1, v0.359: the operators are left-to-right
+// associative). The closure is therefore not kept when the exception leaves
+// `Fill`, and the scope-end release must run there.
+BEZEL_TEST(closure_local_kept_same_stmt_reassign_8847,
+           divide_by_zero_before_the_keep_in_the_same_statement_spec_6_1) {
+    expectNoLeak(leakOracleProgram(
+        "    b := (if 10 / z > 0 and d.TryAdd(0, b) then g else g);\n"));
+}
+
+// §7.8 / §17.8 (v0.359): "`x!` asserts non-nullness. If `x` is null at
+// runtime, `NullReferenceException` is raised." The null-forgiving operator
+// is evaluated BEFORE the keep, so the value is not kept when the exception
+// leaves `Fill`.
+BEZEL_TEST(closure_local_kept_same_stmt_reassign_8847,
+           null_forgiving_bang_before_the_keep_in_the_same_statement_spec_17_8) {
+    expectNoLeak(leakOracleProgram(
+        "    b := (if n! > 0 and d.TryAdd(0, b) then g else g);\n"));
+}
+
+// §17.2 (v0.359): "`and` and `or` short-circuit: the right operand is not
+// evaluated if the result is determined by the left." `flag` is FALSE, so the
+// keep `d.TryAdd(0, b)` is SKIPPED, and the `else` branch's `Mk(1)` raises.
+// The value is not kept when the exception leaves `Fill` — the frame's
+// reference is the closure's only one, so the scope-end release must run
+// there and the program must leak nothing.
+BEZEL_TEST(closure_local_kept_same_stmt_reassign_8847,
+           short_circuit_skips_the_keep_before_the_raise_spec_17_2) {
+    expectNoLeak(leakOracleProgram(
+        "    b := (if flag and d.TryAdd(0, b) then g else Mk(1));\n"));
 }

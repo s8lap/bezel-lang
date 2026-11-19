@@ -43035,169 +43035,701 @@ void Emitter::collectCapturedCellClosureLocals(
 }
 
 
-// fix-forward #8847 (§17.1 / §22.5, v0.359): the FIRST invocation a
-// statement evaluates, in evaluation order.
+// fix-forward #8847 (§6.1 / §6.4 / §7.6 / §7.8 / §17.2 / §17.8 / §17.12
+// / §18.5 / §19.3 / §22.5 / §23.3 / §25, v0.359): the ORDER-AWARE guard on
+// the kept-state join into an unwind edge — PATH-SENSITIVELY.
 //
-// §22.5 (v0.359) "Evaluation order": "A call's supplied argument expressions
-// are evaluated in call-site textual order — left to right as written, for
-// positional and named arguments alike; naming an argument changes which
-// parameter it binds to, never when it runs". §17.1 (v0.359) gives the
-// operators left-to-right associativity. A node's OWN evaluation — the call,
-// the constructor, a property getter, an indexer — happens AFTER the
-// expressions it reads, so the walk registers a node after its children: the
-// arguments of `d.TryAdd(Key(k), b)` run before the `TryAdd` call itself, so
-// `Key(k)` is the FIRST invocation of that statement and `TryAdd` is not.
+// The kept state may reach an unwind edge only for a raise that happens
+// AFTER the keep: §22.5 (v0.359) "Evaluation order" puts a call's arguments
+// in call-site textual order, and §17.1 (v0.359) gives the operators
+// left-to-right associativity. A raise from an operation evaluated BEFORE
+// the keep leaves the value NOT kept (`b := (if d.TryAdd(Key(k), b) then g
+// else g);` — `Key(k)` raises before `TryAdd` stores anything), so the
+// scope-end release must still run there.
 //
-// The walk is CONSERVATIVE in the direction that matters: an expression shape
-// it does not model sets `unknown`, and the caller then answers "the first
-// invocation is not the keep" — the direction that can only cost the #8847
-// fix (the scope-end release still runs on the unwind edge, so a kept closure
-// the collection holds may dangle) and never ADD a leak (a keep the analysis
-// does not join leaks nothing).
+// THE QUESTION. For a statement that keeps a local, the join may happen only
+// if EVERY path that raises out of the statement has ALREADY performed the
+// keep, AND the keep is performed on every path that COMPLETES the
+// statement. The second half is what makes a short-circuit (`and` / `or` /
+// `??`) or an unselected branch that SKIPS the keep a decline: the value is
+// not kept on that path at all, so marking it kept on an unwind edge would
+// leak it. The answer is per STATEMENT, because the scope-end release's
+// unwind decision is one boolean per local.
+//
+// THE ANALYSIS is a path-sensitive walk over the statement's expressions.
+// EVERY node the spec says can raise is a RAISE POINT — not only the nodes
+// that are calls:
+//   * §6.1 (v0.359): `+`, `-`, `*`, `/`, `mod` and unary `-` on integer
+//     types are CHECKED for overflow (`OverflowException`), and division
+//     and `mod` raise `DivideByZeroException`; §6.4 (v0.359) gives
+//     `decimal` the same two faults.
+//   * §7.8 / §17.8 (v0.359): `x!` raises `NullReferenceException` when `x`
+//     is null at runtime.
+//   * §17.12 (v0.359): a `throw` EXPRESSION raises the supplied exception.
+//   * §18.5 (v0.359): an interpolation hole renders through `ToString()`,
+//     which can raise.
+//   * §25 (v0.359): a user-defined operator is a METHOD, and a method can
+//     raise.
+//   * §23.3 (v0.359): a property read runs its getter, which can raise —
+//     including a bare implicit-`this` property read.
+//   * a call, a constructor, an indexer and `await` (as before).
+// The walk is CONSERVATIVE in the direction that matters: an expression
+// shape it does not model sets `unknown`, and the caller then declines the
+// join — the direction that can only cost the #8847 fix (the scope-end
+// release still runs on the unwind edge, so a kept closure the collection
+// holds may dangle) and never ADD a leak (a keep the analysis does not join
+// leaks nothing).
 namespace {
 
-struct FirstInvocation {
-    const ast::Expr* node = nullptr;
+// The keep's reach along the path being analysed.
+struct KeepReach {
+    // The keep has been performed on EVERY path that reaches this point.
+    bool must = false;
+    // The keep has been performed on SOME path that reaches this point.
+    bool may = false;
+};
+
+// What an expression contributes: the keep it performs, and whether it can
+// raise while the keep is NOT performed.
+struct Eff {
+    // The expression performs the keep on EVERY path that completes it.
+    bool ownMust = false;
+    // The expression performs the keep on SOME path that completes it.
+    bool ownMay = false;
+    // The expression can raise on a path where the keep is NOT performed.
+    bool raiseUnkept = false;
+    // An expression or statement shape this walk does not model.
     bool unknown = false;
 };
 
-void firstInvocationInExpr(const ast::Expr* e, const sema::SemaContext& ctx,
-                            FirstInvocation& out);
+// The invocations that keep the local, in the statement under analysis.
+using KeepSites = std::vector<const ast::Expr*>;
 
-void firstInvocationInStmt(const ast::Stmt* s, const sema::SemaContext& ctx,
-                            FirstInvocation& out);
+// The context the order walk needs: the sema context (for a property read's
+// getter and for an operand's type) and the statement's keep sites.
+struct OrderCtx {
+    const sema::SemaContext* sema = nullptr;
+    const KeepSites* keeps = nullptr;
+    bool isKeep(const ast::Expr* e) const {
+        if (!keeps) return false;
+        for (const ast::Expr* k : *keeps)
+            if (k == e) return true;
+        return false;
+    }
+};
 
-void firstInvocationInStmts(
-    const std::vector<std::unique_ptr<ast::Stmt>>& v,
-    const sema::SemaContext& ctx, FirstInvocation& out) {
-    for (const auto& s : v) firstInvocationInStmt(s.get(), ctx, out);
+// Fold an effect into the accumulated reach: the keep it performed is
+// reached on the paths that completed it.
+inline void absorb(KeepReach& r, const Eff& e) {
+    r.must = r.must || e.ownMust;
+    r.may = r.may || e.ownMay;
 }
 
-// A PROPERTY read runs its getter, and §19.5 (v0.359) says a getter that
-// throws propagates out of the `case` construct — so a property read is an
-// invocation. A method reference (`d.TryAdd` used as a callee) runs nothing.
+// The keep a node's CHILDREN contribute. The children of a node run in
+// sequence, and the keep is performed on every completing path of the
+// sequence iff one of them performs it on every path of its own (the others
+// then cover the paths it misses).
+struct OwnFold {
+    bool must = false;
+    bool may = false;
+    void add(const Eff& e) {
+        must = must || e.ownMust;
+        may = may || e.ownMay;
+    }
+};
+
+// §6.1 (v0.359): the integer types, whose arithmetic is CHECKED for
+// overflow; §6.4 (v0.359): `decimal`, whose arithmetic raises
+// `OverflowException` and `DivideByZeroException` too. A `float` /
+// `double` operation overflows to ±Infinity instead (§6.3), so it is not
+// checked and does not raise.
+bool isCheckedNumeric(const sema::TypeRef* t) {
+    if (!t || t->kind != sema::TypeRef::Kind::Primitive) return false;
+    switch (t->primitive) {
+    case sema::PrimitiveType::Byte:
+    case sema::PrimitiveType::SByte:
+    case sema::PrimitiveType::Short:
+    case sema::PrimitiveType::UShort:
+    case sema::PrimitiveType::Int:
+    case sema::PrimitiveType::UInt:
+    case sema::PrimitiveType::Long:
+    case sema::PrimitiveType::ULong:
+    case sema::PrimitiveType::Decimal:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// §25 (v0.359): a user-defined operator is a METHOD, so an operator over a
+// user-declared type can raise. A primitive operand is a built-in operator.
+bool isUserOperatorOperand(const sema::TypeRef* t) {
+    return t && t->kind == sema::TypeRef::Kind::Named &&
+           t->declaration != nullptr;
+}
+
+// Can this binary operator raise? §6.1 / §6.4 (the checked arithmetic) and
+// §25 (a user-defined operator is a method).
+bool binaryCanRaise(const ast::BinaryExpr* b, const sema::SemaContext& ctx) {
+    const sema::TypeRef* lt = ctx.exprType(*b->left);
+    const sema::TypeRef* rt = ctx.exprType(*b->right);
+    // An operand with no recorded type: the operator's kind is unknown, so
+    // assume it can raise (the conservative direction).
+    if (!lt || !rt) return true;
+    if (isUserOperatorOperand(lt) || isUserOperatorOperand(rt)) return true;
+    const std::string_view op = b->op;
+    if (op == "+" || op == "-" || op == "*" || op == "/" || op == "mod")
+        return isCheckedNumeric(lt) || isCheckedNumeric(rt);
+    return false;
+}
+
+// A PROPERTY read runs its getter, and §19.3 (v0.359) says a getter that
+// throws propagates out of the `case` construct — so a property read can
+// raise. A method reference (`d.TryAdd` used as a callee) runs nothing.
 template <typename M>
 bool isPropertyRead(const M& m, const sema::SemaContext& ctx) {
     return dynamic_cast<const sema::PropertySymbol*>(ctx.exprSymbol(m)) !=
            nullptr;
 }
 
-void firstInvocationInExpr(const ast::Expr* e, const sema::SemaContext& ctx,
-                            FirstInvocation& out) {
-    if (!e || out.node || out.unknown) return;
-    if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
-        firstInvocationInExpr(c->callee.get(), ctx, out);
-        for (const auto& a : c->args)
-            firstInvocationInExpr(a.value.get(), ctx, out);
-        if (!out.node && !out.unknown) out.node = e;
-        return;
+// A literal expression runs no user code, so it cannot raise.
+bool isLiteralExpr(const ast::Expr* e) {
+    return e && (dynamic_cast<const ast::IntLiteralExpr*>(e) ||
+                 dynamic_cast<const ast::FloatLiteralExpr*>(e) ||
+                 dynamic_cast<const ast::CharLiteralExpr*>(e) ||
+                 dynamic_cast<const ast::StringLiteralExpr*>(e) ||
+                 dynamic_cast<const ast::VerbatimStringExpr*>(e) ||
+                 dynamic_cast<const ast::BoolLiteralExpr*>(e) ||
+                 dynamic_cast<const ast::NullLiteralExpr*>(e));
+}
+
+// A PATTERN that runs a getter. §19.3 (v0.359): a destructuring pattern
+// reads the matched value's components, and a CLASS slot is "a public
+// readable instance property, stored or computed" — so the read runs the
+// getter, and a getter that throws propagates out of the `case` construct.
+// A discard, a binding, a constant, a type and a name pattern read nothing.
+bool patternCanRaise(const ast::Pattern* p) {
+    if (!p) return false;
+    if (dynamic_cast<const ast::DestructuringPattern*>(p)) return true;
+    if (auto* a = dynamic_cast<const ast::AltPattern*>(p)) {
+        for (const auto& m : a->members)
+            if (patternCanRaise(m.get())) return true;
+        return false;
     }
-    if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
-        firstInvocationInExpr(c->callee.get(), ctx, out);
-        for (const auto& a : c->args)
-            firstInvocationInExpr(a.value.get(), ctx, out);
-        if (!out.node && !out.unknown) out.node = e;
-        return;
+    // A relational or range pattern's bound is an EXPRESSION, evaluated when
+    // the pattern is tested; a literal bound runs nothing.
+    if (auto* rp = dynamic_cast<const ast::RelOpPattern*>(p))
+        return !isLiteralExpr(rp->expr.get());
+    if (auto* rg = dynamic_cast<const ast::RangePattern*>(p))
+        return !isLiteralExpr(rg->rangeExpr.get());
+    return false;
+}
+
+Eff effExpr(const ast::Expr* e, const KeepReach& in, const OrderCtx& c);
+Eff effStmt(const ast::Stmt* s, const KeepReach& in, const OrderCtx& c);
+
+// A statement list: the statements run in order (§1.6).
+Eff effStmts(const std::vector<std::unique_ptr<ast::Stmt>>& v,
+             const KeepReach& in, const OrderCtx& c) {
+    Eff agg;
+    KeepReach r = in;
+    OwnFold own;
+    for (const auto& s : v) {
+        Eff e = effStmt(s.get(), r, c);
+        agg.raiseUnkept |= e.raiseUnkept;
+        agg.unknown |= e.unknown;
+        own.add(e);
+        absorb(r, e);
+    }
+    agg.ownMust = own.must;
+    agg.ownMay = own.may;
+    return agg;
+}
+
+// The alternatives of an `if` statement: `if c1 then B1 elif c2 then B2
+// ... else BE`. At most ONE body runs (§20), so the keep is performed on
+// every path only if the condition performs it or EVERY alternative does.
+Eff effIfChain(const ast::IfStmt* s, size_t i, const KeepReach& in,
+                const OrderCtx& c) {
+    if (i == 0) {
+        Eff ce = effExpr(s->ifBranch.condition.get(), in, c);
+        KeepReach r = in;
+        absorb(r, ce);
+        Eff be = effStmts(s->ifBranch.body, r, c);
+        Eff rest = effIfChain(s, 1, r, c);
+        Eff agg;
+        agg.raiseUnkept = ce.raiseUnkept || be.raiseUnkept || rest.raiseUnkept;
+        agg.unknown = ce.unknown || be.unknown || rest.unknown;
+        agg.ownMust = ce.ownMust || (be.ownMust && rest.ownMust);
+        agg.ownMay = ce.ownMay || be.ownMay || rest.ownMay;
+        return agg;
+    }
+    const size_t ei = i - 1;
+    if (ei < s->elifBranches.size()) {
+        const ast::IfStmt::Branch& br = s->elifBranches[ei];
+        Eff ce = effExpr(br.condition.get(), in, c);
+        KeepReach r = in;
+        absorb(r, ce);
+        Eff be = effStmts(br.body, r, c);
+        Eff rest = effIfChain(s, i + 1, r, c);
+        Eff agg;
+        agg.raiseUnkept = ce.raiseUnkept || be.raiseUnkept || rest.raiseUnkept;
+        agg.unknown = ce.unknown || be.unknown || rest.unknown;
+        agg.ownMust = ce.ownMust || (be.ownMust && rest.ownMust);
+        agg.ownMay = ce.ownMay || be.ownMay || rest.ownMay;
+        return agg;
+    }
+    return effStmts(s->elseBody, in, c);
+}
+
+// A PATTERN that matches ANY value — `_` or an untyped `var x` — so the
+// `case`'s no-match edge is dead for it.
+bool patternIsCatchAll(const ast::Pattern* p) {
+    if (!p) return false;
+    if (dynamic_cast<const ast::DiscardPattern*>(p)) return true;
+    if (auto* b = dynamic_cast<const ast::BindingPattern*>(p))
+        return b->type == nullptr;
+    return false;
+}
+
+// The arms of a `case`: the pattern is matched, then the guard, then the
+// body; the next arm is tried only if this one did not match. Every arm's
+// paths are disjoint, so the keep must be performed on EVERY arm's paths:
+// the arms' contributions are ANDed, not ORed.
+Eff effCaseArms(const std::vector<ast::CaseArm>& arms, size_t i,
+                const KeepReach& in, const OrderCtx& c, bool noMatchLive) {
+    if (i >= arms.size()) {
+        // The no-match edge: §19.6 (v0.359) makes an expression-position
+        // `case` raise MatchFailureException, and a statement-position one
+        // FALL THROUGH (the caller passes `noMatchLive` for the reachable
+        // edge and treats it as a raise — the conservative direction). No
+        // arm's body ran there. The caller passes a reach of the state
+        // BEFORE the scrutinee's own keep, so the edge is unkept whenever
+        // the keep was in an arm.
+        Eff agg;
+        if (noMatchLive) agg.raiseUnkept |= !in.must;
+        agg.ownMust = true;
+        return agg;
+    }
+    const ast::CaseArm& a = arms[i];
+    Eff agg;
+    KeepReach r = in;
+    // The arm's PATTERN is matched first: a destructuring pattern reads the
+    // matched value's components (§19.3), which runs a getter.
+    if (patternCanRaise(a.pattern.get())) agg.raiseUnkept |= !r.must;
+    Eff ge;
+    if (a.guard) {
+        ge = effExpr(a.guard.get(), r, c);
+        agg.raiseUnkept |= ge.raiseUnkept;
+        agg.unknown |= ge.unknown;
+        absorb(r, ge);
+    }
+    Eff be;
+    if (a.bodyKind == ast::CaseArmBodyKind::Expression)
+        be = effExpr(a.exprBody.get(), r, c);
+    else
+        be = effStmts(a.stmts, r, c);
+    agg.raiseUnkept |= be.raiseUnkept;
+    agg.unknown |= be.unknown;
+    // The next arm is tried only if this one did not match; it is reached
+    // with the state BEFORE this arm's guard ran (the pattern did not
+    // match), which is the conservative reach for its own raises.
+    Eff rest = effCaseArms(arms, i + 1, in, c, noMatchLive);
+    agg.raiseUnkept |= rest.raiseUnkept;
+    agg.unknown |= rest.unknown;
+    agg.ownMust = (ge.ownMust || be.ownMust) && rest.ownMust;
+    agg.ownMay = ge.ownMay || be.ownMay || rest.ownMay;
+    return agg;
+}
+
+Eff effExpr(const ast::Expr* e, const KeepReach& in, const OrderCtx& c) {
+    if (!e) return Eff{};
+    const sema::SemaContext& ctx = *c.sema;
+
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(e)) {
+        Eff agg;
+        KeepReach r = in;
+        OwnFold own;
+        Eff ce = effExpr(call->callee.get(), r, c);
+        agg.raiseUnkept |= ce.raiseUnkept;
+        agg.unknown |= ce.unknown;
+        own.add(ce);
+        absorb(r, ce);
+        // §22.5 (v0.359) "Evaluation order": the arguments run in call-site
+        // textual order, before the call itself.
+        for (const auto& a : call->args) {
+            Eff ae = effExpr(a.value.get(), r, c);
+            agg.raiseUnkept |= ae.raiseUnkept;
+            agg.unknown |= ae.unknown;
+            own.add(ae);
+            absorb(r, ae);
+        }
+        if (c.isKeep(e)) {
+            // The keep happens AT the call: the callee holds the local's
+            // value, so a raise inside the call is AFTER the keep.
+            agg.ownMust = true;
+            agg.ownMay = true;
+        } else {
+            // A call is a method, and a method can raise.
+            agg.raiseUnkept |= !r.must;
+        }
+        agg.ownMust = agg.ownMust || own.must;
+        agg.ownMay = agg.ownMay || own.may;
+        return agg;
+    }
+    if (auto* call = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        // §7.6 (v0.359): `?(...)` short-circuits — the call runs only when
+        // the receiver is not null, so a keep it performs is not certain.
+        Eff agg;
+        KeepReach r = in;
+        OwnFold own;
+        Eff ce = effExpr(call->callee.get(), r, c);
+        agg.raiseUnkept |= ce.raiseUnkept;
+        agg.unknown |= ce.unknown;
+        own.add(ce);
+        absorb(r, ce);
+        for (const auto& a : call->args) {
+            Eff ae = effExpr(a.value.get(), r, c);
+            agg.raiseUnkept |= ae.raiseUnkept;
+            agg.unknown |= ae.unknown;
+            own.add(ae);
+            absorb(r, ae);
+        }
+        if (c.isKeep(e)) {
+            agg.ownMay = true;
+        } else {
+            agg.raiseUnkept |= !r.must;
+        }
+        agg.ownMust = agg.ownMust || own.must;
+        agg.ownMay = agg.ownMay || own.may;
+        return agg;
     }
     if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
-        for (const auto& a : n->args)
-            firstInvocationInExpr(a.value.get(), ctx, out);
-        if (!out.node && !out.unknown) out.node = e;
-        return;
+        Eff agg;
+        KeepReach r = in;
+        OwnFold own;
+        for (const auto& a : n->args) {
+            Eff ae = effExpr(a.value.get(), r, c);
+            agg.raiseUnkept |= ae.raiseUnkept;
+            agg.unknown |= ae.unknown;
+            own.add(ae);
+            absorb(r, ae);
+        }
+        if (c.isKeep(e)) {
+            agg.ownMust = true;
+            agg.ownMay = true;
+        } else {
+            // A constructor can raise.
+            agg.raiseUnkept |= !r.must;
+        }
+        agg.ownMust = agg.ownMust || own.must;
+        agg.ownMay = agg.ownMay || own.may;
+        return agg;
     }
     if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
-        firstInvocationInExpr(m->target.get(), ctx, out);
-        if (!out.node && !out.unknown && isPropertyRead(*m, ctx)) out.node = e;
-        return;
+        Eff agg;
+        KeepReach r = in;
+        Eff te = effExpr(m->target.get(), r, c);
+        agg.raiseUnkept |= te.raiseUnkept;
+        agg.unknown |= te.unknown;
+        absorb(r, te);
+        // A PROPERTY read runs its getter (§23.3), which can raise.
+        if (isPropertyRead(*m, ctx)) agg.raiseUnkept |= !r.must;
+        agg.ownMust = te.ownMust;
+        agg.ownMay = te.ownMay;
+        return agg;
     }
     if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
-        firstInvocationInExpr(m->target.get(), ctx, out);
-        if (!out.node && !out.unknown && isPropertyRead(*m, ctx)) out.node = e;
-        return;
+        // §7.5 (v0.359): `?.` short-circuits — the getter runs only when
+        // the receiver is not null.
+        Eff agg;
+        KeepReach r = in;
+        Eff te = effExpr(m->target.get(), r, c);
+        agg.raiseUnkept |= te.raiseUnkept;
+        agg.unknown |= te.unknown;
+        absorb(r, te);
+        if (isPropertyRead(*m, ctx)) agg.raiseUnkept |= !r.must;
+        agg.ownMust = te.ownMust;
+        agg.ownMay = te.ownMay;
+        return agg;
     }
     if (auto* i = dynamic_cast<const ast::IndexExpr*>(e)) {
-        firstInvocationInExpr(i->target.get(), ctx, out);
-        for (const auto& a : i->indices)
-            firstInvocationInExpr(a.value.get(), ctx, out);
-        // An indexer GETTER runs at the read (§23.3).
-        if (!out.node && !out.unknown) out.node = e;
-        return;
+        Eff agg;
+        KeepReach r = in;
+        OwnFold own;
+        Eff te = effExpr(i->target.get(), r, c);
+        agg.raiseUnkept |= te.raiseUnkept;
+        agg.unknown |= te.unknown;
+        own.add(te);
+        absorb(r, te);
+        for (const auto& a : i->indices) {
+            Eff ae = effExpr(a.value.get(), r, c);
+            agg.raiseUnkept |= ae.raiseUnkept;
+            agg.unknown |= ae.unknown;
+            own.add(ae);
+            absorb(r, ae);
+        }
+        // An indexer GETTER runs at the read (§23.3), and an index can be
+        // out of range.
+        agg.raiseUnkept |= !r.must;
+        agg.ownMust = own.must;
+        agg.ownMay = own.may;
+        return agg;
     }
     if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
-        firstInvocationInExpr(p->operand.get(), ctx, out);
-        return;
+        Eff agg;
+        KeepReach r = in;
+        Eff oe = effExpr(p->operand.get(), r, c);
+        agg.raiseUnkept |= oe.raiseUnkept;
+        agg.unknown |= oe.unknown;
+        absorb(r, oe);
+        // §7.8 / §17.8 (v0.359): `x!` raises `NullReferenceException` when
+        // `x` is null at runtime.
+        agg.raiseUnkept |= !r.must;
+        agg.ownMust = oe.ownMust;
+        agg.ownMay = oe.ownMay;
+        return agg;
     }
     if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
-        firstInvocationInExpr(b->left.get(), ctx, out);
-        firstInvocationInExpr(b->right.get(), ctx, out);
-        return;
+        Eff agg;
+        const bool shortCircuit =
+            b->op == "and" || b->op == "or" || b->op == "??";
+        Eff le = effExpr(b->left.get(), in, c);
+        agg.raiseUnkept |= le.raiseUnkept;
+        agg.unknown |= le.unknown;
+        KeepReach rAfterLeft = in;
+        absorb(rAfterLeft, le);
+        Eff re = effExpr(b->right.get(), rAfterLeft, c);
+        agg.raiseUnkept |= re.raiseUnkept;
+        agg.unknown |= re.unknown;
+        if (shortCircuit) {
+            // §17.2 (v0.359): `and` and `or` short-circuit, and `??`
+            // evaluates its right operand only when the left is null. The
+            // LEFT always runs; the right may be skipped, so a keep the
+            // right performs is not certain — and a short-circuit that skips
+            // the keep is a decline.
+            agg.ownMust = le.ownMust;
+            agg.ownMay = le.ownMay || re.ownMay;
+            return agg;
+        }
+        KeepReach r = rAfterLeft;
+        absorb(r, re);
+        // The operator itself.
+        if (binaryCanRaise(b, ctx)) agg.raiseUnkept |= !r.must;
+        agg.ownMust = le.ownMust || re.ownMust;
+        agg.ownMay = le.ownMay || re.ownMay;
+        return agg;
     }
     if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
-        firstInvocationInExpr(u->operand.get(), ctx, out);
-        firstInvocationInExpr(u->replacement.get(), ctx, out);
-        // `await` on a faulted task raises (§30.5).
-        if (!out.node && !out.unknown && u->op == "await") out.node = e;
-        return;
+        Eff agg;
+        KeepReach r = in;
+        OwnFold own;
+        Eff oe = effExpr(u->operand.get(), r, c);
+        agg.raiseUnkept |= oe.raiseUnkept;
+        agg.unknown |= oe.unknown;
+        own.add(oe);
+        absorb(r, oe);
+        if (u->replacement) {
+            Eff re = effExpr(u->replacement.get(), r, c);
+            agg.raiseUnkept |= re.raiseUnkept;
+            agg.unknown |= re.unknown;
+            own.add(re);
+            absorb(r, re);
+        }
+        const std::string_view op = u->op;
+        if (op == "await") {
+            // `await` on a faulted task raises (§30.5).
+            agg.raiseUnkept |= !r.must;
+        } else if (op == "-" || op == "+") {
+            // §6.1 (v0.359): unary `-` on an integer type is CHECKED for
+            // overflow. §25 (v0.359): a user-defined unary operator is a
+            // method.
+            const sema::TypeRef* t = ctx.exprType(*u->operand);
+            if (isCheckedNumeric(t) || isUserOperatorOperand(t))
+                agg.raiseUnkept |= !r.must;
+        }
+        agg.ownMust = own.must;
+        agg.ownMay = own.may;
+        return agg;
     }
     if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
-        firstInvocationInExpr(t->operand.get(), ctx, out);
-        return;
+        // `is` / `as` run no user code.
+        return effExpr(t->operand.get(), in, c);
     }
-    if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
-        // §20 (v0.359): the CONDITION runs first, then the selected branch.
-        firstInvocationInExpr(c->condition.get(), ctx, out);
-        firstInvocationInExpr(c->thenValue.get(), ctx, out);
-        firstInvocationInExpr(c->elseValue.get(), ctx, out);
-        return;
+    if (auto* cnd = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        Eff agg;
+        Eff ce = effExpr(cnd->condition.get(), in, c);
+        agg.raiseUnkept |= ce.raiseUnkept;
+        agg.unknown |= ce.unknown;
+        KeepReach r = in;
+        absorb(r, ce);
+        Eff te = effExpr(cnd->thenValue.get(), r, c);
+        Eff ee = effExpr(cnd->elseValue.get(), r, c);
+        agg.raiseUnkept |= te.raiseUnkept || ee.raiseUnkept;
+        agg.unknown |= te.unknown || ee.unknown;
+        // §20 (v0.359): only the SELECTED branch runs, so the keep is
+        // performed on every path only if the condition performs it or BOTH
+        // branches do.
+        agg.ownMust = ce.ownMust || (te.ownMust && ee.ownMust);
+        agg.ownMay = ce.ownMay || te.ownMay || ee.ownMay;
+        return agg;
     }
     if (auto* t = dynamic_cast<const ast::ThrowExpr*>(e)) {
-        firstInvocationInExpr(t->operand.get(), ctx, out);
-        return;
+        Eff agg;
+        KeepReach r = in;
+        if (t->operand) {
+            Eff oe = effExpr(t->operand.get(), r, c);
+            agg.raiseUnkept |= oe.raiseUnkept;
+            agg.unknown |= oe.unknown;
+            absorb(r, oe);
+            agg.ownMust = oe.ownMust;
+            agg.ownMay = oe.ownMay;
+        }
+        // §17.12 (v0.359): a `throw` expression raises the supplied
+        // exception, in any expression position.
+        agg.raiseUnkept |= !r.must;
+        return agg;
     }
     if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
-        firstInvocationInExpr(r->lo.get(), ctx, out);
-        firstInvocationInExpr(r->hi.get(), ctx, out);
-        firstInvocationInExpr(r->step.get(), ctx, out);
-        return;
+        Eff agg;
+        KeepReach rr = in;
+        OwnFold own;
+        for (const ast::Expr* part :
+             {r->lo.get(), r->hi.get(), r->step.get()}) {
+            if (!part) continue;
+            Eff pe = effExpr(part, rr, c);
+            agg.raiseUnkept |= pe.raiseUnkept;
+            agg.unknown |= pe.unknown;
+            own.add(pe);
+            absorb(rr, pe);
+        }
+        agg.ownMust = own.must;
+        agg.ownMay = own.may;
+        return agg;
     }
     if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
-        firstInvocationInExpr(w->source.get(), ctx, out);
-        for (const auto& a : w->assigns)
-            firstInvocationInExpr(a.value.get(), ctx, out);
-        return;
+        Eff agg;
+        KeepReach r = in;
+        OwnFold own;
+        Eff se = effExpr(w->source.get(), r, c);
+        agg.raiseUnkept |= se.raiseUnkept;
+        agg.unknown |= se.unknown;
+        own.add(se);
+        absorb(r, se);
+        for (const auto& a : w->assigns) {
+            Eff ae = effExpr(a.value.get(), r, c);
+            agg.raiseUnkept |= ae.raiseUnkept;
+            agg.unknown |= ae.unknown;
+            own.add(ae);
+            absorb(r, ae);
+        }
+        agg.ownMust = own.must;
+        agg.ownMay = own.may;
+        return agg;
     }
-    if (auto* c = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
-        for (const auto& k : c->keys) firstInvocationInExpr(k.get(), ctx, out);
-        for (const auto& v : c->elements)
-            firstInvocationInExpr(v.get(), ctx, out);
-        return;
+    if (auto* l = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        Eff agg;
+        KeepReach r = in;
+        OwnFold own;
+        for (const auto& k : l->keys) {
+            Eff ke = effExpr(k.get(), r, c);
+            agg.raiseUnkept |= ke.raiseUnkept;
+            agg.unknown |= ke.unknown;
+            own.add(ke);
+            absorb(r, ke);
+        }
+        for (const auto& v : l->elements) {
+            Eff ve = effExpr(v.get(), r, c);
+            agg.raiseUnkept |= ve.raiseUnkept;
+            agg.unknown |= ve.unknown;
+            own.add(ve);
+            absorb(r, ve);
+        }
+        agg.ownMust = own.must;
+        agg.ownMay = own.may;
+        return agg;
     }
     if (auto* s = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
-        for (const auto& p : s->parts)
-            firstInvocationInExpr(p.expr.get(), ctx, out);
-        return;
-    }
-    if (auto* c = dynamic_cast<const ast::CaseExpr*>(e)) {
-        firstInvocationInExpr(c->scrutinee.get(), ctx, out);
-        for (const auto& arm : c->arms) {
-            firstInvocationInExpr(arm.guard.get(), ctx, out);
-            firstInvocationInExpr(arm.exprBody.get(), ctx, out);
+        Eff agg;
+        KeepReach r = in;
+        OwnFold own;
+        for (const auto& p : s->parts) {
+            if (!p.expr) continue;
+            Eff pe = effExpr(p.expr.get(), r, c);
+            agg.raiseUnkept |= pe.raiseUnkept;
+            agg.unknown |= pe.unknown;
+            own.add(pe);
+            absorb(r, pe);
+            // §18.5 (v0.359): the hole renders through `ToString()`, which
+            // can raise.
+            agg.raiseUnkept |= !r.must;
         }
-        return;
+        agg.ownMust = own.must;
+        agg.ownMay = own.may;
+        return agg;
+    }
+    if (auto* cse = dynamic_cast<const ast::CaseExpr*>(e)) {
+        Eff agg;
+        KeepReach r = in;
+        if (cse->scrutinee) {
+            Eff se = effExpr(cse->scrutinee.get(), r, c);
+            agg.raiseUnkept |= se.raiseUnkept;
+            agg.unknown |= se.unknown;
+            absorb(r, se);
+            agg.ownMust = se.ownMust;
+            agg.ownMay = se.ownMay;
+        }
+        // The arms match the scrutinee (§19.3); a destructuring pattern
+        // reads the matched value's components, which runs a getter. The
+        // no-match edge raises (§19.6) unless a catch-all arm makes it
+        // dead.
+        bool noMatchLive =
+            cse->arms.empty() || !patternIsCatchAll(cse->arms.back().pattern.get());
+        Eff arms = effCaseArms(cse->arms, 0, r, c, noMatchLive);
+        agg.raiseUnkept |= arms.raiseUnkept;
+        agg.unknown |= arms.unknown;
+        agg.ownMust = agg.ownMust || arms.ownMust;
+        agg.ownMay = agg.ownMay || arms.ownMay;
+        return agg;
     }
     if (auto* b = dynamic_cast<const ast::BindExpr*>(e)) {
-        for (const auto& cl : b->clauses)
-            firstInvocationInExpr(cl->initializer.get(), ctx, out);
-        firstInvocationInExpr(b->body.get(), ctx, out);
-        return;
+        Eff agg;
+        KeepReach r = in;
+        OwnFold own;
+        for (const auto& cl : b->clauses) {
+            Eff ce = effExpr(cl->initializer.get(), r, c);
+            agg.raiseUnkept |= ce.raiseUnkept;
+            agg.unknown |= ce.unknown;
+            own.add(ce);
+            absorb(r, ce);
+        }
+        Eff be = effExpr(b->body.get(), r, c);
+        agg.raiseUnkept |= be.raiseUnkept;
+        agg.unknown |= be.unknown;
+        own.add(be);
+        absorb(r, be);
+        agg.ownMust = own.must;
+        agg.ownMay = own.may;
+        return agg;
     }
     if (dynamic_cast<const ast::LambdaExpr*>(e)) {
         // A lambda LITERAL evaluates nothing here: its body runs later, if
         // ever (§27.3).
-        return;
+        return Eff{};
     }
-    // Leaves: literals, a bare name, `typeof` / `nameof` / `default`, the
-    // unit value, the `owned` marker.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+        // A bare implicit-`this` PROPERTY read runs its getter (§23.3),
+        // which can raise. A local, a parameter, a field and a method group
+        // run nothing.
+        if (dynamic_cast<const sema::PropertySymbol*>(ctx.exprSymbol(*id))) {
+            Eff agg;
+            agg.raiseUnkept = !in.must;
+            return agg;
+        }
+        return Eff{};
+    }
+    // Leaves: literals, `typeof` / `nameof` / `default`, the unit value,
+    // the `owned` marker.
     if (dynamic_cast<const ast::IntLiteralExpr*>(e) ||
         dynamic_cast<const ast::FloatLiteralExpr*>(e) ||
         dynamic_cast<const ast::CharLiteralExpr*>(e) ||
@@ -43206,105 +43738,202 @@ void firstInvocationInExpr(const ast::Expr* e, const sema::SemaContext& ctx,
         dynamic_cast<const ast::BoolLiteralExpr*>(e) ||
         dynamic_cast<const ast::NullLiteralExpr*>(e) ||
         dynamic_cast<const ast::UnitExpr*>(e) ||
-        dynamic_cast<const ast::IdentifierExpr*>(e) ||
         dynamic_cast<const ast::TypeOfExpr*>(e) ||
         dynamic_cast<const ast::NameOfExpr*>(e) ||
         dynamic_cast<const ast::DefaultExpr*>(e) ||
         dynamic_cast<const ast::MarkedTransferExpr*>(e))
-        return;
+        return Eff{};
     // A shape this walk does not model: the caller must not join.
-    out.unknown = true;
+    Eff unknown;
+    unknown.unknown = true;
+    return unknown;
 }
 
-void firstInvocationInStmt(const ast::Stmt* s, const sema::SemaContext& ctx,
-                            FirstInvocation& out) {
-    if (!s || out.node || out.unknown) return;
-    if (auto* d = dynamic_cast<const ast::LocalDecl*>(s)) {
-        firstInvocationInExpr(d->initializer.get(), ctx, out);
-        return;
-    }
-    if (auto* d = dynamic_cast<const ast::LocalConstDecl*>(s)) {
-        firstInvocationInExpr(d->value.get(), ctx, out);
-        return;
-    }
-    if (dynamic_cast<const ast::LocalTypeDecl*>(s)) return;
-    if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
-        firstInvocationInExpr(r->value.get(), ctx, out);
-        return;
-    }
-    if (auto* e = dynamic_cast<const ast::ExpressionStmt*>(s)) {
-        firstInvocationInExpr(e->expr.get(), ctx, out);
-        return;
-    }
+Eff effStmt(const ast::Stmt* s, const KeepReach& in, const OrderCtx& c) {
+    if (!s) return Eff{};
+    if (auto* d = dynamic_cast<const ast::LocalDecl*>(s))
+        return effExpr(d->initializer.get(), in, c);
+    if (auto* d = dynamic_cast<const ast::LocalConstDecl*>(s))
+        return effExpr(d->value.get(), in, c);
+    if (dynamic_cast<const ast::LocalTypeDecl*>(s)) return Eff{};
+    if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s))
+        return effExpr(r->value.get(), in, c);
+    if (auto* e = dynamic_cast<const ast::ExpressionStmt*>(s))
+        return effExpr(e->expr.get(), in, c);
     if (auto* a = dynamic_cast<const ast::AssignmentStmt*>(s)) {
-        firstInvocationInExpr(a->target.get(), ctx, out);
-        firstInvocationInExpr(a->value.get(), ctx, out);
-        return;
+        Eff agg;
+        KeepReach r = in;
+        Eff te = effExpr(a->target.get(), r, c);
+        agg.raiseUnkept |= te.raiseUnkept;
+        agg.unknown |= te.unknown;
+        absorb(r, te);
+        Eff ve = effExpr(a->value.get(), r, c);
+        agg.raiseUnkept |= ve.raiseUnkept;
+        agg.unknown |= ve.unknown;
+        absorb(r, ve);
+        agg.ownMust = te.ownMust || ve.ownMust;
+        agg.ownMay = te.ownMay || ve.ownMay;
+        return agg;
     }
     if (auto* t = dynamic_cast<const ast::ThrowStmt*>(s)) {
-        firstInvocationInExpr(t->value.get(), ctx, out);
-        return;
+        Eff agg;
+        KeepReach r = in;
+        Eff ve = effExpr(t->value.get(), r, c);
+        agg.raiseUnkept |= ve.raiseUnkept;
+        agg.unknown |= ve.unknown;
+        absorb(r, ve);
+        // A `throw` STATEMENT raises too.
+        agg.raiseUnkept |= !r.must;
+        agg.ownMust = ve.ownMust;
+        agg.ownMay = ve.ownMay;
+        return agg;
     }
-    if (auto* i = dynamic_cast<const ast::IfStmt*>(s)) {
-        firstInvocationInExpr(i->ifBranch.condition.get(), ctx, out);
-        firstInvocationInStmts(i->ifBranch.body, ctx, out);
-        for (const auto& br : i->elifBranches) {
-            firstInvocationInExpr(br.condition.get(), ctx, out);
-            firstInvocationInStmts(br.body, ctx, out);
-        }
-        firstInvocationInStmts(i->elseBody, ctx, out);
-        return;
-    }
+    if (auto* i = dynamic_cast<const ast::IfStmt*>(s))
+        return effIfChain(i, 0, in, c);
     if (auto* w = dynamic_cast<const ast::WhileStmt*>(s)) {
-        firstInvocationInExpr(w->condition.get(), ctx, out);
-        firstInvocationInStmts(w->body, ctx, out);
-        return;
+        Eff agg;
+        KeepReach r = in;
+        Eff ce = effExpr(w->condition.get(), r, c);
+        agg.raiseUnkept |= ce.raiseUnkept;
+        agg.unknown |= ce.unknown;
+        absorb(r, ce);
+        Eff be = effStmts(w->body, r, c);
+        agg.raiseUnkept |= be.raiseUnkept;
+        agg.unknown |= be.unknown;
+        absorb(r, be);
+        agg.ownMust = ce.ownMust || be.ownMust;
+        agg.ownMay = ce.ownMay || be.ownMay;
+        return agg;
     }
     if (auto* f = dynamic_cast<const ast::ForStmt*>(s)) {
-        firstInvocationInExpr(f->iterable.get(), ctx, out);
-        firstInvocationInExpr(f->withExpr.get(), ctx, out);
-        firstInvocationInStmts(f->body, ctx, out);
-        return;
+        Eff agg;
+        KeepReach r = in;
+        OwnFold own;
+        Eff ie = effExpr(f->iterable.get(), r, c);
+        agg.raiseUnkept |= ie.raiseUnkept;
+        agg.unknown |= ie.unknown;
+        own.add(ie);
+        absorb(r, ie);
+        if (f->withExpr) {
+            Eff we = effExpr(f->withExpr.get(), r, c);
+            agg.raiseUnkept |= we.raiseUnkept;
+            agg.unknown |= we.unknown;
+            own.add(we);
+            absorb(r, we);
+        }
+        Eff be = effStmts(f->body, r, c);
+        agg.raiseUnkept |= be.raiseUnkept;
+        agg.unknown |= be.unknown;
+        own.add(be);
+        absorb(r, be);
+        agg.ownMust = own.must;
+        agg.ownMay = own.may;
+        return agg;
     }
-    if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
-        firstInvocationInStmts(d->body, ctx, out);
-        return;
-    }
+    if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s))
+        return effStmts(d->body, in, c);
     if (auto* t = dynamic_cast<const ast::TryStmt*>(s)) {
-        firstInvocationInStmts(t->body, ctx, out);
-        for (const auto& c : t->catches) {
-            firstInvocationInExpr(c.guard.get(), ctx, out);
-            firstInvocationInStmt(c.body.get(), ctx, out);
+        Eff agg;
+        KeepReach r = in;
+        OwnFold own;
+        Eff be = effStmts(t->body, r, c);
+        agg.raiseUnkept |= be.raiseUnkept;
+        agg.unknown |= be.unknown;
+        own.add(be);
+        absorb(r, be);
+        for (const auto& cat : t->catches) {
+            KeepReach cr = r;
+            if (cat.guard) {
+                Eff ge = effExpr(cat.guard.get(), cr, c);
+                agg.raiseUnkept |= ge.raiseUnkept;
+                agg.unknown |= ge.unknown;
+                own.add(ge);
+                absorb(cr, ge);
+            }
+            Eff ce = effStmt(cat.body.get(), cr, c);
+            agg.raiseUnkept |= ce.raiseUnkept;
+            agg.unknown |= ce.unknown;
+            own.add(ce);
+            absorb(cr, ce);
         }
-        firstInvocationInStmts(t->finallyBody, ctx, out);
-        return;
+        Eff fe;
+        if (!t->finallyBody.empty()) {
+            fe = effStmts(t->finallyBody, r, c);
+            agg.raiseUnkept |= fe.raiseUnkept;
+            agg.unknown |= fe.unknown;
+            own.add(fe);
+            absorb(r, fe);
+        }
+        // The `finally` runs on EVERY path that completes the `try` — the
+        // normal one and the exceptional ones alike — so only a keep the
+        // `finally` performs is performed on every completing path. A keep
+        // in the protected body or in a catch arm (or in a catch guard)
+        // runs on some paths only: the body can complete without the
+        // exception that would reach the catch.
+        //
+        // (The caller's keep-site branch skips a `TryStmt` — a `try`'s own
+        // kept site is its catch guard, which #8769 / #8824 join
+        // separately — so this shape is not reached. It is modelled
+        // soundly all the same.)
+        agg.ownMust = fe.ownMust;
+        agg.ownMay = own.may;
+        return agg;
     }
-    if (auto* c = dynamic_cast<const ast::CaseStmt*>(s)) {
-        firstInvocationInExpr(c->scrutinee.get(), ctx, out);
-        for (const auto& arm : c->arms) {
-            firstInvocationInExpr(arm.guard.get(), ctx, out);
-            firstInvocationInExpr(arm.exprBody.get(), ctx, out);
-            firstInvocationInStmts(arm.stmts, ctx, out);
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+        Eff agg;
+        KeepReach r = in;
+        if (cs->scrutinee) {
+            Eff se = effExpr(cs->scrutinee.get(), r, c);
+            agg.raiseUnkept |= se.raiseUnkept;
+            agg.unknown |= se.unknown;
+            absorb(r, se);
+            agg.ownMust = se.ownMust;
+            agg.ownMay = se.ownMay;
         }
-        return;
+        // The arms match the scrutinee (§19.3); a destructuring pattern
+        // reads the matched value's components, which runs a getter.
+        //
+        // §19.6 (v0.359): in STATEMENT position an unmatched value FALLS
+        // THROUGH with no action — it does not raise — unless §21.7's
+        // totality grant makes the edge statically dead. The edge is
+        // REACHABLE here unless sema proved it dead, and it is treated as
+        // a RAISE — the conservative direction: the fall-through
+        // completes the `case` without the keep on every path where the
+        // keep was not already performed, and a decline is the safe answer
+        // (the scope-end release still runs on the unwind edge, so the
+        // closure is released rather than leaked).
+        bool noMatchLive = !cs->noMatchEdgeStaticallyDead;
+        Eff arms = effCaseArms(cs->arms, 0, r, c, noMatchLive);
+        agg.raiseUnkept |= arms.raiseUnkept;
+        agg.unknown |= arms.unknown;
+        agg.ownMust = agg.ownMust || arms.ownMust;
+        agg.ownMay = agg.ownMay || arms.ownMay;
+        return agg;
     }
     if (auto* i = dynamic_cast<const ast::IncrementStmt*>(s)) {
-        firstInvocationInExpr(i->target.get(), ctx, out);
-        return;
+        Eff agg;
+        KeepReach r = in;
+        Eff te = effExpr(i->target.get(), r, c);
+        agg.raiseUnkept |= te.raiseUnkept;
+        agg.unknown |= te.unknown;
+        absorb(r, te);
+        // §6.1 (v0.359): `++` and `--` are CHECKED for overflow.
+        agg.raiseUnkept |= !r.must;
+        agg.ownMust = te.ownMust;
+        agg.ownMay = te.ownMay;
+        return agg;
     }
-    if (auto* d = dynamic_cast<const ast::DiscardStmt*>(s)) {
-        firstInvocationInExpr(d->value.get(), ctx, out);
-        return;
-    }
-    if (auto* y = dynamic_cast<const ast::YieldStmt*>(s)) {
-        firstInvocationInExpr(y->value.get(), ctx, out);
-        return;
-    }
+    if (auto* d = dynamic_cast<const ast::DiscardStmt*>(s))
+        return effExpr(d->value.get(), in, c);
+    if (auto* y = dynamic_cast<const ast::YieldStmt*>(s))
+        return effExpr(y->value.get(), in, c);
     if (dynamic_cast<const ast::BreakStmt*>(s) ||
         dynamic_cast<const ast::ContinueStmt*>(s))
-        return;
+        return Eff{};
     // A statement shape this walk does not model: the caller must not join.
-    out.unknown = true;
+    Eff unknown;
+    unknown.unknown = true;
+    return unknown;
 }
 
 }  // namespace
@@ -44733,45 +45362,55 @@ void Emitter::collectClosureReleaseEligible(
             auto useHere = [&](const FlowState& st) {
                 if (st.live) out.usedDefs.insert(st.reach.begin(), st.reach.end());
             };
-            // fix-forward #8847 (§17.1 / §22.5, v0.359): the ORDER-AWARE
-            // guard on the kept-state join into the unwind edge.
+            // fix-forward #8847 (§6.1 / §7.8 / §17.2 / §17.12 / §18.5 / §22.5
+            // / §23.3 / §25, v0.359): the ORDER-AWARE guard on the kept-state
+            // join into the unwind edge, PATH-SENSITIVELY.
             //
-            // The kept state may reach an unwind edge only for a throw that
+            // The kept state may reach an unwind edge only for a raise that
             // happens AFTER the keep: §22.5 (v0.359) "Evaluation order" —
             // "A call's supplied argument expressions are evaluated in
             // call-site textual order — left to right as written" — puts a
             // statement's invocations in a definite order, and §17.1 (v0.359)
-            // gives the operators left-to-right associativity. A throw from an
-            // invocation evaluated BEFORE the keep leaves the value NOT kept
+            // gives the operators left-to-right associativity. A raise from an
+            // operation evaluated BEFORE the keep leaves the value NOT kept
             // (`b := (if d.TryAdd(Key(k), b) then g else g);` — `Key(k)`
-            // throws before `TryAdd` stores anything), so the scope-end
+            // raises before `TryAdd` stores anything), so the scope-end
             // release must still run there.
             //
-            // The guard is per STATEMENT: the keep must be the FIRST
-            // invocation that statement evaluates. Then every invocation the
-            // statement can throw from is evaluated after the keep, and the
-            // kept state is right on all of them. A statement whose first
-            // invocation is not the keep is left unjoined — the base's
-            // behaviour, which releases the value on the unwind edge.
-            auto keepIsFirstInvocation = [&](const ast::Stmt* s) -> bool {
+            // The guard is per STATEMENT, and it has TWO halves, because the
+            // value's keptness at the raise is what the unwind edge needs:
+            //
+            //   * EVERY path that raises out of the statement must have
+            //     ALREADY performed the keep — otherwise the value is not
+            //     kept there and the scope-end release must run.
+            //   * the keep must be performed on EVERY path that COMPLETES
+            //     the statement — otherwise a short-circuit (`and` / `or` /
+            //     `??`) or an unselected branch SKIPS the keep, and the
+            //     statement's own value is not the kept one.
+            //
+            // A statement that fails either half is left unjoined — the
+            // base's behaviour, which releases the value on the unwind edge.
+            auto keepPrecedesEveryRaise = [&](const ast::Stmt* s) -> bool {
                 auto kit = keptCallSitesOf.find(b);
                 if (kit == keptCallSitesOf.end()) return false;
-                bool anyKeep = false;
+                KeepSites keeps;
                 for (const auto& pr : kit->second) {
                     if (pr.first != s) continue;
-                    anyKeep = true;
                     // A keep that is NOT a call (a field store) has no
                     // invocation order to reason about: no join.
                     if (!pr.second) return false;
+                    keeps.push_back(pr.second);
                 }
-                if (!anyKeep) return false;
-                FirstInvocation fi;
-                firstInvocationInStmt(s, ctx_, fi);
-                if (fi.unknown || !fi.node) return false;
-                // The statement's first invocation must be one of its keeps.
-                for (const auto& pr : kit->second)
-                    if (pr.first == s && pr.second == fi.node) return true;
-                return false;
+                if (keeps.empty()) return false;
+                OrderCtx oc;
+                oc.sema = &ctx_;
+                oc.keeps = &keeps;
+                KeepReach in;
+                Eff eff = effStmt(s, in, oc);
+                // An unmodelled shape, a raise before the keep, or a path
+                // that skips the keep: no join.
+                if (eff.unknown || eff.raiseUnkept) return false;
+                return eff.ownMust;
             };
             auto reads = [&](const ast::Expr* e) {
                 return e && bw.containsTargetAnywhere(e);
@@ -44895,17 +45534,19 @@ void Emitter::collectClosureReleaseEligible(
                     // kill), the shape `narrow #8824` (ba64bb9c7) used for a
                     // catch guard's kept store.
                     //
-                    // fix-forward #8847 (§17.1 / §22.5, v0.359): the join is
-                    // ORDER-AWARE. It may mark the local kept only for a
-                    // throw that happens AFTER the keep: a statement whose
-                    // FIRST invocation is not the keep has an invocation
-                    // evaluated BEFORE it (`b := (if d.TryAdd(Key(k), b) then
-                    // g else g);` — `Key(k)` throws before `TryAdd` stores
-                    // anything), and the value is NOT kept on that edge, so
-                    // the scope-end release must still run there. The
-                    // statement keeps the base's behaviour instead — the
-                    // #5866 leak class, not a use-after-free.
-                    if (keepIsFirstInvocation(s)) {
+                    // fix-forward #8847 (§6.1 / §7.8 / §17.2 / §17.12 / §18.5
+                    // / §22.5 / §23.3 / §25, v0.359): the join is
+                    // ORDER-AWARE and PATH-SENSITIVE. It may mark the local
+                    // kept only for a raise that happens AFTER the keep: a
+                    // statement that raises BEFORE the keep (`b := (if
+                    // d.TryAdd(Key(k), b) then g else g);` — `Key(k)` raises
+                    // before `TryAdd` stores anything), or one whose
+                    // short-circuit or unselected branch SKIPS the keep, has
+                    // the value NOT kept on that edge, so the scope-end
+                    // release must still run there. The statement keeps the
+                    // base's behaviour instead — the #5866 leak class, not a
+                    // use-after-free.
+                    if (keepPrecedesEveryRaise(s)) {
                         for (FlowState* acc : tryAccs) joinInto(*acc, st);
                         joinInto(unwindSt, st);
                     }
