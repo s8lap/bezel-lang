@@ -29,11 +29,14 @@
 // scope_end` fails under LeakSanitizer (9600 B in 200 allocations).
 #include <string>
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAotChecked;
 using bezel::test::runAotCheckedLenient;
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 constexpr const char* kKeep =
@@ -92,13 +95,53 @@ BEZEL_TEST(codegen_5129,
     BEZEL_EXPECT_EQ(r.exitCode, 200);
 }
 
-// A PARAMETER (a slot that owns no +1) passed to the same callee: must not
-// be released by anyone but the literal's own owner. Leak-free.
-BEZEL_TEST(codegen_5129, param_arg_to_unreferenced_callee_no_over_release) {
+// A PARAMETER (a slot that owns no +1) passed to the same callee at an
+// EXPLICIT function-type instantiation. §28.3 closure bullet, *Provenance*
+// clause 3 (v0.359): "A plain function-typed parameter of the enclosing body
+// contributes itself: its signature announces no set (K2.4), so the value is
+// bounded by the call", so `g`'s source set is non-empty whatever the caller
+// passes. `Keep<U>(x: U)` declares `x` at a bare type parameter, a
+// set-erasing position "at an instantiation substituting a function type"
+// (§28.3 *Set-erasing positions*, v0.359; the rule reads the instantiation,
+// inferred or explicit alike), and "at every set-erasing position a function
+// value with a non-empty source set is rejected". Pre-#8896/#8897 this row
+// compiled and pinned no-over-release; the spec now rejects it (issue #8977).
+BEZEL_TEST(codegen_5129, param_arg_to_bare_typeparam_formal_rejected_set_erasing) {
     auto r = runAotChecked(std::string("module Conf; ") + kKeep +
         "class Program "
         "  public static method Mid(g: () -> int): int "
         "    return H.Keep<() -> int>(g) + g() - 1; "
+        "  end Mid; "
+        "  public static method Main(): int "
+        "    var total := 0; "
+        "    var i := 0; "
+        "    while i < 200 do "
+        "      total := total + Program.Mid(lambda () => 1); "
+        "      i := i + 1; "
+        "    end; "
+        "    return total; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "may not be passed where the parameter is declared at a bare type "
+           "parameter"));
+}
+
+// The legal form of the same intent: a PARAMETER (a slot that owns no +1)
+// passed to a callee whose formal is declared at a FUNCTION type (not a
+// set-erasing position, §28.3 *Set-erasing positions*, v0.359) must not be
+// released by anyone but the literal's own owner. Leak-free.
+BEZEL_TEST(codegen_5129, param_arg_to_function_typed_unreferenced_callee_no_over_release) {
+    auto r = runAotChecked(std::string("module Conf; ") +
+        "class H "
+        "  public static method Keep(x: () -> int): int "
+        "    return 1; "
+        "  end Keep; "
+        "end H; "
+        "class Program "
+        "  public static method Mid(g: () -> int): int "
+        "    return H.Keep(g) + g() - 1; "
         "  end Mid; "
         "  public static method Main(): int "
         "    var total := 0; "
