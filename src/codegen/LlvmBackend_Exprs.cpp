@@ -6512,11 +6512,76 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         // the value the reader gets stays alive; that is the
                         // pre-#8763 behaviour for this spelling, and it is
                         // what the tip does.
+                        // fix #8976 (§14.1 / §23.3 / §7.5, v0.359): install
+                        // the RECEIVER's generic substitution and key the
+                        // memo on the OWNER's instantiation — the two things
+                        // the `.` twin of this read does (this file, ~11040;
+                        // #5315 / #5339 sibling) and this spelling did not.
+                        //
+                        // WHY. The getter is emitted OUT OF LINE as its own
+                        // function, and its body types `this` through
+                        // `Emitter::classStruct` (LlvmBackend_Layout.cpp),
+                        // which is SUBSTITUTION-SENSITIVE: with no live
+                        // substitution it builds the ERASED layout
+                        // (`%class.Box` = { ptr, i8, i32, ptr } — the `T`
+                        // placeholder), and with the receiver's substitution
+                        // it builds the SPECIALIZED one
+                        // (`%"class.Box$spec0"` = { ptr, i8, ptr, ptr } for
+                        // `T = string`).
+                        //
+                        // Under the erased layout the getter's GEP for
+                        // `f: () -> int` lands at byte offset 16 — which in
+                        // the specialized layout is `v: string`, NOT `f` — so
+                        // the getter handed the reader the STRING as the
+                        // closure value, and the program called it: a wild
+                        // jump into the string data (MEASURED on r30-c1
+                        // (f79705960) with `bezelc --sanitize=address` on
+                        // #8976's literal repro: "SUMMARY: AddressSanitizer:
+                        // SEGV bezel in .bz.str.data.58"). `Box<int>` was
+                        // unaffected only BY COINCIDENCE: `T = int` lowers to
+                        // `i32`, so the erased layout { ptr, i8, i32, ptr } IS
+                        // `Box<int>`'s layout — a reference-typed `T` widens
+                        // the slot to `ptr` and shifts `f` by four bytes.
+                        //
+                        // §14.1 (v0.359): "an **instantiation** of a generic
+                        // declaration is the constructed type or constructed
+                        // member obtained by substituting type arguments for
+                        // its type parameters … `var b: Box<string>;` forms
+                        // `Box<string>` exactly as `new Box<string>(…)` does,
+                        // and the nullable form `G<A>?` forms `G<A>`." The
+                        // receiver of a `?.` read is `Box<string>?` — an
+                        // instantiation of `Box<string>` — so the getter this
+                        // read calls must be the `Box<string>` getter, with
+                        // `Box<string>`'s layout.
+                        //
+                        // The MEMO key is the second half of the same defect:
+                        // `ensurePropertyBlockGetter` keys
+                        // `PropBlockGetterKey` on the owner's instantiation
+                        // ONLY when `ps` is non-null (`propertyThunkSubstKey`),
+                        // and this call passed `ps = nullptr` — so the getter
+                        // was memoized in the ERASED key space, where two
+                        // instantiations of one generic class share a single
+                        // body (the #5315 defect). Passing `ps` changes
+                        // nothing else in the callee: `recvPs` is `ps ? ps :
+                        // psKey`, and `psKey` was already `ncPropSym`.
+                        //
+                        // `setupReceiverGenericSubst` is the SAME helper the
+                        // `.` twin and the block-form INDEXER getter use
+                        // (LlvmBackend_Assign.cpp ~3444 — #5315 / #4973): it
+                        // installs the DIRECT receiver's bindings and walks the
+                        // base chain for an INHERITED generic accessor.
+                        // Save+restore keeps the substitution from leaking
+                        // past this read into the enclosing expression.
+                        auto ncSavedSubst =
+                            setupReceiverGenericSubst(nm->target.get(),
+                                                      ncPropSym->parent);
                         llvm::Function* ncGetterFn =
                             ensurePropertyBlockGetter(
-                                ncPd, ncBlockAcc, /*ps=*/nullptr,
+                                ncPd, ncBlockAcc, /*ps=*/ncPropSym,
                                 /*psKey=*/ncPropSym,
                                 /*mintReaderRef=*/false);
+                        genericSubst_ = std::move(ncSavedSubst.subst);
+                        genericSubstSemaTy_ = std::move(ncSavedSubst.semaTy);
                         ncRaw = builder_.CreateCall(
                             ncGetterFn->getFunctionType(), ncGetterFn, {obj});
                         emitPendingCheck();  // §31.1/§31.2: throw propagation
