@@ -11826,6 +11826,73 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         // non-escaping lambdas is still reclaimed at scope end.
         collectBorrowingArrayFreeEligible(*ci.stmts, /*yieldIsBorrowIterYield=*/false,
                                           /*lambdaCaptureBorrow=*/true);  // #1003
+    } else if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {
+        // fix #8905 (§27.5 / §28.9, v0.359): an EXPRESSION-bodied method's
+        // capture-cell pre-scan must see the body its BLOCK-bodied twin has.
+        //
+        // THE DEFECT. Every collector in the branch above is gated on
+        // `ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts`, so an
+        // expression-bodied method ran NONE of them:
+        //   * `definitelyEscapingLambdas_` stayed empty — the returned lambda was
+        //     never classified as definitely escaping;
+        //   * `singleCaptureLocals_` stayed empty — the captured parameter was
+        //     never counted as a sole holder;
+        //   * `cellFreeEligible_` / `sharedCellEnvdtorFreeOwner_` /
+        //     `declsCapturedByEscaping_` stayed empty — the scope-end and
+        //     shared-cell reclaim routes had no verdict.
+        // `lowerLambda`'s captured-PARAM branch (LlvmBackend_Exprs2.cpp, the
+        // #4261-FORWARD arm) arms `ce.freeCellInEnvdtor` only when the lambda IS
+        // definitely escaping AND the parameter IS captured by exactly one env;
+        // neither held, so the envdtor did not free the cell. The #7611
+        // refcounted-cell route declined as well: for a `string` parameter the
+        // cell's CONTENTS are already managed by #2689's per-capture retain
+        // (that is exactly what `pContentsAlsoManaged` says), so the refcount
+        // route is for the cells that leak today — and this cell is one of them.
+        // The 8-byte capture cell `boxLocalSlot` allocated was then freed by
+        // NOBODY.
+        //
+        // MEASURED (r30-c1 @ a40ba4c2f, `bezelc --sanitize=address`):
+        //   method Ident(p: string): () -> string => lambda() => p;
+        //     -> 1600 B / 200 allocations (8 B each), allocated in `Program.Ident`.
+        //   method Ident(n: int): () -> int => lambda() => n;
+        //     ->  800 B / 200 allocations (4 B each).
+        // The BLOCK-bodied twins (`{ return lambda() => p; }` and
+        // `{ var q := p; return lambda() => q; }`) leak NOTHING — they run the
+        // collectors — which is the discriminator the issue reports.
+        //
+        // THE FIX. Run the SAME capture-cell pre-scan over the body the
+        // expression-bodied method WOULD have had: a single `return <exprBody>;`
+        // statement. That is exactly the block-bodied twin's shape, so the two
+        // spellings classify identically — the returned lambda is marked
+        // definitely escaping, the captured parameter is counted as a sole
+        // holder, and `lowerLambda` arms the envdtor's cell free.
+        //
+        // WHY THE SYNTHESIS AND NOT A NEW COLLECTOR. The four collectors walk a
+        // STATEMENT list; the expression-bodied method has none. Synthesizing
+        // the one statement the block-bodied twin has keeps the two spellings on
+        // ONE code path, so a future change to the block-bodied classification
+        // cannot leave the expression-bodied spelling behind — the same reason
+        // the ASYNC path already synthesizes `return <exprBody>;` for its own
+        // pre-scan (see the synthesis above, ~L11545).
+        //
+        // The synthesized ReturnStmt BORROWS the AST-owned exprBody (as that
+        // async synthesis does); its `value` is released below so the
+        // synthesized statement's destructor does not free the AST-owned node.
+        std::vector<std::unique_ptr<ast::Stmt>> synthBody;
+        auto ret = std::make_unique<ast::ReturnStmt>();
+        ret->span = ci.exprBody->span;
+        ret->value.reset(const_cast<ast::Expr*>(ci.exprBody));
+        synthBody.push_back(std::move(ret));
+        // The ORDER is load-bearing (see the block-body branch above):
+        // collectCellFreeEligible consumes collectClosureReleaseEligible's
+        // result and reads definitelyEscapingLambdas_, so it must run last.
+        collectClosureReleaseEligible(synthBody);
+        collectBoxCaptureLocals(synthBody);
+        collectDefinitelyEscapingLambdas(synthBody);
+        collectCellFreeEligible(synthBody);
+        // Release the borrowed exprBody so synthBody's destructor does not free
+        // the AST-owned expression node.
+        static_cast<ast::ReturnStmt*>(synthBody[0].get())->value.release();
     }
 
     // fix #633 / §33.4: Main(args: Array<string>) has C ABI signature
