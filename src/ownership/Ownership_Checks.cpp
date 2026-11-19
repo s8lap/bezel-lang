@@ -167,6 +167,14 @@ const ast::Expr* lookThroughForceUnwrap(const ast::Expr* e) {
 static const sema::TypeRef* functionValueCalleeType(
     const ast::Expr* callee, const sema::SemaContext& ctx);  // defined below
 
+// fix #8960 (§22.3 *Parameter modifiers* / §28.3.7, v0.359): defined below;
+// the modifier of the parameter slot a FUNCTION-VALUE callee's argument binds
+// to — the reader §22.3's call-site marker rule uses when the callee has no
+// `CalleeFormals` to read.
+static std::string_view functionValueSlotModifier(
+    const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
+    std::size_t argIdx, const sema::SemaContext& ctx);  // defined below
+
 // fix #7109 (§28.3 *State match on reassignment*, v0.359): the single text of
 // the self-assignment rejection. Declared in Ownership_impl.hpp.
 std::string selfAssignOwnedLocalMessage(const std::string& name) {
@@ -2058,6 +2066,20 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
         }
         bool userOwned = formals.valid() && boundPos < formals.size() &&
                          formals.modifier(boundPos) == "owned";
+        // fix #8960 (§22.3 *Parameter modifiers* / §28.3.7, v0.359): the
+        // `owned` slot of a FUNCTION-VALUE callee — a closure's own `owned`
+        // parameter — is the SAME owned-IN sink a user `owned` formal is. The
+        // callee has no `CalleeFormals` (it resolves to no MethodSymbol), so
+        // without this arm the slot was never read: `f(a)` over
+        // `lambda(owned ys: T)` compiled clean, the marker §22.3 requires was
+        // not demanded, and the caller's `a` kept its disposal obligation while
+        // the closure disposed the value too (MEASURED: `AddressSanitizer:
+        // attempting double-free`). The slot's modifier comes from the callee's
+        // own function TYPE (§27.1) — the same list #7124 reads for the
+        // mirror-image rule.
+        if (!userOwned && !formals.valid() &&
+            functionValueSlotModifier(callee, args, pos, ctx_) == "owned")
+            userOwned = true;
         // §28.1 per-instantiation erasure (#2047): an `owned` marker on a CHOICE
         // CASE payload whose type, AT THIS INSTANTIATION, is value-like or
         // runtime-managed (`Result<int, string>.Ok(value)` — `owned value: T`
@@ -2814,7 +2836,17 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             // `owned` formal (isImplicitOwned) or a builtin owned-sink method.
             const bool ownedSink =
                 isImplicitOwned(call->args, pos, call->callee.get()) ||
-                builtinOwnedSinkArg(call->callee.get(), pos);
+                builtinOwnedSinkArg(call->callee.get(), pos) ||
+                // fix #8960 (§22.3 *Parameter modifiers* / §28.3.7, v0.359):
+                // the `owned` slot of a FUNCTION-VALUE callee — a closure's
+                // own `owned` parameter — is the SAME owned-IN sink a user
+                // `owned` formal is. The twin of recordMovesInArgs' `userOwned`
+                // arm; the two must not disagree about one call. Without it
+                // the bare-statement / `return`-operand spelling of the
+                // closure call (`f(a);`, `return f(a);`) demanded no marker
+                // and double-freed under ASan.
+                functionValueSlotModifier(call->callee.get(), call->args, pos,
+                                          ctx_) == "owned";
             // fix-forward #8118 (stdlib §6.10, v0.355; #5657): the bare-
             // statement-call twin of recordMovesInArgs' owned-sink TaskScope
             // rejection (`Take(new TaskScope());` with `owned d: Object`).
@@ -12730,6 +12762,64 @@ static const sema::TypeRef* functionValueCalleeType(
         dynamic_cast<const ast::IndexExpr*>(callee))
         return t;
     return nullptr;
+}
+
+// fix #8960 (§22.3 *Parameter modifiers* / §28.3.7, v0.359): the modifier of
+// the parameter slot a FUNCTION-VALUE callee's argument binds to.
+//
+// THE GAP. A call through a function value — a local / parameter / field /
+// property of function type, a lambda literal, the result of a call or an
+// index — resolves to no `MethodSymbol`, so `resolveCalleeParams` answers "this
+// callee has no formals" and §22.3's marker rule had no slot to read. The
+// `owned` slot of a CLOSURE's own parameter list was therefore never checked:
+// `f(a)` over `lambda(owned ys: T)` compiled clean, the closure took the
+// value, and the caller auto-dropped it too (MEASURED on r42-m117-8960 @
+// r30-c1: `AddressSanitizer: attempting double-free`). The method twin
+// (`c.Take(a)` over `method Take(owned ys: T)`) IS rejected, with §22.3's
+// "this call consumes `a`; write `M(move a)`" — the asymmetry #8960 reports.
+//
+// THE READER. The slot is part of the callee's TYPE (`TypeRef::funcParams`,
+// §27.1) — the SAME list `functionValueCalleeType` hands to #7124's
+// mirror-image rule (a `move` marker at a NON-`owned` slot of a function value
+// is rejected). This reader is the other direction of the same rule: the
+// marker is REQUIRED at an `owned` slot and ABSENT at every other one, so the
+// two spellings of one rule live on one list.
+//
+// THE BINDING. §22.5's binding applies, restricted to the form a function-value
+// call admits: the call is POSITIONAL — the compiler rejects the named form at
+// a function-value call site ("the named-argument form `ys := …` is not
+// admitted at a function-value call site — calls are positional", §27.1,
+// MEASURED) — so the slot is the count of the positional arguments before it.
+//
+// §15.3's carve applies as it does at a method formal: an `owned` formal whose
+// type is a MOVE-ONLY VALUE TYPE is identical to a plain `(x: V)` parameter —
+// the argument is written UNMARKED and the position is NOT an owned sink — so
+// the `owned` marker is hidden here exactly as `CalleeFormals::modifier` hides
+// it, and the two readers cannot disagree about a move-only value.
+// // per §15.3, §22.3, §22.5, §27.1, §28.3.7
+static std::string_view functionValueSlotModifier(
+    const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
+    std::size_t argIdx, const sema::SemaContext& ctx) {
+    const sema::TypeRef* ft = functionValueCalleeType(callee, ctx);
+    if (!ft || argIdx >= args.size()) return {};
+    // §22.5: the BOUND slot. A function-value call is positional (§27.1), so
+    // the slot is the count of the positional arguments before this one — the
+    // same count `boundParamIndex` computes for a method callee.
+    std::size_t slot = 0;
+    for (std::size_t k = 0; k < argIdx; ++k)
+        if (args[k].name.empty()) ++slot;
+    if (slot >= ft->funcParams.size()) return {};
+    const std::string_view m = ft->funcParams[slot].modifier;
+    // §15.3 *Parameter passing*: the `owned` marker on a MOVE-ONLY VALUE formal
+    // is REDUNDANT — "a parameter declared `(owned x: V)` is identical to plain
+    // `(x: V)` for a move-only V" — so the position is the plain by-value-move
+    // parameter: the argument is written UNMARKED and the slot is not an owned
+    // sink. The same carve `CalleeFormals::modifier` applies at a method
+    // formal, read through the same predicate.
+    if (m == "owned" &&
+        formalIsMoveOnlyValued(nullptr, ft->funcParams[slot].type))
+        return {};
+    return m;
 }
 
 // issue #7693 (see #6233, #7541; §15.3 *Parameter passing* / *Whole-value
