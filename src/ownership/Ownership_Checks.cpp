@@ -183,6 +183,36 @@ std::string selfAssignOwnedLocalMessage(const std::string& name) {
            "explicitly with `move`";
 }
 
+// fix #8768 (§28.3 *State match on reassignment*, v0.359): the §28.3
+// ownership-state lattice of the locals of ONE getter accessor body (or of ONE
+// lambda body nested in it), as a bitmask — one bit per `OwnershipState`.
+// The mask is an OVER-APPROXIMATION of the states a local can hold at a
+// program point, so a conditional store widens it instead of guessing which
+// path ran. Declared here (file-local) because only the getter scan reads it.
+static constexpr std::uint32_t getterStateBit(OwnershipState s) {
+    return std::uint32_t(1) << static_cast<unsigned>(s);
+}
+
+// The OWNED bit: the state §28.3's state match asks about.
+static constexpr std::uint32_t kGetterOwnedStateBit =
+    getterStateBit(OwnershipState::Owned);
+
+// The states that CONFLICT with an owned-state LHS: a path holding one of
+// them is NOT the method body's "Owned" state, so the scan must not claim the
+// self-assignment is a state-match violation (the method body answers such a
+// program with a different diagnostic — §28.3's borrow-into-owned-state rule,
+// §28.2's use-after-dispose, §7.9's definite-assignment).
+//
+// POLY-NULL is NOT here: K7.5 has the `null` arm absorb to the other arm's
+// state, so a poly-null path joins an owned path to owned, and the method body
+// rejects the self-assignment there. per §28.3, v0.359
+static constexpr std::uint32_t kGetterConflictingStateMask =
+    getterStateBit(OwnershipState::Borrowed) |
+    getterStateBit(OwnershipState::MovedFrom) |
+    getterStateBit(OwnershipState::Disposed) |
+    getterStateBit(OwnershipState::Poisoned) |
+    getterStateBit(OwnershipState::Uninitialized);
+
 // fix #8782 (§28.3 *State match on reassignment*, v0.359): the single text of
 // the other-binding state-match rejection `u := v;` (an unmarked read of
 // ANOTHER binding stored into an owned-state local), shared by the method-body
@@ -23120,73 +23150,170 @@ void MethodOwnership::checkAutoPropertyInitializer(
 // borrow, into an owned-state LHS and is rejected at the assignment by this
 // rule" — had no reader there.
 //
-// The getter walk carries no dataflow, so "owned-state" is decided
-// STRUCTURALLY and CONSERVATIVELY (it can under-reject, never over-reject): the
-// local is a `var` declared by this very body whose initializer is a fresh
-// owned producer (`producerState == Owned`, the same single home
-// `scanGetterReturns` uses), and EVERY store to it in the body is a
-// self-assignment — so no other store can have moved the local out of the
-// owned state before the self-assignment is reached. The same exclusions as
-// the method-body arm hold: a move-only VALUE type keeps §15.3's whole-value
-// no-op, and a marked RHS (`t := move t`) is the sanctioned transfer. The walk
-// uses `forEachNestedStmt`, which never crosses into a lambda body (that body
-// has its own arm). // per §28.3, §15.3, §28.7, v0.359
+// fix #8768 (§28.3, v0.359): this scan now TRACKS the local's §28.3 ownership
+// state through the body's stores instead of deciding "owned-state" from the
+// DECLARATION initializer alone, and it CROSSES INTO A LAMBDA BODY nested in
+// the getter. (The #7109 scan was STRUCTURAL and CONSERVATIVE: the local's
+// initializer had to be a fresh owned producer and EVERY store to it had to be
+// a self-assignment, so it could not see a local that BECOMES owned by a
+// later store — `var t: Cell? := null; t := new Cell(1);` — and it never
+// crossed into a lambda body.) The state track, its over-approximating mask
+// and the conflicting-state rule are documented at
+// `scanGetterSelfAssignStmts` below. The same exclusions as the method-body
+// arm hold: a move-only VALUE type keeps §15.3's whole-value no-op, and a
+// marked RHS (`t := move t`) is the sanctioned transfer.
+// per §28.3, §28.9, §15.3, §28.7, v0.359
 void MethodOwnership::scanGetterSelfAssignments(
         const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
-    std::vector<const ast::AssignmentStmt*> selfStores;
-    std::vector<const ast::Node*> otherlyStored;
-    auto selfSym = [&](const ast::AssignmentStmt* as) -> const sema::Symbol* {
-        if (!as || !as->target || !as->value || as->op != ":=" ||
-            as->valueHasOwnedMarker)
-            return nullptr;
-        const auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as->target.get());
-        const auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
-            lookThroughForceUnwrap(as->value.get()));
-        if (!tid || !rid) return nullptr;
-        const sema::Symbol* ts = ctx_.exprSymbol(*tid);
-        return ts && ts == ctx_.exprSymbol(*rid) ? ts : nullptr;
-    };
-    auto noteOther = [&](const ast::Expr* target) {
-        if (!target) return;
-        if (auto* ls = dynamic_cast<const sema::LocalSymbol*>(
-                ctx_.exprSymbol(*target)))
-            if (ls->decl &&
-                std::find(otherlyStored.begin(), otherlyStored.end(), ls->decl) ==
-                    otherlyStored.end())
-                otherlyStored.push_back(ls->decl);
-    };
-    for (const auto& s : stmts) {
-        if (!s) continue;
-        forEachNestedStmt(*s, [&](const ast::Stmt& inner) {
-            if (const auto* as = dynamic_cast<const ast::AssignmentStmt*>(&inner)) {
-                if (selfSym(as)) selfStores.push_back(as);
-                else noteOther(as->target.get());
-            } else if (const auto* is =
-                           dynamic_cast<const ast::IncrementStmt*>(&inner)) {
-                noteOther(is->target.get());
+    // fix #8768: the getter body's own locals.
+    std::unordered_map<const ast::Node*, std::uint32_t> states;
+    scanGetterSelfAssignStmts(stmts, states);
+    // fix #8768: a LAMBDA nested in the getter body is its OWN scope, and the
+    // lambda-body arm that carries the rule in a METHOD body
+    // (`applyUsingVarBorrowPinInLambdaStmt`) runs only from the METHOD
+    // dataflow — which a getter accessor never reaches. Walk each nested
+    // lambda's body with a FRESH state map: the lambda's OWN locals are
+    // tracked; a local CAPTURED from the getter body is not (its state at the
+    // lambda's DEFINITION point is a different fact — see the handback).
+    std::vector<const ast::LambdaExpr*> lambdas;
+    for (const auto& s : stmts)
+        if (s) collectBodyLambdas(*s, lambdas);
+    for (const ast::LambdaExpr* lam : lambdas) {
+        std::unordered_map<const ast::Node*, std::uint32_t> lambdaStates;
+        for (const auto& s : lam->stmts)
+            if (s) scanGetterSelfAssignStmt(*s, lambdaStates);
+    }
+}
+
+// fix #8768 (§28.3 *State match on reassignment*, v0.359): the state-tracked
+// walk behind `scanGetterSelfAssignments`.
+//
+// A local's §28.3 ownership state is a property of the PROGRAM POINT, not of
+// its declaration: `var t: Cell? := null;` leaves `t` poly-null, and the
+// fresh producer in `t := new Cell(1);` makes it OWNED — and only then is
+// `t := t;` the state-match violation the rule rejects ("A self-assignment is
+// no exception: for an owned-state class-typed local `t`, `t := t;` stores the
+// unmarked read `t`, a borrow, into an owned-state LHS and is rejected at the
+// assignment by this rule"). The #7109 scan decided "owned-state" from the
+// DECLARATION initializer alone and required EVERY store to the local to be a
+// self-assignment, so it could not see that state.
+//
+// The rule NAMES NO SCOPE — the #7109 fix's own argument — so it reaches a
+// getter accessor body and a lambda body nested in one; and §28.9 makes the
+// two accessor body spellings "semantically indistinguishable at every read
+// site". The compiler's method body, which runs the real §28.3 dataflow, is
+// the reference for the answer, and it rejects these programs.
+//
+// The track is an OVER-APPROXIMATION: each local carries a bitmask of the
+// states it can hold at the current point (one bit per `OwnershipState`).
+// A store at the body's top level REPLACES the mask (the store always
+// happens); a store inside a nested scope-introducer (if / while / for /
+// do-end / try / case — `forEachNestedStmt`'s depth) WIDENS it (the other
+// path keeps the old state). A rejection needs "Owned" on every path, so the
+// mask must carry Owned AND carry no state that CONFLICTS with an owned-state
+// LHS: poly-null does not conflict (K7.5 — the `null` arm absorbs to the
+// other arm's state, so a poly-null path joins an owned path to owned), while
+// borrow / moved-from / disposed / uninitialized does (the method body answers
+// such a program with a DIFFERENT diagnostic — §28.3's
+// borrow-into-owned-state rule, §28.2's use-after-dispose, §7.9's
+// definite-assignment — so this scan must not claim the self-assignment).
+//
+// per §28.3, §28.9, §28.7, §15.3, v0.359
+void MethodOwnership::scanGetterSelfAssignStmts(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+        std::unordered_map<const ast::Node*, std::uint32_t>& states) {
+    for (const auto& s : stmts)
+        if (s) scanGetterSelfAssignStmt(*s, states);
+}
+
+// fix #8768: one statement (and its nested statements) of the tracked walk.
+// The walk is `forEachNestedStmt`'s STATEFUL form, so the grammar stays in the
+// one place that owns it; the DEPTH it threads is what tells an unconditional
+// store (depth 0) from a conditional one (a nested scope-introducer).
+void MethodOwnership::scanGetterSelfAssignStmt(
+        const ast::Stmt& s,
+        std::unordered_map<const ast::Node*, std::uint32_t>& states) {
+    forEachNestedStmt(
+        s,
+        [&](const ast::Stmt& cur, const StmtVisitState& st) {
+            if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
+                // A LOCAL DECLARATION: the local's state at its declaration.
+                // A marked initializer (`var x := owned y;`) is a transfer
+                // (Owned); a plain one takes the RHS's producer state (§28.3's
+                // "var x := expr; takes the ownership state of expr"), and a
+                // declaration with no initializer is uninitialized (§28.3).
+                OwnershipState init = OwnershipState::Uninitialized;
+                if (ld->initializer)
+                    init = ld->initializerHasOwnedMarker
+                               ? OwnershipState::Owned
+                               : producerState(*ld->initializer);
+                states[ld] = getterStateBit(init);
+                return;
             }
-        });
+            if (const auto* as =
+                    dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
+                scanGetterSelfAssignAssignment(*as, st.depth, states);
+                return;
+            }
+        },
+        StmtVisitState{});
+}
+
+// fix #8768: one assignment of the tracked walk — the §28.3 self-assignment
+// check, then the target local's state transition.
+void MethodOwnership::scanGetterSelfAssignAssignment(
+        const ast::AssignmentStmt& as, int depth,
+        std::unordered_map<const ast::Node*, std::uint32_t>& states) {
+    const auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as.target.get());
+    const sema::Symbol* tsym = tid ? ctx_.exprSymbol(*tid) : nullptr;
+    const auto* ls =
+        tsym ? dynamic_cast<const sema::LocalSymbol*>(tsym) : nullptr;
+    // LOCALDECL-ONLY: the target is an assignment TARGET, and a §21.1 `const`
+    // local can never be one (rejected as "cannot assign to const local"), so
+    // a `LocalConstDecl` cannot reach here.
+    const auto* ld = ls ? dynamic_cast<const ast::LocalDecl*>(ls->decl) : nullptr;
+    if (!tid || !ld) return;
+    auto it = states.find(ld);
+    if (it == states.end()) return;  // not a local of THIS body
+
+    // (1) the §28.3 self-assignment rule.
+    bool rejected = false;
+    if (as.op == ":=" && !as.valueHasOwnedMarker && !ld->isUsing && as.value) {
+        const auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+            lookThroughForceUnwrap(as.value.get()));
+        if (rid && ctx_.exprSymbol(*rid) == tsym) {
+            const std::uint32_t mask = it->second;
+            if ((mask & kGetterOwnedStateBit) &&
+                !(mask & kGetterConflictingStateMask)) {
+                // (3-exclusion) a move-only VALUE type keeps §15.3's no-op —
+                // the same exclusion the method-body arm (`handleAssignment`)
+                // and the #7109 getter scan keep.
+                const char* moKind = nullptr;
+                if (!common::isMoveOnlyValueType(ctx_.exprType(*tid), ctx_,
+                                                 moKind)) {
+                    report(Severity::Error, as.target->span.begin,
+                           selfAssignOwnedLocalMessage(std::string(tid->name)));
+                    rejected = true;
+                }
+            }
+        }
     }
-    for (const ast::AssignmentStmt* as : selfStores) {
-        const auto* tid = static_cast<const ast::IdentifierExpr*>(as->target.get());
-        const auto* ls =
-            dynamic_cast<const sema::LocalSymbol*>(ctx_.exprSymbol(*tid));
-        if (!ls) continue;
-        // LOCALDECL-ONLY: `selfStores` holds assignment TARGETS, and a §21.1
-        // `const` local can never be an assignment target (rejected as "cannot
-        // assign to const local"), so a `LocalConstDecl` cannot reach here.
-        const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
-        if (!ld || !ld->initializer || ld->isUsing) continue;
-        if (std::find(otherlyStored.begin(), otherlyStored.end(), ls->decl) !=
-            otherlyStored.end())
-            continue;
-        if (producerState(*ld->initializer) != OwnershipState::Owned) continue;
-        const char* moKind = nullptr;
-        if (common::isMoveOnlyValueType(ctx_.exprType(*tid), ctx_, moKind))
-            continue;
-        report(Severity::Error, as->target->span.begin,
-               selfAssignOwnedLocalMessage(std::string(tid->name)));
-    }
+    // (2) the target local's state transition. A REJECTED store never
+    // happens, so it does not move the local out of the owned state — the
+    // method-body arm's `stateMatchRejected` skips its transition for the same
+    // reason (#8328), and a second `t := t;` after the first is therefore
+    // rejected too.
+    if (rejected) return;
+    const OwnershipState next =
+        as.valueHasOwnedMarker
+            ? OwnershipState::Owned
+            : (as.value ? producerState(*as.value)
+                        : OwnershipState::Uninitialized);
+    const std::uint32_t bit = getterStateBit(next);
+    if (depth == 0)
+        it->second = bit;  // unconditional: the local now holds exactly this
+    else
+        it->second |= bit;  // conditional: widen — the other path keeps the old
 }
 
 void MethodOwnership::scanGetterReturnsStmt(const ast::Stmt* s,

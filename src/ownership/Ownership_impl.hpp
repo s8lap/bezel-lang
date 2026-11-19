@@ -658,8 +658,30 @@ public:
     // fix #7109 (§28.3 *State match on reassignment*, v0.359): a getter body
     // never reaches `handleAssignment`, so its owned-state locals' §28.3
     // self-assignment `t := t;` is rejected by this narrow structural scan.
+    //
+    // fix #8768 (§28.3, v0.359): the scan now TRACKS each local's §28.3
+    // ownership state through the body's stores (the #7109 scan decided
+    // "owned-state" from the DECLARATION initializer alone, so a local that
+    // becomes owned by a later store — `var t: Cell? := null; t := new Cell(1);`
+    // — was missed), and it CROSSES INTO A LAMBDA BODY nested in the getter
+    // (the lambda-body arm, `applyUsingVarBorrowPinInLambdaStmt`, runs only
+    // from the METHOD dataflow, which a getter accessor never reaches).
     void scanGetterSelfAssignments(
         const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
+    // fix #8768: the state-tracked walk. `states` maps a local's DECLARATION
+    // node to the bitmask of the §28.3 states the local can hold at the
+    // current program point (one bit per `OwnershipState`); the mask is an
+    // OVER-APPROXIMATION, so a conditional store widens it.
+    // per §28.3, §28.9, v0.359
+    void scanGetterSelfAssignStmts(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+        std::unordered_map<const ast::Node*, std::uint32_t>& states);
+    void scanGetterSelfAssignStmt(
+        const ast::Stmt& s,
+        std::unordered_map<const ast::Node*, std::uint32_t>& states);
+    void scanGetterSelfAssignAssignment(
+        const ast::AssignmentStmt& as, int depth,
+        std::unordered_map<const ast::Node*, std::uint32_t>& states);
 
     // #1484 / #2168 / §23.1 / §28.6: declaration initializers that store a
     // freshly-produced owned value (producerState == Owned) into NON-`owned`
