@@ -21528,6 +21528,11 @@ static bool forwardedArgPositionIsCallBounded(
 static bool bodyWalkAllowsForwarding(const sema::SemaContext& ctx,
                                      const ast::MethodDecl& md,
                                      std::string_view name, int depth);
+// fix #8953 (§27.5 / §28.14 / §28.9, v0.359): does the closure held by the
+// local `decl` ESCAPE the callee? (declared here and defined after the walk
+// below, which the scan reuses.)
+static bool captureClosureLocalEscapes(const ast::MethodDecl& md,
+                                       const ast::LocalDecl* decl);
 
 namespace {
 // fix #5216 / narrow #5129 (§28.9 / §28.14, v0.313): the fail-closed walk
@@ -21613,6 +21618,45 @@ struct FormalInvocationOnlyWalk {
     bool isFormalOrAlias(const ast::Expr* e) const {
         return isName(e) || isAliasIdentifier(e);
     }
+    // fix #8953 (§27.5 / §28.14 / §28.9, v0.359): the CAPTURE admission.
+    //
+    // §28.14 (v0.359) forbids the callback being "captured by a closure that
+    // itself ESCAPES the callee" — so a capture by a closure that does NOT
+    // escape is a legal use of a call-bounded formal, and the callee then
+    // holds nothing past its own call (the closure is a local of the callee,
+    // disposed at the callee's scope end). The #8482 lambda rule failed EVERY
+    // occurrence of the formal inside a lambda body ("an invocation or an
+    // inspection there is a capture, which the closure's env holds past the
+    // call"); that rule is right for an ESCAPING closure and over-broad for
+    // one that is not, because the walk did not track whether the capturing
+    // closure escapes.
+    //
+    // `allowCaptureClosure` turns the admission on. It is set ONLY by the
+    // forwarding walk (bodyWalkAllowsForwarding) — the one the caller's
+    // call-bounded relief proves the obligation with; the strict and the
+    // inspection walk keep their verdicts.
+    bool allowCaptureClosure = false;
+    // true while the walk is INSIDE the body of a closure that captures the
+    // formal. Inside such a body the #8482 rule is relaxed: the formal may
+    // be used in the positions the walk admits at depth 0 (an invocation, an
+    // inspection, a forward to a call-bounded parameter); every other use
+    // still fails the walk closed. The relaxation does NOT reach a NESTED
+    // lambda (a closure inside the capturing closure could itself escape),
+    // and it is armed only for a closure whose binding local does not escape
+    // the callee (the ESCAPE scan below).
+    bool captureRelaxed = false;
+    // the number of references to the formal the walk has ADMITTED inside a
+    // relaxed closure. A non-zero delta over one closure's body means that
+    // closure CAPTURES the formal, so its binding local must not escape.
+    int formalAdmitCount = 0;
+    // the callee's own declaration — the ESCAPE scan of a capturing closure's
+    // binding local walks the callee's body.
+    const ast::MethodDecl* md = nullptr;
+    // fix #8953: the ESCAPE SCAN's target — the local that HOLDS the closure
+    // under scan. Its own declaration is not a use of itself; every other
+    // binding of the name is (a re-binding makes the scan ambiguous) and
+    // fails the scan closed. Null in every other walk.
+    const ast::LocalDecl* escapeDecl = nullptr;
     bool isNullTestOfName(const ast::BinaryExpr& be) const {
         if (be.op != "=" && be.op != "<>") return false;
         auto isNull = [](const ast::Expr* e) {
@@ -21649,18 +21693,42 @@ struct FormalInvocationOnlyWalk {
             if (!ok) return;
             const ast::CallArgument& a = c.args[i];
             if (!a.value) continue;
-            if (allowForwarding && ctx && lambdaDepth == 0 &&
-                (isName(a.value.get()) || isAliasIdentifier(a.value.get())) &&
-                forwardedArgPositionIsCallBounded(*ctx, c, i, forwardDepth))
+            // fix #8953 (§27.5 / §28.14 / §28.9, v0.359): inside a RELAXED
+            // closure (one that captures the formal and does not escape the
+            // callee) the formal may be forwarded exactly as at depth 0. An
+            // ADMITTED ALIAS is not: the alias is a local of the callee, so a
+            // closure that captures it captures the formal with it, and that
+            // is the closure's own business — the alias rule keeps its
+            // depth-0 spelling.
+            const bool isFormalArg = isName(a.value.get());
+            if (allowForwarding && ctx &&
+                (lambdaDepth == 0 || captureRelaxed) &&
+                (isFormalArg ||
+                 (lambdaDepth == 0 && isAliasIdentifier(a.value.get()))) &&
+                forwardedArgPositionIsCallBounded(*ctx, c, i, forwardDepth)) {
+                // fix #8953: the reference is a CAPTURE the closure holds.
+                if (isFormalArg && captureRelaxed) ++formalAdmitCount;
                 continue;  // #8933: the formal is forwarded to a
                            // call-bounded position
+            }
             expr(a.value.get());
         }
     }
     void stmt(const ast::Stmt* s) {
         if (!ok || !s) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            if (ld->name == name) { ok = false; return; }  // shadowing
+            if (ld->name == name) {
+                // fix #8953: the ESCAPE SCAN's target is the local that HOLDS
+                // the closure under scan — its own declaration is not a use of
+                // itself. Every OTHER binding of the name fails the scan
+                // closed (a re-binding makes the scan ambiguous).
+                if (escapeDecl) {
+                    if (ld != escapeDecl) { ok = false; return; }
+                    expr(ld->initializer.get());
+                    return;
+                }
+                ok = false; return;  // shadowing
+            }
             // fix #8972: re-binding a name the walk already admitted as an
             // ALIAS breaks its purity (the local may name another value
             // after the re-binding) — and a nested scope that shadows an
@@ -21700,6 +21768,41 @@ struct FormalInvocationOnlyWalk {
                 isFormalOrAlias(ld->initializer.get())) {
                 aliasNames.push_back(ld->name);
                 return;
+            }
+            // fix #8953 (§27.5 / §28.14 / §28.9, v0.359): a CLOSURE that
+            // CAPTURES the formal.
+            //
+            // §28.14 (v0.359) forbids the callback being "captured by a
+            // closure that itself ESCAPES the callee", so a capture by a
+            // closure that does not escape is legal: the closure is a local
+            // of the callee, disposed at the callee's scope end, so the
+            // callee holds nothing past its own call and the CALLER's closure
+            // local may be released at the caller's scope end.
+            //
+            // The closure is admitted only when it is bound to a local of the
+            // CALLEE's own body AND that local does not escape the callee:
+            // the closure is then invoked only inside the callee, so it
+            // cannot outlive the call. The ESCAPE scan proves the second
+            // half and fails closed (an unknown node kind, a use of the local
+            // other than a direct invocation of it — a store, a return, an
+            // argument, a capture by another closure — all leave the
+            // argument an escape, which is a leak, never an early release).
+            if (allowCaptureClosure && lambdaDepth == 0) {
+                if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(
+                        ld->initializer.get())) {
+                    const int before = formalAdmitCount;
+                    lambdaBody(*lam, /*relaxed=*/true);
+                    if (!ok) return;
+                    if (formalAdmitCount != before) {
+                        // the closure CAPTURES the formal: its binding local
+                        // must not escape the callee.
+                        if (!md || captureClosureLocalEscapes(*md, ld)) {
+                            ok = false;
+                            return;
+                        }
+                    }
+                    return;
+                }
             }
             expr(ld->initializer.get());
             return;
@@ -21801,6 +21904,29 @@ struct FormalInvocationOnlyWalk {
         // anything else: fail closed.
         ok = false;
     }
+    // fix #8953 (§27.5 / §28.14 / §28.9, v0.359): the body of a LAMBDA.
+    // `relaxed` arms the #8482 relaxation for a closure that captures the
+    // formal and whose binding local does not escape the callee (see
+    // `captureRelaxed`); every other lambda is walked with the #8482 rule
+    // unchanged (inside one, EVERY occurrence of the formal fails).
+    void lambdaBody(const ast::LambdaExpr& lam, bool relaxed) {
+        for (const auto& lp : lam.params)
+            if (lp.name == name) { ok = false; return; }
+        // fix #8972: a lambda parameter that shadows an ADMITTED ALIAS
+        // breaks its purity — fail closed.
+        for (const auto& lp : lam.params)
+            if (isAliasName(lp.name)) { ok = false; return; }
+        const bool savedRelaxed = captureRelaxed;
+        // fix #8953: the relaxation reaches THIS closure's body only — a
+        // closure nested inside it could escape the callee on its own.
+        captureRelaxed = relaxed;
+        ++lambdaDepth;
+        if (lam.isBlockBody) stmts(lam.stmts);
+        else if (lam.exprBody) expr(lam.exprBody.get());
+        else ok = false;
+        --lambdaDepth;
+        captureRelaxed = savedRelaxed;
+    }
     void expr(const ast::Expr* e) {
         if (!ok || !e) return;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
@@ -21824,8 +21950,18 @@ struct FormalInvocationOnlyWalk {
             // callback may be invoked, bound to locals, and passed on as an
             // argument to another call-bounded parameter"), and an alias
             // names the same callback.
-            if (!isFormalOrAlias(c->callee.get()) || lambdaDepth > 0)
+            // fix #8953 (§27.5 / §28.14 / §28.9, v0.359): inside a RELAXED
+            // closure (one that captures the formal and does not escape the
+            // callee) the invocation is admitted, exactly as at depth 0, and
+            // the reference is counted as a capture the closure holds — for
+            // the FORMAL and for an ADMITTED ALIAS alike, since an alias
+            // names the same callback.
+            if (isFormalOrAlias(c->callee.get())) {
+                if (captureRelaxed) ++formalAdmitCount;
+                else if (lambdaDepth > 0) expr(c->callee.get());
+            } else {
                 expr(c->callee.get());
+            }
             // fix #8933: a call's arguments may carry the formal FORWARDED to
             // another call-bounded parameter (§28.14) — callArgs admits that
             // shape, every other argument use still fails the walk closed.
@@ -21860,8 +21996,13 @@ struct FormalInvocationOnlyWalk {
             return;
         }
         if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
-            if (allowInspection && lambdaDepth == 0 && isNullTestOfName(*be))
+            // fix #8953 (§27.5 / §28.14 / §28.9, v0.359): inside a RELAXED
+            // closure the inspection is admitted, exactly as at depth 0.
+            if (allowInspection && (lambdaDepth == 0 || captureRelaxed) &&
+                isNullTestOfName(*be)) {
+                if (captureRelaxed) ++formalAdmitCount;
                 return;  // #8743 (#8482: not inside a lambda, a capture)
+            }
             expr(be->left.get());
             expr(be->right.get());
             return;
@@ -21871,9 +22012,13 @@ struct FormalInvocationOnlyWalk {
             return;
         }
         if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
-            if (allowInspection && lambdaDepth == 0 && tt->op != "as" &&
-                isName(tt->operand.get()))
+            // fix #8953 (§27.5 / §28.14 / §28.9, v0.359): inside a RELAXED
+            // closure the inspection is admitted, exactly as at depth 0.
+            if (allowInspection && (lambdaDepth == 0 || captureRelaxed) &&
+                tt->op != "as" && isName(tt->operand.get())) {
+                if (captureRelaxed) ++formalAdmitCount;
                 return;  // fix #8743: `name is T` / `name is not T`
+            }
             expr(tt->operand.get());
             return;
         }
@@ -21939,17 +22084,10 @@ struct FormalInvocationOnlyWalk {
         // local passed to such a callee was never released (64 B per run,
         // the issue's repro).
         if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
-            for (const auto& lp : lam->params)
-                if (lp.name == name) { ok = false; return; }
-            // fix #8972: a lambda parameter that shadows an ADMITTED ALIAS
-            // breaks its purity — fail closed.
-            for (const auto& lp : lam->params)
-                if (isAliasName(lp.name)) { ok = false; return; }
-            ++lambdaDepth;
-            if (lam->isBlockBody) stmts(lam->stmts);
-            else if (lam->exprBody) expr(lam->exprBody.get());
-            else ok = false;
-            --lambdaDepth;
+            // fix #8953 (§27.5 / §28.14 / §28.9, v0.359): a lambda in any
+            // position other than the initializer of a callee local keeps the
+            // #8482 rule — inside one, EVERY occurrence of the formal fails.
+            lambdaBody(*lam, /*relaxed=*/false);
             return;
         }
         // CaseExpr (pattern bindings), BindExpr, and anything else: fail
@@ -21998,6 +22136,46 @@ bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
 bool calleeBodyUsesFormalOnlyByInvocationOrInspection(
         const ast::MethodDecl& md, std::string_view name) {
     return calleeBodyUsesFormalOnly(md, name, /*allowInspection=*/true);
+}
+
+// fix #8953 (§27.5 / §28.14 / §28.9, v0.359): does the closure held by the
+// local `decl` ESCAPE the callee?
+//
+// §28.14 (v0.359) forbids the call-bounded callback being "captured by a
+// closure that itself ESCAPES the callee (judged by these same rules,
+// applied transitively)". The judgement is the callee's own: the closure is
+// a local of the callee, and it escapes when it can still be reached after
+// the callee's call — stored in a field, stored into a collection, returned,
+// captured by a closure that escapes, or handed to a position that may keep
+// it.
+//
+// The scan is the SAME fail-closed walk, run over the callee's body with the
+// closure's binding local as its target: every use of that local other than
+// a DIRECT INVOCATION of it fails the scan closed, and so does every node
+// kind the walk does not know. Both are the safe direction — the argument
+// stays an escape, which is a leak, never an early release.
+//
+// The DECLARING local is not a use of itself; every other binding of the name
+// is (a re-binding makes the scan ambiguous) and fails it closed.
+static bool captureClosureLocalEscapes(const ast::MethodDecl& md,
+                                       const ast::LocalDecl* decl) {
+    if (!decl) return true;
+    FormalInvocationOnlyWalk scan{decl->name};
+    scan.escapeDecl = decl;
+    // the scan judges the LOCAL, not the formal: an inspection of the
+    // closure local and a forward of it are USES of it, so both admissions
+    // stay off.
+    scan.allowInspection = false;
+    scan.allowForwarding = false;
+    if (md.bodyKind == ast::MethodBodyKind::Expression) {
+        if (!md.exprBody) return true;
+        scan.expr(md.exprBody.get());
+    } else if (md.bodyKind == ast::MethodBodyKind::Block) {
+        scan.stmts(md.stmts);
+    } else {
+        return true;
+    }
+    return !scan.ok;
 }
 
 
@@ -22072,6 +22250,14 @@ static bool bodyWalkAllowsForwarding(const sema::SemaContext& ctx,
     w.allowForwarding = true;
     w.ctx = &ctx;
     w.forwardDepth = depth;
+    // fix #8953 (§27.5 / §28.14 / §28.9, v0.359): the CAPTURE admission —
+    // a closure that captures the formal and does not escape the callee.
+    // Only the forwarding walk arms it (this is the walk the caller's
+    // call-bounded relief proves the obligation with); the strict and the
+    // inspection walk keep their verdicts. The callee's own declaration is
+    // needed by the ESCAPE scan of the capturing closure's binding local.
+    w.allowCaptureClosure = true;
+    w.md = &md;
     if (md.bodyKind == ast::MethodBodyKind::Expression) {
         if (!md.exprBody) return false;
         w.expr(md.exprBody.get());
