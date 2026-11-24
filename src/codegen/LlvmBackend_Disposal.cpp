@@ -6509,6 +6509,26 @@ bool Emitter::owningChoiceReceiverTempEligible(
 // The slot is the receiver's OWN §35.2 spill slot, not a fresh one: the value
 // is already in it (the receiver lowering stored it there before the call),
 // and the callee read it through that very pointer.
+//
+// fix #9009 / §28.3.11 (v0.359) — THE SLOT IS ZERO-INITIALISED IN THE ENTRY
+// BLOCK. #2733's discipline: "a slot whose disposal is registered on
+// disposeStack_ must be null on such a path or the pass frees an undef
+// pointer". The receiver is produced ONLY on the path that evaluates it — a
+// short-circuited `and`/`or` operand, a sibling branch of an `if`, an
+// `if`-expression's untaken arm SKIPS the production store entirely — so a
+// later unwind in the same scope would read an UNINITIALISED slot: a garbage
+// tag and a garbage payload pointer, freed as if they were the temporary's.
+// The zeroing is placed in the entry block, so it dominates every path.
+//
+// fix #9009 / §28.3.11 (v0.359) — THE ENTRY'S DISPOSAL CLEARS THE SLOT. An
+// `unwindOnly` entry can fire MORE THAN ONCE: the scope's unwind pass runs on
+// EVERY throw that leaves the scope, so a throw in a LATER statement of the
+// same scope re-reads the slot an earlier throw already disposed (a STALE,
+// already-freed payload — MEASURED on the rejected commit dc8fbc750:
+// "AddressSanitizer: heap-use-after-free", the stale-slot probe p14). The
+// `owningChoiceSelfClearing` flag makes the owning-choice arm zero the slot
+// after its disposal, so the later pass reads the moved-from encoding (tag 0,
+// null payload pointers) and disposes nothing.
 llvm::AllocaInst* Emitter::registerOwningChoiceReceiverTempUnwind(
         const ast::Expr* recvExpr, llvm::Value* recvSlot,
         const sema::TypeRef* resultTy) {
@@ -6523,9 +6543,13 @@ llvm::AllocaInst* Emitter::registerOwningChoiceReceiverTempUnwind(
     const sema::TypeRef* recvTy =
         resolveTypeParamRef(ctx_.exprType(*recvExpr));
     if (!recvTy || !recvTy->declaration) return nullptr;
+    // The zero-initialisation, in the entry block (see the commentary above).
+    zeroInitEntrySlot(slot);
     Disposal d{slot, nullptr};
     d.unwindOnly = true;      // the normal edge is the reclaim below
     d.owningChoice = true;
+    // The disposal clears the slot, so a LATER unwind pass disposes nothing.
+    d.owningChoiceSelfClearing = true;
     d.owningChoiceTy = recvTy->declaration;
     d.owningChoiceRef = recvTy;
     disposeStack_.back().push_back(d);
@@ -13523,6 +13547,32 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             else
                 emitOwningChoiceActiveCaseDisposal(ocAddr, it->owningChoiceTy,
                                                    it->owningChoiceRef);
+            // fix #9009 (§28.3.11, v0.359): THE SELF-CLEARING ZERO-STORE. An
+            // `unwindOnly` owning-choice entry can fire MORE THAN ONCE: the
+            // scope's UNWIND pass runs on every throw that leaves the scope, so
+            // a throw in a LATER statement of the same scope re-reads the slot
+            // an earlier throw already disposed — a STALE (already freed)
+            // payload (MEASURED on the rejected commit dc8fbc750:
+            // "AddressSanitizer: heap-use-after-free"). The zeroing is the
+            // moved-from encoding #4566 uses (tag 0, null payload pointers),
+            // which every downstream walk skips (the active-case disposal
+            // null-guards each payload pointer), so the later pass disposes
+            // nothing.
+            //
+            // Only the owning-choice RECEIVER temporary's exception-edge entry
+            // sets the flag (`registerOwningChoiceReceiverTempUnwind`); every
+            // other owning-choice entry keeps the single-exit invariant of
+            // `emitOwningChoiceActiveCaseDisposal` ("WHY NO NULL-AFTER").
+            // `ocAddr == it->slot` is the BOXED-slot guard: a boxed slot's
+            // value lives in a heap CELL, so the holder cannot be zeroed in
+            // its place (the cell would leak). The flag is never set for a
+            // boxed slot — the receiver's spill slot is a plain entry-block
+            // alloca, never a captured local's cell holder — so the guard is
+            // belt-and-braces.
+            if (it->owningChoiceSelfClearing && ocAddr == it->slot)
+                builder_.CreateStore(
+                    llvm::Constant::getNullValue(it->slot->getAllocatedType()),
+                    it->slot);
             continue;
         }
         // fix #2115 / §28.9 / §35.4: a VALUE-LIKE choice local whose

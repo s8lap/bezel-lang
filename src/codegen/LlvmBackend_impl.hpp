@@ -3685,6 +3685,25 @@ private:
         // (e.g. `owned error: string`) is NOT vtable-disposed. Null for a
         // non-generic owning choice (owningChoiceTy alone suffices there).
         const sema::TypeRef* owningChoiceRef = nullptr;
+        // fix #9009 (§28.3.11, v0.359): an `owningChoice` entry whose slot must
+        // be ZEROED after the disposal, so a LATER pass through the same entry
+        // disposes NOTHING.
+        //
+        // WHY. The owning-choice active-case disposal's own invariant is "one
+        // pass per entry, per exit" (`emitOwningChoiceActiveCaseDisposal`'s
+        // "WHY NO NULL-AFTER"), which does NOT hold for an `unwindOnly` entry:
+        // the scope's UNWIND pass runs on EVERY throw that leaves the scope, so
+        // a throw in a LATER statement of the same scope re-reads a slot the
+        // earlier throw already disposed — a STALE (already freed) payload.
+        // MEASURED on the rejected commit dc8fbc750: "AddressSanitizer:
+        // heap-use-after-free" (the stale-slot probe p14: a receiver produced
+        // and disposed on one path, a later throw in the same scope re-reading
+        // the slot).
+        //
+        // Set ONLY by the owning-choice RECEIVER temporary's exception-edge
+        // entry (`registerOwningChoiceReceiverTempUnwind`); every other
+        // owning-choice entry keeps the single-exit invariant.
+        bool owningChoiceSelfClearing = false;
         // fix #2115 / §28.9 / §35.4: a VALUE-LIKE choice local whose cases
         // carry a runtime-managed (`string`) payload. The choice value is a
         // value-typed struct on the stack; a +1 producer string stored into a
@@ -5449,6 +5468,39 @@ private:
             tmp.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), a);
         }
         return a;
+    }
+
+    // fix #9009 (§28.3.11, v0.359): ZERO-INITIALISE an EXISTING entry-block
+    // alloca, IN the entry block, so the zeroing dominates every path —
+    // including a path that never reached the slot's own store (a sibling
+    // branch of an `if`, a short-circuited `and`/`or` operand, an unwind out
+    // of an operand evaluated before the store).
+    //
+    // This is #2733's discipline (`entryAllocaNullPtr`'s commentary: "a slot
+    // whose disposal is registered on disposeStack_ must be null on such a
+    // path or the pass frees an undef pointer"), for a slot that holds a
+    // VALUE (a choice struct) rather than a pointer. The zeroed value is the
+    // moved-from encoding #4566 uses (tag 0, null payload pointers), which
+    // every downstream walk skips (the active-case disposal null-guards each
+    // payload pointer).
+    //
+    // The zero store is placed immediately AFTER the alloca (`entryAlloca`
+    // puts it at the top of the entry block), so it dominates every use of
+    // the slot: the entry block dominates the whole function.
+    void zeroInitEntrySlot(llvm::AllocaInst* slot) {
+        if (!slot) return;
+        llvm::BasicBlock* entry = &currentFn_->getEntryBlock();
+        // The slot must be an ENTRY-BLOCK alloca (`entryAlloca` puts it
+        // there), so a store in the entry block dominates every use of it.
+        if (slot->getParent() != entry) return;
+        // The zero store goes immediately after the alloca; when the alloca is
+        // the last instruction of the block, the store is appended at the end
+        // of it — still inside the entry block, and still dominating.
+        llvm::Instruction* after = slot->getNextNode();
+        llvm::IRBuilder<> tmp(
+            entry, after ? llvm::BasicBlock::iterator(after) : entry->end());
+        tmp.CreateStore(llvm::Constant::getNullValue(slot->getAllocatedType()),
+                        slot);
     }
 
     // CG50: a `ref` / `out` parameter is passed by reference (its LLVM type
