@@ -12,7 +12,7 @@ module M;
 import System;
 public class H
   public s: string := "";
-  public property this[i: int]: string
+  public property [i: int]: string
     get => s;
     set => do var k := lambda(): string => value; s := k(); end;
   end;
