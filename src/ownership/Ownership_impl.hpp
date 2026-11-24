@@ -996,6 +996,44 @@ public:
     void checkGetterBlockReturnFieldCaptures(
         const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
 
+    // fix #9034 (§28.3 closure bullet, *Provenance* clause 3 / *Set-erasing
+    // positions*, v0.359): the §28.3 *Set-erasing positions* rule at an
+    // ACCESSOR BLOCK body.
+    //
+    // THE GAP.  The rule is reached from ONE walker (the method-body walker
+    // `scopedPreScanExpr`, queued into `setErasingCheckQueue_` and judged by
+    // `reportSetErasingPosition`), and that walker runs only from
+    // `MethodOwnership::run` — i.e. only for a BLOCK method / constructor /
+    // operator body, a `set(owned)` accessor body (`runOwnedSetterBody`) and
+    // a block getter body (`runGetterBody`, and only when the body is proved
+    // confined, and then in the getter-scope-only mode whose diagnostics are
+    // deliberately suppressed).  A PLAIN setter's block body runs no
+    // ownership pass at all (#5252 scoped the `set(owned)` fix), and an
+    // UNCONFINED block getter body runs none either — so at those positions
+    // the rule was never reached.
+    //
+    // And a LAMBDA's own plain function-typed parameters are seeded as
+    // call-bounded only there too (`callBoundedScan` →
+    // `seedLambdaCallBoundedParams`), so a lambda written in an accessor
+    // block body had its parameters read as UNTRACED instead of NON-EMPTY —
+    // Provenance clause 3: "A plain function-typed parameter of the enclosing
+    // body contributes itself: its signature announces no set, so the value
+    // is bounded by the call, §28.14's call-bounded tier".  A function value
+    // with a non-empty source set was therefore stored where no rule could
+    // bound it (an `Object` parameter) and then invoked after its capture was
+    // freed (MEASURED: heap-use-after-free).
+    //
+    // THE DRIVER.  It REUSES the ownership pass's own COMPLETE flow walk
+    // (`setErasingFlowBuild` — every statement kind, every expression kind
+    // through `forEachSyncSubExpr`, lambda bodies included), so no second
+    // spelling of that grammar is added.  The walk is asked, for this body
+    // only, to do the two extra things the §28.3 verdict needs: seed each
+    // LAMBDA's own call-bounded parameters, and queue the set-erasing
+    // positions the body meets.  It adds NO other diagnostic. // per §28.3,
+    // v0.359
+    void checkSetErasingPositionsInAccessorBody(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
     // fix #3564: seed `states_` with the owned scope-bound locals declared in
     // ONE lambda body, so `checkClosureEscapesOnReturn`'s §28.3 leg (and
     // `checkBorrowStoreEscape`'s owned-source legs) can answer about that
@@ -7976,6 +8014,26 @@ private:
     void setErasingFlowStmts(const std::vector<std::unique_ptr<ast::Stmt>>& ss);
     void setErasingFlowExpr(const ast::Expr* e);
     void setErasingFlowUse(const ast::IdentifierExpr& id);
+    // fix #9034 (§28.3 closure bullet, *Provenance* clause 3 / *Set-erasing
+    // positions*, v0.359): true while the ACCESSOR-BODY set-erasing walk runs
+    // (`checkSetErasingPositionsInAccessorBody`).  The walk is the ownership
+    // pass's own flow walk, which already reaches every statement and every
+    // expression of the body (lambda bodies included); the flag asks it for
+    // the two things the §28.3 verdict needs and that walk does not
+    // otherwise do — seed each LAMBDA's own plain function-typed parameters
+    // as call-bounded (Provenance clause 3), and queue the set-erasing
+    // positions the body meets.
+    bool setErasingAccessorWalk_ = false;
+    // fix #9034: queue the set-erasing positions of ONE call — the three
+    // positions the block-body walk queues at a call: an argument of a
+    // parameter declared `Object`, an argument of a parameter declared at a
+    // bare type parameter, and the receiver of an extension call whose head
+    // is `Object` — read off the SAME `CalleeFormals` view the block-body
+    // walk reads, so the two walks cannot disagree about which argument sits
+    // at which formal. // per §28.3
+    void queueAccessorSetErasingPositions(
+        const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
+        const ast::NewExpr* ctor);
     template <typename F>
     void setErasingFlowIn(SetErasingFlowKind kind, const void* group, F&& f) {
         const int saved = seFlowCur_;

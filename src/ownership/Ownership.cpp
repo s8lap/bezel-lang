@@ -21850,6 +21850,32 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
                     acc.bodyKind == ast::PropertyAccessorBodyKind::Block) {
                     runOwnedSetterBody(*pd, acc, ctx, enclosingType);
                 }
+                // fix #9034 (§28.3 closure bullet, *Provenance* clause 3 /
+                // *Set-erasing positions*, v0.359): the §28.3 *Set-erasing
+                // positions* rule at an ACCESSOR BLOCK body.  A plain
+                // setter's block body (`set(v) => do … end;`) and a block
+                // getter's body (`get => do … end;`) are MEMBER bodies, and
+                // §28.3's rules govern them like any other body — but no
+                // ownership pass reached them: a plain setter's body runs
+                // none at all (#5252 scoped the `set(owned)` fix to that
+                // spelling), and a block getter's body runs one only when it
+                // is PROVED CONFINED, and then in the getter-scope-only mode
+                // whose diagnostics are deliberately suppressed.  So a LAMBDA
+                // written in such a body had its own plain function-typed
+                // parameters read as UNTRACED instead of NON-EMPTY
+                // (Provenance clause 3), and a function value with a
+                // non-empty source set was admitted at an `Object` parameter
+                // (MEASURED: heap-use-after-free once the closure was
+                // invoked).  A `set(owned)` accessor body is EXCLUDED: the
+                // full ownership pass above already reaches the rule there,
+                // and running it twice would report the same position twice.
+                // // per §28.3
+                if (acc.bodyKind == ast::PropertyAccessorBodyKind::Block &&
+                    !(acc.isSet && acc.setterParamMod == "owned")) {
+                    MethodOwnership setErasingMo(ctx);
+                    setErasingMo.checkSetErasingPositionsInAccessorBody(
+                        acc.stmts);
+                }
                 if (acc.isSet) continue;  // §28.6 getter-fresh-owned: getters only
                 if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression &&
                     acc.exprBody) {

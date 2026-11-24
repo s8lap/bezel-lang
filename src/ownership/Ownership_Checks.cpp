@@ -31101,6 +31101,105 @@ void MethodOwnership::reportSetErasingPosition(const SetErasingCheck& c) {
     }
 }
 
+// fix #9034 (§28.3 closure bullet, *Provenance* clause 3 / *Set-erasing
+// positions*, v0.359): the set-erasing positions of ONE call, for the
+// ACCESSOR-BODY walk.
+//
+// The three positions are the ones the block-body walk queues at a call — an
+// argument of a parameter declared `Object`, an argument of a parameter
+// declared at a bare type parameter, and the receiver of an extension call
+// whose head is `Object` — read off the SAME `CalleeFormals` view the
+// block-body walk reads (`scopedPreScanExpr`), so the two walks cannot
+// disagree about which argument sits at which formal, nor about which
+// formal is set-erasing. // per §28.3
+void MethodOwnership::queueAccessorSetErasingPositions(
+    const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
+    const ast::NewExpr* ctor) {
+    CalleeFormals f;
+    if (ctor)
+        f = resolveCtorParams(*ctor, ctx_);
+    else if (callee)
+        f = calleeOrChainFormals(callee, args);
+    // fix #8962 (§28.3 *Set-erasing positions*, v0.359): a record's generated
+    // primary constructor has no resolved formals; its parameters ARE the
+    // §9.1 components, read here by declared type — the same reading
+    // `scopedPreScanExpr` makes.
+    std::vector<const sema::TypeRef*> recordComps;
+    if (ctor && !f.valid()) recordComps = recordCtorArgComponentTypes(*ctor);
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const auto& a = args[i];
+        if (!a.value) continue;
+        const std::size_t bp = boundFormalIndex(args, i, f);
+        const bool recordComp = i < recordComps.size() && recordComps[i];
+        if (bp >= f.size() && !recordComp) continue;
+        const sema::TypeRef* pt = nullptr;
+        if (recordComp) {
+            pt = recordComps[i];
+        } else {
+            const ast::Type* dType = f.declType(bp);
+            pt = dType ? ctx_.resolvedType(*dType) : f.resolvedType(bp);
+        }
+        if (!pt) continue;
+        // A bare type parameter: kind=Named with declaration=nullptr per
+        // resolveNamed's type-param marker (TypeResolution_Names.cpp). `Object`
+        // is set-erasing as a Primitive. // per §28.3
+        if (pt->kind == sema::TypeRef::Kind::Named && !pt->declaration)
+            setErasingCheckQueue_.push_back(
+                {SetErasingPosition::BareTypeParameter, a.value.get()});
+        else if (pt->kind == sema::TypeRef::Kind::Primitive &&
+                 pt->primitive == sema::PrimitiveType::Object)
+            setErasingCheckQueue_.push_back(
+                {SetErasingPosition::ObjectParameter, a.value.get()});
+    }
+    // The extension-call receiver position (fix #8785): the receiver of an
+    // extension call whose head is `Object`.  Queued by the SAME helper the
+    // block-body walk uses, so the two walks agree on it too.
+    if (callee) checkObjectExtensionReceiver(*callee);
+}
+
+// fix #9034 (§28.3 closure bullet, *Provenance* clause 3 / *Set-erasing
+// positions*, v0.359): the §28.3 *Set-erasing positions* rule at an ACCESSOR
+// BLOCK body.
+//
+// A plain setter's block body (`set(v) => do … end;`) and a block getter's
+// body (`get => do … end;`) are MEMBER bodies, and §28.3's rules govern them
+// like any other body — but no ownership pass reached them (a plain setter's
+// body runs none at all; a block getter's body runs one only when it is
+// proved confined, and then in the getter-scope-only mode, whose diagnostics
+// are deliberately suppressed).  So the rule was never reached there, and a
+// LAMBDA written in such a body had its own plain function-typed parameters
+// read as UNTRACED rather than NON-EMPTY (Provenance clause 3).
+//
+// THE WALK.  The ownership pass's own COMPLETE flow walk
+// (`setErasingFlowBuild`) — every statement kind, every expression kind
+// through `forEachSyncSubExpr`, lambda bodies included — is reused, so no
+// second spelling of that grammar is added.  While it runs, it also seeds
+// each LAMBDA's own call-bounded parameters and queues the set-erasing
+// positions the body meets (see `setErasingAccessorWalk_`).  The verdicts
+// are then judged by the SAME `reportSetErasingPosition` the block-body walk
+// uses, against the SAME flow facts, so the accessor body and the method
+// body cannot disagree about a verdict.
+//
+// NO OTHER DIAGNOSTIC.  The walk adds the §28.3 *Set-erasing positions*
+// rule and nothing else: it does not run the dataflow, does not arm a
+// scope-end free, and does not report through `MethodOwnership::report`
+// anything but the set-erasing verdict. // per §28.3, v0.359
+void MethodOwnership::checkSetErasingPositionsInAccessorBody(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    if (body.empty()) return;
+    const bool saved = setErasingAccessorWalk_;
+    setErasingAccessorWalk_ = true;
+    // The flow facts (Provenance clause 6) are built by the same walk that
+    // queues the positions, exactly as `scopedPreScan` does — the verdict of
+    // a local read at a set-erasing position is judged against them.
+    setErasingFlowBuild(body);
+    setErasingAccessorWalk_ = saved;
+    // The verdicts, in the order the walk met the positions. // per §28.3
+    for (const SetErasingCheck& c : setErasingCheckQueue_)
+        reportSetErasingPosition(c);
+    setErasingCheckQueue_.clear();
+}
+
 void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
     // Call-like nodes: run the §28.14 admission for each arg whose formal is
     // `scoped`, then descend.
@@ -32403,6 +32502,18 @@ void MethodOwnership::setErasingFlowExpr(const ast::Expr* e) {
             return;
         }
         if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&n)) {
+            // fix #9034 (§28.3 closure bullet, *Provenance* clause 3,
+            // v0.359): a LAMBDA's OWN plain function-typed parameters are
+            // call-bounded in its own body (§28.14) and so contribute a
+            // NON-EMPTY source set (Provenance clause 3: "A plain
+            // function-typed parameter of the enclosing body contributes
+            // itself: its signature announces no set, so the value is bounded
+            // by the call").  The block-body walk seeds them in
+            // `callBoundedScan`; a lambda written in an ACCESSOR BLOCK body
+            // was never seeded, so a read of its parameter was read as
+            // UNTRACED rather than NON-EMPTY.  Seeded here for the
+            // accessor-body walk only. // per §28.3, §28.14
+            if (setErasingAccessorWalk_) seedLambdaCallBoundedParams(*lam);
             setErasingFlowIn(Kind::Lambda, lam, [&] {
                 if (const std::vector<sema::Symbol*>* ps =
                         ctx_.lambdaParams(lam))
@@ -32435,6 +32546,23 @@ void MethodOwnership::setErasingFlowExpr(const ast::Expr* e) {
             args = &nc->args;
         else if (auto* ne = dynamic_cast<const ast::NewExpr*>(&n))
             args = &ne->args;
+        // fix #9034 (§28.3 closure bullet, *Provenance* clause 3 / *Set-erasing
+        // positions*, v0.359): the ACCESSOR-BODY walk queues the set-erasing
+        // positions the body meets.  The block-body walk queues them in
+        // `scopedPreScanExpr`; this walk reaches the SAME calls (this very
+        // walk is the one that builds the flow facts the block-body walk's
+        // verdict reads), so the two walks cannot disagree about which
+        // argument sits at which formal. // per §28.3
+        if (setErasingAccessorWalk_) {
+            if (auto* ce = dynamic_cast<const ast::CallExpr*>(&n))
+                queueAccessorSetErasingPositions(ce->callee.get(), ce->args,
+                                                 nullptr);
+            else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&n))
+                queueAccessorSetErasingPositions(nc->callee.get(), nc->args,
+                                                 nullptr);
+            else if (auto* ne = dynamic_cast<const ast::NewExpr*>(&n))
+                queueAccessorSetErasingPositions(nullptr, ne->args, ne);
+        }
         if (!args) return;
         for (const ast::CallArgument& a : *args) {
             if (a.modifier.find("out") == std::string_view::npos &&
