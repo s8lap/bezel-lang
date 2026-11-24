@@ -4235,7 +4235,7 @@ void Emitter::emitCdMarkEscaped(llvm::Value* v) {
         llvm::isa<llvm::ConstantPointerNull>(v))
         return;
     llvm::BasicBlock* bb = builder_.GetInsertBlock();
-    if (!bb || bb->getTerminator()) return;
+    if (!bb || terminatorOrNull(bb)) return;
     builder_.CreateCall(
         declareC("bz_cd_mark_escaped", llvm::Type::getVoidTy(llvm_),
                  {ptrTy()}), {v});
@@ -7946,7 +7946,7 @@ llvm::Function* Emitter::boxedRecordValueFreer(const sema::TypeRef* valTy,
     // emitted into and is currently unterminated. Append the free + branch
     // to retBB on the local IRBuilder (NOT builder_, which we are about to
     // restore), so the boxed-V storage reclaim runs on every walk path.
-    if (!builder_.GetInsertBlock()->getTerminator()) {
+    if (!terminatorOrNull(builder_.GetInsertBlock())) {
         b.SetInsertPoint(builder_.GetInsertBlock());
         b.CreateCall(freeFn(), {box});
         b.CreateBr(retBB);
@@ -8026,7 +8026,7 @@ llvm::Function* Emitter::boxedChoiceValueFreer(const sema::TypeRef* valTy,
     // release. The unterminated path is the case where the walker emitted
     // nothing (no active case or no string-owning case). Chain the free
     // exactly the same way as the record variant.
-    if (!builder_.GetInsertBlock()->getTerminator()) {
+    if (!terminatorOrNull(builder_.GetInsertBlock())) {
         b.SetInsertPoint(builder_.GetInsertBlock());
         b.CreateCall(freeFn(), {box});
         b.CreateBr(retBB);
@@ -10525,7 +10525,7 @@ void Emitter::flushK8RecvTemps() {
     // entry without emitting — the unwind edge's disposeStack_ walk has
     // already reclaimed it and emitting after a terminator is invalid IR.
     llvm::BasicBlock* bb = builder_.GetInsertBlock();
-    bool live = currentFn_ && bb && !bb->getTerminator();
+    bool live = currentFn_ && bb && !terminatorOrNull(bb);
     std::vector<K8RecvTemp> keep;
     for (const auto& t : k8RecvTemps_) {
         if (t.fn != currentFn_) { keep.push_back(t); continue; }
@@ -10657,7 +10657,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
     const unsigned dispatchesAtPassEntry = userCodeDisposalCount_;
     llvm::Value* excAtPassEntry = nullptr;
     if (!isUnwind && !scope.empty() && builder_.GetInsertBlock() &&
-        !builder_.GetInsertBlock()->getTerminator())
+        !terminatorOrNull(builder_.GetInsertBlock()))
         excAtPassEntry = snapshotInFlightExc();
     for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
         // fix #3070 / §30.5 + §28.3 *Unbound owned temporaries* (v0.249): an

@@ -1263,7 +1263,7 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
         builder_.CreateCondBr(isNull, nullBB, liveBB);
         builder_.SetInsertPoint(nullBB);
         emitThrowBuiltin("SerializationException");
-        if (!builder_.GetInsertBlock()->getTerminator())
+        if (!terminatorOrNull(builder_.GetInsertBlock()))
             builder_.CreateUnreachable();
         builder_.SetInsertPoint(liveBB);
     }
@@ -1341,7 +1341,7 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
 
                 builder_.SetInsertPoint(dupBB);
                 emitThrowBuiltin("SerializationException");
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateUnreachable();
 
                 builder_.SetInsertPoint(freshBB);
@@ -1422,7 +1422,7 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
         builder_.CreateCondBr(notSeen, missBB, okBB);
         builder_.SetInsertPoint(missBB);
         emitThrowBuiltin("SerializationException");
-        if (!builder_.GetInsertBlock()->getTerminator())
+        if (!terminatorOrNull(builder_.GetInsertBlock()))
             builder_.CreateUnreachable();
         builder_.SetInsertPoint(okBB);
     }
@@ -1705,7 +1705,7 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
                 builder_.CreateCondBr(cond, ovfBB, okBB);
                 builder_.SetInsertPoint(ovfBB);
                 emitThrowBuiltin("SerializationException");
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateUnreachable();
                 builder_.SetInsertPoint(okBB);
             }
@@ -1724,7 +1724,7 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
                 builder_.CreateCondBr(builder_.CreateOr(lo, hi, "deser.sbyte.ovf"), ovfBB, okBB);
                 builder_.SetInsertPoint(ovfBB);
                 emitThrowBuiltin("SerializationException");
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateUnreachable();
                 builder_.SetInsertPoint(okBB);
             }
@@ -1743,7 +1743,7 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
                 builder_.CreateCondBr(builder_.CreateOr(lo, hi, "deser.short.ovf"), ovfBB, okBB);
                 builder_.SetInsertPoint(ovfBB);
                 emitThrowBuiltin("SerializationException");
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateUnreachable();
                 builder_.SetInsertPoint(okBB);
             }
@@ -1761,7 +1761,7 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
                 builder_.CreateCondBr(cond, ovfBB, okBB);
                 builder_.SetInsertPoint(ovfBB);
                 emitThrowBuiltin("SerializationException");
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateUnreachable();
                 builder_.SetInsertPoint(okBB);
             }
@@ -1784,7 +1784,7 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
                 builder_.CreateCondBr(builder_.CreateOr(lo, hi, "deser.int.ovf"), ovfBB, okBB);
                 builder_.SetInsertPoint(ovfBB);
                 emitThrowBuiltin("SerializationException");
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateUnreachable();
                 builder_.SetInsertPoint(okBB);
             }
@@ -1802,7 +1802,7 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
                 builder_.CreateCondBr(cond, ovfBB, okBB);
                 builder_.SetInsertPoint(ovfBB);
                 emitThrowBuiltin("SerializationException");
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateUnreachable();
                 builder_.SetInsertPoint(okBB);
             }
@@ -2400,7 +2400,7 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
         builder_.CreateCondBr(isNull, nullBB, liveBB);
         builder_.SetInsertPoint(nullBB);
         emitThrowBuiltin("SerializationException");
-        if (!builder_.GetInsertBlock()->getTerminator())
+        if (!terminatorOrNull(builder_.GetInsertBlock()))
             builder_.CreateUnreachable();
         builder_.SetInsertPoint(liveBB);
     }
@@ -2635,7 +2635,7 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
                 builder_.CreateCondBr(isNull, nullBB, liveBB);
                 builder_.SetInsertPoint(nullBB);
                 emitThrowBuiltin("SerializationException");
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateUnreachable();
                 builder_.SetInsertPoint(liveBB);
             }
@@ -2687,7 +2687,7 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
 
                         builder_.SetInsertPoint(dupBB);
                         emitThrowBuiltin("SerializationException");
-                        if (!builder_.GetInsertBlock()->getTerminator())
+                        if (!terminatorOrNull(builder_.GetInsertBlock()))
                             builder_.CreateUnreachable();
 
                         builder_.SetInsertPoint(freshBB);
@@ -2749,7 +2749,7 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
                 builder_.CreateCondBr(miss, missBB, okBB);
                 builder_.SetInsertPoint(missBB);
                 emitThrowBuiltin("SerializationException");
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateUnreachable();
                 builder_.SetInsertPoint(okBB);
             }
@@ -2796,7 +2796,7 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
     builder_.CreateCall(relFn, {discPtr});
     builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), discSlot);
     emitThrowBuiltin("SerializationException");
-    if (!builder_.GetInsertBlock()->getTerminator())
+    if (!terminatorOrNull(builder_.GetInsertBlock()))
         builder_.CreateUnreachable();
 
     builder_.SetInsertPoint(doneBB);
@@ -2873,7 +2873,7 @@ void Emitter::emitPolyClassSerialize(const TypeSymbol* baseTs,
     builder_.SetInsertPoint(throwBB);
     emitThrowBuiltin("SerializationException");
     // emitThrowBuiltin branches to unwindBB(); add unreachable fallback.
-    if (!builder_.GetInsertBlock()->getTerminator())
+    if (!terminatorOrNull(builder_.GetInsertBlock()))
         builder_.CreateUnreachable();
 
     builder_.SetInsertPoint(endBB);
@@ -2917,7 +2917,7 @@ llvm::Value* Emitter::emitPolyClassDeserialize(const TypeSymbol* baseTs,
         builder_.CreateCondBr(isNull, nullBB, liveDiscBB);
         builder_.SetInsertPoint(nullBB);
         emitThrowBuiltin("SerializationException");
-        if (!builder_.GetInsertBlock()->getTerminator())
+        if (!terminatorOrNull(builder_.GetInsertBlock()))
             builder_.CreateUnreachable();
         builder_.SetInsertPoint(liveDiscBB);
     }
@@ -3003,7 +3003,7 @@ llvm::Value* Emitter::emitPolyClassDeserialize(const TypeSymbol* baseTs,
         builder_.CreateCall(relFn, {discPtr});
         builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), discSlot);
         emitThrowBuiltin("SerializationException");
-        if (!builder_.GetInsertBlock()->getTerminator())
+        if (!terminatorOrNull(builder_.GetInsertBlock()))
             builder_.CreateUnreachable();
     }
 
@@ -3238,7 +3238,7 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
                 // Cycle: raise SerializationException.
                 builder_.SetInsertPoint(cycleBB);
                 emitThrowBuiltin("SerializationException");
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateUnreachable();
                 // No cycle: write the $ref.
                 builder_.SetInsertPoint(noRefBB);
@@ -3949,7 +3949,7 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         // scope above).
         emitThrowBuiltin("SerializationException");
         // emitThrowBuiltin branches to unwindBB; add unreachable as fallback.
-        if (!builder_.GetInsertBlock()->getTerminator())
+        if (!terminatorOrNull(builder_.GetInsertBlock()))
             builder_.CreateUnreachable();
 
         builder_.SetInsertPoint(contBB);
@@ -4022,7 +4022,7 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
 
                 builder_.SetInsertPoint(dupBB);
                 emitThrowBuiltin("SerializationException");
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateUnreachable();
 
                 builder_.SetInsertPoint(freshBB);
@@ -4131,7 +4131,7 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 builder_.CreateCondBr(isNullR, shCycBB, shOkBB);
                 builder_.SetInsertPoint(shCycBB);
                 emitThrowBuiltin("SerializationException");
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateUnreachable();
                 builder_.SetInsertPoint(shOkBB);
                 auto* cloneFn =
@@ -4201,7 +4201,7 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 builder_.CreateCondBr(wkNullR, wkCycBB, wkOkBB);
                 builder_.SetInsertPoint(wkCycBB);
                 emitThrowBuiltin("SerializationException");
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateUnreachable();
                 builder_.SetInsertPoint(wkOkBB);
                 auto* downFn =
@@ -4263,7 +4263,7 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 builder_.CreateCondBr(isNullPtr, cycleBB, beResolvBB);
                 builder_.SetInsertPoint(cycleBB);
                 emitThrowBuiltin("SerializationException");
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateUnreachable();
                 builder_.SetInsertPoint(beResolvBB);
                 builder_.CreateBr(beMergeBB);
@@ -4394,7 +4394,7 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         // unconditionally before this check ever runs — a second, separately
         // maintained walk here added risk without adding coverage.
         emitThrowBuiltin("SerializationException");
-        if (!builder_.GetInsertBlock()->getTerminator())
+        if (!terminatorOrNull(builder_.GetInsertBlock()))
             builder_.CreateUnreachable();
         builder_.SetInsertPoint(okBB);
     }

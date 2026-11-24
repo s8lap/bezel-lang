@@ -739,7 +739,7 @@ llvm::Function* Emitter::coOwnLeafVisitThunk(const sema::TypeRef* et) {
     currentFn_ = fn;
     builder_.SetInsertPoint(entry);
     emitRecordStringFieldRetains_impl(&*fn->args().begin(), et);
-    if (!builder_.GetInsertBlock()->getTerminator()) builder_.CreateRetVoid();
+    if (!terminatorOrNull(builder_.GetInsertBlock())) builder_.CreateRetVoid();
     currentFn_ = savedFn;
     if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
     auto* leafFn = declareC("bz_coown_leaf", llvm::Type::getVoidTy(llvm_),
@@ -7744,7 +7744,7 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
 
     // --- Emit body ---
     lowerScopedBlock(acc->stmts);
-    if (!builder_.GetInsertBlock()->getTerminator())
+    if (!terminatorOrNull(builder_.GetInsertBlock()))
         emitImplicitReturn(fn);
     if (publishGetterReturnType)
         currentReturnTypeNode_ = savedGetterReturnTypeNode;
@@ -8160,7 +8160,7 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
             }
         } else if (getterExpr) {
             llvm::Value* v = lowerExpr(*getterExpr);
-            if (!builder_.GetInsertBlock()->getTerminator()) {
+            if (!terminatorOrNull(builder_.GetInsertBlock())) {
                 // #510 / §7 / §12.1 / §13 (Bug3): when the property return
                 // type is a nullable value type ({ i8, T } struct) but
                 // lowerExpr returned the raw inner value (e.g. i1 for `true`,
@@ -8451,7 +8451,7 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                 takeCurrentDictFreeEligibleFn_ = fn;       // #3880
                 lowerScopedBlock(blockGet->stmts);
             }
-            if (!builder_.GetInsertBlock()->getTerminator())
+            if (!terminatorOrNull(builder_.GetInsertBlock()))
                 emitImplicitReturn(fn);
             emittingGenericTemplateBody_ = savedEmittingGenericTemplateBody;
         }
@@ -8639,7 +8639,7 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
             else
                 lowerScopedBlock(setAcc->stmts);
         }
-        if (!builder_.GetInsertBlock()->getTerminator())
+        if (!terminatorOrNull(builder_.GetInsertBlock()))
             builder_.CreateRetVoid();
     }
 
@@ -8841,7 +8841,7 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
         takeCurrentDictFreeEligibleFn_ = fn;       // #3880
         lowerScopedBlock(acc->stmts);
     }
-    if (!builder_.GetInsertBlock()->getTerminator())
+    if (!terminatorOrNull(builder_.GetInsertBlock()))
         emitImplicitReturn(fn);
 
     // --- Restore state ---
@@ -9310,7 +9310,7 @@ llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
         result = wrapNullableGetterResult(ctx_.resolvedType(*pd->type), result);
     if (!result) result = llvm::Constant::getNullValue(retTy);
     result = coerceNumericToType(result, retTy, false);
-    if (!builder_.GetInsertBlock()->getTerminator())
+    if (!terminatorOrNull(builder_.GetInsertBlock()))
         builder_.CreateRet(result);
 
     currentFn_        = savedFn;
@@ -9485,7 +9485,7 @@ llvm::Function* Emitter::ensureIndexerSetterFn(const sema::TypeSymbol* cls,
         AccessorClosureScope accessorClosureScope(*this, *setterStmts, fn);
         lowerScopedBlock(*setterStmts);
     }
-    if (!builder_.GetInsertBlock()->getTerminator())
+    if (!terminatorOrNull(builder_.GetInsertBlock()))
         builder_.CreateRetVoid();
 
     currentFn_        = savedFn;
@@ -10152,7 +10152,7 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
     // body reaches (§21.7's accessor-end target, #739), which is exactly
     // §22.16's "normal exit" — "throw exits check nothing" is why an
     // unwinding path must not reach it.
-    if (invCls4614 && !builder_.GetInsertBlock()->getTerminator())
+    if (invCls4614 && !terminatorOrNull(builder_.GetInsertBlock()))
         emitInvariantCheck(recv, invCls4614);
     // fix #2568 (§23.3/§28.9/§4.6, v0.236): the INSTANCE-PATH twin of the
     // static-path emitProducerRelease above. Same gate (classOwned) for the
@@ -11093,7 +11093,7 @@ bool Emitter::lowerAccessorNullCoalescingAssign(const ast::AssignmentStmt& as) {
         if (!stored && ix)
             stored = lowerCollectionIndexerSet(*ix, rhs, as.value.get());
     }
-    if (!builder_.GetInsertBlock()->getTerminator())
+    if (!terminatorOrNull(builder_.GetInsertBlock()))
         builder_.CreateBr(endBB);
     builder_.SetInsertPoint(endBB);
     // fix #2929: the getter (unconditional) and the setter (assign branch) are

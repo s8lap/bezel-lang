@@ -516,7 +516,7 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
         // degrades to the caller's null value — only the IR SHAPE is
         // repaired; a right operand that does not lower stays a degrade.
         if (rhsDiverged) return nullptr;  // threw: rhsBB already terminated
-        if (!builder_.GetInsertBlock()->getTerminator())
+        if (!terminatorOrNull(builder_.GetInsertBlock()))
             builder_.CreateBr(endBB);
         builder_.SetInsertPoint(endBB);
         return nullptr;
@@ -4826,7 +4826,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             }
         }
         if (!v) v = lowerExpr(*lam.exprBody);
-        if (!builder_.GetInsertBlock()->getTerminator()) {
+        if (!terminatorOrNull(builder_.GetInsertBlock())) {
             if (v && !retTy->isVoidTy()) {
                 // fix #541 / §7.1: when the lambda's expected return type is a
                 // NULLABLE VALUE TYPE (`T?` → `{i8 hasValue; T value}`) but the
@@ -4970,12 +4970,12 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // A disposal pass can leave the block terminated (it branches
                 // on a null slot); the `ret` belongs on the live edge only —
                 // the same guard `lowerScopedBlock`'s caller uses.
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateRet(v);
             } else {
                 // fix #6480: the same discharge on the void / null-result arm.
                 emitDisposals(disposeStack_.back());
-                if (!builder_.GetInsertBlock()->getTerminator()) {
+                if (!terminatorOrNull(builder_.GetInsertBlock())) {
                     // fix #1255 / §27.5 / §14.2: when the expression body lowered
                     // to null (e.g. `x.Val()` where x: T with T erased to i32 in
                     // the unspecialized generic template — the non-pointer receiver
@@ -5010,7 +5010,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // (retTy != void) would otherwise get a `ret void` here — malformed IR
         // (ret-type mismatch). Mirror emitImplicitReturn: void → retvoid, else
         // a zero-initialized value of retTy.
-        if (!builder_.GetInsertBlock()->getTerminator()) {
+        if (!terminatorOrNull(builder_.GetInsertBlock())) {
             if (retTy->isVoidTy()) builder_.CreateRetVoid();
             else builder_.CreateRet(llvm::Constant::getNullValue(retTy));
         }

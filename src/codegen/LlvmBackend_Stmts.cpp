@@ -1905,9 +1905,9 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // have an exit check appended, and appending one to a
                 // terminated block is malformed IR besides. Mirrors #4646's
                 // `:=` exit guard and #4682's compound one.
-                if (invCls4732 && !builder_.GetInsertBlock()->getTerminator())
+                if (invCls4732 && !terminatorOrNull(builder_.GetInsertBlock()))
                     emitInvariantCheck(invRecv4646, invCls4732);
-                if (!builder_.GetInsertBlock()->getTerminator())
+                if (!terminatorOrNull(builder_.GetInsertBlock()))
                     builder_.CreateBr(endBB);
                 builder_.SetInsertPoint(endBB);
                 return false;
@@ -2792,7 +2792,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // a store path that left the current block terminated (an
                 // unwind edge) must not have an exit check appended to it, and
                 // appending one to a terminated block is malformed IR besides.
-                if (invCls4646 && !builder_.GetInsertBlock()->getTerminator())
+                if (invCls4646 && !terminatorOrNull(builder_.GetInsertBlock()))
                     emitInvariantCheck(invRecv4646, invCls4646);
             } else {
                 // fix #610 / §25.1 / §6.6: compound assignment `target OP= value`
@@ -2921,7 +2921,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // appended to it, and appending one to a terminated block is
                 // malformed IR besides. Mirrors #4646's `:=` exit guard.
                 auto invExit4682 = [&] {
-                    if (invCls4682 && !builder_.GetInsertBlock()->getTerminator())
+                    if (invCls4682 && !terminatorOrNull(builder_.GetInsertBlock()))
                         emitInvariantCheck(invRecv4646, invCls4682);
                 };
                 std::string op(as->op);
@@ -3255,7 +3255,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // §22.16's "throw exits check nothing" — see the compound arm's
             // twin for the full note.
             auto invExit4682 = [&] {
-                if (invCls4682 && !builder_.GetInsertBlock()->getTerminator())
+                if (invCls4682 && !terminatorOrNull(builder_.GetInsertBlock()))
                     emitInvariantCheck(invRecv4682, invCls4682);
             };
             if (addr) {
@@ -3585,7 +3585,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // local that holds null).
             if (v && v->getType()->isPointerTy() && !diverged_ &&
                 currentFn_ == closureReleaseEligibleFn_ &&
-                !builder_.GetInsertBlock()->getTerminator()) {
+                !terminatorOrNull(builder_.GetInsertBlock())) {
                 const ast::Expr* core = rs->value.get();
                 while (auto* pb =
                            dynamic_cast<const ast::PostfixBangExpr*>(core)) {
@@ -4200,7 +4200,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // method, heap-use-after-free). Retaining earlier changes no
             // count, only the order.
             if (v && rs->value && v->getType()->isPointerTy() &&
-                !builder_.GetInsertBlock()->getTerminator()) {
+                !terminatorOrNull(builder_.GetInsertBlock())) {
                 const sema::TypeRef* bodySemaTy =
                     ctx_.exprType(*rs->value);
                 bool arrivesFromCallee =
@@ -10852,7 +10852,7 @@ bool Emitter::lowerStringFor(const ast::ForStmt& fs) {
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
     lowerForBody(fs);
     loopStack_.pop_back();
-    if (!builder_.GetInsertBlock()->getTerminator())
+    if (!terminatorOrNull(builder_.GetInsertBlock()))
         builder_.CreateBr(incBB);
 
     builder_.SetInsertPoint(incBB);
@@ -10938,7 +10938,7 @@ bool Emitter::lowerStringSpanFor(const ast::ForStmt& fs) {
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
     lowerForBody(fs);
     loopStack_.pop_back();
-    if (!builder_.GetInsertBlock()->getTerminator())
+    if (!terminatorOrNull(builder_.GetInsertBlock()))
         builder_.CreateBr(incBB);
 
     builder_.SetInsertPoint(incBB);
@@ -12193,7 +12193,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         loopStack_.push_back({incBB, endBB, disposeStack_.size()});
         lowerForBody(fs);
         loopStack_.pop_back();
-        if (!builder_.GetInsertBlock()->getTerminator())
+        if (!terminatorOrNull(builder_.GetInsertBlock()))
             builder_.CreateBr(incBB);
         builder_.SetInsertPoint(incBB);
         llvm::Value* oldIdx = builder_.CreateLoad(i64(), idxSlot);
@@ -12642,7 +12642,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     loopStack_.push_back({condBB, endBB, disposeStack_.size()});
     lowerForBody(fs);
     loopStack_.pop_back();
-    if (!builder_.GetInsertBlock()->getTerminator())
+    if (!terminatorOrNull(builder_.GetInsertBlock()))
         builder_.CreateBr(condBB);
 
     // Normal exhaustion: endBB. Dispose the enumerator (Dispose runs the
@@ -14152,7 +14152,7 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
     loopStack_.push_back({condBB, endBB, disposeStack_.size()});
     lowerForBody(fs);
     loopStack_.pop_back();
-    if (!builder_.GetInsertBlock()->getTerminator())
+    if (!terminatorOrNull(builder_.GetInsertBlock()))
         builder_.CreateBr(condBB);
 
     builder_.SetInsertPoint(endBB);

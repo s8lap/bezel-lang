@@ -5647,7 +5647,7 @@ llvm::Function* Emitter::arrayEmbeddedStringThunk(const sema::TypeRef* et,
         emitRecordStringFieldRetains_impl(elemAddr, et);
     else
         emitRecordStringFieldReleases_impl(elemAddr, et);
-    if (!builder_.GetInsertBlock()->getTerminator()) builder_.CreateRetVoid();
+    if (!terminatorOrNull(builder_.GetInsertBlock())) builder_.CreateRetVoid();
     currentFn_ = savedFn;
     if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
     return fn;
@@ -6945,6 +6945,7 @@ void Emitter::fixupCapturedCellHolderReads() {
     }
     for (auto& [fn, reads] : byFn) {
         if (!fn || fn->isDeclaration()) continue;
+        ScopedCloseOpenBlocks closeOpen(*fn);  // an open block has no successors
         llvm::DominatorTree dt(*fn);
         // fix #4612: holders this pass has already null-initialised, so a
         // second repaired read of the same holder does not emit a second store.
@@ -8823,7 +8824,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
         // never leave a block without a terminator.
         llvm::BasicBlock* objDispEnd = builder_.GetInsertBlock();
         builder_.CreateBr(dispEndBB);
-        if (strDispEnd && !strDispEnd->getTerminator()) {
+        if (strDispEnd && !terminatorOrNull(strDispEnd)) {
             builder_.SetInsertPoint(strDispEnd);
             builder_.CreateBr(dispEndBB);
         }

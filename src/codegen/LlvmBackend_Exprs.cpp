@@ -13251,7 +13251,7 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
     // its own post-body join (`invCls4614 && !builder_.GetInsertBlock()->
     // getTerminator()`), and for the same §22.16 reason: "throw exits check
     // nothing".
-    if (invCls6205 && !builder_.GetInsertBlock()->getTerminator())
+    if (invCls6205 && !terminatorOrNull(builder_.GetInsertBlock()))
         emitInvariantCheck(recv, invCls6205);
     // fix #2490/#2500/#2506 (§23.3/§4.6/§27.5/§28.9, v0.236): the virtual/
     // interface-dispatch twin of lowerImportedPropertySetValue's ARGUMENT-PASS

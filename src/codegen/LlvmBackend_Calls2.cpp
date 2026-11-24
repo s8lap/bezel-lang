@@ -23708,7 +23708,7 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             // arms and taking the itable result — never leave a dangling block.
             llvm::BasicBlock* objDispEnd = builder_.GetInsertBlock();
             builder_.CreateBr(dispEndBB);
-            if (strDispEnd && !strDispEnd->getTerminator()) {
+            if (strDispEnd && !terminatorOrNull(strDispEnd)) {
                 builder_.SetInsertPoint(strDispEnd);
                 builder_.CreateBr(dispEndBB);
             }

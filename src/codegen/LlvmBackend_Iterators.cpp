@@ -2883,7 +2883,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         disposeStack_.emplace_back();
         bool term = lowerBody(*ci.stmts);
         // If body didn't terminate, fall through to done.
-        if (!term && !builder_.GetInsertBlock()->getTerminator()) {
+        if (!term && !terminatorOrNull(builder_.GetInsertBlock())) {
             // #821 / §29.7: on NORMAL completion (the body runs off its end), the
             // `using var` resources active at the end must be disposed before the
             // iterator reports done. (The abandonment path — Dispose while still
@@ -3002,7 +3002,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // blocks the body never reached are affected — reachable yield states
         // already carry their terminators.
         for (llvm::BasicBlock* bb : stateBBs) {
-            if (bb && !bb->getTerminator()) {
+            if (bb && !terminatorOrNull(bb)) {
                 builder_.SetInsertPoint(bb);
                 builder_.CreateRet(builder_.getFalse());
             }

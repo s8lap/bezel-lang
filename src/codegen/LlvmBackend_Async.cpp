@@ -2236,12 +2236,12 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // emitDisposals, were freed. A body that terminated (an explicit
         // `return`, which runs emitAllDisposals via the return handler) already
         // disposed them, so this is gated on the un-terminated fall-off path.
-        if (!term && !builder_.GetInsertBlock()->getTerminator())
+        if (!term && !terminatorOrNull(builder_.GetInsertBlock()))
             emitDisposals(disposeStack_.back());
         disposeStack_.pop_back();
         // If the body fell through without a terminator, complete with no value
         // and return (§30.1 fall-off == return;).
-        if (!term && !builder_.GetInsertBlock()->getTerminator()) {
+        if (!term && !terminatorOrNull(builder_.GetInsertBlock())) {
             emitAsyncComplete(/*value=*/nullptr);
             builder_.CreateRetVoid();
         }
@@ -2259,7 +2259,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         if (smDoneBB_) {
             for (unsigned s = smNextSuspendState_ + 1; s < smStateBBs_.size(); ++s) {
                 auto* orphanBB = smStateBBs_[s];
-                if (orphanBB && !orphanBB->getTerminator()) {
+                if (orphanBB && !terminatorOrNull(orphanBB)) {
                     llvm::IRBuilder<> tmp(orphanBB);
                     tmp.CreateBr(smDoneBB_);
                 }
@@ -3136,7 +3136,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             const sema::TypeRef* bodySemaTy = ctx_.exprType(*lam.exprBody);
             if (v && resultTy && bodySemaTy &&
                 v->getType()->isPointerTy() &&
-                !builder_.GetInsertBlock()->getTerminator()) {
+                !terminatorOrNull(builder_.GetInsertBlock())) {
                 // ⚠ NO STRING ARM. The sync venue this block mirrors has one
                 // (`emitStringRetain` beside its closure retain), and it was
                 // written here, built and MEASURED — then removed, because in
@@ -3245,11 +3245,11 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             // expression that threw already diverted control to `faultBB` and
             // left the block terminated; emitting a Store into a terminated
             // block is invalid IR).
-            if (chainedReturn && !builder_.GetInsertBlock()->getTerminator())
+            if (chainedReturn && !terminatorOrNull(builder_.GetInsertBlock()))
                 deferChainedAsyncReturnSource(lam.exprBody.get());
-            if (!builder_.GetInsertBlock()->getTerminator())
+            if (!terminatorOrNull(builder_.GetInsertBlock()))
                 emitDisposals(disposeStack_.back());
-            if (!builder_.GetInsertBlock()->getTerminator()) {
+            if (!terminatorOrNull(builder_.GetInsertBlock())) {
                 // fix #3960 (§30.5 kind 1/2, v0.295): attach the kind-1 per-T
                 // result disposer (or the kind-2 chained slot) to the outer
                 // task BEFORE emitAsyncComplete — same race-safety ordering
@@ -3277,9 +3277,9 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             // the return handler, so re-running here would double-dispose —
             // this is gated to the un-terminated fall-off path exactly as
             // the method twin is.
-            if (!term && !builder_.GetInsertBlock()->getTerminator())
+            if (!term && !terminatorOrNull(builder_.GetInsertBlock()))
                 emitDisposals(disposeStack_.back());
-            if (!term && !builder_.GetInsertBlock()->getTerminator()) {
+            if (!term && !terminatorOrNull(builder_.GetInsertBlock())) {
                 emitAsyncComplete(/*value=*/nullptr);
                 builder_.CreateRetVoid();
             }
@@ -3291,7 +3291,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             for (unsigned s = smNextSuspendState_ + 1; s < smStateBBs_.size();
                  ++s) {
                 auto* orphanBB = smStateBBs_[s];
-                if (orphanBB && !orphanBB->getTerminator()) {
+                if (orphanBB && !terminatorOrNull(orphanBB)) {
                     llvm::IRBuilder<> tmp(orphanBB);
                     tmp.CreateBr(smDoneBB_);
                 }
@@ -4639,7 +4639,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         builder_.SetInsertPoint(stateBBs[0]);
         disposeStack_.emplace_back();
         bool term = lowerBody(*ci.stmts);
-        if (!term && !builder_.GetInsertBlock()->getTerminator()) {
+        if (!term && !terminatorOrNull(builder_.GetInsertBlock())) {
             // #821 / §29.7 (async): on NORMAL completion (the async iterator body
             // runs off its end), dispose the `using var` resources still active
             // at the end before reporting done. The abandonment path — Dispose
@@ -4668,7 +4668,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         if (smDoneBB_) {
             for (unsigned s = smNextSuspendState_ + 1; s < smStateBBs_.size(); ++s) {
                 auto* orphanBB = smStateBBs_[s];
-                if (orphanBB && !orphanBB->getTerminator()) {
+                if (orphanBB && !terminatorOrNull(orphanBB)) {
                     llvm::IRBuilder<> tmp(orphanBB);
                     tmp.CreateBr(smDoneBB_);
                 }
@@ -6000,7 +6000,7 @@ void Emitter::registerAwaitedTaskTemp(llvm::AllocaInst* slot,
 // `Process(await Producer())`.
 void Emitter::flushAwaitedTaskTemps() {
     llvm::BasicBlock* bb = builder_.GetInsertBlock();
-    bool live = currentFn_ && bb && !bb->getTerminator();
+    bool live = currentFn_ && bb && !terminatorOrNull(bb);
     std::vector<AwaitedTaskTemp> keep;
     for (const auto& t : awaitedTaskTemps_) {
         // Never emit against another function's alloca, and never DROP such an
@@ -6074,6 +6074,9 @@ void Emitter::fixupSuspendDominance(llvm::Function* fn) {
     bool changed = true;
     unsigned guard = 0;
     const unsigned cap = 100000;  // safety bound; never expected to be hit
+    // A still-open block reads as having no successors, as it did under
+    // LLVM 21 (see ScopedCloseOpenBlocks).
+    ScopedCloseOpenBlocks closeOpen(*fn);
     while (changed && guard++ < cap) {
         changed = false;
         llvm::DominatorTree dt(*fn);
@@ -6224,7 +6227,7 @@ void Emitter::promoteDemotedSlotsToFrame(
     // hardcoded arg index.
     llvm::Value* self = smSelf_;
     llvm::BasicBlock& entryBB = fn->getEntryBlock();
-    llvm::Instruction* term = entryBB.getTerminator();
+    llvm::Instruction* term = terminatorOrNull(&entryBB);
     // The resume entry always ends in the dispatch switch (emitResumeDispatch);
     // bail defensively if that invariant is ever broken rather than crash.
     if (!term) return;
@@ -6246,7 +6249,7 @@ void Emitter::promoteDemotedSlotsToFrame(
                                  contBB);
     // splitBasicBlock left an unconditional br entry->cont; rewrite it to the
     // null-check branch (the load/icmp above precede this terminator).
-    entryBB.getTerminator()->eraseFromParent();
+    terminatorOrNull(&entryBB)->eraseFromParent();
     {
         llvm::IRBuilder<> eb(&entryBB);
         eb.CreateCondBr(isNull, allocBB, contBB);

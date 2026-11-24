@@ -15535,7 +15535,7 @@ void Emitter::flushFfiExprTemps() {
     // after a terminator would be invalid IR. Drop the queue: entry (1) above
     // still guards every remaining edge.
     llvm::BasicBlock* bb = builder_.GetInsertBlock();
-    bool live = currentFn_ && bb && !bb->getTerminator();
+    bool live = currentFn_ && bb && !terminatorOrNull(bb);
     std::vector<FfiExprTemp> keep;
     for (const auto& t : ffiExprTemps_) {
         // Never emit a free against another function's alloca (see

@@ -1771,7 +1771,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             // invalid IR ("Basic Block ... does not have a terminator").
             if (E->diverged_) return;
             llvm::BasicBlock* bb = E->builder_.GetInsertBlock();
-            if (!bb || bb->getTerminator()) return;
+            if (!bb || terminatorOrNull(bb)) return;
             for (llvm::Value* v : *Producers) E->emitStringRelease(v);
         }
     };

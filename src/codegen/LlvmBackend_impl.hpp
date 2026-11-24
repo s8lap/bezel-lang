@@ -52,8 +52,48 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Config/llvm-config.h"
 
 namespace bezel::codegen {
+
+// The block's terminator, or null while the block is still open. Emission asks
+// "is this block terminated yet?" all the time (before appending a fall-through
+// branch, a dispose, a ret). LLVM 21's BasicBlock::getTerminator() returned null
+// for an open block. LLVM 23's assumes a well-formed block and, in a release
+// libLLVM, returns the block's last (non-terminator) instruction, or reads past
+// the end of an empty list. The null-returning query is now
+// getTerminatorOrNull(). The static release still builds against Alpine's
+// LLVM 21, so both are spelled here, in one place.
+inline llvm::Instruction* terminatorOrNull(llvm::BasicBlock* bb) {
+#if LLVM_VERSION_MAJOR >= 23
+    return bb->getTerminatorOrNull();
+#else
+    return bb->getTerminator();
+#endif
+}
+
+// Building a DominatorTree walks every block's successors. LLVM 21 read an open
+// block as having none; LLVM 23 calls successors() on its last instruction,
+// which traps. While a function is still being emitted, one of its blocks can be
+// open (an unreachable continuation the emitter has not closed yet). This guard
+// closes every open block with a temporary `unreachable` (no successors, the
+// LLVM 21 reading) for the guard's lifetime. On destruction it erases exactly
+// the instructions it added, so the blocks are open again afterwards.
+class ScopedCloseOpenBlocks {
+public:
+    explicit ScopedCloseOpenBlocks(llvm::Function& fn) {
+        for (llvm::BasicBlock& bb : fn)
+            if (!terminatorOrNull(&bb))
+                added_.push_back(new llvm::UnreachableInst(fn.getContext(), &bb));
+    }
+    ~ScopedCloseOpenBlocks() {
+        for (llvm::Instruction* i : added_) i->eraseFromParent();
+    }
+    ScopedCloseOpenBlocks(const ScopedCloseOpenBlocks&) = delete;
+    ScopedCloseOpenBlocks& operator=(const ScopedCloseOpenBlocks&) = delete;
+private:
+    std::vector<llvm::Instruction*> added_;
+};
 
 // fix #5275 (§22.3 / §28.9, v0.313): one bare-identifier `ref` ARGUMENT site
 // in a body — the argument, the callee expression it is passed to, and its
