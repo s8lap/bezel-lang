@@ -47,6 +47,12 @@ std::string program(const std::string& methodBody) {
            "  public static method Swap(ref a: () -> int, ref b: () -> int) "
            "    var t: () -> int := a; a := b; b := t; "
            "  end Swap; "
+           "  public static method Mix(ref n: int, ref a: () -> int) "
+           "    n := n + 1; "
+           "  end Mix; "
+           "  public static method MixS(ref s: string, ref a: () -> int) "
+           "    s := s + \"y\"; "
+           "  end MixS; "
            "  public static method Via(rg: Reg2, q: () -> int, c: bool) " +
            methodBody +
            "  end Via; "
@@ -136,5 +142,42 @@ BEZEL_TEST(set_erasing_ref_arg_definition_9075,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     std::string want;
     for (int i = 0; i < 200; ++i) want += "8\n";
+    BEZEL_EXPECT_EQ(r.stdoutText, want);
+}
+
+// ADMIT (named control, RED against the over-broad fix) — a `ref` `int` passed
+// beside a function-typed `ref` holding q's closure is still an `int`: §28.3
+// *Set-erasing positions* rejects "a function value with a non-empty source
+// set", and a callee cannot store a function value into an `int`.  Catches
+// the wrong fix that gives EVERY `ref` argument's definition the call's
+// `ref` sources whatever its declared type (probe a02).
+BEZEL_TEST(set_erasing_ref_arg_definition_9075,
+           int_ref_beside_nonempty_function_ref_admitted_spec_28_3) {
+    auto r = runAot(program(
+        "    var n: int := 1; "
+        "    var g: () -> int := q; "
+        "    Mix(ref n, ref g); "
+        "    rg.Keep(n); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    std::string want;
+    for (int i = 0; i < 200; ++i) want += "7\n";
+    BEZEL_EXPECT_EQ(r.stdoutText, want);
+}
+
+// ADMIT (named control) — the same with a `string`: catches the wrong fix that
+// excludes only the numeric primitives and still treats a heap-represented
+// `string` location as one that can hold a function value (probe a30).
+BEZEL_TEST(set_erasing_ref_arg_definition_9075,
+           string_ref_beside_nonempty_function_ref_admitted_spec_28_3) {
+    auto r = runAot(program(
+        "    var s: string := \"x\"; "
+        "    var g: () -> int := q; "
+        "    MixS(ref s, ref g); "
+        "    rg.Keep(s); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    std::string want;
+    for (int i = 0; i < 200; ++i) want += "7\n";
     BEZEL_EXPECT_EQ(r.stdoutText, want);
 }

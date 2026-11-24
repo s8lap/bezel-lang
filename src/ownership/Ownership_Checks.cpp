@@ -32616,6 +32616,34 @@ void MethodOwnership::setErasingFlowExpr(const ast::Expr* e) {
         // each `out`/`ref` identifier then takes a definition whose set joins
         // the current values of all the call's `ref` arguments (itself
         // included).
+        //
+        // Only a location whose declared type can hold a FUNCTION value — a
+        // function type, `Object`, or a type parameter — takes or gives such
+        // a set: a callee cannot store a function value into an `int` or a
+        // `string`, and *Set-erasing positions* rejects only "a function value
+        // with a non-empty source set". // per §28.3
+        auto holdsFunctionValue = [&](const ast::IdentifierExpr& id) {
+            const sema::TypeRef* t = ctx_.exprType(id);
+            if (!t) return true;
+            using K = sema::TypeRef::Kind;
+            switch (t->kind) {
+                case K::Function:
+                    return true;
+                case K::Primitive:
+                    return t->primitive == sema::PrimitiveType::Object;
+                case K::Named:
+                    return !t->declaration &&
+                           (t->isResolvedTypeParam() ||
+                            (t->astNode && t->astNode->name &&
+                             t->astNode->name->parts.size() == 1 &&
+                             typeParamIsDeclaredHere(
+                                 t->astNode->name->parts.front())));
+                case K::Error:
+                    return true;
+                default:
+                    return false;
+            }
+        };
         std::vector<const ast::IdentifierExpr*> locs;
         std::vector<const ast::Expr*> refVals;
         for (const ast::CallArgument& a : *args) {
@@ -32627,13 +32655,13 @@ void MethodOwnership::setErasingFlowExpr(const ast::Expr* e) {
             if (!ctx_.exprSymbol(*oid)) continue;
             setErasingFlowUse(*oid);
             locs.push_back(oid);
-            if (isRef) refVals.push_back(oid);
+            if (isRef && holdsFunctionValue(*oid)) refVals.push_back(oid);
         }
         for (const ast::IdentifierExpr* oid : locs) {
             const sema::Symbol* osym = ctx_.exprSymbol(*oid);
             SetErasingFlowDef def{nullptr, /*traced=*/false, /*kills=*/false,
                                   /*positioned=*/true, {seFlowCur_, ++seFlowSeq_}};
-            def.refSources = refVals;
+            if (holdsFunctionValue(*oid)) def.refSources = refVals;
             seFlowDefs_[osym].push_back(std::move(def));
         }
     });
