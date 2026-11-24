@@ -1884,6 +1884,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // closure release branches (a box has an Object static type, never
         // String/Function).
         bool                   releaseBoxInEnvdtor = false;
+        // fix #9060 (§14.1 / §27.5 / §28.9, v0.359): the captured `T`-at-
+        // `string` parameter's cell is a refcounted cell write target — the
+        // lambda's binding slot joins typeParamStringCellHolders_.
+        bool                   typeParamStringCell = false;
         // §27.5 / §28.9 / #694: true when this capture's boxed cell is held by
         // exactly ONE env (singleCaptureLocals_) whose lambda DEFINITELY escapes
         // (returned — definitelyEscapingLambdas_). The escaped closure's envdtor
@@ -2254,6 +2258,44 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                  declSemaTy->kind == sema::TypeRef::Kind::Function &&
                  !declSemaTy->nullable && !isOwnedClosureParamSlot(sym))
             cellSeedRetainSlots_[slot] = CellSeedKind::Closure;
+        // fix #9060 (§14.1 / §27.5 / §28.9, v0.359): a parameter declared by a
+        // bare type parameter at `string` is classified at `string` by #2689's
+        // per-capture retain, the envdtor release and the #9025 seed retain
+        // above (all on the SUBSTITUTED type), but its writes were plain
+        // stores: lowerStringLocalReassign asks the UNSUBSTITUTED expression
+        // type. So a write neither retained the value it stored nor released
+        // the one it displaced: a single env's envdtor released a borrowed
+        // value it never retained (`refcount over-release (string)`), an
+        // escaping reader read the caller's freed argument, and the seed's
+        // reference leaked (#9060).
+        //
+        // The cell owns a reference to its seed whenever a write can reach
+        // it: the per-capture retain when the content release is NOT
+        // suppressed, the seed retain above when it is. Mark the cell holder
+        // so the write path retains-new / releases-old for it — but only
+        // when every write runs inside a lambda body: the FRAME's own writes
+        // stay plain stores (the #4980 `T`-local retain policy), and one of
+        // them would store a value the cell does not own for a later lambda
+        // write to release. A function whose scan did not run arms nothing.
+        if (declSemaTy && !declSemaTy->nullable &&
+            isTypeParamBoundToString(declSemaTy) &&
+            isStringTypeRefNonNull(ce.semaTy)) {
+            if (alreadyBoxed) {
+                ce.typeParamStringCell = typeParamStringCellHolders_.count(slot);
+            } else if (currentFn_ == stringReleaseEligibleFn_) {
+                auto fit = frameAssignedTypeParamStringParams_.find(currentFn_);
+                const bool suppressed =
+                    mutatedSharedCaptureCell(static_cast<const void*>(sym),
+                                             ce.semaTy,
+                                             /*freshCellPerIteration=*/false) ||
+                    capturedLocalReturnedByName(static_cast<const void*>(sym),
+                                                ce.semaTy);
+                ce.typeParamStringCell =
+                    fit != frameAssignedTypeParamStringParams_.end() &&
+                    !fit->second.count(sym) &&
+                    (!suppressed || cellSeedRetainSlots_.count(slot));
+            }
+        }
         ce.envValue = boxLocalSlot(slot, newSlot, /*forLoopVar=*/false,
                                    &wasGuardedParam);  // the shared cell pointer
         // fix #9004 (§27.5, v0.359): a capture site INSIDE A LOOP makes the
@@ -2270,6 +2312,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         if (!alreadyBoxed && wasGuardedParam)
             redirectSlotToCellHolder(slot, newSlot, preCaptureUsers);
         paramSlots_[sym] = newSlot;  // rebind to the ptr cell-holder
+        if (ce.typeParamStringCell && newSlot)  // fix #9060
+            typeParamStringCellHolders_.insert(newSlot);
         rebindDisposalSlot(slot, newSlot);
         // §30 / #1377: same smAllocaToField_ update as for local captures above
         // — a captured param of an async method that is a suspend-local needs its
@@ -4196,6 +4240,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 builder_.CreateStore(ptrVal, slot);
                 cellVars_[slot] = ce.valTy;
                 if (ce.sym) paramSlots_[ce.sym] = slot;
+                if (ce.typeParamStringCell)  // fix #9060
+                    typeParamStringCellHolders_.insert(slot);
                 if (ce.decl) locals_[ce.decl] = slot;
             }
         }

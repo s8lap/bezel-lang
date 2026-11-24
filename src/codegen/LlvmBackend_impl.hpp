@@ -22763,6 +22763,25 @@ private:
     std::unordered_map<const llvm::Function*,
                        std::unordered_set<const sema::Symbol*>>
         retainedClosureParams_;
+    // fix #9060 (§14.1 / §27.5 / §28.9, v0.359): per LLVM function, the
+    // by-value parameters declared by a bare type parameter the active
+    // substitution binds to `string` that THIS body (not its lambdas)
+    // assigns — filled by retainAssignedStringParams' scan. The PRESENCE of a
+    // function's key means the scan ran for it; a capture in a function with
+    // no key arms nothing (see typeParamStringCellHolders_).
+    std::unordered_map<const llvm::Function*,
+                       std::unordered_set<const sema::Symbol*>>
+        frameAssignedTypeParamStringParams_;
+    // fix #9060 (§14.1 / §27.5 / §28.9, v0.359): the capture-cell HOLDER
+    // slots (the frame's post-boxing holder and each capturing lambda's
+    // binding of it) of a captured `T` parameter at `string` whose cell owns
+    // a reference to every value it holds — its seed through #2689's
+    // per-capture retain or #9025's cell seed retain, every later value
+    // through the write's own retain-new. lowerStringLocalReassign admits a
+    // target in one of these slots although its declared type is `T`, so a
+    // write through the cell retains the new value and releases the one it
+    // displaces, exactly as for a captured `string` parameter.
+    std::unordered_set<const llvm::AllocaInst*> typeParamStringCellHolders_;
     // fix #5253 (§22.3 / §28.9, v0.313): inline `out var` recipients (their
     // introducing IdentifierExpr) at a `string` / `string?` `out` formal of a
     // compiled callee, in a pinned body — registerOutVarStringRelease /

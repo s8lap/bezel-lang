@@ -32346,7 +32346,13 @@ bool Emitter::lowerStringLocalReassign(const ast::Expr& target,
     // Must be an actual LOCAL/parameter slot, string-typed, a bare `ptr` slot.
     if (!localSlot(target)) return false;          // not a local/param
     if (!elemTy || !elemTy->isPointerTy()) return false;  // not a `ptr` slot
-    if (!isStringExprType(target)) return false;   // not string-typed
+    // fix #9060 (§14.1 / §27.5 / §28.9, v0.359): a captured parameter
+    // declared `T` at `string` whose cell owns every value it holds
+    // (typeParamStringCellHolders_, armed in lowerLambda) is written exactly
+    // as a captured `string` parameter is.
+    if (!isStringExprType(target) &&
+        !typeParamStringCellHolders_.count(localSlot(target)))
+        return false;                              // not string-typed
     // fix #5245 (§4.6 / §28.9, v0.313): a nullable `string?` target lowers to a
     // `ptr` too; retain/release are null-safe. It is admitted ONLY when the slot
     // provably owns a +1 — a `var` local the collectStringReleaseEligible walk
@@ -32800,6 +32806,27 @@ void Emitter::retainAssignedStringParams(
         if (paramSlots_.find(s) == paramSlots_.end()) continue;
         candidates.insert(s);
     }
+    // 1a. fix #9060 (§14.1 / §27.5 / §28.9, v0.359): by-value parameters
+    //     declared by a bare type parameter the active substitution binds to
+    //     `string`. They take no +1 here (the frame's own writes to them stay
+    //     plain stores — the #4980 retain-policy question); the scan below
+    //     only RECORDS which of them this body assigns, so lowerLambda arms
+    //     the refcounted cell write (typeParamStringCellHolders_) only for a
+    //     parameter whose every write runs inside a lambda body.
+    std::unordered_set<const sema::Symbol*> typeParamCandidates;
+    for (sema::Symbol* s : params) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(s);
+        if (!ps || isByRefMod(ps->modifier)) continue;
+        const sema::TypeRef* ty =
+            ps->resolvedDeclType
+                ? ps->resolvedDeclType
+                : (ps->declType ? ctx_.resolvedType(*ps->declType) : nullptr);
+        if (!ty || ty->nullable || !isTypeParamBoundToString(ty)) continue;
+        if (paramSlots_.find(s) == paramSlots_.end()) continue;
+        typeParamCandidates.insert(s);
+    }
+    auto& frameAssignedTypeParams =
+        frameAssignedTypeParamStringParams_[currentFn_];
     // 1b. fix #2712: the same candidacy test for the implicit `value`. Its slot
     //     lives in locals_ keyed on the PropertyDecl (the caller must already
     //     have bound it); a `ref`/`out` SetterParamSpec is excluded exactly as a
@@ -32823,7 +32850,8 @@ void Emitter::retainAssignedStringParams(
             vit->second->getAllocatedType()->isPointerTy())
             valueSlot = vit->second;
     }
-    if (candidates.empty() && !valueSlot) return;
+    if (candidates.empty() && !valueSlot && typeParamCandidates.empty())
+        return;
 
     // 2. Does the body assign to one? Both `:=` and the compound forms count —
     //    they are one AssignmentStmt node (op) and BOTH release the displaced
@@ -32838,6 +32866,8 @@ void Emitter::retainAssignedStringParams(
                     dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
                 if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
                     if (candidates.count(sym)) assigned.insert(sym);
+                    if (typeParamCandidates.count(sym))  // fix #9060
+                        frameAssignedTypeParams.insert(sym);
                     // fix #2712: `value := …` — the setter's implicit parameter,
                     // recognised by its anchor, NOT by the name `value` (a
                     // SetterParamSpec may rename it, §A.4).
@@ -32881,8 +32911,11 @@ void Emitter::retainAssignedStringParams(
         std::vector<const ast::IdentifierExpr*> byRef;
         collectByRefArgIdents(body, byRef);
         for (const ast::IdentifierExpr* id : byRef)
-            if (sema::Symbol* sym = ctx_.exprSymbol(*id))
+            if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
                 if (candidates.count(sym)) assigned.insert(sym);
+                if (typeParamCandidates.count(sym))  // fix #9060
+                    frameAssignedTypeParams.insert(sym);
+            }
     }
     // 2c. fix #5275 (§22.3 / §28.9, v0.313): the `ref` twin of 2b. §22.3's
     //     "`ref` argument naming a mutable local … is a true alias: callee
@@ -32917,12 +32950,17 @@ void Emitter::retainAssignedStringParams(
         std::vector<RefArgSite> refSites;
         collectRefArgSites(body, refSites);
         for (const RefArgSite& site : refSites)
-            if (sema::Symbol* sym = ctx_.exprSymbol(*site.id))
+            if (sema::Symbol* sym = ctx_.exprSymbol(*site.id)) {
+                // fix #9060: any `ref` argument counts as a frame write of a
+                // `T` parameter (conservative: it only disarms the cell write).
+                if (typeParamCandidates.count(sym))
+                    frameAssignedTypeParams.insert(sym);
                 if (candidates.count(sym) &&
                     refFormalWriteVerdict(ctx_, site.callee,
                                           site.index) !=
                         RefFormalVerdict::NoWrite)
                     assigned.insert(sym);
+            }
     }
 
     // 3. Mint the frame's own reference. Emitted in the prologue, where the
