@@ -32307,6 +32307,17 @@ bool Emitter::isOwnedStringParamSlot(const sema::Symbol* sym) const {
     return it != retainedStringParams_.end() && it->second.count(sym);
 }
 
+// fix #9039 (§27.5 / §28.9, v0.359): the closure twin of
+// isOwnedStringParamSlot — does `sym` name a by-value function-typed
+// parameter whose slot retainAssignedClosureParams gave an independent +1 in
+// the body being lowered? Answered from the set that function filled, under
+// the same analyzed-function gate it runs under.
+bool Emitter::isOwnedClosureParamSlot(const sema::Symbol* sym) const {
+    if (!sym || currentFn_ != closureReleaseEligibleFn_) return false;
+    auto it = retainedClosureParams_.find(currentFn_);
+    return it != retainedClosureParams_.end() && it->second.count(sym);
+}
+
 
 bool Emitter::isNullableStringExprType(const ast::Expr& target) const {
     const sema::TypeRef* tt = ctx_.exprType(target);
@@ -33076,6 +33087,9 @@ void Emitter::retainAssignedClosureParams(
         llvm::AllocaInst* slot = paramSlots_[const_cast<sema::Symbol*>(sym)];
         if (!slot) continue;
         emitClosureRetain(builder_.CreateLoad(ptrTy(), slot, "clo.parm"));
+        // fix #9039: record the frame's +1 so a capture of this parameter
+        // knows its cell inherits a reference (isOwnedClosureParamSlot).
+        retainedClosureParams_[currentFn_].insert(sym);
         // fix #8764 (§28.9, v0.359): the scope-end release of the parameter's
         // FINAL value — the closure twin of retainAssignedStringParams' own
         // step-3 release (fix #5253, above).

@@ -21903,6 +21903,9 @@ private:
     // fix #5253: did retainAssignedStringParams give `sym`'s slot a +1 in
     // the body being lowered?
     bool isOwnedStringParamSlot(const sema::Symbol* sym) const;
+    // fix #9039: the closure twin — did retainAssignedClosureParams give
+    // `sym`'s slot a +1 in the body being lowered?
+    bool isOwnedClosureParamSlot(const sema::Symbol* sym) const;
     // fix #5253: does `ms`'s declaration carry an `ensures` clause (§22.16)?
     static bool hasEnsuresClause(const sema::MethodSymbol* ms) {
         // SEAM-DEBT: #5253 an imported callee has no decl; answers the conservative "yes" (no release)
@@ -22753,6 +22756,13 @@ private:
     std::unordered_map<const llvm::Function*,
                        std::unordered_set<const sema::Symbol*>>
         retainedStringParams_;
+    // fix #9039 (§27.5 / §28.9, v0.359): per LLVM function, the by-value
+    // function-typed parameters retainAssignedClosureParams gave an
+    // independent +1 at bind (see isOwnedClosureParamSlot). A captured such
+    // parameter's cell inherits that +1, so it mints no seed reference.
+    std::unordered_map<const llvm::Function*,
+                       std::unordered_set<const sema::Symbol*>>
+        retainedClosureParams_;
     // fix #5253 (§22.3 / §28.9, v0.313): inline `out var` recipients (their
     // introducing IdentifierExpr) at a `string` / `string?` `out` formal of a
     // compiled callee, in a pinned body — registerOutVarStringRelease /
@@ -23732,12 +23742,29 @@ private:
     // cell owns exactly one reference to whatever it holds; its FINAL value
     // still leaks, because the envdtor release stays suppressed (#2706: the
     // cell is shared and no one env is its last holder — the #2718 trade).
-    std::unordered_set<const llvm::AllocaInst*> cellSeedRetainSlots_;
-    // fix #9025: mint the cell's reference to its seed `seed`, read from the
-    // pre-boxing slot `origSlot`, if lowerLambda armed that slot above.
+    //
+    // fix #9039 / §27.5 / §28.1 / §28.9 (v0.359): the same for a captured
+    // non-nullable FUNCTION-typed parameter. §28.1 makes `owned` a compile
+    // error on a function type too, so the parameter is a borrow of the
+    // CALLER's closure, and the cell's write path (lowerClosureLocalReassign
+    // in the capturing frame, lowerCapturedClosureLocalReassign inside a
+    // capturing lambda) releases the closure each write displaces. Unminted,
+    // the first write released the caller's reference and the caller's own
+    // scope-end release then aborted with `refcount over-release (closure)`.
+    // The mapped value says which retain the seed takes.
+    enum class CellSeedKind { String, Closure };
+    std::unordered_map<const llvm::AllocaInst*, CellSeedKind>
+        cellSeedRetainSlots_;
+    // fix #9025 / #9039: mint the cell's reference to its seed `seed`, read
+    // from the pre-boxing slot `origSlot`, if lowerLambda armed that slot.
     void emitCellSeedRetain(const llvm::AllocaInst* origSlot,
                             llvm::Value* seed) {
-        if (origSlot && cellSeedRetainSlots_.count(origSlot))
+        if (!origSlot) return;
+        auto it = cellSeedRetainSlots_.find(origSlot);
+        if (it == cellSeedRetainSlots_.end()) return;
+        if (it->second == CellSeedKind::Closure)
+            emitClosureRetain(seed);
+        else
             emitStringRetain(seed);
     }
     // fix #2706 / §27.5 / §28.9 (v0.240): does this capture's cell need BOTH its

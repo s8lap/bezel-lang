@@ -2160,11 +2160,15 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // #429/#672: resolve sema type for retain/release classification.
         // Resolved BEFORE boxing so the cell-seed decision below can be handed
         // to boxLocalSlot's allocation branch.
+        // The DECLARED type, before any generic substitution (fix #9039
+        // arms the closure seed retain on it — see below).
+        const sema::TypeRef* declSemaTy = nullptr;
         if (auto* par = dynamic_cast<const sema::ParameterSymbol*>(sym)) {
             if (par->resolvedDeclType)
                 ce.semaTy = par->resolvedDeclType;
             else if (par->declType)
                 ce.semaTy = ctx_.resolvedType(*par->declType);
+            declSemaTy = ce.semaTy;
             // fix #8946 / §14.1 / §28.9: inside a generic instantiation a
             // parameter declared `T` classifies at its CONCRETE substitution.
             if (ce.semaTy && !genericSubstSemaTy_.empty())
@@ -2218,16 +2222,38 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // taken when the cell is never written: then nothing releases a
         // displaced value and the borrow is balanced as is (the reference
         // would only leak).
-        if (isStringTypeRefNonNull(ce.semaTy) && !alreadyBoxed &&
-            currentFn_ == boxCaptureLocalsFn_ &&
+        //
+        // fix #9039 (§27.5 / §28.1 / §28.9, v0.359): the same missing
+        // reference for a captured non-nullable FUNCTION-typed parameter.
+        // §28.1 makes `owned` a compile error on a function type as well, so
+        // the parameter is a borrow of the CALLER's closure, #2706 suppresses
+        // the per-capture closure retain for a written, shared cell, and the
+        // cell's write path (lowerClosureLocalReassign /
+        // lowerCapturedClosureLocalReassign) releases the closure each write
+        // displaces. The first write therefore dropped the caller's reference,
+        // and the caller's own release of its argument aborted with
+        // `refcount over-release (closure)`. The cell mints a closure
+        // reference to its seed instead, under the same conditions, with
+        // isOwnedClosureParamSlot (retainAssignedClosureParams' bind-time +1,
+        // #4174) in place of the string's #2696 test. Armed on the DECLARED
+        // type: a bare `T` at a function type is written by a plain store
+        // (both closure write paths ask the unsubstituted expression type),
+        // so nothing would release a minted seed there.
+        const bool writtenSuppressedCell =
+            !alreadyBoxed && currentFn_ == boxCaptureLocalsFn_ &&
             assignedCaptureVars_.count(static_cast<const void*>(sym)) &&
-            !isOwnedStringParamSlot(sym) &&
             (mutatedSharedCaptureCell(static_cast<const void*>(sym),
                                       ce.semaTy,
                                       /*freshCellPerIteration=*/false) ||
              capturedLocalReturnedByName(static_cast<const void*>(sym),
-                                         ce.semaTy)))
-            cellSeedRetainSlots_.insert(slot);
+                                         ce.semaTy));
+        if (writtenSuppressedCell && isStringTypeRefNonNull(ce.semaTy) &&
+            !isOwnedStringParamSlot(sym))
+            cellSeedRetainSlots_[slot] = CellSeedKind::String;
+        else if (writtenSuppressedCell && declSemaTy &&
+                 declSemaTy->kind == sema::TypeRef::Kind::Function &&
+                 !declSemaTy->nullable && !isOwnedClosureParamSlot(sym))
+            cellSeedRetainSlots_[slot] = CellSeedKind::Closure;
         ce.envValue = boxLocalSlot(slot, newSlot, /*forLoopVar=*/false,
                                    &wasGuardedParam);  // the shared cell pointer
         // fix #9004 (§27.5, v0.359): a capture site INSIDE A LOOP makes the
