@@ -7035,6 +7035,35 @@ void Emitter::fixupCapturedCellHolderReads() {
 }
 
 
+// fix #9004 (§27.5, v0.359): does the value a store writes into `slot` depend
+// on the slot's PREVIOUS value?  A store that does is an ACCUMULATION
+// (`k := k + i`); a store that does not is a RE-INITIALISATION (`k := 5`).
+// The distinction decides the capture mode (§27.5: one cell per binding).
+namespace {
+// The walk is bounded: the value of a store is a shallow expression tree, and
+// a cycle is impossible in SSA IR.
+constexpr unsigned kStoreValueWalkDepth = 16;
+
+bool valueReadsSlot(llvm::Value* v, llvm::Value* slot, unsigned depth) {
+    if (!v || depth > kStoreValueWalkDepth) return false;
+    if (auto* li = llvm::dyn_cast<llvm::LoadInst>(v))
+        return li->getPointerOperand() == slot;
+    auto* user = llvm::dyn_cast<llvm::User>(v);
+    if (!user) return false;
+    for (llvm::Value* op : user->operands())
+        if (valueReadsSlot(op, slot, depth + 1)) return true;
+    return false;
+}
+
+// Does the value a store writes into `slot` depend on the slot's PREVIOUS
+// value?  A store that does is an ACCUMULATION (`k := k + i`); a store that
+// does not is a RE-INITIALISATION (`k := 5`).
+bool storeValueReadsSlot(llvm::StoreInst* si, llvm::Value* slot) {
+    return si && valueReadsSlot(si->getValueOperand(), slot, 0);
+}
+}  // namespace
+
+
 // §27.5: promote a local/param slot to a shared heap cell so that the
 // enclosing function and any capturing closure access the same storage.
 // Idempotent: a slot already boxed is reused (multiple lambdas capturing the
@@ -7161,14 +7190,32 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
         freshEachIteration = true;
     if (!freshEachIteration) {
         llvm::BasicBlock* cur = builder_.GetInsertBlock();
+        // fix #9004 (§27.5, v0.359): the fresh (by-VALUE) mode snapshots the
+        // variable's value into a per-iteration cell, so it is right only for a
+        // RE-INITIALISATION — a store whose new value does not depend on the
+        // old one (`using var r := new R()` inside a while loop, which
+        // re-stores into r_slot each iteration; using the null-guard would
+        // preserve the first iteration's (disposed) pointer in the cell).
+        // A store that READS the slot is an ACCUMULATION (`k := k + i`), and
+        // the by-value mode resets the accumulated value to the snapshot at
+        // every iteration — so the capture observes a stale value (#9004).
+        // §27.5 gives one cell per binding ("Modifications to a captured
+        // variable inside the lambda are visible outside, and vice versa"),
+        // so an accumulating local takes the by-CELL (guarded) mode, whose
+        // cell the redirection below keeps in step with the loop's accesses.
+        bool reInitialises = false;
+        bool accumulates = false;
         for (llvm::Use& u : slot->uses()) {
             if (auto* si = llvm::dyn_cast<llvm::StoreInst>(u.getUser())) {
-                if (si->getPointerOperand() == slot && si->getParent() == cur) {
-                    freshEachIteration = true;
-                    break;
-                }
+                if (si->getPointerOperand() != slot || si->getParent() != cur)
+                    continue;
+                if (storeValueReadsSlot(si, slot))
+                    accumulates = true;
+                else
+                    reInitialises = true;
             }
         }
+        if (reInitialises && !accumulates) freshEachIteration = true;
     }
 
     if (freshEachIteration) {
@@ -7317,6 +7364,106 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
     // (e.g. a while-loop condition already lowered before boxing) in sync.
     cellVarSyncSlot_[newSlot] = slot;
     return cellPtr;
+}
+
+
+// fix #9004 (§27.5, v0.359): the address a captured local's VALUE is read from
+// and written to once the capture site has been lowered: the cell the holder
+// names when there is one, the pre-boxing alloca when there is not.
+//
+// This is the funnel `boxedStorage` hands to the accesses emitted AFTER the
+// capture site (fix #3484's null fall-back), written out here because the
+// accesses it serves are emitted BEFORE the capture site.  The fixup cannot
+// serve them: it decides "does this read need a fall-back" by asking whether
+// the capture's join block DOMINATES the read, and a pre-capture read is never
+// dominated by it (it precedes the capture in the block order) — so the fixup
+// would leave those reads addressing a null holder on the first pass.  Its
+// DECLINE 3 (a fall-back slot that does not round-trip across a suspend)
+// would leave them without a fall-back at all.
+llvm::Value* Emitter::cellHolderAddress(llvm::AllocaInst* holder,
+                                        llvm::AllocaInst* fallBack) {
+    llvm::Value* cell = builder_.CreateLoad(ptrTy(), holder, "cell");
+    llvm::Value* isNull = builder_.CreateICmpEQ(
+        cell, llvm::ConstantPointerNull::get(ptrTy()), "cell.unset");
+    return builder_.CreateSelect(isNull, fallBack, cell, "cell.orslot");
+}
+
+
+// fix #9004 (§27.5, v0.359): redirect the accesses the enclosing body already
+// emitted against a captured local's PRE-BOXING alloca to the cell holder's
+// address, so the variable has ONE storage in the enclosing body too.
+//
+// §27.5: "Captured variables are heap-allocated in a closure object ...
+// Modifications to a captured variable inside the lambda are visible outside,
+// and vice versa."  The compiler lowers the enclosing body's statements in
+// order, so the accesses to the local that come BEFORE the capture site were
+// emitted against the pre-boxing alloca and only the accesses that come AFTER
+// it go through the cell holder.  Two storages for one binding, and in a loop
+// the closure observes a stale value (#9004).
+//
+// The redirection is the same funnel the post-capture accesses use, so the
+// variable's value lives in the cell from the moment the cell exists and in
+// the pre-boxing alloca before that — one binding, one value.
+// The redirection is needed exactly when the capture site sits INSIDE a loop:
+// the accesses emitted before the capture site then run again on the next
+// iteration, AFTER the cell exists, and would otherwise read and write the
+// pre-boxing alloca while the closure reads and writes the cell.  Outside a
+// loop the pre-capture accesses run before the cell exists, so the pre-boxing
+// alloca IS the variable's storage there and the two agree.
+//
+// An ASYNC state machine is declined: its frame round-trip rules (fix
+// #3484's DECLINE 3) decide whether a pre-boxing alloca is still valid after
+// a resume, and this redirection does not establish that.  The synchronous
+// shape this issue reports is fixed; the async one is left as it was.
+//
+// The caller admits only the GUARDED (by-CELL) capture: in the FRESH
+// (by-VALUE) mode the cell is a per-pass SNAPSHOT seeded from the pre-boxing
+// alloca, so the pre-boxing alloca is that pass's storage and the redirection
+// would make the seed read the cell it is about to replace.  The by-CELL mode
+// keeps ONE cell for the binding's lifetime, so the cell — and the pre-boxing
+// alloca before it exists — is the binding's storage.
+//
+// `users` is the slot's user list as it stood BEFORE the capture's own
+// instructions were emitted: the allocation branch's seed load reads the
+// pre-boxing alloca on purpose (it is what seeds the cell), and the guard's
+// holder load reads the holder.
+void Emitter::redirectSlotToCellHolder(llvm::AllocaInst* slot,
+                                       llvm::AllocaInst* holder,
+                                       const std::vector<llvm::User*>& users) {
+    if (loopStack_.empty() || smStateStruct_) return;
+    // An already-boxed slot IS the cell holder (boxLocalSlot's already-boxed
+    // path sets the holder to the slot it is handed): the "pre-capture accesses"
+    // of that call are reads and writes of the CELL POINTER, not of the
+    // variable's value, and the first capture already redirected the value
+    // accesses.
+    if (slot == holder) return;
+    llvm::IRBuilder<>::InsertPointGuard guard(builder_);
+    for (llvm::User* u : users) {
+        auto* inst = llvm::dyn_cast<llvm::Instruction>(u);
+        if (!inst || inst->getFunction() != currentFn_) continue;
+        if (auto* li = llvm::dyn_cast<llvm::LoadInst>(u)) {
+            if (li->getPointerOperand() != slot) continue;
+            builder_.SetInsertPoint(li);
+            llvm::Value* addr = cellHolderAddress(holder, slot);
+            llvm::Value* redirected = builder_.CreateLoad(
+                li->getType(), addr, "cell.redirect");
+            li->replaceAllUsesWith(redirected);
+            li->eraseFromParent();
+        } else if (auto* si = llvm::dyn_cast<llvm::StoreInst>(u)) {
+            if (si->getPointerOperand() != slot) continue;
+            builder_.SetInsertPoint(si);
+            llvm::Value* addr = cellHolderAddress(holder, slot);
+            si->setOperand(1, addr);
+        } else if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(u)) {
+            if (gep->getPointerOperand() != slot) continue;
+            builder_.SetInsertPoint(gep);
+            llvm::Value* addr = cellHolderAddress(holder, slot);
+            gep->setOperand(0, addr);
+        }
+        // Any other use of the alloca (a call argument, an atomic update) is
+        // left addressing the pre-boxing alloca: it is not a read or a write
+        // of the variable's value that the funnel can carry.
+    }
 }
 
 

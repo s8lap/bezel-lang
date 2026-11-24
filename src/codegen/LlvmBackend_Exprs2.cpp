@@ -2150,8 +2150,28 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                                 : slot->getAllocatedType();
         llvm::AllocaInst* newSlot = nullptr;
         bool wasGuardedParam = false;
+        // fix #9004 (§27.5, v0.359): the slot's users as they stand BEFORE the
+        // capture's own instructions are emitted — the redirection below acts on
+        // exactly these, and the capture's own instructions (the allocation
+        // branch's seed load, the guard's holder load) are not pre-capture
+        // accesses of the parameter's value.
+        std::vector<llvm::User*> preCaptureUsers;
+        for (llvm::User* u : slot->users()) preCaptureUsers.push_back(u);
         ce.envValue = boxLocalSlot(slot, newSlot, /*forLoopVar=*/false,
                                    &wasGuardedParam);  // the shared cell pointer
+        // fix #9004 (§27.5, v0.359): a capture site INSIDE A LOOP makes the
+        // accesses the enclosing body already emitted against the
+        // parameter's pre-boxing alloca run again on the next iteration,
+        // AFTER the cell exists — so they must address the cell (the
+        // parameter's ONE storage, §27.5) and not the pre-boxing alloca.
+        // `redirectSlotToCellHolder` redirects them to the cell holder's
+        // address, the same funnel the accesses emitted after the capture
+        // site use. It declines the shapes that do not apply (no enclosing
+        // loop, an async state machine, an already-boxed slot, the by-VALUE
+        // capture mode — where the cell is a per-pass snapshot seeded from the
+        // pre-boxing alloca and the alloca is that pass's storage).
+        if (!alreadyBoxed && wasGuardedParam)
+            redirectSlotToCellHolder(slot, newSlot, preCaptureUsers);
         paramSlots_[sym] = newSlot;  // rebind to the ptr cell-holder
         rebindDisposalSlot(slot, newSlot);
         // §30 / #1377: same smAllocaToField_ update as for local captures above
@@ -2641,6 +2661,13 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 dd != declScopeDepth_.end() &&
                 dd->second <= loopStack_.back().scopeDepth;
         }
+        // fix #9004 (§27.5, v0.359): the slot's users as they stand BEFORE the
+        // capture's own instructions are emitted — the redirection below acts on
+        // exactly these, and the capture's own instructions (the allocation
+        // branch's seed load, the guard's holder load) are not pre-capture
+        // accesses of the local's value.
+        std::vector<llvm::User*> preCaptureUsers;
+        for (llvm::User* u : slot->users()) preCaptureUsers.push_back(u);
         ce.envValue = boxLocalSlot(slot, newSlot, /*forLoopVar=*/forceFresh,
                                    &wasGuardedLocal, declaredOutsideLoop);
         // A case-arm binding's source slot is written by pattern matching each
@@ -2670,8 +2697,35 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // arms: that is a release-direction change and needs its own evidence.
         // The cost of leaving it is one leaked cell per method invocation, which
         // is the behaviour every guarded in-loop capture already has (#3403).
-        if ((isPatternBinding || (declSym && declSym->isCatchBinding)) &&
-            wasGuardedLocal) {
+        //
+        // fix #9004 (§27.5, v0.359): a capture site INSIDE A LOOP makes the
+        // accesses the enclosing body already emitted against the local's
+        // pre-boxing alloca run again on the next iteration, AFTER the cell
+        // exists — so they must address the cell (the local's ONE storage,
+        // §27.5) and not the pre-boxing alloca. `redirectSlotToCellHolder`
+        // redirects them to the cell holder's address, the same funnel the
+        // accesses emitted after the capture site use.
+        //
+        // The REFRESH above and the REDIRECT are mutually exclusive: a
+        // case-arm / catch-arm binding's slot is re-initialised by the
+        // pattern matching on every arm entry and the refresh copies that
+        // fresh value into the cell — the redirect would instead send the
+        // arm's own re-initialising store into the cell and leave the refresh
+        // copying a stale slot into it (measured: the #3503 row
+        // `sync_reentered_catch_arm_refreshes_cell_spec_27_5_31_2` crashed
+        // under ASan).
+        //
+        // The REDIRECT applies to the GUARDED (by-CELL) capture only: in the
+        // FRESH (by-VALUE) mode the cell is a per-pass snapshot seeded from
+        // the pre-boxing alloca, so that alloca is the pass's storage and the
+        // redirection would make the seed read the cell it is about to
+        // replace.
+        bool refreshesGuardedCell =
+            (isPatternBinding || (declSym && declSym->isCatchBinding)) &&
+            wasGuardedLocal;
+        if (!refreshesGuardedCell && !alreadyBoxed && wasGuardedLocal)
+            redirectSlotToCellHolder(slot, newSlot, preCaptureUsers);
+        if (refreshesGuardedCell) {
             llvm::Value* current = builder_.CreateLoad(ce.valTy, slot,
                                                        "pattern.capture.value");
             builder_.CreateStore(current, ce.envValue);

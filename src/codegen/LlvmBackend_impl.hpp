@@ -25570,6 +25570,32 @@ private:
                               bool* wasGuardedBoxing = nullptr,
                               bool declaredOutsideLoop = false);
 
+    // fix #9004 (§27.5, v0.359): the address a captured local's VALUE is read
+    // from and written to once the capture site has been lowered: the cell the
+    // holder names when there is one, the pre-boxing alloca when there is not.
+    // This is the same funnel `boxedStorage` hands to the accesses emitted
+    // AFTER the capture site (fix #3484's null fall-back), written out here
+    // because the accesses it serves are emitted BEFORE the capture site: the
+    // fixup's dominance test would leave those without a fall-back (they are
+    // never dominated by the capture's join block), and its DECLINE 3 would
+    // leave them addressing a null holder.
+    llvm::Value* cellHolderAddress(llvm::AllocaInst* holder,
+                                    llvm::AllocaInst* fallBack);
+
+    // fix #9004 (§27.5, v0.359): redirect the accesses already emitted
+    // against a captured local's PRE-BOXING alloca to the cell holder's
+    // address, so the variable has ONE storage in the enclosing body too
+    // (§27.5: "Modifications to a captured variable inside the lambda are
+    // visible outside, and vice versa").
+    //
+    // `users` is the slot's user list as it stood BEFORE the boxing machinery
+    // ran: the capture's own instructions (the allocation branch's seed load,
+    // the guard's holder load) are NOT pre-capture accesses of the variable's
+    // value and must keep addressing the slot / the holder.
+    void redirectSlotToCellHolder(llvm::AllocaInst* slot,
+                                  llvm::AllocaInst* holder,
+                                  const std::vector<llvm::User*>& users);
+
     // §27.5 / #673: after writing `val` to the cell of a boxed local (whose
     // cell-holder alloca is `newSlot`), also store `val` to
     // the original pre-boxing alloca if `cellVarSyncSlot_` has an entry.
