@@ -19,7 +19,6 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
-using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -52,12 +51,6 @@ std::string prog(const std::string& body) {
 
 std::string out(const std::string& body) {
     JitResult r = runAotChecked(prog(body));
-    if (!r.ran || r.exitCode != 0) return "<<fail rc=" + std::to_string(r.exitCode) + ">>";
-    return r.stdoutText;
-}
-
-std::string outUnchecked(const std::string& body) {
-    JitResult r = runAot(prog(body));
     if (!r.ran || r.exitCode != 0) return "<<fail rc=" + std::to_string(r.exitCode) + ">>";
     return r.stdoutText;
 }
@@ -146,11 +139,47 @@ BEZEL_TEST(codegen_record_equality_different_type_6686, record_vs_interface_loca
                     std::string("True\nTrue\nFalse\n"));
 }
 
-// Uses runAot, not runAotChecked: `record = Object-local` leaks the operand box
-// independently of this fold (#6733); this row pins the printed answers only.
+// Strengthened to runAotChecked by #6733: `record = Object-local` no longer leaks
+// the local's box (the leak oracle is armed on this row).
 BEZEL_TEST(codegen_record_equality_different_type_6686, record_vs_object_local_equal_true) {
-    BEZEL_EXPECT_EQ(outUnchecked("var v := new V(1); var o: Object := v; var p: Object := new V(2); "
+    BEZEL_EXPECT_EQ(out("var v := new V(1); var o: Object := v; var p: Object := new V(2); "
                         "Console.WriteLine(v = o); Console.WriteLine(o = v); "
                         "Console.WriteLine(v <> o); Console.WriteLine(v = p); return 0; "),
                     std::string("True\nTrue\nFalse\nFalse\n"));
+}
+
+// #6733 (§8.4, §8.6, §28.9, v0.359): `=` / `<>` between a value kind and an
+// `Object` / interface LOCAL only READS the local's box (the generated
+// box-equals thunk), so the local's scope-end `bz_box_release` must still run.
+// The walker used to read any non-null `=` operand as an escape and suppressed
+// the release: 24 B leaked per evaluation. Both operand orders, `<>`, a record,
+// an int, and the Object and interface spellings, 150 iterations each.
+BEZEL_TEST(codegen_record_equality_different_type_6686, value_vs_box_local_equality_releases_box_loop_6733) {
+    JitResult r = runAotChecked(
+        std::string(kHead) +
+        "public class Program "
+        "  public static method Once(n: int): int "
+        "    var v := new VI(n); var i: IA := v; "
+        "    var w := new V(n); var o: Object := w; "
+        "    var k: Object := n; "
+        "    var c := 0; "
+        "    if v = i then c := c + 1; end; "
+        "    if i = v then c := c + 1; end; "
+        "    if v <> i then c := c + 100; end; "
+        "    if w = o then c := c + 1; end; "
+        "    if o = w then c := c + 1; end; "
+        "    if w <> o then c := c + 100; end; "
+        "    if k = n then c := c + 1; end; "
+        "    if n = k then c := c + 1; end; "
+        "    return c; "
+        "  end Once; "
+        "  public static method Main(): int "
+        "    var t := 0; "
+        "    for var j in 0 ..< 150 do t := t + Once(j); end; "
+        "    Console.WriteLine(t); return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("900\n"));
 }

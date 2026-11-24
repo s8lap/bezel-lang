@@ -52018,6 +52018,30 @@ struct BoxEscapeWalker {
     // boxes); the LocalDecl copy-out twin leaked 24 B (or 32 B for `[3]int`)
     // per iteration, and an ordinary call argument `Take(o)` in the same
     // block leaked 24 B.
+    // fix #6733 (§8.4 / §8.6 / §28.9, v0.359): is `e` a non-nullable VALUE
+    // kind (record, enum, non-generic choice, numeric/bool/char primitive)
+    // other than the tracked local itself? Mirrors the parameter walker's
+    // `isValueKindExpr` (fix #6769, Assign.cpp), whose spec checks apply
+    // unchanged: such an operand's `=` against an `Object`/interface
+    // dispatches through the box-equals thunk, which only reads `other`.
+    bool isValueKindOperand(const ast::Expr* e) {
+        if (!e || isTargetIdent(e)) return false;
+        const sema::TypeRef* t = ctx.exprType(*e);
+        if (!t || t->nullable) return false;
+        using K = sema::TypeRef::Kind;
+        using P = sema::PrimitiveType;
+        if (t->kind == K::Primitive)
+            return t->primitive != P::None && t->primitive != P::Object &&
+                   t->primitive != P::String;
+        if (t->kind == K::Named && t->declaration && t->genericArgs.empty()) {
+            auto k = t->declaration->kind;
+            return k == ast::TypeDeclKind::Record ||
+                   k == ast::TypeDeclKind::Enum ||
+                   k == ast::TypeDeclKind::Choice;
+        }
+        return false;
+    }
+
     bool isNarrowedRead(const ast::Expr* e) const {
         if (!e) return false;
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -52211,8 +52235,30 @@ struct BoxEscapeWalker {
                                  b->left.get()) != nullptr;
                 bool rNull = dynamic_cast<const ast::NullLiteralExpr*>(
                                  b->right.get()) != nullptr;
-                expr(b->left.get(), /*safeRead=*/rNull);
-                expr(b->right.get(), /*safeRead=*/lNull);
+                // fix #6733 (§8.4, §8.6, §28.9, v0.359): `valueKind = o` /
+                // `o = valueKind` (a record, enum, choice or primitive against
+                // the tracked Object/interface local) boxes the value side and
+                // compares through the generated box-equals thunk, which only
+                // READS the local's box -- the local-side twin of the
+                // parameter walker's #6769 arm (`isValueKindExpr`, Assign.cpp),
+                // whose premise and checks it shares. Treating the read as an
+                // escape suppressed the scope-end `bz_box_release`, leaking
+                // the box `var o: Object := v` / `var i: IA := v` minted
+                // (24 B per evaluation). EXCEPT a `=`/`<>` the value kind
+                // OVERLOADS (§25.2): the author's operator body may store its
+                // `Object` parameter. A class / `Object` other operand stays
+                // an escape (a user `Equals` override may store its argument,
+                // #3480).
+                bool userOperator = false;
+                if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                        ctx.exprSymbol(*b)))
+                    userOperator = ms->isOperator;
+                bool lVal = !userOperator && !inLambda &&
+                            isValueKindOperand(b->left.get());
+                bool rVal = !userOperator && !inLambda &&
+                            isValueKindOperand(b->right.get());
+                expr(b->left.get(), /*safeRead=*/rNull || rVal);
+                expr(b->right.get(), /*safeRead=*/lNull || lVal);
                 return;
             }
             expr(b->left.get(), /*safeRead=*/isNarrowedRead(b->left.get()));
