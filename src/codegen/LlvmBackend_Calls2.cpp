@@ -26936,11 +26936,30 @@ llvm::Value* Emitter::emitInlineGenericMethod(
     // — duplicating the disposal the try/catch's own shared unwind target
     // (unwindTarget_, deliberately left untouched below) performs again when
     // it is reached, a double free (bz_array_free called twice on the same
-    // `Array<T>` header). `disposeStack_.size()` is the same "nothing already
-    // on the stack is mine" boundary lowerTry uses when entering a try body
-    // (LlvmBackend_Stmts.cpp) — correct here for the same reason: this call
-    // is not a fresh function, just a normal call within the current scope.
-    unwindScopeDepth_ = disposeStack_.size();
+    // `Array<T>` header).
+    //
+    // fix #9106 / §28.3 *Exception-path discharge* (v0.359): the boundary is
+    // the CALLER's own `unwindScopeDepth_` at this call site — NOT
+    // `disposeStack_.size()`. #2361's value stopped the double free by
+    // disposing NOTHING at the generic call site, but the caller's live scopes
+    // are precisely what §28.3's *Exception-path discharge* requires to be
+    // disposed on the unwind edge: "every already-produced, not-yet-consumed
+    // unbound owned temporary is disposed during unwinding" — and the
+    // `try` BODY's scope (which holds them) is popped before the catch arms
+    // are lowered, so the catch arm's own disposal does NOT cover it. With
+    // #2361's boundary the generic call's post-call pending check
+    // (`emitUnwindDisposals` over `[unwindScopeDepth_, disposeStack_.size())`)
+    // had an EMPTY range and the caller's scopes survived the throw undisposed
+    // — a leak (the destructor never ran).
+    //
+    // The boundary the ORDINARY (non-generic) call path uses is the caller's
+    // own `unwindScopeDepth_` — the `try` body's scope is ABOVE it, so the
+    // pending check disposes it, and the ENCLOSING scopes (the `using var`s
+    // #2361's repro declares) stay below it for the single disposal path the
+    // catch arm performs. That is exactly the split #2361 needed, and it is
+    // what the generic path must use too: the caller owns the scopes, the
+    // generic callee is a separate function.
+    unwindScopeDepth_ = savedUnwindDepth;
     diverged_ = false;
     // Bind user params (skip leading `this`).
     std::size_t paramStart = isStaticMethod(ms) ? 0 : 1;
