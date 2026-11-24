@@ -7914,6 +7914,7 @@ private:
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void setErasingFlowBuildExpr(const ast::Expr& e);
     void setErasingFlowReset();
+    std::unordered_set<const void*> seFlowExhaustive_;
     void setErasingFlowStmt(const ast::Stmt& s);
     void setErasingFlowStmts(const std::vector<std::unique_ptr<ast::Stmt>>& ss);
     void setErasingFlowExpr(const ast::Expr* e);

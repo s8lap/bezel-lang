@@ -32175,7 +32175,15 @@ MethodOwnership::SetErasingSourceSet MethodOwnership::setErasingSourceSet(
     if (!ls && !ps) return Set::Untraced;
     // A local that aliases a call-bounded parameter carries the alias's
     // captures.
-    if (ls && callBoundedAlias_.count(sym)) return Set::NonEmpty;
+    // fix #9059 (§28.3 *Provenance* clause 6, v0.359): the alias map is built
+    // flow-insensitively, so it is consulted per REACHING definition below
+    // (an overwrite that dominates the read cuts the alias off) and as a
+    // blanket verdict only where the flow facts are not exact.
+    const bool aliased = ls && callBoundedAlias_.count(sym) != 0;
+    if (aliased &&
+        (!seFlowComplete_ || seFlowCaptured_.count(sym) != 0 ||
+         !seFlowReads_.count(id)))
+        return Set::NonEmpty;
     if (!visited.insert(id).second) return Set::Empty;
 
     // The definitions: the declaration and every assignment.
@@ -32239,7 +32247,9 @@ MethodOwnership::SetErasingSourceSet MethodOwnership::setErasingSourceSet(
         if (!flowInsensitive && d.positioned &&
             !setErasingFlowReaches(d, rp->second, defs))
             continue;
-        if (!d.traced)
+        if (aliased && d.traced && d.value && callBoundedSourceOf(*d.value))
+            r = Set::NonEmpty;
+        else if (!d.traced)
             r = join(r, Set::Untraced);
         else if (d.nonEmpty)
             r = Set::NonEmpty;
@@ -32282,6 +32292,7 @@ void MethodOwnership::setErasingFlowReset() {
     seFlowReads_.clear();
     seFlowParamLambda_.clear();
     seFlowCaptured_.clear();
+    seFlowExhaustive_.clear();
 }
 
 void MethodOwnership::setErasingFlowStmts(
@@ -32422,6 +32433,9 @@ void MethodOwnership::setErasingFlowStmt(const ast::Stmt& s) {
         }
         setErasingFlowIn(Kind::Arm, ifs,
                          [&] { setErasingFlowStmts(ifs->elseBody); });
+        // fix #9059: an `if` with an `else` runs exactly one arm, so a kill
+        // in EVERY arm is a kill on every path past the construct.
+        if (!ifs->elseBody.empty()) seFlowExhaustive_.insert(ifs);
         return;
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
@@ -32538,6 +32552,36 @@ bool MethodOwnership::setErasingFlowReaches(
         if (k.pos.seq > d.pos.seq) fwd = false;
         if (back && setErasingFlowAncestorOrEqual(loop, k.pos.node))
             back = false;
+    }
+    // fix #9059 (§28.3 clause 6, v0.359): the forward path is also cut by an
+    // exhaustive `if`/`else` whose every arm kills directly (a plain `:=` in
+    // the arm's own statement list) after `d` and before the read, when the
+    // construct's parent encloses the read.
+    if (fwd) {
+        for (const void* g : seFlowExhaustive_) {
+            bool all = true, any = false;
+            for (int n = 1; n < (int)seFlowNodes_.size() && all; ++n) {
+                const SetErasingFlowNode& nd = seFlowNodes_[n];
+                if (nd.kind != SetErasingFlowKind::Arm || nd.group != g)
+                    continue;
+                if (!setErasingFlowAncestorOrEqual(nd.parent, read.node) ||
+                    setErasingFlowAncestorOrEqual(n, read.node)) {
+                    all = false;
+                    break;
+                }
+                any = true;
+                bool killed = false;
+                for (const SetErasingFlowDef& k : defs)
+                    if (k.kills && k.positioned && k.pos.node == n &&
+                        k.pos.seq > d.pos.seq && k.pos.seq < read.seq)
+                        killed = true;
+                if (!killed) all = false;
+            }
+            if (all && any) {
+                fwd = false;
+                break;
+            }
+        }
     }
     return fwd || back;
 }
