@@ -37995,26 +37995,130 @@ bool Emitter::blockGetterMintsClosureRef(
     return sawBlockGetter;
 }
 
+// fix #8981 (§23.2, v0.359): the getter BODY of an EXPRESSION-bodied
+// function-typed property — the property-level `property P: T => expr;` of
+// §23.2, or an accessor's `get => expr;` inside a block-form property.
+// Null for a BLOCK-bodied getter (that is `blockGetterOf`'s body) and for an
+// abstract accessor (no body at all).
+static const ast::Expr* exprGetterBodyOfDecl(const ast::PropertyDecl* pd) {
+    if (!pd) return nullptr;
+    if (pd->bodyKind == ast::PropertyBodyKind::Expression)
+        return pd->exprBody.get();
+    if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+        for (const auto& acc : pd->accessors) {
+            if (acc.isSet) continue;
+            if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression)
+                return acc.exprBody.get();
+            // A BLOCK-bodied accessor is the other predicate's business.
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
+
 // fix #8763 (follow-up, §27.5 / §28.9, v0.359): the READ-SIDE twin of
 // `blockGetterMintsClosureRef` — "this EXPRESSION is a property read whose
 // getter hands the reader a +1 reference".
 //
 // Both spellings of the read are admitted: the qualified `obj.P`
 // (MemberAccessExpr) and the BARE / implicit-`this` `P` (IdentifierExpr).
-// The `?.` spelling (NullCondMemberExpr) is DELIBERATELY NOT admitted: it
-// lifts the result to §7.5's always-nullable type, so the value that reaches
-// the reader is a NULLABLE function value, and the read sites that consume it
-// have their own nullable protocol (the `?.` path is a pre-existing leak
-// class of its own — the same class #8481 tracks — and admitting it here
-// would release a reference the nullable protocol has not given up).
+// The `?.` spelling (NullCondMemberExpr) is admitted for the
+// EXPRESSION-bodied getter ONLY (fix #8981, below): the `?.` read of a
+// BLOCK-bodied getter is a BORROW — that getter is emitted out of line and
+// its `mintReaderRef = false` variant does not mint the reader's reference
+// at all (#8763's fix-forward 2) — so admitting that spelling would release
+// a reference nobody minted.
+//
+// fix #8981 (§23.2 / §27.5 / §28.9, v0.359): the EXPRESSION-bodied getter
+// joins the protocol, and with it the `?.` spelling of THAT form.
+//
+// THE DEFECT. #8763's protocol covers the BLOCK-bodied getter, whose body is
+// emitted OUT OF LINE (`ensurePropertyBlockGetter`): the getter hands the
+// reader ONE reference and the read sites give it back. The
+// EXPRESSION-bodied getter (§23.2 `property P: T => expr;`) has no frame of
+// its own — §23.2's body is INLINED in the READER's frame
+// (`computedGetterOf` → `lowerExpr(*getter)`, LlvmBackend_Exprs.cpp) — so a
+// LAMBDA-LITERAL body allocates its closure cell THERE, in the reader. The
+// reader therefore holds a +1 that no read site gave back: the binding local
+// is not a producer candidate (no scope-end release), the discarded-read
+// sites did not fire, and the direct-call site did not fire.
+//
+// MEASURED on this fix's parent (b916d130b), 200 reads of
+// `property EP: (int) -> int => lambda(x: int) => x + 2;`:
+// "SUMMARY: AddressSanitizer: 14400 byte(s) leaked in 400 allocation(s)" —
+// 72 B per read (the 64 B cell + its 8 B env), one per read, unbounded. The
+// BLOCK-bodied twin of every one of those probes is clean.
+//
+// WHY THE `?.` SPELLING JOINS **THIS** FORM ONLY. The `?.` read of a
+// BLOCK-bodied getter is a BORROW: that getter is emitted out of line and
+// `ensurePropertyBlockGetter`'s `mintReaderRef = false` variant does not
+// mint the reader's reference at all (#8763's fix-forward 2), so admitting
+// the `?.` spelling there would release a reference nobody minted. The
+// EXPRESSION-bodied getter has no such variant: its production happens in the
+// reader's own frame, so the reader's +1 is the reader's to give back,
+// whichever spelling produced it. §7.5's lift makes the VALUE nullable, and
+// the nullable function value is a PLAIN pointer in the generated IR
+// (null = null), so the discharge sites release it exactly as they release
+// the non-nullable one.
+//
+// The `?.` READ's own value is nullable, so the binding local that takes it
+// owns a NULLABLE function value; the closure-local candidate walk admits a
+// producer-initialized local of any function type (the nullable gate is on
+// the BORROW arm, not on the producer arm), and `bz_closure_release` is
+// null-safe — so the `?.` read's reference is discharged exactly once.
 bool Emitter::propertyReadMintsClosureRef(const ast::Expr* e) const {
     if (!e) return false;
-    if (!dynamic_cast<const ast::MemberAccessExpr*>(e) &&
+    const bool safeNav =
+        dynamic_cast<const ast::NullCondMemberExpr*>(e) != nullptr;
+    if (!safeNav && !dynamic_cast<const ast::MemberAccessExpr*>(e) &&
         !dynamic_cast<const ast::IdentifierExpr*>(e))
         return false;
     auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*e));
     if (!ps) return false;
-    return blockGetterMintsClosureRef(ps);
+    // The BLOCK form's out-of-line protocol — the `?.` spelling does NOT
+    // read it (that getter does not mint; see the header above).
+    if (!safeNav && blockGetterMintsClosureRef(ps)) return true;
+    // fix #8981: the EXPRESSION-bodied form's inlined production — "this
+    // property's getter is an EXPRESSION whose value is a fresh +1 closure
+    // production, and the read hands the reader that reference".
+    //
+    // WHY IT IS A SEPARATE QUESTION. The BLOCK form's reference is minted by
+    // the getter, OUT OF LINE, and handed over (`blockGetterMintsClosureRef`).
+    // The EXPRESSION form's reference is minted by the getter's BODY, IN LINE,
+    // in the reader's own frame — §23.2's body is lowered by `lowerExpr` in
+    // the reader (`computedGetterOf` → `lowerExpr(*getter)`,
+    // LlvmBackend_Exprs.cpp). The reader owns it either way, so the
+    // reader-side discharge is the same question in both forms; only the
+    // place the cell is allocated differs.
+    //
+    // THE GATES (the BLOCK form's, unchanged):
+    //   * not an indexer (an indexer getter is a different emitter);
+    //   * not slot-dispatched (`propGetSlot_` / `ifacePropertyGetIndex_`): a
+    //     virtual or interface read runs the OVERRIDE's getter, a different
+    //     body, whose mint this classification cannot see;
+    //   * the declared type is a non-nullable function type (a nullable
+    //     function value has no owner for a closure reference — #8763's
+    //     fix-forward 2).
+    // Plus the two that make this form ITS OWN:
+    //   * the getter body is an EXPRESSION (the property-level `=> expr` of
+    //     §23.2 or an accessor's `get => expr`), not a block body (that is
+    //     the other predicate's business);
+    //   * that body is a +1 closure PRODUCTION — a lambda literal, a method
+    //     reference, or a call to a user method whose declared return type is
+    //     a function type. A body that reads a FIELD's closure is a BORROW:
+    //     the field keeps that reference and the read mints nothing, so
+    //     admitting it here would release a reference the field owns.
+    if (ps->isIndexer) return false;
+    if (propGetSlot_.count(ps) || ifacePropertyGetIndex_.count(ps))
+        return false;
+    const ast::PropertyDecl* pd = propertyDeclOf(ps);
+    if (!pd || !pd->type) return false;
+    const sema::TypeRef* pty = ctx_.resolvedType(*pd->type);
+    if (!pty || pty->kind != sema::TypeRef::Kind::Function || pty->nullable)
+        return false;
+    const ast::Expr* body = exprGetterBodyOfDecl(pd);
+    if (!body) return false;
+    return isPlusOneClosureProducer(body) || isUserMethodClosureReturnCall(body);
 }
 
 bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
@@ -38036,14 +38140,18 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     // specified").
     //
     // The GATES that keep the two sides in lockstep live in the SHARED
-    // predicate `blockGetterMintsClosureRef` (defined above), so the producer
+    // predicate `propertyReadMintsClosureRef` (defined above), so the producer
     // side (here) and the discharge side (the read sites that must give the
     // reference back — a direct call, a discarded read) ask the SAME question
     // and cannot disagree.
-    auto blockGetterMintsClosure =
-            [this](const sema::PropertySymbol* ps) -> bool {
-        return blockGetterMintsClosureRef(ps);
-    };
+    //
+    // fix #8981 (§23.2 / §28.9, v0.359): that SHARED question is now the
+    // UNION of the two getter forms — the BLOCK-bodied getter, whose body is
+    // emitted out of line and mints the reader's reference there, and the
+    // EXPRESSION-bodied getter (§23.2), whose body is INLINED in the reader's
+    // own frame and mints the reader's reference THERE. The read side asks
+    // `propertyReadMintsClosureRef`; the producer side asks the SAME
+    // predicate (below), so neither side can drift from the other.
     // fix #4040 (§17/§20 if-expression / §28.3 producers arm-meet, v0.294):
     // a `(if c then v1 else v2)` whose two branches are themselves +1 closure
     // producers lowers to a PHI of the two arms' closure pointers
@@ -38219,7 +38327,15 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
             // The BLOCK-bodied getter's own protocol still hands the reader a
             // +1 (see the helper above), so the read IS a +1 producer and the
             // binding local owns that reference.
-            if (blockGetterMintsClosure(ps)) return true;
+            //
+            // fix #8981 (§23.2 / §28.9, v0.359): the SHARED read-side
+            // predicate `propertyReadMintsClosureRef` now also admits the
+            // EXPRESSION-bodied getter, whose body is INLINED in the reader's
+            // frame (§23.2) and therefore mints the reader's reference THERE.
+            // Asking the SHARED question — the very question the discharge
+            // sites ask (a direct call, a discarded read) — keeps the
+            // producer side and the discharge side in lockstep.
+            if (propertyReadMintsClosureRef(init)) return true;
         }
     }
     // fix #5318 (§27.6 / §28.6, v0.315): the BARE (implicit-`this`) sibling
@@ -38286,12 +38402,37 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
             // leaked in 400 allocation(s)" — every closure the loop's `Reset()`
             // replaced stayed alive.
             //
-            // The gate is the SHARED predicate `blockGetterMintsClosureRef`
+            // The gate is the SHARED predicate `propertyReadMintsClosureRef`
             // (the same one the qualified arm asks), so the two spellings of
             // the read are classified by ONE question and cannot drift.
-            if (blockGetterMintsClosure(ps)) return true;
+            //
+            // fix #8981 (§23.2 / §28.9, v0.359): that SHARED question also
+            // admits the EXPRESSION-bodied getter (the body is inlined in the
+            // reader's frame, so the reader owns the reference it mints).
+            if (propertyReadMintsClosureRef(init)) return true;
         }
     }
+    // fix #8981 (§7.5 / §23.2 / §28.9, v0.359): the `?.` SPELLING of a read
+    // of an EXPRESSION-bodied function-typed property.
+    //
+    // WHY THIS FORM ONLY. The `?.` read of a BLOCK-bodied getter is a
+    // BORROW: that getter is emitted OUT OF LINE and its `mintReaderRef =
+    // false` variant does not mint the reader's reference at all (#8763's
+    // fix-forward 2), so admitting that spelling would release a reference
+    // nobody minted. The EXPRESSION-bodied getter has no such variant — its
+    // body is INLINED in the reader's own frame, so the closure cell is
+    // allocated there and the reader owns that +1, whichever spelling read
+    // it. §7.5 lifts the `?.` result to a NULLABLE function value; the
+    // nullable function value is a PLAIN pointer in the generated IR (null =
+    // null) and `bz_closure_release` is null-safe, so the discharge sites
+    // release it exactly as they release the non-nullable one.
+    //
+    // MEASURED on this fix's parent (b916d130b), 200 reads of
+    // `var g := hn?.EP;` over `property EP: (int) -> int => lambda(x: int)
+    // => x + 2;`: "SUMMARY: AddressSanitizer: 14400 byte(s) leaked in 400
+    // allocation(s)" — the same 72 B per read as the `.` spelling.
+    if (dynamic_cast<const ast::NullCondMemberExpr*>(init))
+        return propertyReadMintsClosureRef(init);
     // §27.6 (v0.184, #1758): a bare reference to a primitive-intrinsic static
     // method (`int.Parse`, `char.IsDigit`, …) ALSO lowers to a fresh calloc'd
     // rc=1 closure cell — via makePrimIntrinsicThunk (the CG60 path,
