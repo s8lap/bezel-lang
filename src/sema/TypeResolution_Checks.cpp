@@ -13958,6 +13958,15 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
             report(std::string(bound->headName()));
             return;
         }
+        // fix #8796 (§14.2, stdlib §9.6, v0.359): a primitive against a
+        // declaration-less built-in iteration interface it provably does not
+        // conform to (`string` against `IEnumerable<int>`: a string is a
+        // sequence of `char`) — decided by the predicate the call-site arm
+        // reads too (TypeRef.hpp).
+        if (primitiveRejectedByDeclLessIterationIface(arg, bound)) {
+            report(std::string(bound->headName()));
+            return;
+        }
         // We can only verify a type-bound when both sides are user-declared
         // named types (BFS over baseTypes). Built-in bounds/args carry no
         // base-type chain here; defer to avoid false positives.

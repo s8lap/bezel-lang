@@ -310,6 +310,56 @@ inline bool primitiveNeverConformsToBuiltinIface(std::string_view head) {
     return common::isBuiltinDisposalFamilyHead(head);
 }
 
+// fix #8796 (§14.2 *Type-parameter bounds* / *Interface conformance*, stdlib
+// §9.6 `String`, v0.359): a PRIMITIVE against a DECLARATION-LESS built-in
+// iteration/collection interface (`IEnumerable<int>`, `IList<char>`...).
+//
+// §14.2: "a type satisfies an interface bound only by conforming to that
+// interface at that instantiation". These interfaces carry no synthesized
+// declaration, so the conformance walk has nothing to read and the check
+// DEFERRED — which admitted `string` against `IEnumerable<int>` (a string is a
+// sequence of `char`) and `int` against `IEnumerable<int>`.
+//
+// A primitive implements NONE of them, bar `string`, whose stdlib declaration
+// (`public class String: IEnumerable<char>, IComparable<string>,
+// IEquatable<string>`, stdlib §9.6) lists `IEnumerable<char>` and no other.
+// True only when the primitive PROVABLY does not conform; an undecided shape
+// stays deferred: `Object` (as #8777), a bound argument that is a built-in
+// name or a type parameter (no declaration to decide it by), a nullable or
+// missing argument.
+//
+// The ONE predicate both §14.2 sites read: the type-instantiation site
+// (`Resolver::checkOneConstraint`) and the call site (`typeCall`'s bound
+// arms), so the two cannot disagree.
+inline bool primitiveRejectedByDeclLessIterationIface(const TypeRef* arg,
+                                                      const TypeRef* bound) {
+    if (!arg || !bound || arg->kind != TypeRef::Kind::Primitive ||
+        arg->nullable)
+        return false;
+    if (arg->primitive == PrimitiveType::None ||
+        arg->primitive == PrimitiveType::Object)
+        return false;
+    if (bound->kind != TypeRef::Kind::Named || bound->declaration ||
+        bound->nullable || bound->isResolvedTypeParam())
+        return false;
+    const std::string_view head = bound->headName();
+    const bool iterationFamily =
+        common::isIterableInterfaceHead(head) || head == "IReadOnlyCollection" ||
+        head == "IReadOnlyList" || head == "ICollection" || head == "IList" ||
+        head == "IOwningCollection" || head == "IOwningList";
+    if (!iterationFamily) return false;
+    if (arg->primitive != PrimitiveType::String) return true;
+    // `string` conforms to `IEnumerable<char>` and to nothing else here.
+    if (head != "IEnumerable") return true;
+    if (bound->genericArgs.size() != 1 || !bound->genericArgs[0]) return false;
+    const TypeRef* e = bound->genericArgs[0];
+    if (e->kind == TypeRef::Kind::Primitive &&
+        e->primitive != PrimitiveType::None &&
+        e->primitive != PrimitiveType::Object)
+        return e->nullable || e->primitive != PrimitiveType::Char;
+    return false;  // a built-in name / type parameter / user type: defer
+}
+
 // fix #3434 (spec §4.7 *The unit type* / §21.7 *The `return` statement*,
 // v0.283): does a callable whose return-type ascription RESOLVES to `r`
 // produce a value?
