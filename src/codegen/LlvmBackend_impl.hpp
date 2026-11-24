@@ -2896,6 +2896,14 @@ private:
         // exception leaves the scope (closureReassignedKeptAtUnwind_); the
         // slot's reference is then the one keeping that value alive.
         bool closureReleaseSkipOnUnwind = false;
+        // fix-forward #9061 (§28.9 / §8.1, v0.359): `slot` holds an
+        // `Object` view that owns ONE reference iff its run-time value is a
+        // function value (a dynamic fnval field read retained for a full
+        // expression, or a mint call's result adopted by a local's pin). The
+        // release is `emitObjectSlotFnvalOp(load, release)`, followed by a
+        // null store so a second pass (the K8 flush ran first, or a loop
+        // re-enters the scope) is a no-op.
+        bool objectFnvalRelease = false;
         // #422 / §8.6 / §28.9: a `var` Object/interface local holding a BOXED
         // VALUE that PROVABLY does not escape its scope (a non-escape walk found
         // every use is a non-consuming read — `is`/`as`/`= null`/`<> null`) and
@@ -24339,6 +24347,47 @@ private:
     bool lowerDynFnvalFieldStore(const ast::Expr& target,
                                  llvm::Value* fieldAddr, llvm::Value* newVal,
                                  const ast::Expr* valueExpr);
+    // fix-forward #9061 (§28.9 / §8.1 / §27.5, v0.359): the READ side of the
+    // discipline above. Once the field holds a counted reference, its
+    // displacement or its holder's disposal frees the cell when the field
+    // was the only holder, so every read that leaves the field as a value
+    // needs a reference of its own. `collectDynFnvalReadSides` (run at the
+    // end of collectBoxStorageFields) keeps a field in dynFnvalStorageFields_
+    // only when EVERY read of it, module-wide, is one of:
+    //   * an inspection (`is` / `is not`, a compare with `null`, an `as` to a
+    //     type no function value can be) -- nothing is kept;
+    //   * the operand of an `as` to a function type that is the CALLEE of a
+    //     call -- `dynFnvalCastCallees_`, retained for the full expression
+    //     (deferDynFnvalCastCalleeRetainToK8), so a closure that displaces
+    //     the field while it runs is not freed under itself;
+    //   * the right side of `:=` into another kept field (whose store
+    //     retains);
+    //   * the value of a `return` / an expression body of a method in
+    //     `fnvalMintMethods_` -- such a method hands its caller a reference
+    //     of its own (mintDynFnvalReturnRef), and `var g := <such call>;`
+    //     keeps it in a scope-end pin (armDynFnvalMintPin).
+    // Any other read (a bind, an argument, a capture, an unknown node kind,
+    // a read in a lambda, async, iterator or destructor body) declines the
+    // field, which keeps the base behaviour: a leak, never a dangling read.
+    void collectDynFnvalReadSides();
+    std::unordered_set<const ast::Expr*> dynFnvalCastCallees_;
+    std::unordered_set<const sema::Symbol*> fnvalMintMethods_;
+    // A call whose callee is a method of fnvalMintMethods_: its result owns
+    // one reference iff it is a function value.
+    bool isDynFnvalMintCall(const ast::Expr* e);
+    // At a `return` / expression body of a fnvalMintMethods_ method, before
+    // the scope's disposals: retain `v` iff it is a function value, unless
+    // `value` is a mint call (its reference transfers).
+    void mintDynFnvalReturnRef(llvm::Value* v, const ast::Expr* value);
+    // At `as`-to-function-type over a kept field read in callee position:
+    // retain the occupant (iff a function value) until the K8 boundary.
+    void deferDynFnvalCastCalleeRetainToK8(llvm::Value* obj);
+    // At `var g := <mint call>;`: adopt the call's reference into a pin slot
+    // released at scope end, when every use of `g` is one the reference
+    // need not outlive. Otherwise the reference leaks.
+    void armDynFnvalMintPin(const ast::LocalDecl* ld, const ast::Expr* init,
+                            llvm::Value* v);
+    bool dynFnvalMintPinSafe(const ast::LocalDecl* ld);
 
     // fix #8215: `bz_box_retain` (retain=true) / `bz_box_release` (false) on
     // `obj` IFF its runtime value is a genuine §8.6 box -- not null, not a
@@ -24944,6 +24993,10 @@ private:
         // its K8-boundary release is `bz_string_release`, not a Dispose.
         // See `deferExtStringReceiverReleaseToK8`.
         bool stringRelease = false;
+        // fix-forward #9061 (§28.9, v0.359): the slot holds an `Object` view
+        // retained iff it is a function value
+        // (deferDynFnvalCastCalleeRetainToK8); released the same way.
+        bool objectFnvalRelease = false;
     };
     std::vector<K8RecvTemp> k8RecvTemps_;
 

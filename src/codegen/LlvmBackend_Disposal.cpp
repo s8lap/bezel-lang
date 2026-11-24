@@ -10318,6 +10318,40 @@ bool Emitter::deferExtStringReceiverReleaseToK8(llvm::Value* recvStr) {
 }
 
 
+// fix-forward #9061 (§28.9 / §8.1 / §27.5, v0.359): `(h._o as F)!(args)` over
+// a dynamic function-value storage field (dynFnvalStorageFields_). The field
+// holds a counted reference, and the call it makes may displace the field or
+// dispose its holder (`lambda(x: Hx) => do x.Keep(new Foo(1)); return k; end`)
+// while the closure still runs and reads its environment -- MEASURED: a
+// heap-use-after-free in the lambda once the field was the cell's only
+// holder. §28.9: the cell must stay valid "as long as anything can still
+// reach it", and the running call reaches it. So the operand takes a
+// reference of its own (iff it is a function value) for the rest of the full
+// expression, released at the K8 boundary on the normal edge and by the
+// registered scope entry on the exception edge -- the
+// deferExtStringReceiverReleaseToK8 shape. When no scope can take the entry
+// the retain is not made; collectDynFnvalReadSides declines every read in a
+// body where that can happen (a destructor, a lambda, an async or iterator
+// body), so this never meets a kept field there.
+void Emitter::deferDynFnvalCastCalleeRetainToK8(llvm::Value* obj) {
+    if (!obj || !obj->getType()->isPointerTy()) return;
+    if (disposeStack_.empty() || emittingDisposerBody_ || !currentFn_ ||
+        smStateStruct_)
+        return;
+    llvm::BasicBlock* bb = builder_.GetInsertBlock();
+    if (!bb || terminatorOrNull(bb)) return;
+    llvm::AllocaInst* slot = entryAllocaNullPtr();
+    emitObjectSlotFnvalOp(obj, /*retain=*/true);
+    builder_.CreateStore(obj, slot);
+    Disposal d{slot, nullptr};
+    d.objectFnvalRelease = true;
+    disposeStack_.back().push_back(d);
+    K8RecvTemp t{slot, currentFn_};
+    t.objectFnvalRelease = true;
+    k8RecvTemps_.push_back(t);
+}
+
+
 bool Emitter::deferUnboundOwnedTempToK8(llvm::AllocaInst* slot) {
     if (!slot || !currentFn_ || emittingDisposerBody_) return false;
     if (slot->getAllocatedType() != ptrTy()) return false;
@@ -10667,6 +10701,18 @@ void Emitter::flushK8RecvTemps() {
                                  t.slot);
             continue;
         }
+        // fix-forward #9061 (§28.9, v0.359): a dynamic fnval field's
+        // occupant retained for the full expression
+        // (deferDynFnvalCastCalleeRetainToK8). Released and nulled; the
+        // registered `objectFnvalRelease` entry then reads null.
+        if (t.objectFnvalRelease) {
+            emitObjectSlotFnvalOp(
+                builder_.CreateLoad(ptrTy(), t.slot, "k8recv.fnval"),
+                /*retain=*/false);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 t.slot);
+            continue;
+        }
         // fix #8009 (§28.3 K8.1 / §28.11, v0.350): a COLLECTION temporary's
         // release is the COLLECTION'S OWN arm — the runtime free
         // (`bz_array_free` / `bz_dict_free` / `bz_llist_free`) plus the §28.11
@@ -10858,6 +10904,16 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             if (isUnwind && it->closureReleaseSkipOnUnwind) continue;
             llvm::Value* c = builder_.CreateLoad(ptrTy(), it->slot, "cl.rel");
             emitClosureRelease(c);
+            continue;
+        }
+        // fix-forward #9061 (§28.9 / §8.1, v0.359): see
+        // Disposal::objectFnvalRelease. The reference dies on either exit.
+        if (it->objectFnvalRelease) {
+            llvm::Value* o =
+                builder_.CreateLoad(ptrTy(), it->slot, "dynfn.pin.rel");
+            emitObjectSlotFnvalOp(o, /*retain=*/false);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 it->slot);
             continue;
         }
         // #1930 / stdlib §5 / §28.9: a provably-non-escaping `var g :=

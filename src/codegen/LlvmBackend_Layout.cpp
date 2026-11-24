@@ -4271,6 +4271,14 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
                     releaseFreshBoxTemp();
                     return builder_.CreateXor(hit, builder_.getInt1(true));
                 }
+                // fix-forward #9061 (§28.9, v0.359): the callee cast of a
+                // kept dynamic function-value field (`(_o as F)!(a)`) holds
+                // its own reference to the occupant until the full
+                // expression ends, so a call that displaces the field while
+                // the closure runs cannot free the running cell.
+                if (!opIsFn && !dynFnvalCastCallees_.empty() &&
+                    dynFnvalCastCallees_.count(te.operand.get()))
+                    deferDynFnvalCastCalleeRetainToK8(obj);
                 llvm::Value* cell = opIsFn ? obj : fnValFromObjectView(obj);
                 return builder_.CreateSelect(
                     hit, cell, llvm::ConstantPointerNull::get(ptrTy()),

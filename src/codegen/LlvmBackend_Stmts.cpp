@@ -4755,6 +4755,9 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // (`F(x: string): Object  return x;`) — see
             // mintObjectReturnStringRef.
             mintObjectReturnStringRef(v, rs->value.get(), declRet);
+            // fix-forward #9061 (§28.9, v0.359): a minting method's `return`
+            // of a kept dynamic function-value field.
+            mintDynFnvalReturnRef(v, rs->value.get());
         }
         // #429 (closure RETURN category) / §27.5 / §28.9 / §28.3: a method
         // whose declared return type is a function type (Kind::Function) mints
@@ -6895,9 +6898,13 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         // Dispose edge would be a second drop of one
                         // reference: an over-release, and with an env still
                         // holding the cell, a use-after-free.
+                        // fix-forward #9061: `objectFnvalRelease` (a mint
+                        // pin / callee-cast reference) likewise drops a
+                        // counted reference the scope exit already dropped.
                         if (d.closureRelease || d.boxedCellFree ||
                             d.boxedCellFreeDeferred || d.inlineOwnedArrayCell ||
-                            d.capturedCellContentRelease || d.cellRelease)
+                            d.capturedCellContentRelease || d.cellRelease ||
+                            d.objectFnvalRelease)
                             continue;
                         if (d.iterEnumDispose) {
                             auto* alloca =

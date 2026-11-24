@@ -12323,6 +12323,9 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
                 // `Object`/interface-returning twin (`F(x: string): Object
                 // => x;`).
                 mintObjectReturnStringRef(v, ci.exprBody, declRet);
+                // fix-forward #9061 (§28.9, v0.359): a minting method's
+                // expression body (`Get(): Object? => _o;`).
+                mintDynFnvalReturnRef(v, ci.exprBody);
             }
             // fix #8141 (§22.2 / §28.9 / §21.7, v0.355): the CLOSURE twin of
             // the string mint just above, which this face never had. §22.2:
@@ -20831,6 +20834,9 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // fix #8444 (§28.9 / §8.6, v0.357): the local's own reference to a box of
     // unknown provenance (a box-storage field read, a call result, a copy).
     armBoxBorrowPin(declNode, declType, init, v);
+    // fix-forward #9061 (§28.9, v0.359): the reference a minting call's
+    // value carries (`var g := h.Get();`).
+    armDynFnvalMintPin(dynamic_cast<const ast::LocalDecl*>(declNode), init, v);
     // #1003 / stdlib §5 / §28: if this `var` borrowing-`Array<T>` local was bound
     // to a fresh materializer (ToArray/Sorted/Reversed) and the escape walk proved
     // it never escapes its scope, register a scope-end bz_array_free of its single
@@ -39857,7 +39863,8 @@ bool Emitter::lowerDynBoxFieldStore(const ast::Expr& target,
     // dynFnvalStorageFields_): the same retain / release, on a run-time test.
     const bool alsoFnval = isDynFnvalStorageMember(sym);
     if (alsoFnval && !isPlusOneClosureProducer(valueExpr) &&
-        !isUserMethodClosureReturnCall(valueExpr))
+        !isUserMethodClosureReturnCall(valueExpr) &&
+        !isDynFnvalMintCall(valueExpr))  // fix-forward #9061: transfers
         emitObjectSlotFnvalOp(newVal, /*retain=*/true);
     builder_.CreateStore(newVal, fieldAddr);
     emitObjectSlotBoxOp(oldVal, /*retain=*/false);
@@ -39898,8 +39905,10 @@ bool Emitter::lowerDynFnvalFieldStore(const ast::Expr& target,
     if (!sym || !isDynFnvalStorageMember(sym)) return false;
     if (isDynBoxStorageMember(sym)) return false;  // lowerDynBoxFieldStore's
     llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), fieldAddr, "dynfn.old");
+    // fix-forward #9061: a minting call's reference transfers into the field.
     if (!isPlusOneClosureProducer(valueExpr) &&
-        !isUserMethodClosureReturnCall(valueExpr))
+        !isUserMethodClosureReturnCall(valueExpr) &&
+        !isDynFnvalMintCall(valueExpr))
         emitObjectSlotFnvalOp(newVal, /*retain=*/true);
     builder_.CreateStore(newVal, fieldAddr);
     emitObjectSlotFnvalOp(oldVal, /*retain=*/false);
@@ -41250,9 +41259,16 @@ namespace {
 // named/positional argument, a formal that is neither a function-typed
 // declaration (arm (b), #5611) nor exactly a method-own `U` (arm (a), #5129),
 // or a callee body with any non-invocation use.
+//
+// fix-forward #9061 (§27.5 / §28.9, v0.359): `viaFnvalFieldStore`, when
+// given, is set when the verdict rests on arm (c)'s fnval-FIELD-STORE
+// admission rather than on the formal being only invoked or inspected. The
+// caller's reference is still balanced (the field's store retains), but the
+// VALUE then outlives the caller's scope in that field, so the walker files
+// the local as one whose capture cells must not be freed with the scope.
 inline bool closureArgBindsMethodOwnTypeParamBorrow(
         const sema::SemaContext& ctx, const ast::CallExpr& call,
-        std::size_t ai) {
+        std::size_t ai, bool* viaFnvalFieldStore = nullptr) {
     if (ai >= call.args.size() || !call.args[ai].value) return false;
     if (!call.args[ai].modifier.empty()) return false;
     auto* ms = dynamic_cast<sema::MethodSymbol*>(
@@ -41346,14 +41362,19 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
         const sema::TypeRef* ft = ctx.resolvedType(*p.type);
         if (ft && ft->kind == sema::TypeRef::Kind::Primitive &&
             ft->primitive == sema::PrimitiveType::Object)
+        {
             // fix #9061 (§28.9 / §8.1 / §27.5, v0.359): a callee that also
             // STORES the formal into a dynamic function-value field keeps a
             // reference of its own (the store retains), so the caller's
             // scope-end release is still the one that balances its own.
-            return calleeBodyUsesFormalOnlyByInvocationOrInspection(*md,
-                                                                   p.name) ||
-                   calleeBodyUsesFormalOnlyByInvocationInspectionOrFnvalFieldStore(
-                       ctx, *md, p.name);
+            if (calleeBodyUsesFormalOnlyByInvocationOrInspection(*md, p.name))
+                return true;
+            if (!calleeBodyUsesFormalOnlyByInvocationInspectionOrFnvalFieldStore(
+                    ctx, *md, p.name))
+                return false;
+            if (viaFnvalFieldStore) *viaFnvalFieldStore = true;
+            return true;
+        }
     }
     // arm (a) — narrow #5129: a bare METHOD-OWN generic `U` instantiated at
     // this call site to a non-nullable function type.
@@ -41865,6 +41886,13 @@ struct ClosureEscapeWalker {
     // collectClosureReleaseEligible files it under
     // `closureEscapingScopeEndRelease_`, not `closureReleaseEligible_`.
     bool mayOutliveScope_ = false;
+    // fix-forward #9061 (§27.5 / §28.9, v0.359): set, together with
+    // mayOutliveScope_, when target is handed to a callee that stores it into
+    // a dynamic function-value field (closureArgBindsMethodOwnTypeParamBorrow's
+    // `viaFnvalFieldStore`). §27.5 keeps a closure's captures alive as long as
+    // the closure, and the field now holds it past this scope, so no walk may
+    // read `!escaped` alone as "its captures die with this frame".
+    bool storedIntoFnvalField_ = false;
     // fix #4473 (§27.5 / §28.9, v0.301): true when target is the RHS of an
     // AssignmentStmt whose LHS is a same-scope closure-typed local/parameter
     // (a `lambdaRef := y` shape where `y` is the walked target and
@@ -42420,6 +42448,12 @@ struct ClosureEscapeWalker {
                     }
                 }
                 if (bw.escaped) return false;
+                // fix-forward #9061: an arm binding stored into a dynamic
+                // fnval field carries target's value past this scope.
+                if (bw.storedIntoFnvalField_) {
+                    mayOutliveScope_ = true;
+                    storedIntoFnvalField_ = true;
+                }
             }
         }
         return true;
@@ -42748,9 +42782,16 @@ struct ClosureEscapeWalker {
                 // nothing else escapes it.
                 // fix #8717: each relief below also admits target reached
                 // through `??` / `as` (argIsTarget).
+                bool viaFnvalFieldStore = false;  // fix-forward #9061
                 if (!safeArg && argIsTarget(c->args[ai].value.get()) &&
-                    closureArgBindsMethodOwnTypeParamBorrow(ctx, *c, ai))
+                    closureArgBindsMethodOwnTypeParamBorrow(
+                        ctx, *c, ai, &viaFnvalFieldStore)) {
                     safeArg = true;
+                    if (viaFnvalFieldStore) {
+                        mayOutliveScope_ = true;
+                        storedIntoFnvalField_ = true;
+                    }
+                }
                 // fix #8872 (§28.14 / §28.9 / §27.5, v0.359): the
                 // FUNCTION-VALUE callee twin of the arm above. A call through
                 // a function VALUE — a lambda-typed local `h(k)`, a
@@ -54930,7 +54971,7 @@ void Emitter::collectCellFreeEligible(
             // the frame's scope end).
             ClosureEscapeWalker hw{ctx, static_cast<const void*>(ld)};
             for (auto& s : frameBodyStmts) hw.stmt(s.get());
-            if (hw.escaped) return;
+            if (hw.escaped || hw.storedIntoFnvalField_) return;  // fix-forward #9061
             bool sawInvokedAtOnce = false;
             int calls = 0;
             if (!resultConsumedLocally(frameBodyStmts, /*exprBody=*/nullptr, ld,
@@ -55008,7 +55049,7 @@ void Emitter::collectCellFreeEligible(
                 ClosureEscapeWalker hw{ctx, static_cast<const void*>(decl)};
                 if (exprBody) hw.expr(exprBody, false);
                 for (auto& s : stmts) hw.stmt(s.get());
-                return !hw.escaped;
+                return !hw.escaped && !hw.storedIntoFnvalField_;  // fix-forward #9061
             };
             std::function<void(const ast::Expr*)> ex;
             std::function<void(const ast::Stmt*)> st;
@@ -55553,7 +55594,9 @@ void Emitter::collectCellFreeEligible(
                             if (lam->exprBody)
                                 cew.expr(lam->exprBody.get(), false);
                             for (auto& s : lam->stmts) cew.stmt(s.get());
-                            if (!cew.escaped) {
+                            // fix-forward #9061: a binding stored into a
+                            // dynamic fnval field outlives `lam`'s body.
+                            if (!cew.escaped && !cew.storedIntoFnvalField_) {
                                 // fix #4525: `var g := lambda() => H` whose
                                 // every call result is consumed in `lam`'s
                                 // body — the widening below may then treat
@@ -57438,6 +57481,9 @@ void Emitter::collectBoxStorageFields() {
             !isExternallyWritableBoxField(m))
             dynFnvalStorageFields_.insert(static_cast<const void*>(m));
     }
+    // fix-forward #9061: keep the discipline only for fields every read of
+    // which can be given a reference of its own.
+    collectDynFnvalReadSides();
 }
 
 
@@ -58252,6 +58298,693 @@ void Emitter::collectValueLikeChoiceFieldOwners() {
         }
         if (!dropped) break;
     }
+}
+
+
+// fix-forward #9061 (§28.9 / §8.1 / §27.5, v0.359): the fail-closed USE walk
+// behind collectDynFnvalReadSides (module-wide reads of the dynamic
+// function-value storage fields) and dynFnvalMintPinSafe (the uses of one
+// local bound from a mint call). It recognises every statement and
+// expression kind and reports each read of a TRACKED expression with the
+// position it is read in; an unrecognised node sets `incomplete`, and both
+// callers then keep nothing. The positions:
+//   Inspect    -- `is` / `is not`, a compare with `null`, or an `as` to a type
+//                 no function value can be: the read keeps nothing.
+//   CastCallee -- the operand of an `as` to a FUNCTION type that is itself
+//                 the callee of a call (`(x as F)!(a)`).
+//   StoreRhs   -- the right side of `:=` (`aux` is the assignment target).
+//   Return     -- a `return` value outside any lambda.
+//   Other      -- anything else.
+// `inLambda` is set for a read inside a lambda body (a capture).
+namespace {
+struct DynFnvalUseWalk {
+    enum class Use { Other, Inspect, CastCallee, StoreRhs, Return };
+    std::function<bool(const ast::Expr*)> tracked;
+    // An `as` / compare target type a function value cannot have.
+    std::function<bool(const ast::TypeTestExpr*)> castCannotYieldFnval;
+    std::function<bool(const ast::TypeTestExpr*)> castToFunction;
+    std::function<void(const ast::Expr* read, Use use, const ast::Node* aux,
+                       bool inLambda)> onUse;
+    std::function<void(const ast::Expr* value)> onReturn;   // may be empty
+    std::function<void(const ast::LocalDecl*, bool inLambda)> onLocal;  // may be empty
+    bool incomplete = false;
+    bool sawYield = false;
+    int lambdaDepth = 0;
+    const ast::TypeTestExpr* calleeCast = nullptr;
+
+    void report(const ast::Expr* e, Use u, const ast::Node* aux) {
+        if (tracked && tracked(e)) onUse(e, u, aux, lambdaDepth > 0);
+    }
+    void args(const std::vector<ast::CallArgument>& as) {
+        for (const ast::CallArgument& a : as) expr(a.value.get(), Use::Other);
+    }
+    void arms(const std::vector<ast::CaseArm>& arms) {
+        for (const ast::CaseArm& arm : arms) {
+            expr(arm.guard.get(), Use::Other);
+            expr(arm.exprBody.get(), Use::Other);
+            for (const auto& s : arm.stmts) stmt(s.get());
+        }
+    }
+    static bool isNull(const ast::Expr* e) {
+        return dynamic_cast<const ast::NullLiteralExpr*>(e) != nullptr;
+    }
+    void expr(const ast::Expr* e, Use use, const ast::Node* aux = nullptr) {
+        if (!e) return;
+        report(e, use, aux);
+        const Use o = Use::Other;
+        if (dynamic_cast<const ast::IntLiteralExpr*>(e) ||
+            dynamic_cast<const ast::FloatLiteralExpr*>(e) ||
+            dynamic_cast<const ast::CharLiteralExpr*>(e) ||
+            dynamic_cast<const ast::StringLiteralExpr*>(e) ||
+            dynamic_cast<const ast::VerbatimStringExpr*>(e) ||
+            dynamic_cast<const ast::BoolLiteralExpr*>(e) ||
+            dynamic_cast<const ast::NullLiteralExpr*>(e) ||
+            dynamic_cast<const ast::IdentifierExpr*>(e) ||
+            dynamic_cast<const ast::TypeOfExpr*>(e) ||
+            dynamic_cast<const ast::NameOfExpr*>(e) ||
+            dynamic_cast<const ast::DefaultExpr*>(e) ||
+            dynamic_cast<const ast::UnitExpr*>(e))
+            return;
+        // A `^name` transfer marker names a local, never a field; it is a
+        // consuming use of whatever it names.
+        if (dynamic_cast<const ast::MarkedTransferExpr*>(e)) {
+            if (tracked) incomplete = true;  // cannot be told apart by name
+            return;
+        }
+        if (auto* si = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (const auto& p : si->parts) expr(p.expr.get(), o);
+            return;
+        }
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            expr(ma->target.get(), o); return; }
+        if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            expr(nm->target.get(), o); return; }
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
+            const ast::Expr* c = ce->callee.get();
+            if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(c))
+                c = pb->operand.get();
+            const ast::TypeTestExpr* saved = calleeCast;
+            calleeCast = dynamic_cast<const ast::TypeTestExpr*>(c);
+            expr(ce->callee.get(), o);
+            calleeCast = saved;
+            args(ce->args);
+            return;
+        }
+        if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            expr(nc->callee.get(), o); args(nc->args); return; }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(ix->target.get(), o); args(ix->indices); return; }
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(pb->operand.get(), o); return; }
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+            args(ne->args); return; }
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            const bool nullCmp = (be->op == "=" || be->op == "<>") &&
+                                 (isNull(be->left.get()) || isNull(be->right.get()));
+            expr(be->left.get(), nullCmp ? Use::Inspect : o);
+            expr(be->right.get(), nullCmp ? Use::Inspect : o);
+            return;
+        }
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            expr(ue->operand.get(), o); return; }
+        if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            Use u = o;
+            if (tt->op == "is" || tt->op == "is not")
+                u = Use::Inspect;
+            else if (tt->op == "as" && castCannotYieldFnval(tt))
+                u = Use::Inspect;
+            else if (tt->op == "as" && tt == calleeCast && castToFunction(tt))
+                u = Use::CastCallee;
+            const ast::TypeTestExpr* saved = calleeCast;
+            calleeCast = nullptr;
+            expr(tt->operand.get(), u, tt);
+            calleeCast = saved;
+            return;
+        }
+        if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(co->condition.get(), o); expr(co->thenValue.get(), o);
+            expr(co->elseValue.get(), o); return; }
+        if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(th->operand.get(), o); return; }
+        if (auto* rg = dynamic_cast<const ast::RangeExpr*>(e)) {
+            expr(rg->lo.get(), o); expr(rg->hi.get(), o); expr(rg->step.get(), o);
+            return; }
+        if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+            expr(we->source.get(), o);
+            for (const auto& a : we->assigns) expr(a.value.get(), o);
+            return; }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (const auto& el : cl->elements) expr(el.get(), o);
+            for (const auto& k : cl->keys) expr(k.get(), o);
+            return; }
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            ++lambdaDepth;
+            expr(lam->exprBody.get(), o);
+            for (const auto& s : lam->stmts) stmt(s.get());
+            for (const ast::Param& p : lam->params) expr(p.defaultValue.get(), o);
+            --lambdaDepth;
+            return; }
+        if (auto* cx = dynamic_cast<const ast::CaseExpr*>(e)) {
+            expr(cx->scrutinee.get(), o); arms(cx->arms); return; }
+        if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+            // A `bind` region is walked as a lambda body: only inspections.
+            ++lambdaDepth;
+            for (const auto& c : bx->clauses) stmt(c.get());
+            expr(bx->body.get(), o);
+            --lambdaDepth;
+            return; }
+        incomplete = true;
+    }
+    void stmt(const ast::Stmt* s) {
+        if (!s) return;
+        const Use o = Use::Other;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            if (onLocal) onLocal(ld, lambdaDepth > 0);
+            expr(ld->initializer.get(), o); return; }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            expr(lc->value.get(), o); return; }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            // The target is written, not read: walk only what it reads.
+            const ast::Expr* t = as->target.get();
+            if (tracked && t && tracked(t)) {
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(t))
+                    expr(ma->target.get(), o);
+                else if (!dynamic_cast<const ast::IdentifierExpr*>(t))
+                    incomplete = true;
+                // `??=` reads the target first.
+                if (as->op != ":=") report(t, o, nullptr);
+            } else {
+                expr(t, o);
+            }
+            expr(as->value.get(), as->op == ":=" ? Use::StoreRhs : o, t);
+            return; }
+        if (auto* is = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            expr(is->target.get(), o); return; }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            if (lambdaDepth == 0 && onReturn && rs->value) onReturn(rs->value.get());
+            expr(rs->value.get(), lambdaDepth == 0 ? Use::Return : o);
+            return; }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            expr(es->expr.get(), o); return; }
+        if (auto* th = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            expr(th->value.get(), o); return; }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            expr(ds->value.get(), o); return; }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            if (lambdaDepth == 0) sawYield = true;
+            expr(ys->value.get(), o); return; }
+        if (dynamic_cast<const ast::BreakStmt*>(s)) return;
+        if (dynamic_cast<const ast::ContinueStmt*>(s)) return;
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s)) {
+            expr(ifs->ifBranch.condition.get(), o);
+            for (const auto& b : ifs->ifBranch.body) stmt(b.get());
+            for (const auto& br : ifs->elifBranches) {
+                expr(br.condition.get(), o);
+                for (const auto& b : br.body) stmt(b.get());
+            }
+            for (const auto& b : ifs->elseBody) stmt(b.get());
+            return; }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            expr(ws->condition.get(), o);
+            for (const auto& b : ws->body) stmt(b.get()); return; }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            expr(fs->iterable.get(), o); expr(fs->withExpr.get(), o);
+            for (const auto& b : fs->body) stmt(b.get()); return; }
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (const auto& b : db->body) stmt(b.get()); return; }
+        if (auto* tr = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (const auto& b : tr->body) stmt(b.get());
+            for (const ast::CatchArm& c : tr->catches) {
+                expr(c.guard.get(), o);
+                stmt(c.body.get());
+            }
+            for (const auto& b : tr->finallyBody) stmt(b.get());
+            return; }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            expr(cs->scrutinee.get(), o); arms(cs->arms); return; }
+        incomplete = true;
+    }
+};
+}  // namespace
+
+// fix-forward #9061 (§28.9 / §8.1 / §27.5, v0.359): the READ side of the
+// dynamic function-value storage discipline (see dynFnvalStorageFields_ and
+// the declaration of this function for the admitted read positions).
+//
+// WHY. §28.9 (v0.359): "Runtime management governs the *function value
+// itself* -- the heap-allocated closure object that backs it", so the cell
+// must stay valid while anything can still reach it. The store side gives the
+// field a counted reference and releases it on displacement and at the
+// holder's disposal; once the caller's own local is released, the field is
+// the ONLY holder. A read that keeps the value past the field's occupancy --
+// an `Object?` getter bound to a local and the field then overwritten, the
+// getter's value returned past the holder's disposal, a closure invoked
+// through the field that displaces the field while it runs -- then reads a
+// freed cell (MEASURED: heap-use-after-free under ASan, review probes i22 /
+// j03 / j04 and the invoke-and-displace shape). A function-typed field's
+// getter mints a reference for its caller (#429 / #8141); this is the same
+// for the `Object` slot, restricted to the read positions that can be given
+// one:
+//   * the CALLEE cast `(x._o as F)!(a)` retains the occupant until the full
+//     expression ends (dynFnvalCastCallees_);
+//   * a `return` / expression body of a non-virtual, non-generic, non-async
+//     local METHOD declared `Object` / `Object?` mints a reference for the
+//     caller (fnvalMintMethods_; mintDynFnvalReturnRef), and a local bound
+//     from such a call keeps it in a scope-end pin (armDynFnvalMintPin);
+//   * a store into another kept field is retained by that store.
+// Every other read declines the field: it leaves dynFnvalStorageFields_ and
+// gets the base behaviour (no retain, no release -- a leak, never a free
+// under a live reader).
+void Emitter::collectDynFnvalReadSides() {
+    dynFnvalCastCallees_.clear();
+    fnvalMintMethods_.clear();
+    if (dynFnvalStorageFields_.empty()) return;
+    std::unordered_set<const sema::Symbol*> cand;
+    for (const void* p : dynFnvalStorageFields_)
+        cand.insert(static_cast<const sema::Symbol*>(p));
+    std::unordered_set<const sema::Symbol*> declined;
+    for (const sema::Symbol* f : cand) {
+        auto* ms = dynamic_cast<const sema::MemberSymbol*>(f);
+        // A non-main module's non-private member can be READ by an importer
+        // (through a field access or an exported auto-property getter) whose
+        // code this walk cannot see.
+        if (!isMainModule_ &&
+            (!ms || ms->visibility != ast::Visibility::Private))
+            declined.insert(f);
+        const sema::TypeSymbol* owner = ms ? ms->parent : nullptr;
+        // SEAM-ACCESSOR: `owner` is a class compiled in this module (the
+        // candidate set holds only local classes' members). #3152
+        auto* td = owner ? dynamic_cast<const ast::TypeDecl*>(owner->decl)
+                         : nullptr;
+        // A value-type holder is copied with the slot (two holders, one
+        // reference); a generic, positional or serialized class has member
+        // paths this walk does not model.
+        if (!td || owner->kind != ast::TypeDeclKind::Class ||
+            !td->genericParams.empty() || td->hasPositionalFields ||
+            td->serializedClass)
+            declined.insert(f);
+    }
+
+    auto isObjectTy = [](const sema::TypeRef* t) {
+        return t && t->kind == sema::TypeRef::Kind::Primitive &&
+               t->primitive == sema::PrimitiveType::Object;
+    };
+    // A method whose returns can hand its caller a reference of its own: a
+    // local, non-generic, non-virtual, synchronous method of a non-generic
+    // class, declared `Object` / `Object?`, lowered once into methodFns_.
+    auto mintEligible = [&](const sema::MethodSymbol* m) -> const ast::MethodDecl* {
+        if (!m || m->isOperator || m->extensionDecl || !m->parent) return nullptr;
+        if (ctx_.isImported(m)) return nullptr;
+        // SEAM-ACCESSOR: gated by the isImported test just above. #3152
+        auto* md = dynamic_cast<const ast::MethodDecl*>(m->decl);
+        if (!md || md->bodyKind == ast::MethodBodyKind::Abstract) return nullptr;
+        if (!md->genericParams.empty() || !m->genericParams.empty()) return nullptr;
+        for (auto mod : md->modifiers)
+            if (mod == "virtual" || mod == "abstract" || mod == "override" ||
+                mod == "async")
+                return nullptr;
+        // SEAM-ACCESSOR: the parent of a local method is local. #3152
+        auto* ptd = dynamic_cast<const ast::TypeDecl*>(m->parent->decl);
+        if (!ptd || !ptd->genericParams.empty()) return nullptr;
+        if (!md->returnType || md->returnOwned) return nullptr;
+        if (!isObjectTy(ctx_.resolvedType(*md->returnType))) return nullptr;
+        if (methodFns_.find(const_cast<sema::MethodSymbol*>(m)) ==
+            methodFns_.end())
+            return nullptr;
+        return md;
+    };
+
+    const sema::MethodSymbol* curMethod = nullptr;   // mint-eligible body
+    std::vector<const sema::Symbol*> touched;
+    bool bodyUnsupported = false;
+    // (read field, method whose return it is)
+    std::vector<std::pair<const sema::Symbol*, const sema::MethodSymbol*>> retReads;
+    // (method, the method whose call it returns)
+    std::vector<std::pair<const sema::MethodSymbol*, const sema::MethodSymbol*>> retCalls;
+    std::unordered_set<const sema::MethodSymbol*> mintSeeds;
+    std::vector<std::pair<const sema::Symbol*, const sema::Symbol*>> edges;
+    std::vector<std::pair<const ast::TypeTestExpr*, const sema::Symbol*>> castCallees;
+    std::unordered_set<const sema::MethodSymbol*> yieldingMethods;
+
+    auto fieldOf = [&](const ast::Expr* e) -> const sema::Symbol* {
+        if (!e) return nullptr;
+        if (!dynamic_cast<const ast::IdentifierExpr*>(e) &&
+            !dynamic_cast<const ast::MemberAccessExpr*>(e) &&
+            !dynamic_cast<const ast::NullCondMemberExpr*>(e))
+            return nullptr;
+        const sema::Symbol* s = ctx_.exprSymbol(*e);
+        return s && cand.count(s) ? s : nullptr;
+    };
+    auto calleeMethod = [&](const ast::Expr* e) -> const sema::MethodSymbol* {
+        auto* ce = dynamic_cast<const ast::CallExpr*>(e);
+        if (!ce || !ce->callee) return nullptr;
+        return dynamic_cast<const sema::MethodSymbol*>(
+            ctx_.exprSymbol(*ce->callee));
+    };
+
+    DynFnvalUseWalk w;
+    w.tracked = [&](const ast::Expr* e) { return fieldOf(e) != nullptr; };
+    w.castCannotYieldFnval = [&](const ast::TypeTestExpr* tt) {
+        if (!tt->testType) return false;
+        const sema::TypeRef* t = ctx_.resolvedType(*tt->testType);
+        if (!t || t->kind == sema::TypeRef::Kind::Function) return false;
+        // Only a target no function value can convert to: a non-`Object`
+        // primitive (string, a number), or a declared class / record /
+        // enum / choice. An interface, `Object`, a type parameter (which a
+        // function type may bind) or an unresolved name is not one.
+        if (t->kind == sema::TypeRef::Kind::Primitive)
+            return t->primitive != sema::PrimitiveType::Object &&
+                   t->primitive != sema::PrimitiveType::None;
+        if (t->kind != sema::TypeRef::Kind::Named || !t->declaration ||
+            t->isResolvedTypeParam())
+            return false;
+        return t->declaration->kind != ast::TypeDeclKind::Interface;
+    };
+    w.castToFunction = [&](const ast::TypeTestExpr* tt) {
+        if (!tt->testType) return false;
+        const sema::TypeRef* t = ctx_.resolvedType(*tt->testType);
+        return t && t->kind == sema::TypeRef::Kind::Function;
+    };
+    w.onUse = [&](const ast::Expr* e, DynFnvalUseWalk::Use u,
+                  const ast::Node* aux, bool inLambda) {
+        const sema::Symbol* f = fieldOf(e);
+        if (!f) return;
+        touched.push_back(f);
+        using U = DynFnvalUseWalk::Use;
+        if (u == U::Inspect) return;
+        if (inLambda || bodyUnsupported) { declined.insert(f); return; }
+        switch (u) {
+        case U::CastCallee:
+            castCallees.emplace_back(static_cast<const ast::TypeTestExpr*>(aux), f);
+            return;
+        case U::StoreRhs: {
+            const sema::Symbol* to =
+                aux ? fieldOf(static_cast<const ast::Expr*>(aux)) : nullptr;
+            if (to) edges.emplace_back(f, to);
+            else declined.insert(f);
+            return;
+        }
+        case U::Return:
+            if (curMethod) { retReads.emplace_back(f, curMethod); mintSeeds.insert(curMethod); }
+            else declined.insert(f);
+            return;
+        default:
+            declined.insert(f);
+            return;
+        }
+    };
+    // Every return of a mint-eligible method must be a candidate field read
+    // (minted at the return), a call of a method that mints (its reference
+    // transfers), or `null`; anything else keeps the method out.
+    std::unordered_set<const sema::MethodSymbol*> badReturn;
+    std::unordered_set<const sema::MethodSymbol*> eligibleSeen;
+    w.onReturn = [&](const ast::Expr* value) {
+        if (!curMethod) return;
+        if (bodyUnsupported) { badReturn.insert(curMethod); return; }
+        if (fieldOf(value)) return;  // recorded by onUse (Use::Return)
+        if (dynamic_cast<const ast::NullLiteralExpr*>(value)) return;
+        if (const sema::MethodSymbol* n = calleeMethod(value)) {
+            retCalls.emplace_back(curMethod, n);
+            return;
+        }
+        badReturn.insert(curMethod);
+    };
+
+    // One member body. `unsupported`: only inspections are admitted (a
+    // destructor, an async body, an accessor, a contract clause, an
+    // initializer). An iterator body (one with a `yield`) declines every
+    // field it reads.
+    auto walkBody = [&](bool unsupported, const sema::MethodSymbol* mintM,
+                        const std::function<void()>& walk) {
+        touched.clear();
+        w.sawYield = false;
+        const bool savedU = bodyUnsupported;
+        const sema::MethodSymbol* savedM = curMethod;
+        bodyUnsupported = unsupported;
+        curMethod = mintM;
+        walk();
+        if (w.sawYield) {
+            for (const sema::Symbol* f : touched) declined.insert(f);
+            if (mintM) yieldingMethods.insert(mintM);
+        }
+        bodyUnsupported = savedU;
+        curMethod = savedM;
+        touched.clear();
+    };
+    auto hasMod = [](const std::vector<std::string_view>& mods,
+                     std::string_view m) {
+        for (auto x : mods) if (x == m) return true;
+        return false;
+    };
+    std::unordered_map<const ast::Node*, const sema::MethodSymbol*> methodSymByDecl;
+    for (const auto& sym : ctx_.symbols())
+        if (auto* ms = dynamic_cast<const sema::MethodSymbol*>(sym.get()))
+            if (ms->decl) methodSymByDecl.emplace(ms->decl, ms);
+    auto methodSymOf = [&](const ast::MethodDecl* md) -> const sema::MethodSymbol* {
+        auto it = methodSymByDecl.find(md);
+        return it == methodSymByDecl.end() ? nullptr : it->second;
+    };
+    std::function<void(const ast::Member*)> walkMember;
+    walkMember = [&](const ast::Member* mem) {
+        if (!mem) return;
+        const auto o = DynFnvalUseWalk::Use::Other;
+        auto contracts = [&](const std::vector<ast::ContractClause>& cs) {
+            walkBody(true, nullptr, [&] {
+                for (const ast::ContractClause& c : cs) w.expr(c.expr.get(), o);
+            });
+        };
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(mem)) {
+            walkBody(true, nullptr, [&] { w.expr(fd->initializer.get(), o); });
+            return; }
+        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(mem)) {
+            walkBody(true, nullptr, [&] {
+                w.expr(pd->autoInitializer.get(), o);
+                w.expr(pd->exprBody.get(), o);
+                for (const ast::PropertyAccessor& acc : pd->accessors) {
+                    w.expr(acc.exprBody.get(), o);
+                    for (const auto& s : acc.stmts) w.stmt(s.get());
+                }
+            });
+            return; }
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(mem)) {
+            const sema::MethodSymbol* ms = methodSymOf(md);
+            const sema::MethodSymbol* mintM =
+                ms && mintEligible(ms) == md ? ms : nullptr;
+            if (mintM) eligibleSeen.insert(mintM);
+            walkBody(hasMod(md->modifiers, "async"), mintM, [&] {
+                if (md->exprBody) {
+                    w.onReturn(md->exprBody.get());
+                    w.expr(md->exprBody.get(),
+                           DynFnvalUseWalk::Use::Return);
+                }
+                for (const auto& s : md->stmts) w.stmt(s.get());
+                for (const ast::Param& p : md->params)
+                    w.expr(p.defaultValue.get(), o);
+            });
+            contracts(md->contractClauses);
+            return; }
+        if (auto* od = dynamic_cast<const ast::OperatorDecl*>(mem)) {
+            walkBody(false, nullptr, [&] {
+                w.expr(od->exprBody.get(), o);
+                for (const auto& s : od->stmts) w.stmt(s.get());
+            });
+            return; }
+        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(mem)) {
+            walkBody(false, nullptr, [&] {
+                for (const auto& s : cd->body) w.stmt(s.get());
+                for (const ast::Param& p : cd->params)
+                    w.expr(p.defaultValue.get(), o);
+            });
+            contracts(cd->contractClauses);
+            return; }
+        if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(mem)) {
+            walkBody(true, nullptr, [&] {
+                for (const auto& s : dd->body) w.stmt(s.get());
+            });
+            return; }
+        if (auto* iv = dynamic_cast<const ast::InvariantDecl*>(mem)) {
+            walkBody(true, nullptr, [&] { w.expr(iv->expr.get(), o); });
+            return; }
+        if (dynamic_cast<const ast::EventDecl*>(mem)) return;
+        if (auto* kd = dynamic_cast<const ast::ConstDecl*>(mem)) {
+            walkBody(true, nullptr, [&] { w.expr(kd->value.get(), o); });
+            return; }
+        if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(mem)) {
+            if (nt->decl)
+                for (const auto& sub : nt->decl->members) walkMember(sub.get());
+            return; }
+        w.incomplete = true;
+    };
+
+    for (const auto& sym : ctx_.symbols()) {
+        const ast::Node* d = sym ? sym->decl : nullptr;
+        if (!d) continue;
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(d)) {
+            for (const auto& mem : td->members) walkMember(mem.get());
+        } else if (auto* xd = dynamic_cast<const ast::ExtensionDecl*>(d)) {
+            for (const auto& mem : xd->members) walkMember(mem.get());
+        } else if (auto* mem = dynamic_cast<const ast::Member*>(d)) {
+            walkMember(mem);
+        }
+    }
+    if (w.incomplete) {
+        // Fail closed: a read the walk could not classify may keep the
+        // value, so no field keeps the counted discipline.
+        dynFnvalStorageFields_.clear();
+        return;
+    }
+
+    std::unordered_set<const sema::Symbol*> kept;
+    for (const sema::Symbol* f : cand)
+        if (!declined.count(f)) kept.insert(f);
+    std::unordered_set<const sema::MethodSymbol*> mint;
+    for (const sema::MethodSymbol* m : eligibleSeen)
+        if (!badReturn.count(m) && !yieldingMethods.count(m) &&
+            mintSeeds.count(m))
+            mint.insert(m);
+    for (const auto& [m, n] : retCalls)
+        if (eligibleSeen.count(m) && !badReturn.count(m) &&
+            !yieldingMethods.count(m))
+            mint.insert(m);
+    // Joint greatest fixpoint: a field stays only while every field it is
+    // stored into stays and every method returning it mints; a method mints
+    // only while every field it returns stays and every method whose call
+    // it returns mints.
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const auto& [from, to] : edges)
+            if (kept.count(from) && !kept.count(to)) {
+                kept.erase(from); changed = true; }
+        for (const auto& [f, m] : retReads) {
+            if (kept.count(f) && !mint.count(m)) { kept.erase(f); changed = true; }
+            if (mint.count(m) && !kept.count(f)) { mint.erase(m); changed = true; }
+        }
+        for (const auto& [m, n] : retCalls)
+            if (mint.count(m) && !mint.count(n)) { mint.erase(m); changed = true; }
+    }
+    for (const sema::Symbol* f : cand)
+        if (!kept.count(f)) dynFnvalStorageFields_.erase(static_cast<const void*>(f));
+    // A method minting with no field left to return mints only `null`s and
+    // calls of other such methods: harmless, but pointless; it stays only
+    // while it can return a kept field's value through some chain.
+    fnvalMintMethods_.insert(mint.begin(), mint.end());
+    for (const auto& [tt, f] : castCallees)
+        if (kept.count(f) && tt && tt->operand)
+            dynFnvalCastCallees_.insert(tt->operand.get());
+}
+
+
+// fix-forward #9061: is `e` a call of a method that mints a reference for
+// its caller (fnvalMintMethods_)? Its value then carries a reference of its
+// own, which a consumer takes over (a kept-field store, a `return` of a
+// minting method, a mint pin) instead of retaining.
+bool Emitter::isDynFnvalMintCall(const ast::Expr* e) {
+    if (fnvalMintMethods_.empty() || !e) return false;
+    auto* ce = dynamic_cast<const ast::CallExpr*>(e);
+    if (!ce || !ce->callee) return false;
+    auto* ms = dynamic_cast<const sema::MethodSymbol*>(ctx_.exprSymbol(*ce->callee));
+    return ms && fnvalMintMethods_.count(ms) != 0;
+}
+
+
+// fix-forward #9061 (§28.9, v0.359): the RETURN of a minting method (see
+// collectDynFnvalReadSides) gives its caller a reference of its own: a kept
+// field's value is retained (on the run-time function-value test, so a class
+// instance, a string or a box returned from the same field is left alone); a
+// minting call's reference transfers; `null` carries nothing. Only the
+// method's OWN body mints: a `return` in a lambda lowered inside it belongs
+// to the lambda.
+void Emitter::mintDynFnvalReturnRef(llvm::Value* v, const ast::Expr* value) {
+    if (fnvalMintMethods_.empty() || !v || !value || !currentMethod_) return;
+    if (!v->getType()->isPointerTy()) return;
+    if (!fnvalMintMethods_.count(currentMethod_)) return;
+    auto it = methodFns_.find(currentMethod_);
+    if (it == methodFns_.end() || it->second != currentFn_) return;
+    if (dynamic_cast<const ast::NullLiteralExpr*>(value)) return;
+    if (isDynFnvalMintCall(value)) return;  // its reference transfers
+    llvm::BasicBlock* bb = builder_.GetInsertBlock();
+    if (!bb || terminatorOrNull(bb)) return;
+    emitObjectSlotFnvalOp(v, /*retain=*/true);
+}
+
+
+// fix-forward #9061 (§28.9 / §27.5, v0.359): may the minted reference of
+// `var <ld> := <minting call>` be held in a scope-end pin? Only when no use
+// of the local can carry the value past the local's scope: each use is an
+// inspection, the operand of a callee cast (`(g as F)!(a)`, the call runs
+// inside the scope), the right side of a `:=` into a kept field (whose store
+// retains), or a plain `:=` rebinding of the local itself. A capture, an
+// argument, a `return`, a `^` transfer or any other use leaves the reference
+// unpinned: a bounded leak, never a release under a live reader.
+bool Emitter::dynFnvalMintPinSafe(const ast::LocalDecl* ld) {
+    if (!ld || !currentMethod_) return false;
+    auto* md = dynamic_cast<const ast::MethodDecl*>(currentMethod_->decl);
+    if (!md) return false;
+    bool found = false;
+    bool safe = true;
+    DynFnvalUseWalk w;
+    w.tracked = [&](const ast::Expr* e) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id) return false;
+        auto* ls = dynamic_cast<const sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+        return ls && ls->decl == ld;
+    };
+    w.castCannotYieldFnval = [](const ast::TypeTestExpr*) { return false; };
+    w.castToFunction = [&](const ast::TypeTestExpr* tt) {
+        if (!tt->testType) return false;
+        const sema::TypeRef* t = ctx_.resolvedType(*tt->testType);
+        return t && t->kind == sema::TypeRef::Kind::Function;
+    };
+    w.onUse = [&](const ast::Expr*, DynFnvalUseWalk::Use u,
+                  const ast::Node* aux, bool inLambda) {
+        using U = DynFnvalUseWalk::Use;
+        if (inLambda) { safe = false; return; }
+        if (u == U::Inspect || u == U::CastCallee) return;
+        if (u == U::StoreRhs && aux) {
+            auto* t = static_cast<const ast::Expr*>(aux);
+            if (dynamic_cast<const ast::IdentifierExpr*>(t) ||
+                dynamic_cast<const ast::MemberAccessExpr*>(t)) {
+                const sema::Symbol* fs = ctx_.exprSymbol(*t);
+                if (fs && isDynFnvalStorageMember(fs)) return;
+            }
+        }
+        safe = false;
+    };
+    w.onLocal = [&](const ast::LocalDecl* d, bool inLambda) {
+        if (d == ld) { found = true; if (inLambda) safe = false; }
+    };
+    w.expr(md->exprBody.get(), DynFnvalUseWalk::Use::Other);
+    for (const auto& s : md->stmts) w.stmt(s.get());
+    return found && safe && !w.incomplete && !w.sawYield;
+}
+
+
+// fix-forward #9061 (§28.9, v0.359): the MINT PIN. `var g := h.Get()` over a
+// minting method binds a value that carries its own reference
+// (mintDynFnvalReturnRef); the pin holds that reference in a hidden entry-
+// block slot and releases it at the local's scope end, on the normal and the
+// unwind path alike (the #8444 box-borrow pin's mechanism). No retain here:
+// the mint IS the reference. An unpinnable local (dynFnvalMintPinSafe)
+// leaves it unreleased -- the bounded leak.
+void Emitter::armDynFnvalMintPin(const ast::LocalDecl* ld,
+                                 const ast::Expr* init, llvm::Value* v) {
+    if (fnvalMintMethods_.empty() || !ld || !init || !v) return;
+    if (!v->getType()->isPointerTy()) return;
+    if (ld->isUsing || ld->isBindAtomClause) return;
+    if (!currentFn_ || disposeStack_.empty() || smStateStruct_ ||
+        emittingDisposerBody_ || !currentMethod_)
+        return;
+    auto it = methodFns_.find(currentMethod_);
+    if (it == methodFns_.end() || it->second != currentFn_) return;
+    if (!isDynFnvalMintCall(init)) return;
+    llvm::BasicBlock* bb = builder_.GetInsertBlock();
+    if (!bb || terminatorOrNull(bb)) return;
+    if (!dynFnvalMintPinSafe(ld)) return;
+    llvm::AllocaInst* pin = entryAllocaNullPtr();
+    builder_.CreateStore(v, pin);
+    Disposal d{pin, nullptr};
+    d.objectFnvalRelease = true;
+    disposeStack_.back().push_back(d);
 }
 
 
