@@ -7590,7 +7590,33 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
         if (elemPol.disposerThunk) {
             elemDisposer = elemPol.disposerThunk;
         } else if (elemPol.cat == ElementPolicy::Category::RuntimeManaged &&
-                   isStringElementTypeRef(elemForDisposer)) {
+                   isStringElementTypeRef(elemForDisposer) &&
+                   // fix-forward #9064 / §28.9 / §28.11 (v0.359): the nullable
+                   // string release is GATED BY COLLECTION KIND, because the
+                   // matching per-element RETAIN is per kind (§28.11's slot
+                   // policy is a pair: the store takes the reference, the
+                   // collection's free gives it back).
+                   //
+                   //   * the ARRAY-backed family (Array / Stack / Queue, and the
+                   //     owning forms, which §14.4 rejects for a runtime-managed
+                   //     element) and the BORROWING Dictionary's VALUE take that
+                   //     +1 — `arrIsStringElem` (LlvmBackend_Calls.cpp),
+                   //     `litIsStrArr` (materializeHeapCollectionLiteral) and
+                   //     `dictIsStringValue` (#8207) — so their free gives one
+                   //     back per slot, `string?` included.
+                   //   * the LINKED LIST does NOT: `llIsStrElem` (LlvmBackend_
+                   //     Calls3.cpp) and `llitIsStrElem` (materializeHeapColl-
+                   //     ectionLiteral) are still `!nullable`-gated, so a
+                   //     `LinkedList<string?>` element was never retained.
+                   //     Releasing it here would be an UNPAIRED release — the
+                   //     double-free direction: MEASURED, an async method
+                   //     returning `Task<LinkedList<string?>>` that holds a
+                   //     borrowed element aborted with "bezel: fatal: refcount
+                   //     over-release (string)" (rc 134) — twice released for
+                   //     one reference. The LINKED-LIST arm therefore keeps the
+                   //     `!nullable` gate, exactly as `buildCollectionTempDisposal`
+                   //     (LlvmBackend_Setup.cpp) does for the same kind.
+                   (!isLL || !elemForDisposer->nullable)) {
             // Borrowing Array<string> / Dictionary<string, int> / etc. —
             // release each string element. Mirrors the
             // collectionElemDisposer wiring in LlvmBackend_Setup.cpp
@@ -7598,15 +7624,16 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
             // collections).
             //
             // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate
-            // is GONE. A `string?` element is the same §28.11 *runtime-managed
-            // reference* row as a `string` one (§3.6's *Nullable forms* rule
-            // reads the element category of `V?` as `V`, nullability stripped),
-            // so the collection co-owns a +1 per element and the free gives one
-            // back per slot (`null` is the null-safe release no-op). The gate
-            // was issue #9064 (a +1 producer stored by `Array<string?>.Add` was
-            // neither retained nor TRANSFERRED — its +1 was orphaned) and issue
-            // #8485 (a BORROWED string stored by the same call was stored
-            // without a reference — a use-after-free once the source died).
+            // is GONE for the kinds whose retain is in place. A `string?`
+            // element is the same §28.11 *runtime-managed reference* row as a
+            // `string` one (§3.6's *Nullable forms* rule reads the element
+            // category of `V?` as `V`, nullability stripped), so the collection
+            // co-owns a +1 per element and the free gives one back per slot
+            // (`null` is the null-safe release no-op). The gate was issue
+            // #9064 (a +1 producer stored by `Array<string?>.Add` was neither
+            // retained nor TRANSFERRED — its +1 was orphaned) and issue #8485
+            // (a BORROWED string stored by the same call was stored without a
+            // reference — a use-after-free once the source died).
             elemDisposer = stringElementReleaseThunk();
         }
     }
