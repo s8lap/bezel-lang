@@ -1,6 +1,6 @@
 # Compiler bugs found by the r42 recheck
 
-Compiler: r42, `bezelc 0.0.0-8ccf7ff0` (origin/main 8ccf7ff06), `--checked-disposal`, default `--link`. Spec and stdlib v0.359. **No issues were filed** (study constraint). Each entry gives the spec sentence, what r42 did, a minimal repro checked on r42 as written, the workaround, the tasks it hit, and the existing issue found by REST search ("new" means none was found). NB16 and NB17 are what remains of B1 and B3 from the first study.
+Compiler: r42, `bezelc 0.0.0-8ccf7ff0` (origin/main 8ccf7ff06), `--checked-disposal`, default `--link`. Spec and stdlib v0.359. **No issues were filed** (study constraint). Nine entries have no matching issue and are marked new; NB16 is a tenth, whose only match is the closed #8383. Each entry gives the spec sentence, what r42 did, a minimal repro checked on r42 as written, the workaround, the tasks it hit, and the existing issue found by REST search ("new" means none was found). NB16 and NB17 are what remains of B1 and B3 from the first study.
 
 Also hit, documented as not yet implemented, so not numbered here: `GetType()` / `typeof` (#3819, #487), a missing file reading as empty (#7057), `Counter<K>` (#3848, #8472). NB8 and NB14 do not change any output.
 
@@ -17,12 +17,12 @@ Also hit, documented as not yet implemented, so not numbered here: `GetType()` /
 | NB9 | an interface constraint whose type argument is another type parameter is not satisfied | no | new (#8754, #8728 adjacent) |
 | NB10 | false must-use warning on an owned parameter stored into a generic `OwningDictionary` slot | no | new (B2/B20 family) |
 | NB11 | a bounded channel with `SendAsync` and two producers loses items and hangs | yes | new |
-| NB12 | four or more tasks pending in `Semaphore.AcquireAsync` stall the program | yes | new (possibly the same runtime root as NB11) |
+| NB12 | four or more tasks pending in `Semaphore.AcquireAsync` stall the program | yes (a hang) | new (possibly the same runtime root as NB11) |
 | NB13 | forwarding a `scoped` handler into an `EventSource` field over-releases the closure | no | new (closure over-release family: #6269, #8674, #7772) |
-| NB14 | the trust-admission report is silent on a primary-constructor parameter stored by a field initializer | no | #8395 (open) family |
+| NB14 | the trust-admission report is silent on a primary-constructor parameter stored by a field initializer | no | #7467 (open; exact duplicate) |
 | NB15 | `RemoveAt` with a narrowed `int?` emits malformed IR | no | #2625 (open) family |
-| NB16 | B1 residual: string members on a local inferred from `Console.In.ReadToEnd()` lower to nothing | yes | #8383 (closed): reopen or new |
-| NB17 | B3 residual: an untyped lambda over a group's elements takes the key type | no | #8542 (open); #6627 (closed) named it |
+| NB16 | B1 residual: string members on a local inferred from `Console.In.ReadToEnd()` lower to nothing | yes | new (closed #8383 covered the direct path only, fad5f5e31) |
+| NB17 | B3 residual: an untyped lambda over a group's elements takes the key type | no | #8542 (open): its own repro fails with the same message |
 
 ## NB1. `IFailure` is an unresolved type name
 
@@ -306,7 +306,7 @@ end Program;
 
 - **Existing issue:** new
 - **Spec:** stdlib §6.9 / Guide 4 §6: `SendAsync` awaits capacity; each item is received exactly once; disposing the last sender closes the channel.
-- **r42:** capacity 1, two producers of three items: the consumer receives 1, 2, 10, the first producer then reports items 2 and 3 as sent and finishes, and the program hangs. At capacity 4 with two producers of five items the received sum was 25 (expected 165) and no error.
+- **r42:** at capacity 4 with two producers of five items the received sum is 25, expected 165, with no error: deterministic, 6 of 6 runs (the critic's count). At capacity 1 with two producers of three items the consumer receives 1, 2, 10, the first producer then reports items 2 and 3 as sent and finishes, and the program hangs; that hang is timing-dependent (24 of 25 runs, critic's count).
 - **Workaround:** unbounded channel and synchronous `Send` (no back-pressure).
 - **Tasks:** n14
 - **Note:** silent data loss, then a hang.
@@ -342,7 +342,7 @@ end Program;
 
 - **Existing issue:** new (possibly the same runtime root as NB11)
 - **Spec:** stdlib §6.3: `AcquireAsync` awaits a permit; disposing the token returns it.
-- **r42:** with `Semaphore(1)` and five jobs (four waiting) nothing after the first `job 1 in` runs, not even the holder's `Task.Delay`; four jobs (three waiting) complete. With `Semaphore(2)` and five jobs, job 4 entered before job 3.
+- **r42:** with `Semaphore(1)` and five jobs (four waiting) nothing after the first `job 1 in` runs, not even the holder's `Task.Delay`; four jobs (three waiting) complete. (Entry order among waiters is unspecified, so an out-of-order entry seen at `Semaphore(2)` is not a bug.)
 - **Workaround:** start the jobs in waves so that at most three tasks wait.
 - **Tasks:** n16
 - **Note:** silent hang.
@@ -407,7 +407,7 @@ end Program;
 
 ## NB14. the trust-admission report is silent on a primary-constructor parameter stored by a field initializer
 
-- **Existing issue:** #8395 (open) family
+- **Existing issue:** #7467 (open), an exact duplicate (its probe `a12_field_init_from_param`)
 - **Spec:** spec §28.3 *Diagnostics* (report mode): every borrow of a plain parameter stored in a plain field is listed.
 - **r42:** the report lists `Display`'s constructor store (`_thermo := thermo`) but not `Thermostat`'s field initializer.
 - **Workaround:** none needed (informative mode).
@@ -440,7 +440,7 @@ end Program;
 
 ## NB16. B1 residual: string members on a local inferred from `Console.In.ReadToEnd()` lower to nothing
 
-- **Existing issue:** #8383 (closed): reopen or new
+- **Existing issue:** new. Closed #8383 (fad5f5e31) fixed the direct `ReadToEnd()` path and its own repro passes; file this residual as a new issue citing that commit, rather than reopening
 - **Spec:** stdlib §7.4 `ReadToEnd(): string`; stdlib §9.6 string members.
 - **r42:** `var raw := Console.In.ReadToEnd(); var c := raw.ToUpper();` warns `internal: lowerLocalDecl's initializer expression failed to lower … — #2434` and `c` prints `0`; the same with `.Trim()` and with the chained `Console.In.ReadToEnd().ToLower()`. `raw.Length` and `var e: string := raw; e.ToLower()` work.
 - **Workaround:** ascribe the local `: string`.
@@ -467,7 +467,7 @@ end Program;
 
 ## NB17. B3 residual: an untyped lambda over a group's elements takes the key type
 
-- **Existing issue:** #8542 (open); #6627 (closed) named it
+- **Existing issue:** #8542 (open); its own repro fails on r42 with the same message, so comment there. Closed #6627's own repro passes; no reopen
 - **Spec:** stdlib §5: `IGrouping<TKey, T>: IEnumerable<T>`; spec §27.3 lambda parameter inference.
 - **r42:** `g.Where(lambda(e) => e.Salary > 1)` and `g.Sum(lambda(e) => e.Salary)` inside `for var g in rows.GroupBy(lambda(e) => e.Dept)` give `string member \`.Salary\` is not yet supported in codegen`; `for var e in g` is right, and a typed lambda works.
 - **Workaround:** type the inner lambda.

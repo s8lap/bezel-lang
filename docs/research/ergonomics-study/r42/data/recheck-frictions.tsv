@@ -9,7 +9,7 @@ F007	t02-wordfreq	OrderByDescending(...).ThenBy(string key)	COMPILER-BUG		C-sile
 F008	t02-wordfreq	sort dictionary entries	COMPILER-BUG		C-silent-query	2	resolved	compiler fix	B5
 F009	t02-wordfreq	record from entry field	COMPILER-BUG		C-string-lifetime	2	resolved	compiler fix	B6
 F010	t02-wordfreq	untyped comparer lambda	COMPILER-BUG		C-silent-query	2	resolved	compiler fix	B7
-F011	t03-csv	GroupBy stored in a variable	COMPILER-BUG		C-documented-nyi	1	still	-	stored GroupBy still rejected citing closed #755
+F011	t03-csv	GroupBy stored in a variable	COMPILER-BUG		C-documented-nyi	1	still	-	stored GroupBy still rejected, citing closed #755 (open tracker #4694); no document marks it NYI
 F012	t03-csv	GroupBy with untyped key lambda	COMPILER-BUG		C-inference	2	changed	compiler fix (partial)	B3 key lambda fixed; inner untyped lambdas over a group now typed as the key (t03 v1/v2)
 F013	t03-csv	sort groups by key	COMPILER-BUG		C-silent-query	2	resolved	compiler fix	B4
 F014	t03-csv	record from array element	COMPILER-BUG		C-string-lifetime	3	resolved	compiler fix	B6

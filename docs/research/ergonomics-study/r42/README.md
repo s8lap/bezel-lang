@@ -4,7 +4,7 @@
 
 ## One page for the owner
 
-**What is fixed.** Of the first study's 24 compiler bugs, **19 are fixed** and one (B16) is now rejected correctly at compile time. All 9 silent wrong-output bugs except B1 are gone: the OrderBy keys (B4), the `DictionaryEntry` sorts (B5), the string use-after-free (B6), the untyped comparer (B7), decimal `Sum` (B13) and the checked-mode false fault on sets (B11) all behave as the spec says. `ParseOrNull`, `NameOf`/`FromNameOrNull`, the stream span overloads and `DateOnly.ToString(format)` now exist. Every must-use false positive the study met (B2, B12, B20, B23) is gone.
+**What is fixed.** Of the first study's 24 compiler bugs, **19 are fixed** and one (B16) is now rejected correctly at compile time. All 9 silent wrong-output bugs except B1 are gone: the OrderBy keys (B4), the `DictionaryEntry` sorts (B5), the string use-after-free (B6), the untyped comparer (B7), decimal `Sum` (B13) and the checked-mode false fault on sets (B11) all behave as the spec says. `ParseOrNull`, `NameOf`/`FromNameOrNull`, the stream span overloads on `FileStream` (not yet on a `Stream`-typed receiver, #1394) and `DateOnly.ToString(format)` now exist. Every must-use false positive the study met (B2, B12, B20, B23) is gone.
 
 | | r40 | r42 |
 |---|---|---|
@@ -20,42 +20,47 @@ Of the 96 friction rows, **33 are resolved, 6 changed, 57 still present** (`data
 - **B1:** `ReadToEnd()` works, but a string member on a local inferred from it (`raw.ToLower()`, `.Trim()`, or the chained `Console.In.ReadToEnd().ToLower()`) still lowers to nothing, with only an internal warning (NB16).
 - **B3:** the key lambda works, but an untyped lambda over a group's elements is typed as the key (`g.Sum(lambda(e) => e.Salary)`), so t03 v1/v2 and t11 v1 still fail (NB17, open #8542).
 
-The documented not-yet-implemented items are all still missing: `Counter`, `Json`, `Locked`, `typeof`/`GetType`, and stored `GroupBy`.
+The documented not-yet-implemented items are all still missing: `Counter`, `Json`, `Locked`, `typeof`/`GetType`. Stored `GroupBy` results are still rejected too, but no document marks them as not implemented (a gap, below).
 
 **What is new.** 23 new tasks (`tasks/n*.md`) and 71 program files. **All 23 reach the expected output, 6 of them through a compromise.** Only 7 first drafts ran unchanged. There are 40 friction rows (`data/new-frictions.tsv`):
 
 | Cause | COMPILER-BUG | LANG-RULE | USER-ERROR | VERBOSE/AWKWARD | MISSING | DIAGNOSTIC |
 |---|---|---|---|---|---|---|
-| Rows | 22 | 7 | 4 | 4 | 2 | 1 |
+| Rows | 22 | 6 | 5 | 4 | 2 | 1 |
 
-These rows hold **17 distinct bugs** (`data/new-compiler-bugs.md`). Ten have no existing issue. The worst:
+These rows hold **17 distinct bugs** (`data/new-compiler-bugs.md`). Nine have no matching issue at all; a tenth, NB16, matches only the closed #8383. The worst:
 
-- **Concurrency hangs and losses.** A bounded channel with `SendAsync` and two producers loses items and hangs (NB11). Four or more tasks waiting in `Semaphore.AcquireAsync` stall the program, timers included (NB12).
+- **Concurrency losses and hangs.** A bounded channel with `SendAsync` and two producers silently loses items: at capacity 4 the sum is 25 instead of 165, in every run. At capacity 1 it usually hangs (NB11). Four or more tasks waiting in `Semaphore.AcquireAsync` stall the program, timers included (NB12).
 - **Generic code.** In a generic class at `K = string`, `Remove` with a key read from the dictionary itself returns false (NB7, silent). `GetOrNull` over a generic-record value emits malformed IR (NB6). `where T: IEntity<K>` is not satisfied by `User: IEntity<int>` (NB9).
 - **Serialization and closures.** An array of choices serializes but does not deserialize past its first element (NB5). Forwarding a `scoped` handler into an `EventSource` over-releases the closure (NB13).
 
-**Doc-vs-compiler gaps.** The v0.359 error-handling story is mostly implemented. `ParseOrNull`, the `Result` combinators, bare `Ok`/`Error`, the `??` rule, `OverflowException` from `Parse` and catching by name all work exactly as Guide 2 and the code-generation reference teach. Four things the documents teach without a "not yet implemented" marker fail on r42:
+**Doc-vs-compiler gaps.** The v0.359 error-handling story is mostly implemented. `ParseOrNull`, the `Result` combinators, bare `Ok`/`Error`, the `??` rule, `OverflowException` from `Parse` and catching by name all work exactly as Guide 2 and the code-generation reference teach. These fail on r42, and the documents carry no "not yet implemented" marker for them:
 
-- `IFailure` is an unresolved type name (#8414). The documented boundary shape, a marked user exception taken by an `IFailure` arm after `OperationCanceledException => throw`, cannot be written. It hit four tasks (n01, n03, n05, n13).
-- `string.IsEmpty`, which codegen §5.9 lists and uses in its own idiom (#2348).
-- `Exception.ToString()` omits the message (#3302).
-- Collection-literal locals of records or choices cannot be moved into an `owned` parameter (#8498), although the spec calls the literal a fresh owned production.
+- **A marker is owed** (a stdlib surface, spec-change process §5 item 3):
+  - `string.IsEmpty` (#2348): stdlib §9.6 and the reference §5.9, whose own idiom uses it.
+- **A marker is probably owed:**
+  - `IFailure` (#8414): stdlib §1 and §2.17. It is an unresolved type name, so the documented boundary shape cannot be written: a marked user exception taken by an `IFailure` arm after `OperationCanceledException => throw`. It hit four tasks (n01, n03, n05, n13).
+- **No marker is owed; report these as gaps:**
+  - `Exception.ToString()` omits the message (#3302). This is a spec §31.4 rule, not a stdlib surface.
+  - Collection-literal locals of records or choices cannot be moved into an `owned` parameter (#8498), although the spec calls the literal a fresh owned production. This is an ownership bug.
+  - Stored `GroupBy` results are rejected (open tracker #4694). No document marks this, and stdlib §5 and Guide 05 assume a `GroupBy` result can be stored.
 
-The missing-file behaviour (#7057) is documented as not yet implemented, but the idiom built on it (catch `FileNotFoundException` at the call) still silently never runs.
+The missing-file behaviour (#7057) is documented as not yet implemented. Even so, the idiom built on it (catch `FileNotFoundException` at the call) silently never runs.
 
-**Issue state mismatches.**
+**Issue states.** No closed issue's own repro fails on r42. Recommended actions:
 
-- **Closed, but the repro (or its named family) still fails on r42:**
-  - #8383 (B1, via NB16)
-  - #6627 (B3; its residual is open #8542)
-  - #755 (stored `GroupBy` is still rejected, citing #755)
-  - #487 (the reflection message still cites it as the tracker)
-- **Open, but the study's repro now passes (hand-close candidates):**
-  - #8386 (B6; confirm under ASan, which this box lacks)
-  - #8394 (B24)
-  - #1394 (B15, span half)
-  - #2240 (B21, the format half; the Counter leg cannot pass yet)
-  - #6314 (B11; it is an umbrella, so re-check its other legs first)
+- **No reopens.**
+  - #8383 and #6627: their own repros pass on r42. The failures above are new shapes.
+    - File NB16 as a new issue, citing fad5f5e31; closed #8383 covered only the direct path.
+    - Comment NB17 on open #8542, whose own repro fails with the same message.
+  - #755 and #487: open successors already exist (#4694 for stored `GroupBy`; #3819 and #4630 for reflection). Repoint the trackers the diagnostics cite.
+- **Keep open, and comment:**
+  - #1394: the issue's own repro still fails on a `Stream`-typed receiver (`s.Read(b.AsSpan())` and the windowed `s.Read(b, 0, 4)` "produced no value"). Only `FileStream` works (b870b63de), and its Count-window guards do raise.
+  - #8394: the typed-lambda form with no type arguments is still rejected, and residual R1 (a same-arity overload) still prints `ann` silently.
+- **Keep open; no comment needed:**
+  - #6314: the t15 leg passes, but its other 13 legs were not checked.
+  - #8386: B6 passes. Close it only after an ASan loop, which this box cannot run; its remaining residuals live in #8484.
+  - #2240: no action.
 
 **Updated top design themes** (first-study rows still present plus the new rows, same scoring formula):
 
@@ -67,10 +72,10 @@ The missing-file behaviour (#7057) is documented as not yet implemented, but the
 6. **Expression forms** (5).
 7. **Query surface** (5). `OrderBy(f).First()` is at least correct now.
 8. **Tuples** (4).
-9. **Unused results** (4).
-10. **Small rules** (4).
+9. **Small rules** (4).
+10. **Exception boilerplate** (3).
 
-Enum names dropped out of the top ten, because `NameOf` now works.
+Enum names (3, tied with 10 and placed 11th by the tie-break) and unused results (3 rows; n18's discard turned out to be unneeded) dropped out of the top ten. Enum names fell because `NameOf` now works.
 
 ---
 
@@ -83,7 +88,14 @@ Enum names dropped out of the top ten, because `NameOf` now works.
   - n04 was built with `--checked-contracts`.
   - The final runs are in `data/new-final-outputs.txt` (trust lines truncated).
 - **Classification.** The causes and the 1/2/3 weight follow the first study. Each suspected bug was reduced to a minimal repro and searched for with REST (`search/issues`). Three rows of `notes` kind (things that went well, the trust-report observation) are in the text below, not in the TSV.
-- **Not done.** There is no ASan runtime on this box (`libclang_rt.asan` is missing), so B6's fix rests on a 300-row stress, not on a sanitizer. NB11/NB12 timings were not explored beyond the threshold. No issues were filed.
+- **Not done.** There is no ASan runtime on this box (`libclang_rt.asan` is missing), so B6's fix rests on a 300-row stress, not on a sanitizer. NB12's threshold was not explored further, and NB11's run counts are the reviewing critic's. No issues were filed.
+- **Review.** A non-author critic gave ACCEPT-W-NOTES; every repro and count reproduced. This version applies its notes:
+  - the issue-state recommendations above;
+  - NB14 is a duplicate of #7467;
+  - N033 is reclassified as USER-ERROR;
+  - the marker owed/not-owed split;
+  - the NB11 and NB12 wording;
+  - t02 v1 is rejected, not wrong.
 
 ## Part 1: per-task recheck
 
@@ -91,7 +103,7 @@ Changed tasks (the rest behave exactly as on r40; full table in `data/recheck-ta
 
 | Task | r40 → r42 |
 |---|---|
-| t02 | v2–v5 now correct (B4/B5/B6/B7); v1 still wrong (NB16) |
+| t02 | v2–v5 now correct (B4/B5/B6/B7); v1 still rejected ("codegen for this for statement" after the NB16 internal warning) |
 | t03 | v3 now correct; v1/v2 now stop at NB17 instead of the IR failure |
 | t05, t09, t19 | the `ParseOrNull`/`NameOf` errors are gone; the language-rule errors remain |
 | t06, t08, t37 | v1 now correct (B6, B4, B13) |
@@ -152,7 +164,7 @@ Most diagnostics named their fix: the §28.14 *declare `alarm` before `thermo`* 
 - The five borrow-holding finals drew 5 report lines in all: one per back-reference or helper store (n09 1, n11 2, n17 1, n18 1, n12 0). Every line was at a constructor store, which is the shape the code-generation reference §4.4 recommends.
 - Each line is about 720 characters, and names the obligation and five static remedies.
 - The cheapest remedy worked as named: `scoped clock` at the parameter and the call site silenced n09's line, with no other change.
-- One gap: a plain primary-constructor parameter stored by a field initializer was not reported (NB14, #8395 family).
+- One gap: a plain primary-constructor parameter stored by a field initializer was not reported (NB14, an exact duplicate of open #7467).
 
 **§7 after the fact.** The code-generation reference §7 documents only n15's named-holder `WhenAll` shape (§7.2). None of the other new frictions is there:
 

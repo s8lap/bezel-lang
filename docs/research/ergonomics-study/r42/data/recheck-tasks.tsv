@@ -1,7 +1,7 @@
 task	drafts	final_r40	final_r42	v1_r40	v1_r42	drafts_ok_r40	drafts_ok_r42	per_draft_r40	per_draft_r42	diagnostics_or_behaviour_change
 t01-wc	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	no change
-t02-wordfreq	6	ok	ok	reject	reject	1	5	v1:reject v2:wrong v3:wrong v4:wrong v5:wrong v6:ok final:ok	v1:reject v2:ok v3:ok v4:ok v5:ok v6:ok final:ok	v2-v5 now correct (B4/B5/B6/B7 fixed). v1 still degrades: `Console.In.ReadToEnd().ToLower()` lowers to nothing (B1 changed).
-t03-csv	4	ok	ok	reject	reject	1	2	v1:reject v2:reject v3:wrong v4:ok final:ok	v1:reject v2:reject v3:ok v4:ok final:ok	v3 now correct (B4/B6). v1/v2 now fail on an untyped lambda inside a group (`g.Sum(lambda(e) => e.Salary)`: "string member .Salary") — B3 changed; v1 still hits stored GroupBy (#755).
+t02-wordfreq	6	ok	ok	reject	reject	1	5	v1:reject v2:wrong v3:wrong v4:wrong v5:wrong v6:ok final:ok	v1:reject v2:ok v3:ok v4:ok v5:ok v6:ok final:ok	v2-v5 now correct (B4/B5/B6/B7 fixed). v1 still rejected: `Console.In.ReadToEnd().ToLower()` lowers to nothing with an internal warning, then "codegen for this for statement" (B1 changed, NB16).
+t03-csv	4	ok	ok	reject	reject	1	2	v1:reject v2:reject v3:wrong v4:ok final:ok	v1:reject v2:reject v3:ok v4:ok final:ok	v3 now correct (B4/B6). v1/v2 now fail on an untyped lambda inside a group (`g.Sum(lambda(e) => e.Salary)`: "string member .Salary") — B3 changed; v1 still hits stored GroupBy (open tracker #4694; the message cites closed #755).
 t04-grep	3	ok	ok	reject	reject	1	1	v1:reject v2:reject v3:ok final:ok	v1:reject v2:reject v3:ok final:ok	unchanged: B8 (contested #6698).
 t05-ini	2	ok	ok	reject	reject	1	1	v1:reject v2:ok final:ok	v1:reject v2:ok final:ok	v1 loses the ParseOrNull error (B9 fixed); the owned-field / fresh-store errors (LANG-RULE) remain.
 t06-logsummary	2	ok	ok	wrong	ok	1	2	v1:wrong v2:ok final:ok	v1:ok v2:ok final:ok	v1 now correct (B6 fixed).
