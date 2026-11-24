@@ -4573,7 +4573,25 @@ void MethodOwnership::checkInvokedBorrowHolder(const ast::CallExpr& call) {
         if (!refersTo(csym, *calleeId)) continue;
         if (!clo.heldBorrows.empty())
             checkUseThroughDisposedBorrowHolder(*calleeId, csym);
-        return;
+        break;
+    }
+    checkInvokedClosureOverDisposedCapture(call);
+}
+
+// fix #9085 (§28.2, v0.359): see the declaration. The same question
+// `scanCapturedOwnedConsumeExpr` asks at a method body's call (fix #4355 /
+// #4399, #7435), at the invocation's own state.
+void MethodOwnership::checkInvokedClosureOverDisposedCapture(
+        const ast::CallExpr& call) {
+    if (lambdaPrepassStmtDepth_ == 0) return;
+    const auto* calleeId =
+        dynamic_cast<const ast::IdentifierExpr*>(call.callee.get());
+    if (!calleeId) return;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*calleeId));
+    if (!ls) return;
+    if (const ast::LambdaExpr* calleeLam = lambdaLiteralOfFunctionLocal(ls)) {
+        std::set<const ast::LambdaExpr*> visited;
+        checkTransitiveCapturesDisposed(*calleeLam, visited, call.span.begin);
     }
 }
 

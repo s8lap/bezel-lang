@@ -2609,6 +2609,16 @@ private:
         std::vector<LocalOwnership::HeldBorrow>& out);
     // Invoking a function-valued holder is a use of it. // per §28.2
     void checkInvokedBorrowHolder(const ast::CallExpr& call);
+    // fix #9085 (§28.2, v0.359): INSIDE A LAMBDA BODY, invoking a local that
+    // names a closure over a variable that an explicit disposal has killed on
+    // every path is a use of that variable ("A closure that captures the
+    // variable itself ... its invocation after the kill is a use of the
+    // variable"). The method body's walk asks this from
+    // `scanCapturedOwnedConsumeExpr`, which never runs over a lambda body's
+    // own statements; the lambda-body pre-pass asks it here, from the same two
+    // call-expression arms (`checkRead`, `handleDischarge`) that ask
+    // `checkInvokedBorrowHolder`. No-op outside the pre-pass. // per §28.2
+    void checkInvokedClosureOverDisposedCapture(const ast::CallExpr& call);
     // The entries a plain local read contributes; false when the read names
     // nothing the pass can track (the whole holder is then untracked).
     bool collectHeldBorrowsOfLocalRead(
@@ -7756,6 +7766,10 @@ private:
     // Set once any holder is bound in this method (`bindHeldBorrows`): the
     // `catch`-dispatch edge transform runs only for a method that binds one.
     bool anyHeldBorrows_ = false;
+    // fix #9085: > 0 while the lambda-body pre-pass
+    // (`applyUsingVarBorrowPinInLambdaStmt`) is walking a statement; read by
+    // `checkInvokedClosureOverDisposedCapture`.
+    int lambdaPrepassStmtDepth_ = 0;
     // Every `try … finally` of the body: the statement's start and its
     // `finally` body's extent (source offsets), recorded by the pre-scan for
     // `heldBorrowKillPrecedesFinally`. // per §28.2

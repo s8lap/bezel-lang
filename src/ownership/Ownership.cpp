@@ -16130,11 +16130,27 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdas(
 // instead of plain collection). Under-collecting here merely misses a pin
 // (a conservative over-adopt → ASan trip), so completeness is the bar.
 void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
+    // fix #9085 (§28.2, v0.359): marks the walk as the lambda-body pre-pass for
+    // `checkInvokedClosureOverDisposedCapture`.
+    struct PrepassDepth {
+        int& d;
+        explicit PrepassDepth(int& x) : d(x) { ++d; }
+        ~PrepassDepth() { --d; }
+    } prepassDepth(lambdaPrepassStmtDepth_);
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         // fix #4286: `fromLambdaBody=true` — see `handleLocalDecl`'s own
         // #4286 comment for why this call site needs the retry the
         // method-level `visitStmt` call site (Ownership.cpp) does not.
         handleLocalDecl(*ld, /*fromLambdaBody=*/true);
+        // fix #9085 (§28.2, v0.359): the lambda body's twin of `visitStmt`'s
+        // LocalDecl holder bind — the §28.2 "Use after a dominating explicit
+        // disposal" HOLDER rule (#7435 / #7441) reaches a use through a local
+        // that holds a borrow of the disposed variable's value in a lambda
+        // body exactly as in a method body ("The rule is uniform across body
+        // kinds", §28.3.10). Without the bind no lambda-body local was ever a
+        // holder, so `var y := x; _ := x; return y.tag;` compiled. // per §28.2
+        if (!ld->isUsing && !ld->initializerHasOwnedMarker && ld->initializer)
+            bindHeldBorrows(findLocalSymbol(*ld), ld->initializer.get());
         return;
     }
     if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
@@ -16233,6 +16249,9 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     states_[lsym] = lo;
                 }
             }
+            // fix #9085 (§28.2, v0.359): the `const` twin of the `var` bind
+            // above — §28.2 names both spellings. // per §28.2, §21.1
+            bindHeldBorrows(findLocalSymbol(*lc), lc->value.get());
             std::vector<const ast::LambdaExpr*> nestedLambdas;
             collectBodyLambdasExpr(*lc->value, nestedLambdas);
             for (const ast::LambdaExpr* nested : nestedLambdas)
@@ -16338,6 +16357,12 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // fix #9085 (§28.2, v0.359): a store into a variable ends the tracking
+        // of every holder that borrows the value it held, as `handleAssignment`
+        // does for a method body (any operator). // per §28.2, §6.6
+        if (auto* heldTid =
+                dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
+            dropHeldBorrowsOnSourceStore(*heldTid);
         // fix #8935 (§28.3.7, v0.359): the lambda-body store into an `owned`
         // field gets the same redundant-marker check as a method-body store
         // (the helper is shared with visitStmt; no second copy of the rule).
@@ -17505,6 +17530,14 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             // form must see it too or the two forms disagree. See the
             // `tryBodyExitStates` comment above for the measurements.
             states_ = tryBodyExitStates;
+            // fix #9085 (§28.2, v0.359): every edge into a `catch` dispatch is
+            // an exceptional path out of the `try`, and the body may have
+            // thrown BEFORE a `Dispose()` written in it ran — the method
+            // body's CFG forgets such a holder kill on the edge
+            // (`clearHeldBorrowKillsInside`); this walk's body-exit state
+            // carries it, so the arm forgets it here too. Only ever ADMITS.
+            // // per §28.2
+            if (anyHeldBorrows_) clearHeldBorrowKillsInside(states_, *trys);
             if (arm.guard) {
                 // fix #8991 (§28.3 K1.3, §28.8.1, §22.9, §31.2.1, v0.359):
                 // the arm's `when` guard is an ordinary expression position
