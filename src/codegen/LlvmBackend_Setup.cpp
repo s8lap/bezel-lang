@@ -32385,7 +32385,21 @@ bool Emitter::lowerStringLocalReassign(const ast::Expr& target,
     // declared `T` at `string` whose cell owns every value it holds
     // (typeParamStringCellHolders_, armed in lowerLambda) is written exactly
     // as a captured `string` parameter is.
-    if (!isStringExprType(target) &&
+    //
+    // fix #9077 (§14.1 / §22.3 / §27.5 / §28.9, v0.359): the `ref` twin — a
+    // CAPTURED `ref` parameter declared by a bare type parameter the active
+    // substitution binds to `string` (typeParamRefStringAliasHolders_, armed
+    // in lowerLambda). The write lands in the CALLER's location (§22.3's true
+    // alias), so the value it stores must be one the caller can still read:
+    // the write takes a reference of its own on it, exactly as the concrete
+    // `ref p: string` twin does. Without it the store is plain, the caller's
+    // temporary is released at the end of the call's full expression, and the
+    // caller's later read of its own `ref` local reads a freed string
+    // (#9077).
+    const bool refAlias =
+        !isStringExprType(target) &&
+        typeParamRefStringAliasHolders_.count(localSlot(target)) != 0;
+    if (!isStringExprType(target) && !refAlias &&
         !typeParamStringCellHolders_.count(localSlot(target)))
         return false;                              // not string-typed
     // fix #5245 (§4.6 / §28.9, v0.313): a nullable `string?` target lowers to a
@@ -32423,7 +32437,18 @@ bool Emitter::lowerStringLocalReassign(const ast::Expr& target,
     // `string` PARAMETER the cell mints when it is allocated (see
     // cellSeedRetainSlots_). #9005's skip of this release, for such a cell,
     // leaked every displaced value (#9026).
-    emitStringRelease(oldVal);
+    //
+    // fix #9077 (§14.1 / §22.3 / §28.9, v0.359): NOT for a `ref` ALIAS. The
+    // alias names the CALLER's location, whose value the callee does not own:
+    // it may be a `T` local at `string`, which takes no +1 of its own (the
+    // #4980 `T`-local retain policy), so releasing the displaced value here
+    // would drop a reference the callee never had. The concrete `ref p: string`
+    // twin can release it, because a `string` location always owns its value;
+    // the generic alias cannot know, so it retains-new only and the displaced
+    // value leaks (the same trade #4965's `ref`-typed-by-a-type-parameter store
+    // makes in the frame, and the one #4982's regression test records).
+    if (!refAlias)
+        emitStringRelease(oldVal);
     return true;
 }
 

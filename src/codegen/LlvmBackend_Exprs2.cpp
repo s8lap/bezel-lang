@@ -1888,6 +1888,12 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // `string` parameter's cell is a refcounted cell write target — the
         // lambda's binding slot joins typeParamStringCellHolders_.
         bool                   typeParamStringCell = false;
+        // fix #9077 (§14.1 / §22.3 / §27.5 / §28.9, v0.359): this capture is a
+        // `ref` parameter whose declared type is a bare type parameter the
+        // active substitution binds to `string` — the `ref` twin of #9060's
+        // by-value `T` parameter. The lambda's binding slot joins
+        // typeParamRefStringAliasHolders_.
+        bool                   typeParamRefStringAlias = false;
         // §27.5 / §28.9 / #694: true when this capture's boxed cell is held by
         // exactly ONE env (singleCaptureLocals_) whose lambda DEFINITELY escapes
         // (returned — definitelyEscapingLambdas_). The escaped closure's envdtor
@@ -2710,6 +2716,30 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         ce.envValue = callerPtr; // the pointer itself goes into the env field
         ce.sym      = sym;
         ce.decl     = nullptr;
+        // fix #9077 (§14.1 / §22.3 / §27.5 / §28.9, v0.359): a `ref` parameter
+        // declared by a BARE TYPE PARAMETER is a `string` parameter in the
+        // instantiation `M<string>` (§14.1: an instantiation is the member
+        // obtained by substituting the type arguments). The alias the lambda
+        // writes through names the CALLER's location (§22.3), whose value the
+        // callee does NOT own: a write there must take a reference of its own
+        // on the value it stores, or the caller's later read of its own `ref`
+        // local reads a freed string (#9077). Classified at the CONCRETE
+        // substitution, like every other refcount decision about this
+        // parameter — the declared type is the bare `T`, so only the active
+        // substitution says `string`.
+        if (auto* ps = dynamic_cast<const sema::ParameterSymbol*>(sym)) {
+            const sema::TypeRef* ty =
+                ps->resolvedDeclType
+                    ? ps->resolvedDeclType
+                    : (ps->declType ? ctx_.resolvedType(*ps->declType)
+                                    : nullptr);
+            const sema::TypeRef* r =
+                (ty && !ty->nullable && isTypeParamBoundToString(ty))
+                    ? resolveTypeParamRef(ty)
+                    : nullptr;
+            ce.typeParamRefStringAlias =
+                r && !r->nullable && elemTy && elemTy->isPointerTy();
+        }
         // semaTy / releaseBoxInEnvdtor / freeCellInEnvdtor all stay at their
         // zero-initialised defaults: the closure holds no ownership over the
         // caller's storage, so the envdtor must not release or free anything.
@@ -4276,6 +4306,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 if (ce.sym) paramSlots_[ce.sym] = slot;
                 if (ce.typeParamStringCell)  // fix #9060
                     typeParamStringCellHolders_.insert(slot);
+                if (ce.typeParamRefStringAlias)  // fix #9077
+                    typeParamRefStringAliasHolders_.insert(slot);
                 if (ce.decl) locals_[ce.decl] = slot;
             }
         }

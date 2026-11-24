@@ -22905,6 +22905,16 @@ private:
     // write through the cell retains the new value and releases the one it
     // displaces, exactly as for a captured `string` parameter.
     std::unordered_set<const llvm::AllocaInst*> typeParamStringCellHolders_;
+    // fix #9077 (§14.1 / §22.3 / §27.5 / §28.9, v0.359): the binding slots
+    // (inside the capturing lambda's body) of a CAPTURED `ref` parameter whose
+    // declared type is a bare type parameter the active substitution binds to
+    // `string`. The slot is not a cell: it holds the CALLER's storage address
+    // (§22.3's true alias), and the write through it lands in the caller's
+    // location. lowerStringLocalReassign admits a target in one of these slots
+    // although its declared type is `T`, so the write takes a reference of its
+    // own on the value it stores (the caller's read of its own `ref` local
+    // must not read a freed string — §28.9).
+    std::unordered_set<const llvm::AllocaInst*> typeParamRefStringAliasHolders_;
     // fix #5253 (§22.3 / §28.9, v0.313): inline `out var` recipients (their
     // introducing IdentifierExpr) at a `string` / `string?` `out` formal of a
     // compiled callee, in a pinned body — registerOutVarStringRelease /
