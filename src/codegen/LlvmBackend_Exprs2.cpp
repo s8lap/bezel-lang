@@ -3310,7 +3310,34 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 }
             }
         }
-        if (alreadyBoxed && !wasGuardedLocal && !ce.suppressContentRcInEnvdtor) {
+        // fix #8942 (§23.3 / §27.5 / §28.9, v0.359): an accessor's implicit
+        // `value` is bound as a local anchored on its PropertyDecl, but it is
+        // a PARAMETER of the setter: §23.3 "The implicit setter parameter is
+        // `value`" takes a BORROW, so no reference belongs to this frame for
+        // the first capture to inherit. The envdtor releases the cell's
+        // `string` / closure unconditionally on the sema type, so the capture
+        // takes its own +1 at EVERY capture, exactly as the captured-PARAMS
+        // loop above does for a ParameterSymbol (#2689): without it the first
+        // capture over-released the caller's value and a freshly concatenated
+        // setter argument was freed under the field the body stored it into.
+        // The same retain / release agreement as that loop: both consult
+        // `suppressContentRcInEnvdtor`.
+        const bool isAccessorValueParam =
+            dynamic_cast<const ast::PropertyDecl*>(decl) != nullptr;
+        if (isAccessorValueParam && !ce.suppressContentRcInEnvdtor) {
+            if (isStringTypeRefNonNull(ce.semaTy)) {
+                llvm::Value* str =
+                    builder_.CreateLoad(ptrTy(), ce.envValue, "str.vcap");
+                emitStringRetain(str);
+            } else if (ce.semaTy &&
+                       ce.semaTy->kind == sema::TypeRef::Kind::Function) {
+                llvm::Value* cl =
+                    builder_.CreateLoad(ptrTy(), ce.envValue, "cl.vcap");
+                emitClosureRetain(cl);
+            }
+        }
+        if (alreadyBoxed && !wasGuardedLocal && !isAccessorValueParam &&
+            !ce.suppressContentRcInEnvdtor) {
             if (isStringTypeRefNonNull(ce.semaTy)) {
                 llvm::Value* str =
                     builder_.CreateLoad(ptrTy(), ce.envValue, "str.recap");
