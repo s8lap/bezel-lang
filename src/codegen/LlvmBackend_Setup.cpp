@@ -34242,6 +34242,56 @@ struct StringEscapeWalker {
     // alias stays unreachable there and this pointer is simply unused.
     const std::vector<std::unique_ptr<ast::Stmt>>* wholeBody = nullptr;
 
+    // fix-forward #8964 (§28.9 / §28.3, v0.359): set when the walk sees a READ,
+    // rooted at the tracked record local, of a component that may hold a closure
+    // cell (a function-typed or other non-primitive component) in any position
+    // other than the callee of a call. It is NOT an escape for the STRING
+    // release (a read string is retained by every consumer), so it does not
+    // set `escaped`; the CLOSURE release (`recordClosureFields`) consults it
+    // and declines, because a collection store (`Array.Add`, an indexer or
+    // Dictionary set) of a closure read from a component does NOT retain it:
+    // the collection would alias the cell the scope-end release frees (a
+    // heap-use-after-free, measured on `fs.Add(r.f)` / `fs[i] := r.f`).
+    // A decline is a leak, never a free.
+    bool closureComponentRead = false;
+    // The callee expressions of the calls walked so far (the callee and every
+    // member-access link down to its root): `r.f()` and `r.inner.f()` run the
+    // closure and never hand its cell to anything, so they are not
+    // `closureComponentRead`.
+    std::unordered_set<const ast::Expr*> calleeChain;
+    void noteCalleeChain(const ast::Expr* c) {
+        while (c) {
+            calleeChain.insert(c);
+            if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(c))
+                c = m->target.get();
+            else if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(c))
+                c = nm->target.get();
+            else
+                break;
+        }
+    }
+    bool isRootedAtTarget(const ast::Expr* c) {
+        while (c) {
+            if (isTargetIdent(c)) return true;
+            if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(c))
+                c = m->target.get();
+            else if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(c))
+                c = nm->target.get();
+            else
+                return false;
+        }
+        return false;
+    }
+    void noteClosureComponentRead(const ast::Expr* e) {
+        if (calleeChain.count(e) || !isRootedAtTarget(e)) return;
+        const sema::TypeRef* t = ctx.exprType(*e);
+        // A primitive component (a string, an int) cannot hold a closure cell.
+        // Anything else (a function type, a nested record, an unresolved or
+        // type-parameter type) might: decline.
+        if (t && t->kind == sema::TypeRef::Kind::Primitive) return;
+        closureComponentRead = true;
+    }
+
     bool isTargetIdent(const ast::Expr* e) {
         if (outVarIntroSite && static_cast<const void*>(e) == outVarIntroSite)
             return false;
@@ -36264,6 +36314,7 @@ struct StringEscapeWalker {
                     (sym && sema::isAutoPropertyStorageSymbol(sym, ctx));
                 if (!storageRead) recSafe = false;
             }
+            if (recordFieldReleaseMode) noteClosureComponentRead(m);
             expr(m->target.get(), /*safeRead=*/recSafe);
             return;
         }
@@ -36283,6 +36334,7 @@ struct StringEscapeWalker {
                     (sym && sema::isAutoPropertyStorageSymbol(sym, ctx));
                 if (!storageRead) recSafe = false;
             }
+            if (recordFieldReleaseMode) noteClosureComponentRead(m);
             expr(m->target.get(), /*safeRead=*/recSafe);
             return;
         }
@@ -36326,6 +36378,7 @@ struct StringEscapeWalker {
                         expr(a.value.get(), /*safeRead=*/false);
                 return;
             }
+            noteCalleeChain(c->callee.get());
             expr(c->callee.get(), /*safeRead=*/true);
             walkCallArgs(c->callee.get(), c->args);
             return;
@@ -36339,6 +36392,7 @@ struct StringEscapeWalker {
                 escaped = true;
                 return;
             }
+            noteCalleeChain(c->callee.get());
             expr(c->callee.get(), /*safeRead=*/true);
             walkCallArgs(c->callee.get(), c->args);
             return;
@@ -37025,6 +37079,7 @@ struct StringEscapeWalker {
                     w2.stmt(s2.get());
                     if (w2.escaped) break;
                 }
+                if (w2.closureComponentRead) closureComponentRead = true;
                 if (!w2.escaped) {
                     expr(ld->initializer.get(), /*safeRead=*/true);
                     return;
@@ -37166,6 +37221,7 @@ struct StringEscapeWalker {
                     w2.stmt(s2.get());
                     if (w2.escaped) break;
                 }
+                if (w2.closureComponentRead) closureComponentRead = true;
                 if (!w2.escaped) {
                     expr(lc->value.get(), /*safeRead=*/true);
                     return;
@@ -48506,7 +48562,10 @@ void Emitter::collectRecordCallResultReleaseEligible(
             if (kind & 1u)
                 recordCallResultReleaseEligible_.insert(
                     static_cast<const void*>(ld));
-            if (kind & 2u)
+            // fix-forward #8964: the closure release also needs the walk to
+            // have seen no non-callee read of a closure-bearing component (see
+            // StringEscapeWalker::closureComponentRead).
+            if ((kind & 2u) && !w.closureComponentRead)
                 recordClosureReleaseEligible_.insert(
                     static_cast<const void*>(ld));
         }

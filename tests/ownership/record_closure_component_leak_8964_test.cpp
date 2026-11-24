@@ -78,6 +78,7 @@
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
+using bezel::test::runAotCheckedLenient;
 
 namespace {
 
@@ -221,6 +222,191 @@ BEZEL_TEST(record_closure_component_leak_8964,
         "  end Main; "
         "end Program;";
     expectClean(runAotChecked(src), 0, "600\n");
+}
+
+// fix-forward #8964, review shape (d2): a component READ that is not a call
+// (`r.f` as an argument, an initializer or an indexer / Dictionary store
+// value) hands the collection the SAME cell the record's scope-end release
+// would free: a collection store of a closure does not retain it. The record
+// must decline the release (a leak, as on the base, never a free). §28.9 /
+// §28.3, v0.359. RED on the first #8964 fix (heap-use-after-free freed by
+// bz_closure_release), GREEN with the walker's closure-component-read decline.
+// Lenient oracle: the generated-code ASan is active, the leak sentinel off
+// (the decline is a leak by design).
+BEZEL_TEST(record_closure_component_leak_8964,
+           array_add_of_component_read_does_not_free_the_stored_cell) {
+    const std::string src =
+        "module P; "
+        "import System; "
+        "import System.Collections; "
+        "record R(f: () -> int); "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var fs := new Array<() -> int>(); "
+        "    for var i in 0..<200 do "
+        "      var r := new R(lambda() => 3); fs.Add(r.f); "
+        "    end; "
+        "    var acc := 0; "
+        "    for var g in fs do acc := acc + g(); end; "
+        "    Console.WriteLine(acc); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    const JitResult r = runAotCheckedLenient(src);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "600\n");
+    BEZEL_EXPECT_TRUE(diagnosticText(r).find("ERROR: AddressSanitizer") ==
+                      std::string::npos);
+}
+
+// fix-forward #8964, review shape (e2): a component READ that is not a call
+// (`r.f` as an argument, an initializer or an indexer / Dictionary store
+// value) hands the collection the SAME cell the record's scope-end release
+// would free: a collection store of a closure does not retain it. The record
+// must decline the release (a leak, as on the base, never a free). §28.9 /
+// §28.3, v0.359. RED on the first #8964 fix (heap-use-after-free freed by
+// bz_closure_release), GREEN with the walker's closure-component-read decline.
+// Lenient oracle: the generated-code ASan is active, the leak sentinel off
+// (the decline is a leak by design).
+BEZEL_TEST(record_closure_component_leak_8964,
+           array_add_of_local_alias_of_component_does_not_free_the_stored_cell) {
+    const std::string src =
+        "module P; "
+        "import System; "
+        "import System.Collections; "
+        "record R(f: () -> int); "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var fs := new Array<() -> int>(); "
+        "    for var i in 0..<200 do "
+        "      var r := new R(lambda() => 3); var g := r.f; fs.Add(g); "
+        "    end; "
+        "    var acc := 0; "
+        "    for var g in fs do acc := acc + g(); end; "
+        "    Console.WriteLine(acc); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    const JitResult r = runAotCheckedLenient(src);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "600\n");
+    BEZEL_EXPECT_TRUE(diagnosticText(r).find("ERROR: AddressSanitizer") ==
+                      std::string::npos);
+}
+
+// fix-forward #8964, review shape (f1): a component READ that is not a call
+// (`r.f` as an argument, an initializer or an indexer / Dictionary store
+// value) hands the collection the SAME cell the record's scope-end release
+// would free: a collection store of a closure does not retain it. The record
+// must decline the release (a leak, as on the base, never a free). §28.9 /
+// §28.3, v0.359. RED on the first #8964 fix (heap-use-after-free freed by
+// bz_closure_release), GREEN with the walker's closure-component-read decline.
+// Lenient oracle: the generated-code ASan is active, the leak sentinel off
+// (the decline is a leak by design).
+BEZEL_TEST(record_closure_component_leak_8964,
+           dictionary_set_of_component_read_does_not_free_the_stored_cell) {
+    const std::string src =
+        "module P; "
+        "import System; "
+        "import System.Collections; "
+        "record R(f: () -> int); "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var d := new Dictionary<int, () -> int>(); "
+        "    for var i in 0..<200 do "
+        "      var r := new R(lambda() => 3); d[i] := r.f; "
+        "    end; "
+        "    var acc := 0; "
+        "    for var i in 0..<200 do acc := acc + d[i](); end; "
+        "    Console.WriteLine(acc); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    const JitResult r = runAotCheckedLenient(src);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "600\n");
+    BEZEL_EXPECT_TRUE(diagnosticText(r).find("ERROR: AddressSanitizer") ==
+                      std::string::npos);
+}
+
+// fix-forward #8964, review shape (f2): a component READ that is not a call
+// (`r.f` as an argument, an initializer or an indexer / Dictionary store
+// value) hands the collection the SAME cell the record's scope-end release
+// would free: a collection store of a closure does not retain it. The record
+// must decline the release (a leak, as on the base, never a free). §28.9 /
+// §28.3, v0.359. RED on the first #8964 fix (heap-use-after-free freed by
+// bz_closure_release), GREEN with the walker's closure-component-read decline.
+// Lenient oracle: the generated-code ASan is active, the leak sentinel off
+// (the decline is a leak by design).
+BEZEL_TEST(record_closure_component_leak_8964,
+           array_index_store_of_component_read_does_not_free_the_stored_cell) {
+    const std::string src =
+        "module P; "
+        "import System; "
+        "import System.Collections; "
+        "record R(f: () -> int); "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var fs := new Array<() -> int>(); for var i in 0..<200 do fs.Add(lambda() => 1); end; "
+        "    for var i in 0..<200 do "
+        "      var r := new R(lambda() => 3); fs[i] := r.f; "
+        "    end; "
+        "    var acc := 0; "
+        "    for var g in fs do acc := acc + g(); end; "
+        "    Console.WriteLine(acc); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    const JitResult r = runAotCheckedLenient(src);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "600\n");
+    BEZEL_EXPECT_TRUE(diagnosticText(r).find("ERROR: AddressSanitizer") ==
+                      std::string::npos);
+}
+
+// fix-forward #8964, review shape (f3): a component READ that is not a call
+// (`r.f` as an argument, an initializer or an indexer / Dictionary store
+// value) hands the collection the SAME cell the record's scope-end release
+// would free: a collection store of a closure does not retain it. The record
+// must decline the release (a leak, as on the base, never a free). §28.9 /
+// §28.3, v0.359. RED on the first #8964 fix (heap-use-after-free freed by
+// bz_closure_release), GREEN with the walker's closure-component-read decline.
+// Lenient oracle: the generated-code ASan is active, the leak sentinel off
+// (the decline is a leak by design).
+BEZEL_TEST(record_closure_component_leak_8964,
+           alias_and_direct_component_reads_stored_together_do_not_free_the_stored_cells) {
+    const std::string src =
+        "module P; "
+        "import System; "
+        "import System.Collections; "
+        "record R(f: () -> int); "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var fs := new Array<() -> int>(); "
+        "    for var i in 0..<5 do "
+        "      var r := new R(lambda() => 3); var g := r.f; fs.Add(g); fs.Add(r.f); "
+        "    end; "
+        "    var acc := 0; "
+        "    for var g in fs do acc := acc + g(); end; "
+        "    Console.WriteLine(acc); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    const JitResult r = runAotCheckedLenient(src);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "30\n");
+    BEZEL_EXPECT_TRUE(diagnosticText(r).find("ERROR: AddressSanitizer") ==
+                      std::string::npos);
 }
 
 }  // namespace
