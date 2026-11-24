@@ -12148,6 +12148,54 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         }
         return result;
     }
+    // fix #9096 (§28.9 / §27.5 / §28.3.11, v0.359): is the CALLEE of this
+    // call a READ of a class field's function value?
+    //
+    // The callee of a closure call is a BORROW of the holder it was read from
+    // (§28.3's *Function-typed holders*: "A function value **read** from any
+    // holder — a field, a property or indexer … — carries the empty set"; a
+    // read takes no ownership, the holder keeps the reference). A LOCAL's or
+    // PARAMETER's slot keeps its reference for the whole scope, so a local
+    // callee is safe. A FIELD's reference is the field's own, and the callee
+    // may DISPLACE the field while it runs — `_f := null` (or a fresh
+    // closure) releases the field's reference, and if the field held the only
+    // one, the closure object is freed while its body still reads its
+    // captured environment.
+    //
+    // §28.9: "Runtime management governs the *function value itself* — the
+    // heap-allocated closure object that backs it", and §27.5: "Captured
+    // variables are heap-allocated in a closure object" — so freeing the
+    // closure object while the body runs is a use-after-free of the captures.
+    // The call must therefore take a reference of its OWN for the duration of
+    // the call (the same discipline #8763's property twin follows: "the
+    // reader's reference is what keeps the closure alive across the
+    // invocation (the field it was read from may be replaced while the call
+    // runs), so it may only be given back once the call has returned").
+    //
+    // §17.12: the null-forgiving `!` is TRANSPARENT — `x!` is `x`'s own read —
+    // so the holder is the operand's (`_f!(this)` reads the field `_f`).
+    // §17.4: `x as T` is "a borrow of `x`" — the SAME value, so a cast of a
+    // field read names the same holder (`(_f as F)!(this)`).
+    //
+    // The predicate is `isClosureFieldLvalue` — the SAME one the STORE side
+    // uses (`lowerClosureFieldStore`, #429): a class instance field /
+    // auto-property whose declared type is a function type. That set is
+    // exactly the holders that keep an INDEPENDENT +1 on the closure cell
+    // (retained at store, released on the owner's disposal), so a read of
+    // one borrows a reference that EXISTS and can be taken over for the
+    // call. A record's function-typed component is a BORROW (§9) and holds no
+    // such reference, and a static field's store has its own path — both are
+    // excluded, so neither is touched here.
+    auto calleeReadsClosureField = [this](const ast::Expr* callee) -> bool {
+        if (!callee) return false;
+        const ast::Expr* e = callee;
+        while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
+            e = pb->operand.get();
+        if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e))
+            if (te->op == "as" && te->operand)
+                e = te->operand.get();
+        return e && isClosureFieldLvalue(*e);
+    };
     // CG60: call through a function-typed parameter or local (lambda
     // value). Lambda values are heap-allocated closure structs
     // { ptr fn, ptr env }. The function's actual type includes an env_ptr
@@ -13109,7 +13157,29 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         }
         if (rt && rt->kind == sema::TypeRef::Kind::Function) {
             llvm::Value* closurePtr = lowerExpr(*call.callee);
-            return emitClosureCall(closurePtr, rt, &call);
+            // fix #9096 (§28.9 / §27.5 / §28.3.11, v0.359): the callee is
+            // the FIELD's function value, read as a borrow. The field holds
+            // the reference, and the callee may displace the field while it
+            // runs — the field's reference is then released and, if it was
+            // the last one, the closure object (and the captured variables
+            // §27.5 heap-allocates in it) is freed while the body still
+            // reads them. MEASURED (issue #9096): a heap-use-after-free in
+            // `lam$0`, freed by `bz$lam$0$envdtor`. So the call takes a
+            // reference of its OWN for the duration of the call and gives it
+            // back after it — §28.3.11's discharge at the end of the full
+            // expression, here the end of the call expression.
+            const bool calleeIsField = calleeReadsClosureField(call.callee.get());
+            if (calleeIsField) emitClosureRetain(closurePtr);
+            llvm::Value* r = emitClosureCall(closurePtr, rt, &call);
+            // `!diverged_` mirrors #4078's release discipline in
+            // `emitClosureCall` and #8763's property twin: the release is
+            // emitted only where the code is still reachable (a leak on the
+            // throw path is the safe direction — the reference is not
+            // released TWICE).
+            if (calleeIsField && !diverged_ && closurePtr &&
+                closurePtr->getType()->isPointerTy())
+                emitClosureRelease(closurePtr);
+            return r;
         }
     }
     // fix #2589 (§23.1/§23/§2.8.2/§28.9, v0.236): directly invoking a
@@ -13509,7 +13579,29 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         sema::TypeRef* calleeTy = ctx_.exprType(*call.callee);
         if (calleeTy && calleeTy->kind == sema::TypeRef::Kind::Function) {
             llvm::Value* closurePtr = lowerExpr(*call.callee);
+            // fix #9096 (§28.9 / §27.5 / §28.3.11, v0.359): the callee is
+            // read from a FIELD (`_f!(this)` — the null-forgiving `!` is
+            // transparent, §17.12), so the call borrows the field's
+            // reference. The callee may displace the field while it runs
+            // (`x.Drop()` sets `_f := null`), which releases that reference
+            // and frees the closure object the body is still running in —
+            // MEASURED (issue #9096): a heap-use-after-free in `lam$0`,
+            // freed by `bz$lam$0$envdtor`. The call therefore takes a
+            // reference of its OWN for the duration of the call and gives it
+            // back after it (§28.3.11's discharge at the end of the full
+            // expression — here the end of the call expression). A LOCAL
+            // callee is not this shape and is not touched: its slot keeps
+            // the reference for the whole scope.
+            const bool calleeIsField = calleeReadsClosureField(call.callee.get());
+            if (calleeIsField) emitClosureRetain(closurePtr);
             llvm::Value* ccRes = emitClosureCall(closurePtr, calleeTy, &call);
+            // `!diverged_` mirrors #4078's release discipline in
+            // `emitClosureCall` and #8763's property twin (a leak on the
+            // throw path is the safe direction; the reference is never
+            // released twice).
+            if (calleeIsField && !diverged_ && closurePtr &&
+                closurePtr->getType()->isPointerTy())
+                emitClosureRelease(closurePtr);
             // fix #9040 (§28.3.5 *The announcement table* row 4, v0.359): the
             // scope-end disposal is registered ONLY when the announcement
             // table says the caller OWNS the chain-call result. The
