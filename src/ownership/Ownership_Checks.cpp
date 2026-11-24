@@ -6565,15 +6565,21 @@ void MethodOwnership::reportCapturedThrowOperand(const ast::Expr& operand) {
 // closure draws "the thrown value must be an OWNED exception"), so it is not
 // an admitting twin and this fix does not touch it.
 //
-// The `case` spelling is not handled either: the method arm's own classifier
-// has no `CaseExpr` arm (fix #4008 deferred it), so a `case` operand is
-// admitted in the METHOD body too and must stay admitted here.
+// The `case` spelling is handled too (fix #9043): the expression-bodied arms
+// are walked like a conditional's branches.
 //
 // per §28.3, §31.1, v0.359, #8958
 void MethodOwnership::reportCapturedThrowCompositeOperand(
     const ast::Expr& operand) {
     const ast::Expr* op = lookThroughForceUnwrap(&operand);
     if (!op) return;
+    // fix #9043 (§28.3, §31.1, v0.359): a `case … of` EXPRESSION operand: its
+    // expression-bodied arms are the operand's values exactly as a
+    // conditional's branches are, so each is asked the same question.
+    if (const auto* cs = dynamic_cast<const ast::CaseExpr*>(op)) {
+        reportCapturedThrowArm(cs);
+        return;
+    }
     const auto* ce = dynamic_cast<const ast::ConditionalExpr*>(op);
     if (!ce) return;
     // The arms are MUTUALLY EXCLUSIVE (exactly one is selected), so the first
@@ -6607,6 +6613,16 @@ bool MethodOwnership::reportCapturedThrowArm(const ast::Expr* arm) {
     if (const auto* ce = dynamic_cast<const ast::ConditionalExpr*>(core)) {
         if (reportCapturedThrowArm(ce->thenValue.get())) return true;
         return reportCapturedThrowArm(ce->elseValue.get());
+    }
+    // fix #9043: a `case` expression in arm position (or as the operand): the
+    // expression-bodied arms are the values; a block arm is not walked. The
+    // scrutinee and guards are reads, never the thrown value.
+    if (const auto* cs = dynamic_cast<const ast::CaseExpr*>(core)) {
+        for (const auto& a : cs->arms)
+            if (a.bodyKind == ast::CaseArmBodyKind::Expression &&
+                reportCapturedThrowArm(a.exprBody.get()))
+                return true;
+        return false;
     }
     if (isCapturedOwnedBinding(*core)) {
         const auto* id = dynamic_cast<const ast::IdentifierExpr*>(core);
