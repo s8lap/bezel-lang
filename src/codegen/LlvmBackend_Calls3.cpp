@@ -56,8 +56,8 @@ static int64_t lazyElemSize(llvm::Type* ty, const llvm::DataLayout& dl) {
 // target-typed overload selection may have chosen an overload other than the
 // one `exprSymbol` bound (fix #5019); the selection's choice wins when it
 // published one.
-static sema::TypeRef* linqSelectorResultType(sema::SemaContext& ctx,
-                                             const ast::Expr* arg) {
+sema::TypeRef* linqSelectorResultType(sema::SemaContext& ctx,
+                                      const ast::Expr* arg) {
     if (!arg) return nullptr;
     if (sema::TypeRef* t = ctx.exprType(*arg))
         if (t->kind == sema::TypeRef::Kind::Function && t->funcReturn)

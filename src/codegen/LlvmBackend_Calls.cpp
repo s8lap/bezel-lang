@@ -5761,14 +5761,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::StructType* decTy = decimalStructType();
             bool isDecimalSum = (elemTy == decTy);
             // If the selector returns decimal, also use the decimal path.
-            if (!isDecimalSum && !call.args.empty() && call.args[0].value) {
-                if (auto* lamTy = ctx_.exprType(*call.args[0].value))
-                    if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn)
-                        if (auto* rt = lamTy->funcReturn)
-                            if (rt->kind == sema::TypeRef::Kind::Primitive &&
-                                rt->primitive == sema::PrimitiveType::Decimal)
-                                isDecimalSum = true;
-            }
+            // fix #8730 (stdlib §5, spec §27.6, v0.359): the selector's result
+            // is read off a METHOD GROUP too (`a.Sum(Id)`): a bare method
+            // reference carries no Function TypeRef, so the pre-fix reads of
+            // `lamTy->funcReturn` below found nothing and the fold accumulated
+            // as `int` while sema typed the call at the method's result.
+            sema::TypeRef* selRetRef =
+                (!call.args.empty() && call.args[0].value)
+                    ? linqSelectorResultType(ctx_, call.args[0].value.get())
+                    : nullptr;
+            if (!isDecimalSum && selRetRef &&
+                selRetRef->kind == sema::TypeRef::Kind::Primitive &&
+                selRetRef->primitive == sema::PrimitiveType::Decimal)
+                isDecimalSum = true;
             if (isDecimalSum) {
                 // fix #8388 (stdlib §5, v0.355): the element this fold
                 // accumulates is the RECEIVER'S element, at the ELEMENT's own
@@ -5888,9 +5893,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // 410_065_408). Decimal took the isDecimalSum path above.
             sema::PrimitiveType retP = sema::PrimitiveType::Int;
             if (!call.args.empty() && call.args[0].value) {
-                if (auto* lamTy = ctx_.exprType(*call.args[0].value))
-                    if (lamTy->kind == sema::TypeRef::Kind::Function &&
-                        lamTy->funcReturn) {
+                if (selRetRef) {
                         // fix #8338 (stdlib §5.1, spec §11.8 / §14.2,
                         // v0.355): read the selector's RETURN type through
                         // the generic substitution (`resolveTypeParamRef`) --
@@ -5915,7 +5918,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         // `INumber<U>` conformer, so the sema gate owns that
                         // shape -- the same nullability discipline the
                         // no-selector branch uses for a nullable ELEMENT.
-                        const sema::TypeRef* rawRet = lamTy->funcReturn;
+                        const sema::TypeRef* rawRet = selRetRef;
                         const sema::TypeRef* rt = rawRet->nullable
                             ? rawRet
                             : resolveTypeParamRef(rawRet);

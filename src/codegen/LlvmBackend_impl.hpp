@@ -72,6 +72,14 @@ inline llvm::Instruction* terminatorOrNull(llvm::BasicBlock* bb) {
 #endif
 }
 
+// fix #7160 / #8730 (§27.6 / stdlib §5, v0.359): the RESULT type of a §5
+// callback argument -- a lambda's or a qualified method reference's Function
+// TypeRef, or the declared result of the method a BARE method-group argument
+// names. Defined in LlvmBackend_Calls3.cpp; the eager `Sum` arm
+// (LlvmBackend_Calls.cpp) reads it too.
+sema::TypeRef* linqSelectorResultType(sema::SemaContext& ctx,
+                                      const ast::Expr* arg);
+
 // Building a DominatorTree walks every block's successors. LLVM 21 read an open
 // block as having none; LLVM 23 calls successors() on its last instruction,
 // which traps. While a function is still being emitted, one of its blocks can be

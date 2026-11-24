@@ -1221,23 +1221,49 @@ bool ExprTC::linqElemIsInScopeTypeParam(const TypeRef* elem) const {
     return !n.empty() && isInScopeTypeParam(n) && isInScopeTypeParamRef(elem);
 }
 
-// fix #8688 (stdlib §5, spec §3.6 rule 2 / §5.1 / §14.2, v0.357): see the
-// declaration in ExprTypecheck_impl.hpp. stdlib §5 declares the selector form
-//     public method Sum<U>(selector: (T) -> U): owned U where U: INumber<U>;
-// so the call's type is the selector's return type `U`. This reads `U` off the
-// (already typed) selector lambda for the two shapes every receiver arm can
-// key: a bare type parameter in scope (`a.Sum(lambda(x) => x)` in
-// `H<T>(a: Array<T>) where T: INumber<T>` is `T`, and spec §3.6 rule 2 then
-// confines it to `Object` and its bounds), and a non-nullable numeric
-// primitive the selector returns EXACTLY (`int`, `long`, `uint`, `ulong`,
-// `float`, `double`, `decimal`). Anything else returns null and the caller
-// keeps its own handling.
-TypeRef* ExprTC::linqSelectorSumResult(const ast::CallExpr& ce) {
+namespace {
+std::string spellTypeRefForDiag(const TypeRef* a);  // defined below
+}  // namespace
+
+// fix #8730 (stdlib §5, spec §14.5 / §27.6, v0.359): the RESULT type `U` of a
+// §5 selector argument. A lambda carries a Function TypeRef whose `funcReturn`
+// is `U`. A METHOD-GROUP argument (`a.Sum(Id)`) carries none -- sema's
+// call-resolution slice leaves the bare reference untyped (fix #4897 builds the
+// function type only inside `checkAssignable`) -- so `U` is the DECLARED result
+// of the method the reference names (§27.6: "a method reference converts to a
+// function value of the parameter's function type"; the overload §27.6's
+// target-typed selection chose wins, as in codegen's
+// `linqSelectorResultType`). Null when `U` cannot be read here (a generic
+// method group, an untyped or unresolved argument).
+TypeRef* ExprTC::linqSelectorResultOf(const ast::CallExpr& ce) {
     if (ce.args.empty() || !ce.args[0].value) return nullptr;
-    TypeRef* lt = ctx_.exprType(*ce.args[0].value);
-    if (!lt || lt->kind != TypeRef::Kind::Function || !lt->funcReturn)
-        return nullptr;
-    TypeRef* u = lt->funcReturn;
+    const ast::Expr& arg = *ce.args[0].value;
+    if (TypeRef* lt = ctx_.exprType(arg))
+        if (lt->kind == TypeRef::Kind::Function && lt->funcReturn)
+            return lt->funcReturn;
+    auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(arg));
+    if (!ms) return nullptr;
+    if (MethodSymbol* chosen = ctx_.methodRefSelectedOverload(arg)) ms = chosen;
+    if (!ms->genericParams.empty()) return nullptr;
+    return methodReturnResolvedType(*ms, ctx_);
+}
+
+// fix #8688 (stdlib §5, spec §3.6 rule 2 / §5.1 / §14.2, v0.357) and fix #8730
+// (v0.359): see the declaration in ExprTypecheck_impl.hpp.
+// stdlib §5 declares the selector form
+//     public method Sum<U>(selector: (T) -> U): owned U where U: INumber<U>;
+// so the call's type is the selector's return type `U` -- for a lambda AND for
+// a method-group selector (`linqSelectorResultOf`). This reads `U` for the
+// shapes every receiver arm can key: a bare
+// type parameter in scope (`a.Sum(lambda(x) => x)` in
+// `H<T>(a: Array<T>) where T: INumber<T>` is `T`, and spec §3.6 rule 2 then
+// confines it to `Object` and its bounds), a non-nullable numeric primitive
+// the selector returns EXACTLY (`int`, `long`, `uint`, `ulong`, `float`,
+// `double`, `decimal`). Any other shape returns null and the caller keeps its
+// own handling.
+TypeRef* ExprTC::linqSelectorSumResult(const ast::CallExpr& ce) {
+    TypeRef* u = linqSelectorResultOf(ce);
+    if (!u) return nullptr;
     if (linqElemIsInScopeTypeParam(u)) return u;
     if (u->kind == TypeRef::Kind::Primitive && !u->nullable) {
         using P = PrimitiveType;
@@ -15532,15 +15558,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             srcElem &&
                             srcElem->kind == TypeRef::Kind::Primitive &&
                             srcElem->primitive == P::Decimal;
-                        if (!elemIsDecimal && !ce.args.empty() &&
-                            ce.args[0].value) {
-                            if (auto* lt = ctx_.exprType(*ce.args[0].value))
-                                if (lt->kind == TypeRef::Kind::Function &&
-                                    lt->funcReturn &&
-                                    lt->funcReturn->kind == TypeRef::Kind::Primitive &&
-                                    lt->funcReturn->primitive == P::Decimal)
+                        // fix #8730 (stdlib §5, spec §27.6, v0.359): the selector's
+                        // result is read off a lambda OR a method group.
+                        if (!ce.args.empty() && ce.args[0].value)
+                            if (auto* selU = linqSelectorResultOf(ce)) {
+                                if (!elemIsDecimal &&
+                                    selU->kind == TypeRef::Kind::Primitive &&
+                                    selU->primitive == P::Decimal)
                                     elemIsDecimal = true;
-                        }
+                            }
                         ctx_.setExprType(&ce,
                             elemIsDecimal
                                 ? ctx_.primitiveTypeRef(P::Decimal)
@@ -17511,13 +17537,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             bool sumSelectorClassified = false;
                             if (m == "Sum" && !ce.args.empty() &&
                                 ce.args[0].value) {
-                                if (auto* lt = ctx_.exprType(*ce.args[0].value))
-                                    if (lt->kind == TypeRef::Kind::Function &&
-                                        lt->funcReturn &&
-                                        lt->funcReturn->kind ==
+                                // fix #8730 (stdlib §5, spec §27.6, v0.359):
+                                // the selector's result is read off a METHOD
+                                // GROUP too (`a.Sum(Id)`), not only a lambda.
+                                if (TypeRef* selRet = linqSelectorResultOf(ce))
+                                    if (selRet->kind ==
                                             TypeRef::Kind::Primitive &&
-                                        !lt->funcReturn->nullable) {
-                                        P rp = lt->funcReturn->primitive;
+                                        !selRet->nullable) {
+                                        P rp = selRet->primitive;
                                         static constexpr P sumCands[] = {
                                             P::Int,   P::Long,  P::UInt,
                                             P::ULong, P::Float, P::Double,
@@ -17551,7 +17578,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                                 "Sum(selector): the selector "
                                                 "returns `" +
                                                 spellTypeRefForDiag(
-                                                    lt->funcReturn) +
+                                                    selRet) +
                                                 "`, which converts co-equally "
                                                 "(§5.1) to more than one Sum "
                                                 "overload's result type; no "
@@ -17935,16 +17962,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 recvTy->genericArgs[0]->kind ==
                                     TypeRef::Kind::Primitive &&
                                 recvTy->genericArgs[0]->primitive == P::Decimal;
-                            if (!elemIsDecimal && !ce.args.empty() &&
-                                ce.args[0].value) {
-                                if (auto* lt = ctx_.exprType(*ce.args[0].value))
-                                    if (lt->kind == TypeRef::Kind::Function &&
-                                        lt->funcReturn &&
-                                        lt->funcReturn->kind ==
-                                            TypeRef::Kind::Primitive &&
-                                        lt->funcReturn->primitive == P::Decimal)
+                            // fix #8730 (stdlib §5, spec §27.6, v0.359):
+                            // the selector's result is read off a lambda OR a
+                            // method group.
+                            if (!ce.args.empty() && ce.args[0].value)
+                                if (auto* selU = linqSelectorResultOf(ce)) {
+                                    if (!elemIsDecimal &&
+                                        selU->kind == TypeRef::Kind::Primitive &&
+                                        selU->primitive == P::Decimal)
                                         elemIsDecimal = true;
-                            }
+                                }
                             ctx_.setExprType(&ce,
                                 elemIsDecimal
                                     ? ctx_.primitiveTypeRef(P::Decimal)
