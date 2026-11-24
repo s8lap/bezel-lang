@@ -21934,9 +21934,95 @@ void Emitter::consumeLastLambdaCapturedCells(
         // body the inlined constructor is lowered into: a lambda (or any
         // other body) lowered INSIDE the constructor body restarts its
         // `disposeStack_` at depth 1 and its own parameters are at ITS root.
+        //
+        // fix #8984 (§27.5 / §28.9, v0.359): the DECLINED capture cell of a
+        // PARAMETER captured in a NESTED scope is now DEFERRED to the scope
+        // the parameter is DECLARED in, instead of being dropped on the floor.
+        //
+        // WHY THE DECLINE EXISTED. #3403's hazard is real: after the capture,
+        // the parameter's storage IS the cell (paramSlots_ was rebound to the
+        // cell holder), so a read of the parameter AFTER the capture site's
+        // scope exits dereferences the cell — freeing it there was a measured
+        // SIGSEGV. The free therefore cannot fire at the capture site's scope
+        // end; it has to fire at a scope the parameter is still visible in.
+        //
+        // WHY IT LEAKED. The captured LOCAL's spelling has a route to that
+        // scope: `declScopeDepth_` records the depth at which the local was
+        // DECLARED, and the deferred path below registers the free THERE (the
+        // second pass in `emitDisposals`, after every reads-through-cell
+        // disposal of that scope has run). A PARAMETER is not in
+        // `declScopeDepth_` — it is bound in the body's OUTERMOST scope by
+        // construction — so this decline had no deferral route at all and the
+        // cell simply leaked: 4 B per call (8 B for a `string` capture), on
+        // EVERY exit, for a capture in any nested scope of the method.
+        // MEASURED on the base (r43-f45-toolchain @ 0efd9b0ca): 796 B in 199
+        // allocations over 200 calls of
+        //
+        //     method M(p: int): int
+        //       if p > 0 then
+        //         return Apply(lambda() => p + 1);
+        //       end if;
+        //       return 0;
+        //     end M;
+        //
+        // while the TOP-LEVEL twin of the same shape (the capture at the
+        // parameter's own depth) is CLEAN — the discriminator is the NESTED
+        // scope, not the capture.
+        //
+        // THE FIX. The parameter is visible ONLY in the scope it is declared
+        // in, so EVERY read through the cell — the #3403 hazard's read
+        // included — has happened by the time that scope ends. The free is
+        // therefore registered in THAT scope, as a DEFERRED free (the second
+        // pass, after that scope's main-loop disposals), exactly as a
+        // captured local's cell is (#969's deferred path): the parameter's own
+        // disposal — which, for an owned parameter, reads the value THROUGH
+        // the cell — then still runs before the cell is freed, so no
+        // use-after-free is possible.
+        //
+        // THE INLINED-CONSTRUCTOR BODY. `capturedParamDeclScopeDepthHere()`
+        // is the depth of the scope the parameter is DECLARED in — 1 (the
+        // function-body ROOT scope) for an ordinary method, and the ctor
+        // body's own scope for an INLINED constructor body (#8765), where the
+        // constructor's parameters are declared in the scope that body opens
+        // and are invisible outside it. The deferred free is registered in
+        // THAT scope, so it fires when the constructor body's scope ends —
+        // the first moment at which nothing can read the parameter any more.
+        //
+        // THE EDGES. The EXCEPTION edge registers nothing (the #8980
+        // unwind mode): the cell's free on that edge belongs to the cleanup
+        // block's own bookkeeping, and a bounded leak there is the safe
+        // direction — the same trade #8980 made for the captured LOCAL.
+        // The INLINE-ARRAY case keeps #747/#782's documented skip (only a
+        // plain cell is deferred), and `skipCellFreeOnUnwind` carries #2334's
+        // TaskScope.Spawn carve-over onto the new entry.
         if (ce.isParam &&
-            disposeStack_.size() > capturedParamDeclScopeDepthHere())
+            disposeStack_.size() > capturedParamDeclScopeDepthHere()) {
+            const std::size_t paramScopeIdx =
+                capturedParamDeclScopeDepthHere() - 1;
+            if (!unwindMode && paramScopeIdx < disposeStack_.size() &&
+                ce.inlineArrayN == 0) {
+                // Exactly once: a scope that already frees this slot — either
+                // plainly (the capture site's own scope-end free) or deferred
+                // (an earlier capture of the same parameter) — owns the cell's
+                // free, and a second one would be a double free.
+                bool alreadyFreed = false;
+                for (const auto& existing : disposeStack_[paramScopeIdx]) {
+                    if (existing.slot != ce.newSlot) continue;
+                    if (existing.boxedCellFree ||
+                        existing.boxedCellFreeDeferred) {
+                        alreadyFreed = true;
+                        break;
+                    }
+                }
+                if (!alreadyFreed) {
+                    Disposal dcd{ce.newSlot, nullptr};
+                    dcd.boxedCellFreeDeferred = true;
+                    dcd.skipCellFreeOnUnwind = ce.unwindUnsafe;  // fix #2334
+                    disposeStack_[paramScopeIdx].push_back(dcd);
+                }
+            }
             continue;
+        }
         auto dd = declScopeDepth_.find(ce.key);
         if (dd != declScopeDepth_.end() && dd->second < disposeStack_.size()) {
             // fix #4261: before deferring, check whether an OUTER scope has
