@@ -1248,7 +1248,7 @@ TypeRef* ExprTC::linqSelectorResultOf(const ast::CallExpr& ce) {
     return methodReturnResolvedType(*ms, ctx_);
 }
 
-// fix #8690 (stdlib §5 / §2.19, spec §14.2 *Interface conformance* rules 1 and
+// fix #8691 (stdlib §5 / §2.19, spec §14.2 *Interface conformance* rules 1 and
 // 2, v0.359): does the declared type `e` conform to the builtin SELF-bounded
 // interface `ifaceSym` (`INumber<Self>`), at its OWN type arguments? ONE
 // verdict read by the no-selector §5.1 gate and by the selector §5 gate. The
@@ -1278,7 +1278,7 @@ bool ExprTC::linqConformsToSelfInterface(const TypeRef* e,
 }
 
 // fix #8688 (stdlib §5, spec §3.6 rule 2 / §5.1 / §14.2, v0.357) and fix #8690
-// / #8730 (v0.359): see the declaration in ExprTypecheck_impl.hpp.
+// / #8691 / #8730 (v0.359): see the declaration in ExprTypecheck_impl.hpp.
 // stdlib §5 declares the selector form
 //     public method Sum<U>(selector: (T) -> U): owned U where U: INumber<U>;
 // so the call's type is the selector's return type `U` -- for a lambda AND for
@@ -1288,7 +1288,8 @@ bool ExprTC::linqConformsToSelfInterface(const TypeRef* e,
 // `H<T>(a: Array<T>) where T: INumber<T>` is `T`, and spec §3.6 rule 2 then
 // confines it to `Object` and its bounds), a non-nullable numeric primitive
 // the selector returns EXACTLY (`int`, `long`, `uint`, `ulong`, `float`,
-// `double`, `decimal`). A `U` that PROVABLY fails the bound is refused here
+// `double`, `decimal`), and a user RECORD that lists `INumber<Self>` (§14.2
+// rule 1; stdlib §2.19). A `U` that PROVABLY fails the bound is refused here
 // (`linqSelectorUnsatisfied`) and the call is typed as the caller's recovery
 // type; any other shape returns null and the caller keeps its own handling.
 TypeRef* ExprTC::linqSelectorSumResult(const ast::CallExpr& ce) {
@@ -1310,6 +1311,13 @@ TypeRef* ExprTC::linqSelectorSumResult(const ast::CallExpr& ce) {
                 break;
         }
     }
+    // fix #8691: a RECORD `U` that lists `INumber<Self>` is `U` itself -- the
+    // selector twin of #8223's no-selector keying. Codegen folds it with the
+    // conformer's own `Zero()` / `+`.
+    if (u->kind == TypeRef::Kind::Named && u->declaration && !u->nullable &&
+        u->declaration->kind == ast::TypeDeclKind::Record &&
+        linqConformsToSelfInterface(u, ctx_.builtinInterfaceSym("INumber")))
+        return u;
     return nullptr;
 }
 

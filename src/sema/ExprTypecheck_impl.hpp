@@ -773,7 +773,7 @@ private:
     // typeCall so they cannot drift. Defined beside
     // `linqElemIsInScopeTypeParam`.
     TypeRef* linqSelectorSumResult(const ast::CallExpr& ce);
-    // fix #8730 / #8690 (stdlib §5, spec §14.2 / §27.6, v0.359): the
+    // fix #8730 / #8691 / #8690 (stdlib §5, spec §14.2 / §27.6, v0.359): the
     // selector's RESULT type `U` (lambda or method group), the shared
     // conformance verdict for a SELF-bounded builtin interface (`INumber`),
     // and the diagnostic gate for a `U` that PROVABLY fails the selector

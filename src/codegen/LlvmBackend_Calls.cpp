@@ -5525,6 +5525,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if (m == "Sum") {
             const bool relCl = argIsInlineLambda(0);
             llvm::Type* elemTy = getElemTy();
+            // fix #8730 (stdlib §5, spec §27.6, v0.359): the selector's result
+            // is read off a METHOD GROUP too (`a.Sum(Id)`): a bare method
+            // reference carries no Function TypeRef, so the pre-fix reads of
+            // `lamTy->funcReturn` below found nothing and the fold accumulated
+            // as `int` while sema typed the call at the method's result.
+            sema::TypeRef* selRetRef =
+                (!call.args.empty() && call.args[0].value)
+                    ? linqSelectorResultType(ctx_, call.args[0].value.get())
+                    : nullptr;
 
             // fix #8223 (stdlib §5.1, spec §11.8 / §14.2 *Interface
             // conformance*, v0.355): the no-selector `Sum(): owned T` is the
@@ -5536,10 +5545,22 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // verification. The element type is read through the generic
             // substitution (`resolveTypeParamRef`): inside a generic body
             // `Array<T>` at T=Money is lowered per instantiation.
+            //
+            // fix #8691 (stdlib §5 / §2.19, spec §11.8 / §14.2, v0.359): the
+            // SELECTOR form `Sum<U>(selector: (T) -> U): owned U where U:
+            // INumber<U>` is the same fold over the selector's results, so a
+            // record `U` takes this arm with `U` as the accumulator (and
+            // `rawElem` below names the ACCUMULATOR type, `accTy` its layout).
+            // Pre-fix only the no-selector form did: the selector form fell to
+            // the primitive arm below and accumulated a record as `int`.
+            const sema::TypeRef* foldRef = nullptr;
             if (call.args.empty() && recvTy && !recvTy->genericArgs.empty() &&
-                recvTy->genericArgs[0]) {
-                const sema::TypeRef* rawElem =
-                    resolveTypeParamRef(recvTy->genericArgs[0]);
+                recvTy->genericArgs[0])
+                foldRef = resolveTypeParamRef(recvTy->genericArgs[0]);
+            else if (call.args.size() == 1 && selRetRef && !selRetRef->nullable)
+                foldRef = resolveTypeParamRef(selRetRef);
+            if (foldRef) {
+                const sema::TypeRef* rawElem = foldRef;
                 if (rawElem && rawElem->kind == sema::TypeRef::Kind::Named &&
                     !rawElem->nullable && rawElem->declaration &&
                     rawElem->declaration->kind == ast::TypeDeclKind::Record) {
@@ -5712,10 +5733,22 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         return llvm::Constant::getNullValue(elemTy);
                     }
                     if (zeroM && plusM) {
+                        llvm::Type* accTy = lowerTypeRef(rawElem);
+                        if (!accTy) accTy = elemTy;
+                        sema::TypeRef* foldRet =
+                            call.args.empty()
+                                ? nullptr
+                                : const_cast<sema::TypeRef*>(rawElem);
+                        llvm::Value* closure =
+                            call.args.empty()
+                                ? nullptr
+                                : lowerLinqLambda(call.args[0].value.get(),
+                                                  foldRet);
+                        if (!call.args.empty() && !closure) return nullptr;
                         auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
                         llvm::Value* len = builder_.CreateCall(lenFn, {recv});
                         auto* idxSlot = entryAlloca(i64());
-                        auto* accSlot = entryAlloca(elemTy);
+                        auto* accSlot = entryAlloca(accTy);
                         builder_.CreateStore(builder_.getInt64(0), idxSlot);
                         std::vector<llvm::Value*> zargs;
                         llvm::Value* zero =
@@ -5736,7 +5769,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         llvm::Value* ep = builder_.CreateCall(
                             ptrFn, {recv, idx, builder_.getInt64(esz)});
                         llvm::Value* el = builder_.CreateLoad(elemTy, ep);
-                        llvm::Value* acc = builder_.CreateLoad(elemTy, accSlot);
+                        if (closure) el = callClosure(closure, el, accTy);
+                        llvm::Value* acc = builder_.CreateLoad(accTy, accSlot);
                         std::vector<llvm::Value*> pargs{acc, el};
                         llvm::Value* next =
                             emitMethodCall(plusM, pargs, /*baseQualified=*/false);
@@ -5746,9 +5780,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                             builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
                         builder_.CreateBr(condBB);
                         builder_.SetInsertPoint(endBB);
+                        if (relCl && closure) emitClosureRelease(closure);
                         freeLazyTemp();
                         freeFreshInputTemp();
-                        return builder_.CreateLoad(elemTy, accSlot, "sum.r");
+                        return builder_.CreateLoad(accTy, accSlot, "sum.r");
                     }
                 }
             }
@@ -5761,15 +5796,6 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::StructType* decTy = decimalStructType();
             bool isDecimalSum = (elemTy == decTy);
             // If the selector returns decimal, also use the decimal path.
-            // fix #8730 (stdlib §5, spec §27.6, v0.359): the selector's result
-            // is read off a METHOD GROUP too (`a.Sum(Id)`): a bare method
-            // reference carries no Function TypeRef, so the pre-fix reads of
-            // `lamTy->funcReturn` below found nothing and the fold accumulated
-            // as `int` while sema typed the call at the method's result.
-            sema::TypeRef* selRetRef =
-                (!call.args.empty() && call.args[0].value)
-                    ? linqSelectorResultType(ctx_, call.args[0].value.get())
-                    : nullptr;
             if (!isDecimalSum && selRetRef &&
                 selRetRef->kind == sema::TypeRef::Kind::Primitive &&
                 selRetRef->primitive == sema::PrimitiveType::Decimal)
