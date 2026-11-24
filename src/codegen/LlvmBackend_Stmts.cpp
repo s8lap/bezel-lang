@@ -3075,14 +3075,33 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         // untouched. (Mirrors the string `+` operand discipline.)
                         else if (isPlusOneStringProducer(as->value.get()))
                             emitStringRelease(rhs);
-                        bool isLocal = localSlot(*as->target) &&
+                        llvm::AllocaInst* tgtSlot = localSlot(*as->target);
+                        bool isLocal = tgtSlot &&
                                        elemTy->isPointerTy() &&
                                        !tgtTy->nullable &&
                                        currentFn_ == stringReleaseEligibleFn_;
+                        // fix #9005 / §27.5 / §28.9 (v0.359): the §4.6
+                        // compound-assignment twin of lowerStringLocalReassign's
+                        // drop-on-overwrite release. The displaced value of a
+                        // CAPTURE CELL may not be released unless the CELL owns
+                        // a reference to it: a captured PARAMETER's cell owns
+                        // NOTHING once the per-capture retain of #2689 is
+                        // suppressed (the #2706 mutated-shared-cell rule) — the
+                        // value in it is still the CALLER's (§28.1), and
+                        // releasing it dropped the caller's string, which the
+                        // caller's own scope-end release then freed a second
+                        // time (issue #9005). The capture side records that fact
+                        // per cell holder (unownedCellContentSlots_); where it
+                        // holds, the release is skipped and the cell's final
+                        // value leaks instead (the #2706 / #2718 trade).
+                        bool cellContentUnowned =
+                            tgtSlot &&
+                            unownedCellContentSlots_.count(
+                                static_cast<const void*>(tgtSlot));
                         bool isField = isStringFieldLvalue(*as->target);
                         invEntry4682();  // §22.16 setter ENTRY (#4682)
                         builder_.CreateStore(res, addr);
-                        if (isLocal || isField)
+                        if ((isLocal && !cellContentUnowned) || isField)
                             emitStringRelease(curS);  // release the old value
                         if (llvm::AllocaInst* ns = localSlot(*as->target))
                             syncCellToOrigSlot(ns, res);
