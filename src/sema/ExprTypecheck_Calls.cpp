@@ -1248,22 +1248,57 @@ TypeRef* ExprTC::linqSelectorResultOf(const ast::CallExpr& ce) {
     return methodReturnResolvedType(*ms, ctx_);
 }
 
-// fix #8688 (stdlib §5, spec §3.6 rule 2 / §5.1 / §14.2, v0.357) and fix #8730
-// (v0.359): see the declaration in ExprTypecheck_impl.hpp.
+// fix #8690 (stdlib §5 / §2.19, spec §14.2 *Interface conformance* rules 1 and
+// 2, v0.359): does the declared type `e` conform to the builtin SELF-bounded
+// interface `ifaceSym` (`INumber<Self>`), at its OWN type arguments? ONE
+// verdict read by the no-selector §5.1 gate and by the selector §5 gate. The
+// NAME question asks whether the base closure reaches the interface at all
+// (matched by IDENTITY against the builtin symbol, so a user interface named
+// `INumber` is a different type, §2.8.3 rule 3); the INSTANTIATION question
+// asks whether the closure reaches `ifaceSym<e>` by `typeRefEqual` (§14.2's
+// exact, invariant identity). An EMPTY instantiation list (a closure the walk
+// cannot compose, e.g. an imported type with no parallel `baseTypeRefs`) keeps
+// the NAME answer.
+bool ExprTC::linqConformsToSelfInterface(const TypeRef* e,
+                                         TypeSymbol* ifaceSym) {
+    if (!e || e->nullable || e->kind != TypeRef::Kind::Named ||
+        !e->declaration || !ifaceSym)
+        return false;
+    if (!inheritsBuiltinInterface(e->declaration, ifaceSym->name))
+        return false;
+    std::vector<TypeRef*> impls;
+    collectAncestorInstantiationsOf(e, ifaceSym, impls);
+    if (impls.empty()) return true;  // unknown: keep
+    for (TypeRef* impl : impls) {
+        if (!impl || impl->genericArgs.size() != 1) continue;
+        const TypeRef* ga = impl->genericArgs[0];
+        if (ga && typeRefEqual(ga, e)) return true;
+    }
+    return false;
+}
+
+// fix #8688 (stdlib §5, spec §3.6 rule 2 / §5.1 / §14.2, v0.357) and fix #8690
+// / #8730 (v0.359): see the declaration in ExprTypecheck_impl.hpp.
 // stdlib §5 declares the selector form
 //     public method Sum<U>(selector: (T) -> U): owned U where U: INumber<U>;
 // so the call's type is the selector's return type `U` -- for a lambda AND for
-// a method-group selector (`linqSelectorResultOf`). This reads `U` for the
-// shapes every receiver arm can key: a bare
+// a method-group selector (`linqSelectorResultOf`) -- PROVIDED `U` satisfies
+// the bound. This reads `U` for the shapes every receiver arm can key: a bare
 // type parameter in scope (`a.Sum(lambda(x) => x)` in
 // `H<T>(a: Array<T>) where T: INumber<T>` is `T`, and spec §3.6 rule 2 then
 // confines it to `Object` and its bounds), a non-nullable numeric primitive
 // the selector returns EXACTLY (`int`, `long`, `uint`, `ulong`, `float`,
-// `double`, `decimal`). Any other shape returns null and the caller keeps its
-// own handling.
+// `double`, `decimal`). A `U` that PROVABLY fails the bound is refused here
+// (`linqSelectorUnsatisfied`) and the call is typed as the caller's recovery
+// type; any other shape returns null and the caller keeps its own handling.
 TypeRef* ExprTC::linqSelectorSumResult(const ast::CallExpr& ce) {
     TypeRef* u = linqSelectorResultOf(ce);
     if (!u) return nullptr;
+    if (linqSelectorUnsatisfied(ce, u, "Sum")) {
+        // Recovery: a type parameter keeps its own type so a generic body's
+        // `return` does not add a second, cascading diagnostic.
+        return linqElemIsInScopeTypeParam(u) ? u : nullptr;
+    }
     if (linqElemIsInScopeTypeParam(u)) return u;
     if (u->kind == TypeRef::Kind::Primitive && !u->nullable) {
         using P = PrimitiveType;
@@ -1276,6 +1311,78 @@ TypeRef* ExprTC::linqSelectorSumResult(const ast::CallExpr& ce) {
         }
     }
     return nullptr;
+}
+
+// fix #8690 (stdlib §5, spec §3.6 rule 2 / §14.2 *Interface conformance*,
+// v0.359): the selector aggregates' bound on the selector's RESULT type.
+//     Sum<U>(selector: (T) -> U): owned U where U: INumber<U>
+//     Average(selector: (T) -> int | long | uint | ulong | float | double |
+//                              decimal)
+// Is the selector result `u` PROVABLY outside the signature? `true` means a
+// diagnostic was reported (once per call) and the caller types the call as it
+// would a refused one. `false` means "satisfied OR not decidable here": the
+// sound direction, the call is KEPT. The refused shapes:
+//   * a type parameter IN SCOPE whose declared constraints do not guarantee
+//     `INumber<U>` (an UNCONSTRAINED one, or `where T: notnull`) -- spec §3.6
+//     rule 2: the body type-checks under the weakest assumption its
+//     constraints establish. `Sum` only; `Average` has no generic overload, so
+//     a type-parameter selector result is no overload at all;
+//   * a NULLABLE result (`int?`): "a nullable `T?` does not satisfy
+//     `T: INumber<T>`" (#4730), and no `Average` overload takes one;
+//   * a Named declared type that does not list `INumber<Self>` (`Sum`), or any
+//     Named declared type (`Average`); a CLASS / INTERFACE that does list it
+//     is refused as the #8339 element twin is: the fold lowers primitives and
+//     value-type records only;
+//   * a `bool` / `string` / `Object` result, which widens to no numeric type.
+bool ExprTC::linqSelectorUnsatisfied(const ast::CallExpr& ce, const TypeRef* u,
+                                     std::string_view m) {
+    if (!u) return false;
+    const bool isSum = m == "Sum";
+    std::string why;
+    auto spell = [&]() -> std::string {
+        if (linqElemIsInScopeTypeParam(u)) return std::string(u->headName());
+        return spellTypeRefForDiag(u);
+    };
+    if (u->nullable) {
+        why = "`" + spell() + "` is nullable";
+    } else if (linqElemIsInScopeTypeParam(u)) {
+        if (!isSum)
+            why = "`" + spell() + "` is a type parameter";
+        else if (linqElemIsUnconstrainedTypeParam(u) ||
+                 linqElemTypeParamClauseUnsatisfied(u, "where T: INumber<T>"))
+            why = "the type parameter `" + spell() +
+                  "` does not guarantee `INumber<" + spell() + ">`";
+    } else if (u->kind == TypeRef::Kind::Primitive) {
+        using P = PrimitiveType;
+        if (u->primitive == P::Bool || u->primitive == P::String ||
+            u->primitive == P::Object)
+            why = "`" + spell() + "` is not a numeric type";
+    } else if (u->kind == TypeRef::Kind::Named && u->declaration) {
+        const bool conforms =
+            isSum && linqConformsToSelfInterface(
+                         u, ctx_.builtinInterfaceSym("INumber"));
+        if (!conforms)
+            why = "`" + spell() + "` does not conform to `INumber<" +
+                  spell() + ">`";
+        else if (u->declaration->kind != ast::TypeDeclKind::Record)
+            why = "`" + spell() +
+                  "` conforms to `INumber`, but the fold has no lowering for "
+                  "a CLASS or INTERFACE result (stdlib §2.19, spec §11.8)";
+    }
+    if (why.empty()) return false;
+    if (!linqSelectorGateReported_.insert(&ce).second) return true;
+    std::string msg;
+    if (isSum)
+        msg = "Sum(selector) requires the selector's result type to satisfy "
+              "`U: INumber<U>` (stdlib §5 / spec §2.19 / §14.2 / #8690); " +
+              why + ".";
+    else
+        msg = "no overload of Average(selector) applies (stdlib §5 / spec "
+              "§22.6 / §14.2 / #8690): the selector result must be one of "
+              "int, long, uint, ulong, float, double or decimal; " +
+              why + ".";
+    ctx_.diagnostics().report(Severity::Error, ce.span.begin, msg);
+    return true;
 }
 
 // fix-forward #8181: may the CURRENT method's type parameter `n` carry a
@@ -15558,10 +15665,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             srcElem &&
                             srcElem->kind == TypeRef::Kind::Primitive &&
                             srcElem->primitive == P::Decimal;
-                        // fix #8730 (stdlib §5, spec §27.6, v0.359): the selector's
-                        // result is read off a lambda OR a method group.
+                        // fix #8730 / #8690 (stdlib §5, v0.359): the selector's
+                        // result is read off a lambda OR a method group, and a
+                        // result outside the seven `Average` overloads is
+                        // refused.
                         if (!ce.args.empty() && ce.args[0].value)
                             if (auto* selU = linqSelectorResultOf(ce)) {
+                                linqSelectorUnsatisfied(ce, selU, "Average");
                                 if (!elemIsDecimal &&
                                     selU->kind == TypeRef::Kind::Primitive &&
                                     selU->primitive == P::Decimal)
@@ -16141,8 +16251,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(
                             &ce, sumTy ? sumTy : ctx_.primitiveTypeRef(P::Int));
                     }
-                    else if (m == "Average")
+                    else if (m == "Average") {
+                        // fix #8690 (stdlib §5, v0.359): see the concrete arm.
+                        if (auto* selU = linqSelectorResultOf(ce))
+                            linqSelectorUnsatisfied(ce, selU, "Average");
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
+                    }
                     // issue #995 / stdlib §5: a DEFERRED LINQ operator
                     // (Where/Select/Take/Skip/Distinct/OrderBy/Concat/…) on a
                     // vtable-backed `IEnumerable<T>` receiver (interface-typed
@@ -16233,8 +16347,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(
                             &ce, uTy ? uTy : ctx_.primitiveTypeRef(P::Int));
                     }
-                    else if (m == "Average")
+                    else if (m == "Average") {
+                        // fix #8690 (stdlib §5, v0.359): see the concrete arm.
+                        if (auto* selU = linqSelectorResultOf(ce))
+                            linqSelectorUnsatisfied(ce, selU, "Average");
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
+                    }
                     else typeLinqOperator(charTy);
                 }
                 // stdlib §3.2: a method call on an `Encoding` receiver
@@ -17065,31 +17183,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             auto elemConformsToSelfInterface =
                                 [&](const TypeRef* e,
                                     TypeSymbol* ifaceSym) -> bool {
-                                if (!e || e->nullable ||
-                                    e->kind != TypeRef::Kind::Named ||
-                                    !e->declaration || !ifaceSym)
-                                    return false;
-                                // The NAME question: does the element's base
-                                // closure reach the interface at all (§14.2
-                                // rules 1 and 2)?
-                                if (!inheritsBuiltinInterface(e->declaration,
-                                                               ifaceSym->name))
-                                    return false;
-                                // The INSTANTIATION question: at `e`'s OWN type
-                                // arguments, does the closure reach
-                                // `ifaceSym<e>`?
-                                std::vector<TypeRef*> impls;
-                                collectAncestorInstantiationsOf(e, ifaceSym,
-                                                               impls);
-                                if (impls.empty()) return true;  // unknown: keep
-                                for (TypeRef* impl : impls) {
-                                    if (!impl ||
-                                        impl->genericArgs.size() != 1)
-                                        continue;
-                                    const TypeRef* ga = impl->genericArgs[0];
-                                    if (ga && typeRefEqual(ga, e)) return true;
-                                }
-                                return false;
+                                return linqConformsToSelfInterface(e, ifaceSym);
                             };
                             // stdlib §5.1 (#1194): no-selector Min()/Max() returns
                             // the element type T (`public method Max(): T`). For a
@@ -17540,10 +17634,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // fix #8730 (stdlib §5, spec §27.6, v0.359):
                                 // the selector's result is read off a METHOD
                                 // GROUP too (`a.Sum(Id)`), not only a lambda.
+                                // A refused `U` (#8690) skips the
+                                // classification; the helper below reports it.
                                 if (TypeRef* selRet = linqSelectorResultOf(ce))
                                     if (selRet->kind ==
                                             TypeRef::Kind::Primitive &&
-                                        !selRet->nullable) {
+                                        !selRet->nullable &&
+                                        !linqSelectorUnsatisfied(ce, selRet,
+                                                                 "Sum")) {
                                         P rp = selRet->primitive;
                                         static constexpr P sumCands[] = {
                                             P::Int,   P::Long,  P::UInt,
@@ -17962,11 +18060,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 recvTy->genericArgs[0]->kind ==
                                     TypeRef::Kind::Primitive &&
                                 recvTy->genericArgs[0]->primitive == P::Decimal;
-                            // fix #8730 (stdlib §5, spec §27.6, v0.359):
-                            // the selector's result is read off a lambda OR a
-                            // method group.
+                            // fix #8730 / #8690 (stdlib §5, v0.359): the
+                            // selector's result is read off a lambda OR a
+                            // method group, and a result outside the seven
+                            // `Average` overloads is refused.
                             if (!ce.args.empty() && ce.args[0].value)
                                 if (auto* selU = linqSelectorResultOf(ce)) {
+                                    linqSelectorUnsatisfied(ce, selU, "Average");
                                     if (!elemIsDecimal &&
                                         selU->kind == TypeRef::Kind::Primitive &&
                                         selU->primitive == P::Decimal)

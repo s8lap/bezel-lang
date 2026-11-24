@@ -773,9 +773,17 @@ private:
     // typeCall so they cannot drift. Defined beside
     // `linqElemIsInScopeTypeParam`.
     TypeRef* linqSelectorSumResult(const ast::CallExpr& ce);
-    // fix #8730 (stdlib §5, spec §27.6, v0.359): the selector's RESULT type
-    // `U` (lambda or method group). Defined beside `linqSelectorSumResult`.
+    // fix #8730 / #8690 (stdlib §5, spec §14.2 / §27.6, v0.359): the
+    // selector's RESULT type `U` (lambda or method group), the shared
+    // conformance verdict for a SELF-bounded builtin interface (`INumber`),
+    // and the diagnostic gate for a `U` that PROVABLY fails the selector
+    // aggregates' bound (`true` = reported, once per call). Defined beside
+    // `linqSelectorSumResult`.
     TypeRef* linqSelectorResultOf(const ast::CallExpr& ce);
+    bool linqConformsToSelfInterface(const TypeRef* e, TypeSymbol* ifaceSym);
+    bool linqSelectorUnsatisfied(const ast::CallExpr& ce, const TypeRef* u,
+                                 std::string_view m);
+    std::unordered_set<const ast::CallExpr*> linqSelectorGateReported_;
     // fix #8198 (spec §14.2 *A type parameter as the type argument* /
     // *Interface conformance* rule 6, §26.5.1, v0.355): is the §5 block's
     // `where` clause PROVABLY unsatisfied at the element type `elem` — a type
