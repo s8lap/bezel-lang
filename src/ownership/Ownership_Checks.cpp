@@ -6651,8 +6651,16 @@ const ast::LambdaExpr* MethodOwnership::lambdaOwnerOfParameter(
 // twin's OWN — `reportCapturedOwnedConsume` with the verb "transfer" — so the
 // two arms cannot drift apart in wording. Returns true when it reported.
 //
-// SCOPE: the OWNED LOCAL half of §28.3's rule. The `owned` PARAMETER half of
-// the marked-transfer form is a separate defect, filed as #8975.
+// fix #8975 (§28.3 *Captured owned bindings*, v0.359): the `owned` PARAMETER
+// half of the same rule. §28.3 names it beside the owned local — "an owned
+// local or `owned` parameter of the enclosing body" — and the method twin
+// (`move p`, `p` an `owned` parameter of the METHOD) is rejected with this
+// same text. A lambda's parameter has no binding statement (so
+// `lambdaBodyLocalHoldsBorrow` finds no history) and its `ParameterSymbol`
+// carries no declaration location, so the owner is resolved through
+// `lambdaOwnerOfParameter` (`ctx_.lambdaParams`, #8926's route) and the
+// binding is OWNED iff the parameter's own modifier says so, exactly as
+// `reportEnclosingLambdaOwnedThrow` classifies it.
 //
 // per §28.3, §28.8.1, v0.359
 bool MethodOwnership::reportEnclosingLambdaOwnedTransfer(sema::Symbol* sym,
@@ -6661,16 +6669,27 @@ bool MethodOwnership::reportEnclosingLambdaOwnedTransfer(sema::Symbol* sym,
     if (closureScanStack_.size() < 2) return false;
     if (!sym) return false;
     if (name == "this" || name == "base") return false;
-    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
-    if (!ls || isCatchBorrow(sym)) return false;
-    const ast::LambdaExpr* owner = lambdaOwnerOfDeclaringLambda(sym);
-    // Not declared by any enclosing lambda (the method-body case: #7920's own
-    // arm, already reported above), or declared by the transferring lambda
-    // itself (its own local: admitted — a closure may consume what it owns).
-    if (!owner || owner == closureScanStack_.back()) return false;
-    if (!lambdaBodyLocalHoldsBorrow(ls, *owner, loc.offset,
-                                    OwnershipState::Owned))
-        return false;
+    if (isCatchBorrow(sym)) return false;
+    const ast::LambdaExpr* owner = nullptr;
+    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+        // fix #8975: an `owned` parameter of an ENCLOSING lambda.
+        owner = lambdaOwnerOfParameter(ps);
+        if (!owner || owner == closureScanStack_.back()) return false;
+        if (ps->modifier != "owned" && ps->modifier != "out owned")
+            return false;
+    } else {
+        auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+        if (!ls) return false;
+        owner = lambdaOwnerOfDeclaringLambda(sym);
+        // Not declared by any enclosing lambda (the method-body case: #7920's
+        // own arm, already reported above), or declared by the transferring
+        // lambda itself (its own local: admitted — a closure may consume what
+        // it owns).
+        if (!owner || owner == closureScanStack_.back()) return false;
+        if (!lambdaBodyLocalHoldsBorrow(ls, *owner, loc.offset,
+                                        OwnershipState::Owned))
+            return false;
+    }
     reportCapturedOwnedConsume(name, loc, "transfer");
     return true;
 }
