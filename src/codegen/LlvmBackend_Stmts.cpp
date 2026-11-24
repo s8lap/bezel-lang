@@ -5174,6 +5174,106 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             }
             return diverged_;
         }
+        // fix #8959 / §21.9 / §28.3.11 / §17.13 / §35.4 (v0.359): a BARE
+        // expression statement whose call returns an OWNING-classified CHOICE
+        // (`h.Make();`, `h.Pass(move s);`, `OChoice.Text(new Res());`) left the
+        // choice's active case's `owned` payloads owned by NOTHING — every
+        // iteration leaked the payload.
+        //
+        // §28.3.11 (v0.359): "An owned value may also be produced as an
+        // **unbound temporary**: the result of an `owned`-returning call (or
+        // other owned producer) that is not bound to any name, not `move`d, and
+        // not returned … Such a temporary is disposed at the **end of the full
+        // expression** in which it is produced" — and §21.9 fixes that
+        // boundary for an expression statement ("in an expression statement,
+        // 'end of the full expression' and 'end of the statement' coincide").
+        // The bare expression statement is ADMITTED (with §21.9's unused-result
+        // warning), so its temporary must still be disposed; §17.13 says the
+        // same of the discard spelling, which is why the `_ := …;` form has
+        // disposed the shape since #7861 while the bare form did not.
+        //
+        // WHY A NEW ARM, AND WHY IT CANNOT BE #2655's `disposeOwnedValue`:
+        // that flag is set by SEMA inside §21.9's own walk
+        // (src/sema/ExprTypecheck.cpp) and only for a NAMED, non-nullable,
+        // non-value-builtin CLASS whose type is TRIVIAL-dispose (§28.9). An
+        // owning CHOICE is none of those: §35.4 classifies it by STRUCTURE (a
+        // payload marked `owned`), and §35.3 says a method returning an owning
+        // choice writes the PLAIN type — "`owned` on the return is
+        // admitted-but-redundant per §28.1's move-only clause" — so §21.9's
+        // `ownedProduced` marker (`calleeReturnsOwned`) is not even set for it.
+        // The class arm above therefore cannot see the shape, and it fell
+        // through to the final arm of this block, which reclaims a COLLECTION
+        // temporary and is a no-op here.
+        //
+        // THE GATE IS THE BACKEND'S OWN OWNING-CHOICE AUTHORITY.
+        // `unboundOwningChoiceTemp` (LlvmBackend_Disposal.cpp) is the same gate
+        // the `_ := expr;` DiscardStmt arm reads (#7861) and the §35.5
+        // scrutinee temporary reads, so the owning-choice disposal sites cannot
+        // drift apart. It admits a CALL whose result type is an
+        // owning-classified CHOICE — which covers the issue's `h.Make();` and
+        // `h.Pass(move s);`, the `h?.Make();` spelling (a `?.` call parses as a
+        // `CallExpr` over a `NullCondMemberExpr` callee, so the gate admits it,
+        // and the nullable `C?` result is unwrapped by the disposal itself),
+        // and §35.3's case construction `OChoice.Text(new Res());` (also a
+        // `CallExpr`, and §35.3 calls "a construction not bound to any name …
+        // an unbound owned temporary"). It EXCLUDES a named local, a field /
+        // property / indexer read, and every borrow — none of which is an
+        // unbound temporary.
+        //
+        // THE DISPOSAL IS §35.4's ACTIVE-CASE disposal: the `owningChoice` arm
+        // of `emitDisposals` walks the value's tag and disposes the active
+        // case's owned payloads in payload declaration order ("Disposal is
+        // defined by the active case"), the same disposal the scope-end pass
+        // runs for an owning-choice local and the same one the DiscardStmt arm
+        // runs. The choice is a VALUE (a struct), so it is spilled to an entry
+        // alloca first — the shape the §35.5 scrutinee temporary uses.
+        //
+        // THE ONE-ENTRY SCOPE IS OPENED AFTER THE LOWER, for #3293's reason
+        // (opening it first would RE-HOME every disposal the expression's own
+        // lowering pushes onto `disposeStack_.back()` — the `out owned var`
+        // constructor-recipient case — into this STATEMENT scope).
+        //
+        // NOT A DOUBLE FREE: the disposed value is a FRESH production (a call's
+        // result), so nothing else owns its payloads — the same argument the
+        // DiscardStmt arm makes. The named-binding shape (`_ := o;` over an
+        // owning-choice local) is the `discardOutOwnedVar` arm, a different
+        // operand shape, and never reaches here.
+        //
+        // MEASURED on this fix's base (r43-f45-toolchain @ 0efd9b0ca), 200
+        // iterations under LeakSanitizer:
+        //   `h.Make();`               → "3200 byte(s) leaked in 200
+        //                              allocation(s)", and `Res.N` printed 0
+        //                              (the destructor never ran);
+        //   `h.Pass(move s);`         → the same;
+        //   `h?.Make();`              → "2128 byte(s) leaked in 133
+        //                              allocation(s)" (the 133 non-null
+        //                              iterations of the 200);
+        //   `OChoice.Text(new Res());` → "3200 byte(s) leaked in 200
+        //                              allocation(s)".
+        // The `_ := h.Make();` discard spelling was ALREADY clean (the
+        // DiscardStmt arm below), which is the asymmetry that identifies the
+        // defect: the reclaim fires when the temporary is CONSUMED and not
+        // when it is discarded entirely.
+        // per §21.9, §28.3.11, §17.13, §35.3, §35.4
+        if (es->expr && unboundOwningChoiceTemp(es->expr.get(),
+                                                 ctx_.exprType(*es->expr))) {
+            const sema::TypeRef* rt =
+                resolveTypeParamRef(ctx_.exprType(*es->expr));
+            llvm::Value* v = lowerExpr(*es->expr);
+            if (!diverged_ && v && rt && !v->getType()->isPointerTy()) {
+                disposeStack_.emplace_back();
+                llvm::AllocaInst* slot = entryAlloca(v->getType());
+                builder_.CreateStore(v, slot);
+                Disposal d{slot, nullptr};
+                d.owningChoice = true;
+                d.owningChoiceTy = rt->declaration;
+                d.owningChoiceRef = rt;
+                disposeStack_.back().push_back(d);
+                emitDisposals(disposeStack_.back());
+                disposeStack_.pop_back();
+            }
+            return diverged_;
+        }
         // fix #2728 / §32.6 + §28.3 + §21.9 (v0.240): a BARE FFI-buffer factory
         // statement — `CString.From(s);` on a line of its own — mints a malloc'd
         // buffer the Bezel side owns (§32.6: "The `CString` class is for
