@@ -7468,10 +7468,31 @@ void Emitter::redirectSlotToCellHolder(llvm::AllocaInst* slot,
             if (li->getPointerOperand() != slot) continue;
             builder_.SetInsertPoint(li);
             llvm::Value* addr = cellHolderAddress(holder, slot);
-            llvm::Value* redirected = builder_.CreateLoad(
-                li->getType(), addr, "cell.redirect");
-            li->replaceAllUsesWith(redirected);
-            li->eraseFromParent();
+            // fix #9099 (§27.5 / §28.3, v0.359): REPOINT the load in place
+            // instead of erasing it and RAUW-ing a replacement in.
+            //
+            // The erased form invalidated the load's `llvm::Value*` for
+            // every holder that was NOT an LLVM operand edge — a C++
+            // `std::vector<llvm::Value*>` of call arguments, for one. The
+            // index-expression receiver is exactly such a holder:
+            // `lowerIndexerGet` pushes the receiver into `callArgs` BEFORE it
+            // lowers the index arguments, and lowering a LAMBDA index argument
+            // captures the receiver, which boxes it and runs this redirect. The
+            // erased load's address was then handed back to LLVM's slab
+            // allocator, and the NEXT load instruction created (the scope-exit
+            // disposal path's) took that address — so the call was built on a
+            // value living in a block that does not dominate the call, and the
+            // module failed the verifier with "Instruction does not dominate
+            // all uses!" (MEASURED on r30-c1 @ ff0cc3c53: `bezelc` on
+            // `fl[lambda() => fl.Get()]` inside a loop aborts with exactly that
+            // message, naming the disposal path's load and the indexer's call).
+            //
+            // The two forms are the same instruction — a load of the same type
+            // from the same address, in the same place — so this changes no
+            // behaviour; it only stops the load's IDENTITY from being
+            // destroyed. The STORE and GEP arms below already mutate their
+            // instruction in place; this arm now does the same.
+            li->setOperand(0, addr);
         } else if (auto* si = llvm::dyn_cast<llvm::StoreInst>(u)) {
             if (si->getPointerOperand() != slot) continue;
             builder_.SetInsertPoint(si);
