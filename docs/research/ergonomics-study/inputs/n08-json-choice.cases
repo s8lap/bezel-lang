@@ -1,0 +1,9 @@
+# n08-json-choice: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case ]
+stdout:
+| {"Title":"demo","Shapes":[{"Kind":"Circle","A":1.5,"B":0},{"Kind":"Rect","A":2,"B":3},{"Kind":"Circle","A":0.5,"B":0}]}
+| Circle 1.5
+| Rect 2x3
+| Circle 0.5
+| count 3

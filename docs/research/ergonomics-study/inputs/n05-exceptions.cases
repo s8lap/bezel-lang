@@ -1,0 +1,9 @@
+# n05-exceptions: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case ]
+stdout:
+| a = 1
+| b -> (absent)
+| get b: not found: b
+| get c: corrupt record c
+|   caused by System.FormatException

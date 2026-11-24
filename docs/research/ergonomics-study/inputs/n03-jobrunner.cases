@@ -1,0 +1,8 @@
+# n03-jobrunner: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case ]
+stdout:
+| ok: 1
+| flaky: transient: upstream 503
+| buggy: BUG InvalidOperationException: bad state
+| runner stopped: cancelled

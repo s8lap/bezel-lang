@@ -1,0 +1,9 @@
+# t15-sets: the spec-correct behaviour, from the task statement (tasks/t15-sets.md).
+# r40 recorded a DisposedAccessException here (B11); r42 prints this.
+
+[case ]
+stdout:
+| union: api,auth,cache,db,queue,web
+| both: api,db
+| onlyA: cache,web
+| subset: True

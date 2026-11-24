@@ -1,0 +1,12 @@
+# t34-statemachine: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| Idle -> HasCoin(50)
+| insufficient: 50 < 75
+| HasCoin(50) -> HasCoin(50)
+| HasCoin(50) -> HasCoin(100)
+| HasCoin(100) -> Vending(25)
+| vend, change 25
+| nothing to refund
+| Idle -> Idle

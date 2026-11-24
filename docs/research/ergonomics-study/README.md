@@ -308,3 +308,20 @@ Of the 96 rows, 10 are documented there fully or in part; the column `in_codegen
 - **Some workarounds hide a second bug.** I sometimes switched to a typed lambda before checking whether the untyped form failed for the same reason. The B3, B4 and B7 boundaries, which I tested with both forms, are stated in the repros.
 - **Performance was not measured.** t33's concurrency check is a timing threshold.
 - **No issues were filed** (study constraint).
+
+## Re-running the study
+
+`run.sh BEZELC [--drafts] [--only PATTERN] [--keep] [--timeout SECONDS]` re-runs both rounds against any compiler (bash and python3 only; `run.py` does the work).
+
+- **What it runs.** Every `final.bzl` of `programs/` and `r42/programs/` (and every `v*.bzl` with `--drafts`), then every `repros/*.bzl`. `--only` is a regex over item names such as `t04-grep/final`, `n22-todo/v2`, `B05` or `NB1[12]`.
+- **How.** `bezelc --checked-disposal [flags] -o <exe> <file>`, then the run, with a 20 s timeout per program run. Each program gets its own scratch directory: the runner copies the source and points the hardcoded `/var/tmp/bezel-scratch/` prefix at it, so the files t21, t22, t23, n02 and n22 create stay there. The work goes to `${TMPDIR:-/var/tmp}/bezel-ergo-run/<run>/` (`/var/tmp` when `TMPDIR` is `/tmp`; never inside the repository). Binaries are deleted unless `--keep`; `report.tsv` and per-item logs stay.
+- **Task expectations** are `inputs/<task>.cases`: compile flags, then one `[case]` per invocation with arguments, stdin, stdout, stderr (checked only where given) and exit code. They come from the recorded final runs (`data/final-outputs.txt`, `r42/data/new-final-outputs.txt`), split into stdout and stderr. t15 and t40 use the task statement instead: r40's recorded t15 output is the B11 fault, and t40's final does only the atomic half. n22's cases run in order and share one todo file. A draft is checked against its task's cases.
+- **Repro expectations** are the `//` header of each `repros/<id>.bzl`. The code below the header is the repro block of `data/compiler-bugs.md` or `r42/data/new-compiler-bugs.md`, verbatim. B11, B15 and B18 are the study programs those entries name. A bug with two repro blocks has a second file (`B04b`, `B05b`). NB14 has no repro block and is skipped. Each header gives the **spec-correct** result, so PASS means the bug is fixed:
+  - `expect: run`: it compiles and the stdout matches the `stdout:` lines (`stdout-re:` is a full-line regex, for unspecified sort tie order and renderings);
+  - `expect: quiet`: the same, and the compile prints no warning;
+  - `expect: reject`: the compile fails and prints every `diagnostic:` substring;
+  - `order: any`: the lines compare as a multiset, for scheduling-dependent output (NB10–NB12).
+  - B8 and B17 state the study's reading of contested spec questions (#6698, #7170/#7215).
+  - Diagnostic line numbers include the header lines.
+- **The table.** Each row shows an item, a kind (final, draft or repro), a result and a reason. The results are PASS, FAIL (wrong output, exit code or warning, or accepted where a rejection is required), REJECTED (a compile error where the program should build), TIMEOUT and CRASH (a signal, an unhandled exception or a runtime fatal). The `r42` column is the recorded r42 verdict (`r42/data/recheck-tasks.tsv`, or the disposition in `r42/data/recheck-bugs.tsv`), for comparison. Totals follow. The exit status is 0 whatever the results, and 2 for a usage error or a missing compiler.
+- **Baselines.** A full run takes about 70 s, and about 105 s with `--drafts`. On r42 it gives finals 39/40 and 23/23, with t40 failing. 24 of the 42 repros PASS: every B entry except the contested B8 and B17, and no NB entry; NB11 and NB12 report TIMEOUT. On r40 it gives finals 38/40 (t15 CRASH, t40 FAIL) and 1 repro PASS (NB13, which r40 does not have). The four t25 drafts recorded as wrong report CRASH, because they die on an unhandled `SerializationException`.

@@ -1,0 +1,17 @@
+# n23-stats: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case -p 1]
+args: -p 1
+stdin:
+| 4
+| 8
+|
+| abc
+| 15
+| 16
+| 23
+| 42
+stdout:
+| n=6 min=4.0 max=42.0 mean=18.0 median=15.5
+stderr:
+| stats: line 4: not a number: abc

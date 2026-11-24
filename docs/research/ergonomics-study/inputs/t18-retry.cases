@@ -1,0 +1,9 @@
+# t18-retry: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| attempt 1 failed: transient
+| attempt 2 failed: transient
+| result 42
+| attempt 1 failed: transient
+| gave up: transient

@@ -1,0 +1,11 @@
+# t37-table: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| name       qty   price     total   share
+| ----------------------------------------
+| widget       3    2.50      7.50    6.3%
+| gadget      10    1.25     12.50   10.4%
+| gizmo        1   99.99     99.99   83.3%
+| ----------------------------------------
+| TOTAL                     119.99

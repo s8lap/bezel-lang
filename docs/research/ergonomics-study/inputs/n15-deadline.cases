@@ -1,0 +1,6 @@
+# n15-deadline: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case ]
+stdout:
+| finished: 1 2 3
+| cancelled: 4 5

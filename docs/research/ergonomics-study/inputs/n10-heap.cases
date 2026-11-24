@@ -1,0 +1,7 @@
+# n10-heap: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case ]
+stdout:
+| 1 2 3 5 8 9
+| q z a b
+| empty

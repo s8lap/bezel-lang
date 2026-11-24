@@ -1,0 +1,8 @@
+# t03-csv: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| rows: 5
+| Eng: 215000
+| Ops: 165000
+| Sales: 70000

@@ -1,0 +1,7 @@
+# n06-json-order: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case ]
+stdout:
+| {"Id":7,"Customer":{"Name":"Ann","Email":"ann@x.io"},"Lines":[{"Sku":"A1","Qty":2,"Price":1.5},{"Sku":"B2","Qty":1,"Price":4}]}
+| lines 2 total 7
+| roundtrip equal: True

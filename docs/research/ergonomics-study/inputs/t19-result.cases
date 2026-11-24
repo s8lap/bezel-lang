@@ -1,0 +1,7 @@
+# t19-result: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| 8 -> 4
+| 7 -> error: 7 is odd
+| x -> error: not a number: x

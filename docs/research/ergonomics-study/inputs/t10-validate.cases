@@ -1,0 +1,7 @@
+# t10-validate: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| ok: ann@example.com
+| invalid: bob: email missing @; age out of range
+| invalid: @x: email malformed; password too short; password needs a digit

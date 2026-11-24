@@ -1,0 +1,9 @@
+# t08-shapes: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| Circle 3.14
+| Rect 6.00
+| Triangle 6.00
+| total 15.14
+| largest Rect

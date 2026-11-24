@@ -1,0 +1,9 @@
+# t09-weekday: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| Monday weekend=False next=Tuesday
+| Saturday weekend=True next=Sunday
+| Funday: not a weekday
+| Sunday next=Monday
+| weekend days: 2

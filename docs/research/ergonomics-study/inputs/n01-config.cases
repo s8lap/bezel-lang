@@ -1,0 +1,7 @@
+# n01-config: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case ]
+exit: 2
+stdout:
+| A: port=8080 workers=4
+| B: configuration: missing port

@@ -1,0 +1,8 @@
+# t16-inventory: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| bolt -1
+| nut -2
+| washer 4
+| negative: bolt, nut

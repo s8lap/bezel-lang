@@ -1,0 +1,5 @@
+# t25-json-read: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| items 2 total 6.5

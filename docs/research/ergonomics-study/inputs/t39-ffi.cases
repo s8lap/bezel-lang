@@ -1,0 +1,8 @@
+# t39-ffi: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| strlen 5
+| abs 7
+| pid ok
+| BEZEL

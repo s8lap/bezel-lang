@@ -1,0 +1,12 @@
+# n18-tree: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+flags: --report-trust-admissions
+
+[case ]
+stdout:
+| /usr/bin
+| /
+|   usr
+|     bin
+|     lib
+|   etc
+| leaves 3

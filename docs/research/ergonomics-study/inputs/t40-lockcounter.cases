@@ -1,0 +1,7 @@
+# t40-lockcounter: the spec-correct behaviour, from the task statement (tasks/t40-lockcounter.md).
+# The final expresses only the atomic half (Locked<T>, #1721), so it fails until the mutex half is written.
+
+[case ]
+stdout:
+| count 4000
+| atomic 4000

@@ -1,0 +1,10 @@
+# n12-repo: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+flags: --report-trust-admissions
+
+[case ]
+stdout:
+| find 2 -> bob
+| find 9 -> none
+| active: 1, 3
+| removed 1: True
+| count 2

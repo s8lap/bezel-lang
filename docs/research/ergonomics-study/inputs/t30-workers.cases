@@ -1,0 +1,6 @@
+# t30-workers: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| sum of squares 333833500
+| workers 4

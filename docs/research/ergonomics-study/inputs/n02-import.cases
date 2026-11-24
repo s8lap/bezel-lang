@@ -1,0 +1,9 @@
+# n02-import: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case ]
+stdout:
+| a.csv: 2 ok, 1 bad (line 2: bad qty 'x')
+| b.csv: 3 ok, 0 bad
+| c.csv: 0 ok, 1 bad (line 1: expected 3 fields)
+| missing.csv: not found
+| total 3 files, 5 orders, value 41.50

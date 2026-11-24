@@ -1,0 +1,8 @@
+# t06-logsummary: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| INFO 2
+| ERROR 2
+| WARN 1
+| first=10:02:30 last=10:15:45 span=00:13:15

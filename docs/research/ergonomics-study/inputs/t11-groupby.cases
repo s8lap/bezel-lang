@@ -1,0 +1,7 @@
+# t11-groupby: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| cho 1 30.00
+| ann 2 12.25
+| bob 2 10.00

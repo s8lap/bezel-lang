@@ -1,0 +1,10 @@
+# t35-calc: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| (+ 1 (* 2 3))
+| 1 + 2 * 3 -> 7
+| (1 + 2) * 3 -> 9
+| -4 + 10 / 3 -> -1
+| 2 * (3 +  -> error: unexpected end at 9
+| 8 / (4 - 4) -> error: division by zero

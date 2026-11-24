@@ -1,0 +1,5 @@
+# n19-template: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case ]
+stdout:
+| Hello ADA, you have 3 new {{?things}}. {{literal}}

@@ -1,0 +1,9 @@
+# t23-dirlist: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| a.log 10
+| b.txt 3
+| c.txt 0
+| txt files: 2
+| exists: False

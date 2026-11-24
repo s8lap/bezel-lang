@@ -1,0 +1,5 @@
+# n14-fanin: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case ]
+stdout:
+| received 15 items, sum 1665

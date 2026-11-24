@@ -1,0 +1,8 @@
+# t17-parsesum: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| line 2: bad number 'x'
+| line 4: missing '='
+| sum=0
+| good=3 bad=2

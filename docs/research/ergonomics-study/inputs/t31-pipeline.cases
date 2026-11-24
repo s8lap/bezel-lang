@@ -1,0 +1,8 @@
+# t31-pipeline: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| ALPHA
+| BETA
+| GAMMA
+| done 3

@@ -1,0 +1,9 @@
+# t14-histogram: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| 1 | ***
+| 2 | ***
+| 3 | **
+| 4 | *
+| 5 | *

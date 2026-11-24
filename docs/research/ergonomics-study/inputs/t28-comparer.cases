@@ -1,0 +1,10 @@
+# t28-comparer: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| Bergen 25 bob
+| Bergen 25 eve
+| Oslo 40 cho
+| Oslo 30 ann
+| Oslo 30 dee
+| oldest: cho

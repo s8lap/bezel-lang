@@ -1,0 +1,9 @@
+# n09-ttlcache: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+flags: --report-trust-admissions
+
+[case ]
+stdout:
+| get a@8 -> 1
+| get a@12 -> miss
+| get b@12 -> 2
+| live 1

@@ -1,0 +1,14 @@
+# t36-pool: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| open 1
+| conn 1: query
+| open 2
+| conn 1: a
+| conn 2: b
+| conn 2: will fail
+| caught boom
+| end of main
+| close 2
+| close 1

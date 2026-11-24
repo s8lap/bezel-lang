@@ -182,3 +182,4 @@ Most diagnostics named their fix: the §28.14 *declare `alarm` before `thermo`* 
 - `data/new-compiler-bugs.md`: NB1–NB17 with minimal repros and issue matches.
 - `data/new-final-outputs.txt`: the final run of every new program.
 - `tasks/n*.md`, `programs/n*/v*.bzl` and `final.bzl`.
+- To re-run both rounds and every repro against another compiler: `../run.sh BEZELC` (see *Re-running the study* in `../README.md`).

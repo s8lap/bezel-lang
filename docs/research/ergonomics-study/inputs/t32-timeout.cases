@@ -1,0 +1,6 @@
+# t32-timeout: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| timed out
+| fast result 2

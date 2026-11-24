@@ -1,0 +1,7 @@
+# n13-scope: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case ]
+stdout:
+| failed: upstream c
+| done: A B
+| done: A B C

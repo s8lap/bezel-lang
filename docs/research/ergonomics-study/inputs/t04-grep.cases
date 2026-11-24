@@ -1,0 +1,33 @@
+# t04-grep: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case -i beta]
+args: -i beta
+stdin:
+| alpha
+| Beta
+| gamma
+| betamax
+stdout:
+| 2:Beta
+| 4:betamax
+
+[case -v a]
+args: -v a
+exit: 1
+stdin:
+| alpha
+| Beta
+| gamma
+| betamax
+stdout:
+
+[case ]
+exit: 2
+stdin:
+| alpha
+| Beta
+| gamma
+| betamax
+stdout:
+stderr:
+| usage: grep [-i] [-v] PATTERN

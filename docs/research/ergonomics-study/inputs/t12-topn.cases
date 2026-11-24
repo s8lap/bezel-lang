@@ -1,0 +1,8 @@
+# t12-topn: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| 1. dan 90
+| 2. amy 70
+| 3. bob 70
+| avg 64.0

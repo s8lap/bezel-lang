@@ -1,0 +1,9 @@
+# n04-contracts: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+flags: --checked-contracts
+
+[case ]
+stdout:
+| balance 70
+| fee 0.30
+| bug: contract violated
+| balance 70

@@ -1,0 +1,10 @@
+# n11-comparers: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+flags: --report-trust-admissions
+
+[case ]
+stdout:
+| Bergen 25 bob
+| Bergen 25 eve
+| Oslo 40 cho
+| Oslo 30 ann
+| Oslo 30 dee

@@ -1,0 +1,42 @@
+# n22-todo: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+# The cases run in order and share one scratch directory (the todo file persists between them).
+
+[case add buy milk]
+args: add buy milk
+stdout:
+
+[case add write report]
+args: add write report
+stdout:
+
+[case done 1]
+args: done 1
+stdout:
+
+[case list]
+args: list
+stdout:
+| 1. [x] buy milk
+| 2. [ ] write report
+
+[case done 9]
+args: done 9
+exit: 1
+stdout:
+stderr:
+| todo: no item 9
+
+[case rm 1]
+args: rm 1
+stdout:
+
+[case list]
+args: list
+stdout:
+| 1. [ ] write report
+
+[case ]
+exit: 2
+stdout:
+stderr:
+| usage: todo add <text...> | list | done <n> | rm <n>

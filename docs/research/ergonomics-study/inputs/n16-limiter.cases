@@ -1,0 +1,6 @@
+# n16-limiter: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case ]
+stdout:
+| max concurrent 2
+| completed 6

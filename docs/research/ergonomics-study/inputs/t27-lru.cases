@@ -1,0 +1,9 @@
+# t27-lru: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| get a -> 1
+| evicted b
+| get b -> miss
+| get c -> 3
+| get a -> 10

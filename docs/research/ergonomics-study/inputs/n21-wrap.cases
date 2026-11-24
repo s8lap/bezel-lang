@@ -1,0 +1,9 @@
+# n21-wrap: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case ]
+stdout:
+| =======[ Wrap demo ]========
+| |The quick brown fox jumps   |
+| |over the lazy dog while     |
+| |supercalifragilistic words  |
+| |test the edge cases.        |

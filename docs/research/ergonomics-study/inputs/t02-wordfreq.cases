@@ -1,0 +1,11 @@
+# t02-wordfreq: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdin:
+| It was the best of times, it was the worst of times; it was the age of wisdom. It was the age of foolishness!
+stdout:
+| it 4
+| of 4
+| the 4
+| was 4
+| age 2

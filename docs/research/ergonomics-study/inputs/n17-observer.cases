@@ -1,0 +1,9 @@
+# n17-observer: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+flags: --report-trust-admissions
+
+[case ]
+stdout:
+| display: 21.5 (target 20)
+| display: 26 (target 20)
+| alarm: too hot 26
+| display: 27 (target 20)

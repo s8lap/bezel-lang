@@ -1,0 +1,12 @@
+# t05-ini: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| line 9: syntax error
+| [server]
+|   host=example.com
+|   port=8080
+| [client]
+|   retries=3
+|   name=bezel
+| port=8080 timeout=30

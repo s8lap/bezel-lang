@@ -1,0 +1,10 @@
+# t01-wc: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdin:
+| the quick brown fox
+| jumps over
+|
+| the lazy dog
+stdout:
+| 4 9 45

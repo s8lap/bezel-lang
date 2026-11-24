@@ -1,0 +1,6 @@
+# t24-json-roundtrip: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| {"Name":"Ann","Age":34,"Tags":["admin","dev"]}
+| roundtrip equal: True

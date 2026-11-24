@@ -1,0 +1,9 @@
+# t38-dates: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| 269 days
+| 2026-03-16
+| Saturday
+| Tuesday
+| 1d 01:01:01

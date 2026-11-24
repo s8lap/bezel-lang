@@ -1,0 +1,8 @@
+# n20-logfmt: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case ]
+stdout:
+| info 2
+| error 1
+| slowest: db "main" down (1500 ms)
+| keys: dur, level, msg, user

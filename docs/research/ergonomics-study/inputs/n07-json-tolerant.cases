@@ -1,0 +1,6 @@
+# n07-json-tolerant: the spec-correct behaviour of final.bzl, from the recorded final run (r42/data/new-final-outputs.txt).
+
+[case ]
+stdout:
+| api:8080 tls=True cert=/etc/c.pem retries=3
+| strict: rejected

@@ -1,0 +1,7 @@
+# t33-fanout: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| results 1 2 3
+| sum 6
+| concurrent: True

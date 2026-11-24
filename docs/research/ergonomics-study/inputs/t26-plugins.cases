@@ -1,0 +1,8 @@
+# t26-plugins: the spec-correct behaviour of final.bzl, from the recorded final run (data/final-outputs.txt).
+
+[case ]
+stdout:
+| hello world
+| 3
+| unknown command: nope
+| registered: count, echo
