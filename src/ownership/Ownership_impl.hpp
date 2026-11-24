@@ -866,7 +866,8 @@ public:
     void checkSetErasingPositionsInExpr(const ast::Expr& e);
     // The member-level driver: the declaration-site and expression-body
     // positions of ONE member.
-    void scanMemberForSetErasingPositions(const ast::Member& m);
+    void scanMemberForSetErasingPositions(
+        const ast::Member& m, const std::vector<sema::Symbol*>* paramSyms);
 
     // fix #8031 (§28.3 K8, v0.353): the DECLARATION-SITE expression positions.
     // The three walkers that reach a `case` EXPRESSION inside a method body

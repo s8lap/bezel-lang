@@ -21693,7 +21693,7 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
     // own plain function-typed parameters read as UNTRACED instead of
     // NON-EMPTY (Provenance clause 3). Drive the rule at those positions
     // here, beside the member-level structural walk above. // per §28.3
-    mo.scanMemberForSetErasingPositions(m);
+    mo.scanMemberForSetErasingPositions(m, paramSymsOf(m, ctx));
     // fix #8031 (§28.3 K8, v0.353): a PARAMETER's DEFAULT VALUE is a
     // DECLARATION-SITE expression — it is not part of any method body, so the
     // three method-body walkers (the discharge walk, the read walk, the §35.5

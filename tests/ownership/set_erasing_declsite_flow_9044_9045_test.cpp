@@ -143,3 +143,23 @@ BEZEL_TEST(set_erasing_declsite_flow_9044_9045,
         "fl.H(reg, lambda() => r.V, true);"));
     expectSetErasingReject(r);
 }
+
+// REJECT — #9045's repro: an EXPRESSION-bodied method's own plain
+// function-typed parameter at `Reg2.Keep(o: Object)`.  RED on the base tree
+// (compiled).
+BEZEL_TEST(set_erasing_declsite_flow_9044_9045,
+           expression_bodied_method_own_fn_parameter_at_object_rejected_spec_28_3) {
+    auto r = runAot(registryProgram(
+        "public method M(rg: Reg2, q: () -> int) => rg.Keep(q); ",
+        "fl.M(reg, lambda() => r.V);"));
+    expectSetErasingReject(r);
+}
+
+// REJECT — #9045: the same through a STATIC expression-bodied method.
+BEZEL_TEST(set_erasing_declsite_flow_9044_9045,
+           static_expression_bodied_method_own_fn_parameter_at_object_rejected_spec_28_3) {
+    auto r = runAot(registryProgram(
+        "public static method M(rg: Reg2, q: () -> int) => rg.Keep(q); ",
+        "Fl.M(reg, lambda() => r.V);"));
+    expectSetErasingReject(r);
+}

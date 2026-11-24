@@ -13673,14 +13673,43 @@ void MethodOwnership::checkSetErasingPositionsInExpr(const ast::Expr& e) {
 // accessor runs it always (`runOwnedSetterBody`); a plain setter's block body
 // is a MEMBER-body gap of its own (no ownership pass reaches it at all), not
 // this rule's declaration-site gap.
-void MethodOwnership::scanMemberForSetErasingPositions(const ast::Member& m) {
+void MethodOwnership::scanMemberForSetErasingPositions(
+    const ast::Member& m, const std::vector<sema::Symbol*>* paramSyms) {
     auto ex = [this](const std::unique_ptr<ast::Expr>& p) {
         if (p) checkSetErasingPositionsInExpr(*p);
     };
+    // fix #9045 (§28.3 closure bullet, *Provenance* clause 3, v0.359): "A
+    // plain function-typed parameter of the enclosing body contributes
+    // itself" — an EXPRESSION body is an enclosing body of its method's own
+    // formals exactly as a block body is. `run` seeds them for a block body;
+    // the `=>` path never did, so `method M(rg, q: () -> int) => rg.Keep(q)`
+    // read `q` as UNTRACED and was admitted at an `Object` parameter. Seed
+    // them for the expression body alone: the other declaration-site
+    // positions below are not part of the body, so the seed is dropped
+    // before they are walked. // per §28.3
+    auto exBody = [&](const std::unique_ptr<ast::Expr>& p) {
+        if (!p) return;
+        if (paramSyms) {
+            for (sema::Symbol* sym : *paramSyms) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+                if (!ps || !ps->modifier.empty()) continue;
+                const sema::TypeRef* rt =
+                    ps->declType ? ctx_.resolvedType(*ps->declType)
+                                 : ps->resolvedDeclType;
+                const bool fnTyped =
+                    (rt && rt->kind == sema::TypeRef::Kind::Function) ||
+                    (ps->declType &&
+                     ps->declType->kind == ast::TypeKind::Function);
+                if (fnTyped) callBoundedParams_.insert(sym);
+            }
+        }
+        checkSetErasingPositionsInExpr(*p);
+        callBoundedParams_.clear();
+    };
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
-        if (md->bodyKind == ast::MethodBodyKind::Expression) ex(md->exprBody);
+        if (md->bodyKind == ast::MethodBodyKind::Expression) exBody(md->exprBody);
     } else if (auto* od = dynamic_cast<const ast::OperatorDecl*>(&m)) {
-        if (od->bodyKind == ast::MethodBodyKind::Expression) ex(od->exprBody);
+        if (od->bodyKind == ast::MethodBodyKind::Expression) exBody(od->exprBody);
     } else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
         // An INSTANCE field initializer and a STATIC one alike: both are
         // declaration-site expressions, and both run at a point where the
