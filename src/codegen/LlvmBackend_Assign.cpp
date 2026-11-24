@@ -5540,22 +5540,125 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
             // lowerIndexerGet / lowerIndexerSet their own bindings).
             loopBodyDeclaredSlots_.insert(idxSlots[k]);
         }
+        // fix #9065 (§6.6 / §9.4 / §21.1 / §23.4 / §27.5 / §28.9, v0.359):
+        // the INLINED getter body is the ACCESSOR'S OWN invocation scope.
+        // §6.6: "when the final segment is accessor-mediated (a property or
+        // an indexer), its getter and setter are each invoked exactly once
+        // — the getter produces the left operand, the setter stores the
+        // result", and §9.4: "an author-written accessor that an assignment
+        // or compound assignment invokes (§6.6) is a member call like any
+        // other" — so the getter body runs as an INVOCATION, with an
+        // activation of its own. §21.1: "A local declared by `var`, `const`,
+        // `using var` or `await using var` is in scope from the end of its
+        // declaration to the end of the innermost enclosing statement block"
+        // — and for the accessor that block is its OWN body block, whose
+        // parameters §21.1 names ("an indexer's parameters included,
+        // §23.4"). The compound path lowers the body into the CALLER's
+        // frame, so without a scope of its own the accessor's bindings are
+        // released at the CALLER's scope end — once per program, not once
+        // per invocation.
+        //
+        // MEASURED (issue #9065, the reviewer's own program, 200 compound
+        // assignments, under LeakSanitizer): on r30-c1 the inlined getter's
+        // index-parameter capture cell was allocated FRESH per invocation
+        // (the #8941 mark below) and 199 of the 200 cells were never
+        // released — 796 B — because the scope-end free the capture needs
+        // was registered in the CALLER's scope, one scope above the
+        // accessor's. The sibling cell (the getter body's own `q` local,
+        // dragged into the same fresh-per-pass mode by the same mark) leaked
+        // the same way. The accessor's own scope is what fixes both: the
+        // free now fires at the END OF EACH INVOCATION.
+        disposeStack_.emplace_back();
         {
-            // fix #8941 (§23.4 / §27.5, v0.359): this expression body opens
-            // no scope, so its indexer parameters are declared in the CURRENT
-            // one — the depth #3403's captured-parameter guard compares
-            // against. The twin of `lowerIndexerGet`'s expression-body arm and
-            // of `lowerIndexerSet`'s; the compound path's getter arm was the
-            // only inlined accessor body missing the statement, so the three
-            // paths now agree on where an accessor's parameters are declared.
-            // MEASURED: this statement alone is behaviour-NEUTRAL on the
-            // issue's repro (stdout `200` and the ASan totals unchanged with
-            // it alone) — the mark above is what fixes the value. It is kept
-            // because the guard's threshold is the accessor's declaring scope
-            // and this path was the one that did not state it.
-            CapturedParamScopeDepth idxParamScopeDepth(this, disposeStack_.size());
-            cur = lowerExpr(*getterExpr);
+            // fix #9065 (§27.5 / §28.9, v0.359): the ACCESSOR'S OWN capture
+            // pre-scan. §27.5: "Captured variables are heap-allocated in a
+            // closure object" — so every capture the accessor's body forms
+            // is a HEAP ALLOCATION the runtime owns (§28.9: "Runtime
+            // management governs the *function value itself* — the
+            // heap-allocated closure object that backs it"), and the
+            // compiler has to KNOW about the capture to account for it. The
+            // CALLER's pre-scan (`collectCellFreeEligible` over the caller's
+            // own body) never sees this accessor's body — the body is not
+            // part of the caller's AST — so the accessor's captured
+            // bindings are in NEITHER `cellFreeEligible_` NOR
+            // `closureReleaseEligible_`, and `lowerLambda` therefore records
+            // NO capture cell for them: nothing is ever freed, and the cell
+            // is allocated once per invocation (the #8941 mark) with no
+            // owner. The twin of the expression-bodied METHOD's own
+            // `return <exprBody>;` synthesis (LlvmBackend_Setup.cpp), run
+            // over the accessor body so the two spellings classify alike.
+            //
+            // §17.15's binding atom `(var x := E; body)` — the shape the
+            // issue's repro's getter body has — carries the accessor's own
+            // locals as CLAUSES, and a clause is an embedded plain-`var`
+            // LocalDecl, not a statement: the pre-scan walks STATEMENTS, so
+            // each clause is borrowed as one and the atom's own body is the
+            // `return`.
+            std::vector<std::unique_ptr<ast::Stmt>> synthBody;
+            if (auto* bx = dynamic_cast<const ast::BindExpr*>(getterExpr)) {
+                for (auto& c : bx->clauses)
+                    synthBody.push_back(std::unique_ptr<ast::Stmt>(c.get()));
+                auto ret = std::make_unique<ast::ReturnStmt>();
+                ret->span = bx->body->span;
+                ret->value.reset(const_cast<ast::Expr*>(bx->body.get()));
+                synthBody.push_back(std::move(ret));
+            } else {
+                auto ret = std::make_unique<ast::ReturnStmt>();
+                ret->span = getterExpr->span;
+                ret->value.reset(const_cast<ast::Expr*>(getterExpr));
+                synthBody.push_back(std::move(ret));
+            }
+            AccessorClosureScope getterClosureScope(*this, synthBody, nullptr);
+            // The borrowed AST nodes (the binding atom's clauses and the
+            // `return`'s expression) are AST-OWNED: release them so the
+            // synthesized body's destructor does not free them.
+            for (auto& s : synthBody) {
+                if (auto* r = dynamic_cast<ast::ReturnStmt*>(s.get()))
+                    r->value.release();
+                else
+                    s.release();
+            }
+            {
+                // fix #8941 / fix #9065 (§23.4 / §27.5, v0.359): the depth
+                // #3403's captured-parameter guard compares the capture site's
+                // scope depth against — the depth of the scope the captured
+                // PARAMETER is declared in. The accessor's indexer parameters
+                // are declared in the ACCESSOR's own scope (the one opened
+                // above; the expression body itself opens no scope, but the
+                // accessor's INVOCATION does), so THAT is the depth this body
+                // states — and it is the depth the capture's scope-end free
+                // must land in. Stating the CALLER's depth here instead (what
+                // this arm did before the scope above existed) would make the
+                // guard decline the capture site's free and defer it to the
+                // CALLER's scope — once per program, not once per invocation.
+                // The fresh-per-invocation mark above (#8864 / #8941) is what
+                // makes the VALUE right; this statement is what makes the
+                // scope the capture's free lands in right.
+                CapturedParamScopeDepth idxParamScopeDepth(this,
+                                                           disposeStack_.size());
+                cur = lowerExpr(*getterExpr);
+            }
+            // fix #9065 (§27.5 / §28.9, v0.359): the capture cells this
+            // accessor body formed are consumed HERE, so their scope-end
+            // free lands in the ACCESSOR's scope (the one above) and fires
+            // at the end of THIS invocation: §27.5's "Captured variables are
+            // heap-allocated in a closure object" and §28.9's runtime
+            // management of that closure object are then discharged ONCE per
+            // invocation, as they are for every other accessor body. The
+            // helper skips the entries pushed at a shallower scope (the
+            // CALLER's own captures) and erases only the ones at this scope,
+            // so the caller's pending captures are untouched.
+            consumeLastLambdaCapturedCells();
+            // The scope's disposals are emitted only on the path that reaches
+            // the end of the accessor body: a body that DIVERGED (a `throw`,
+            // §31.2) or that TERMINATED the block (a `return` inside a nested
+            // `do … end`) leaves the block finished, and emitting into a
+            // finished block is invalid IR. Both are the safe direction — a
+            // bounded leak, never an over-free.
+            if (!diverged_ && !terminatorOrNull(builder_.GetInsertBlock()))
+                emitDisposals(disposeStack_.back());
         }
+        disposeStack_.pop_back();
         thisRecvScope.close();  // fix-forward #8127
         currentThis_ = savedThis;
         locals_ = std::move(savedLocals);
@@ -5633,6 +5736,24 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
         CapturedParamScopeDepth idxParamScopeDepth(this, disposeStack_.size());
         lowerExpr(*setterExpr);
     } else if (setterStmts) {
+        // fix #9065 (§27.5 / §28.9, v0.359): the closure-local scope-end
+        // analysis for THIS inlined setter body — the compound path's twin
+        // of `lowerIndexerSet`'s own `AccessorClosureScope` (the #8762
+        // mechanism the other six accessor emitters install). §27.5: the
+        // setter body's captures are "heap-allocated in a closure object" and
+        // §28.9 puts that object under runtime management, so each
+        // invocation's closure, closure environment and capture cell are
+        // allocations that have to be discharged once. The compound path's
+        // setter body is INLINED into the enclosing function, and the
+        // CALLER's pre-scan never sees it — the body is not part of the
+        // caller's AST — so the setter's captured bindings are in NEITHER
+        // `cellFreeEligible_` NOR `closureReleaseEligible_`, and NOTHING was
+        // ever released for them: the setter's closures, the closure
+        // environments and the capture cells all leaked once per
+        // invocation. The scope `lowerScopedBlock` opens for the body is
+        // where the releases now land, so they fire at the end of EACH
+        // invocation.
+        AccessorClosureScope setterClosureScope(*this, *setterStmts, nullptr);
         CapturedParamScopeDepth idxParamScopeDepth(this,
                                                    disposeStack_.size() + 1);
         lowerScopedBlock(*setterStmts);
