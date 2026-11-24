@@ -32457,6 +32457,13 @@ MethodOwnership::SetErasingSourceSet MethodOwnership::setErasingSourceSet(
             r = Set::NonEmpty;
         else if (d.value)
             r = join(r, setErasingSourceSet(*d.value, /*direct=*/false, visited));
+        // fix #9075 (§28.3 *Provenance* clause 6, v0.359): "over every
+        // assignment that reaches the read" — a `ref` argument the callee
+        // writes is such an assignment, and what it can write is the current
+        // value of a `ref` argument of that call (a swap moves one into the
+        // other), so those values' sets join the definition's.
+        for (const ast::Expr* src : d.refSources)
+            r = join(r, setErasingSourceSet(*src, /*direct=*/false, visited));
     }
     if (direct && r == Set::Untraced && ls) {
         auto it = scopedLambdaLocalInit_.find(sym);
@@ -32510,6 +32517,10 @@ void MethodOwnership::setErasingFlowStmts(
 void MethodOwnership::setErasingFlowUse(const ast::IdentifierExpr& id) {
     const sema::Symbol* sym = ctx_.exprSymbol(id);
     if (!sym) return;
+    // fix #9075: an `out`/`ref` argument's read is placed before the call's
+    // definition of it (`setErasingFlowExpr`); the sub-expression walk meets
+    // it again afterwards.
+    if (seFlowReads_.count(&id)) return;
     const int here = seFlowNodes_[seFlowCur_].lambda;
     if (auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym)) {
         auto dp = seFlowDeclPos_.find(ls->decl);
@@ -32599,16 +32610,31 @@ void MethodOwnership::setErasingFlowExpr(const ast::Expr* e) {
                 queueAccessorSetErasingPositions(nullptr, ne->args, ne);
         }
         if (!args) return;
+        // fix #9075 (§28.3 *Provenance* clause 6 and *A `ref` or plain `out`
+        // location outlives the call*, v0.359): the callee reads each `ref`
+        // argument before it writes any, so every such read is placed first;
+        // each `out`/`ref` identifier then takes a definition whose set joins
+        // the current values of all the call's `ref` arguments (itself
+        // included).
+        std::vector<const ast::IdentifierExpr*> locs;
+        std::vector<const ast::Expr*> refVals;
         for (const ast::CallArgument& a : *args) {
-            if (a.modifier.find("out") == std::string_view::npos &&
-                a.modifier != "ref")
+            const bool isRef = a.modifier == "ref";
+            if (!isRef && a.modifier.find("out") == std::string_view::npos)
                 continue;
             auto* oid = dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
             if (!oid) continue;
-            if (const sema::Symbol* osym = ctx_.exprSymbol(*oid))
-                seFlowDefs_[osym].push_back(
-                    {nullptr, /*traced=*/false, /*kills=*/false,
-                     /*positioned=*/true, {seFlowCur_, ++seFlowSeq_}});
+            if (!ctx_.exprSymbol(*oid)) continue;
+            setErasingFlowUse(*oid);
+            locs.push_back(oid);
+            if (isRef) refVals.push_back(oid);
+        }
+        for (const ast::IdentifierExpr* oid : locs) {
+            const sema::Symbol* osym = ctx_.exprSymbol(*oid);
+            SetErasingFlowDef def{nullptr, /*traced=*/false, /*kills=*/false,
+                                  /*positioned=*/true, {seFlowCur_, ++seFlowSeq_}};
+            def.refSources = refVals;
+            seFlowDefs_[osym].push_back(std::move(def));
         }
     });
 }

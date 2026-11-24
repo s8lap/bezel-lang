@@ -8008,6 +8008,14 @@ private:
         // plain function-typed parameter's incoming value, which "contributes
         // itself".
         bool nonEmpty = false;
+        // fix #9075 (§28.3 *Provenance* clause 6 and *A `ref` or plain `out`
+        // location outlives the call*, v0.359): an `out`/`ref` argument
+        // overwrites its local with a value this body does not trace, but the
+        // callee can only write into it a value it holds: the current value
+        // of a `ref` argument of the SAME call (this one's own prior value
+        // and, for a swap, its sibling's). Those reads' sets are joined into
+        // the definition's.
+        std::vector<const ast::Expr*> refSources;
     };
     std::vector<SetErasingFlowNode> seFlowNodes_;
     int seFlowCur_ = 0;
