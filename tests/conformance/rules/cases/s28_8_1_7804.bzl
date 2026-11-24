@@ -1,0 +1,52 @@
+//! case: s28_8_1_7804
+//! doc: spec
+//! section: 28.8.1
+//! title: a local moved in the try and read in a catch guard of a lambda body is rejected
+//! rule: the caller's binding is moved-from on the exception edge exactly as on
+//!   the normal one
+//! cites: 31.2.1, 28.3.1
+//! expect: reject
+//! diagnostic: moved
+module Conf;
+import System;
+
+public class Res
+  public Tag: int;
+  public constructor(t: int)
+    Tag := t;
+  end constructor;
+  destructor
+  end destructor;
+end Res;
+
+public class Sink
+  public static method TakeBoom(owned r: Res): int
+    throw new InvalidOperationException("boom");
+  end TakeBoom;
+  public static method Boom(): int
+    throw new InvalidOperationException("boom");
+  end Boom;
+  public static method Take(owned r: Res): int
+    using var h := move r;
+    return h.Tag;
+  end Take;
+  public static method Peek(r: Res): int
+    return r.Tag;
+  end Peek;
+end Sink;
+
+public class Program
+  public static method Main(): int
+    var f := lambda(): int => do
+      var x := new Res(1);
+      var k := 0;
+      try
+        k := Sink.TakeBoom(move x);
+      catch
+        var e: Exception when x.Tag > 0 => k := 1;
+      end;
+      return k;
+    end;
+    return f();
+  end Main;
+end Program;
