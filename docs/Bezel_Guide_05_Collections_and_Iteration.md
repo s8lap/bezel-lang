@@ -267,7 +267,7 @@ for var g in requests.GroupBy(lambda(r) => r.Route) do     // outer: consumed by
 end;                                                       // g read twice — defined
 ```
 
-Groups appear in first-occurrence-of-key order, elements within a group in source order. When a group feeds *many* aggregations, materializing it once — `using var items := g.ToArray();` on the body's first line — remains the advised shape (stdlib §5); it is advice, not a rule.
+Groups appear in first-occurrence-of-key order, elements within a group in source order. When a group feeds *many* aggregations, materializing it once — `using var items := g.ToArray();` on the body's first line — remains the advised shape (stdlib §5); it is advice, not a rule. The compiler does not yet implement a `GroupBy` result bound to a variable (`var groups := requests.GroupBy(…);`, [#4694](https://github.com/s8lap/bezel-lang/issues/4694)); until it does, iterate the call where it is written, as above, or end it with a terminal operator such as `ToArray()`.
 
 ---
 

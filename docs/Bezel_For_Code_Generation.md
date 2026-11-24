@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.359. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.360. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -12,7 +12,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.359 and `Bezel_Standard_Library.md` v0.359 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.360 and `Bezel_Standard_Library.md` v0.360 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -698,7 +698,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.359 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.360 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -839,7 +839,7 @@ public class TypeInitializationException: Exception
 end                                                      // runtime-owned: never disposed after an arm
 ```
 
-Hierarchy: `Exception` → `ContractViolationException`; `ArgumentException` → `ArgumentNullException`, `ArgumentOutOfRangeException`; `ArithmeticException` → `OverflowException`, `DivideByZeroException`; `InvalidOperationException` → `DisposedAccessException`; plus `NotImplementedException`, `NullReferenceException`, `IndexOutOfRangeException`, `MatchFailureException`, `OperationCanceledException`, `TypeInitializationException`, `FormatException`, `StackOverflowException` (uncatchable). **The failure marker (§31.4):** a class that implements the member-less interface `IFailure` is *`IFailure`-marked* — the environment or a peer produced it: the `IOException` family, `TimeoutException`, `ChannelClosedException`, `ChannelFullException` and `DomainFailedException` (a `DomainFaultedException`: an `IFailure`-marked exception joined from another domain). No built-in class is marked, and every other class makes no statement (`FormatException`, `SerializationException`, `OverflowException`, `ArgumentException`, `InvalidOperationException` and `KeyNotFoundException` included). The marker states origin, never a disposition: what happens next is the handler's decision, and an unmarked exception a handler expects is caught by naming its class. `OperationCanceledException` is apart — never marked, never taken by an `IFailure` arm. Only an `Exception`-derived class may list `IFailure`, under any base but `OperationCanceledException`. `ContractViolationException` reports a broken `requires`/`ensures`/`invariant`: a bug, not an outcome to branch on (§22.16). **There is no `OutOfMemoryException`** — allocation failure terminates. **No user `InnerException`** — chain with `base(msg, cause)`; `TypeInitializationException.InnerException` (above) is the one built-in that carries a live reference. Producer-local exceptions need the producer's import: `KeyNotFoundException`, `SerializationException`, `TimeoutException`/`ChannelClosedException`/`ChannelFullException`/`DomainFaultedException`/`DomainFailedException`, `IOException`/`FileNotFoundException`/`DirectoryNotFoundException`/`EndOfStreamException`/`PathTooLongException`.
+Hierarchy: `Exception` → `ContractViolationException`; `ArgumentException` → `ArgumentNullException`, `ArgumentOutOfRangeException`; `ArithmeticException` → `OverflowException`, `DivideByZeroException`; `InvalidOperationException` → `DisposedAccessException`; plus `NotImplementedException`, `NullReferenceException`, `IndexOutOfRangeException`, `MatchFailureException`, `OperationCanceledException`, `TypeInitializationException`, `FormatException`, `StackOverflowException` (uncatchable). **The failure marker (§31.4):** a class that implements the member-less interface `IFailure` is *`IFailure`-marked* — the environment or a peer produced it: the `IOException` family, `TimeoutException`, `ChannelClosedException`, `ChannelFullException` and `DomainFailedException` (a `DomainFaultedException`: an `IFailure`-marked exception joined from another domain). No built-in class is marked, and every other class makes no statement (`FormatException`, `SerializationException`, `OverflowException`, `ArgumentException`, `InvalidOperationException` and `KeyNotFoundException` included). The marker states origin, never a disposition: what happens next is the handler's decision, and an unmarked exception a handler expects is caught by naming its class. `OperationCanceledException` is apart — never marked, never taken by an `IFailure` arm. Only an `Exception`-derived class may list `IFailure`, under any base but `OperationCanceledException`. (⚠ The compiler does not implement the marker yet, #8414, nor `DomainFailedException`, #8442: both are unresolved type names, so neither a class listing `IFailure` nor an `IFailure` arm compiles today.) `ContractViolationException` reports a broken `requires`/`ensures`/`invariant`: a bug, not an outcome to branch on (§22.16). **There is no `OutOfMemoryException`** — allocation failure terminates. **No user `InnerException`** — chain with `base(msg, cause)`; `TypeInitializationException.InnerException` (above) is the one built-in that carries a live reference. Producer-local exceptions need the producer's import: `KeyNotFoundException`, `SerializationException`, `TimeoutException`/`ChannelClosedException`/`ChannelFullException`/`DomainFaultedException`/`DomainFailedException`, `IOException`/`FileNotFoundException`/`DirectoryNotFoundException`/`EndOfStreamException`/`PathTooLongException`.
 
 `Exception.ToString()` is a **declared override** for `Exception` and every derived type. A conforming rendering contains the qualified type name, the `Message` when non-empty, every `CauseChain` entry (outermost first) and every `SupersededChain` entry (earliest first, distinguishable from causes). It renders **no stack trace**. Arrangement is implementation-defined; the member is **not `pure`**.
 
@@ -1208,6 +1208,8 @@ public extension IEnumerable<T>
   Concat(other: IEnumerable<T>): IEnumerable<T>;
   Zip<U, R>(other: IEnumerable<U>, combine: (T, U) -> R): IEnumerable<R>;   // ends when either ends
   GroupBy<TKey>(key: (T) -> TKey): IEnumerable<IGrouping<TKey, T>>   where TKey: hashable;
+      // ⚠ a STORED result (`var g := xs.GroupBy(…);`) is NOT YET IMPLEMENTED (#4694):
+      //   iterate the call in place (`for var g in xs.GroupBy(…)`) or end it (`.ToArray()`)
   // Materialization (EAGER)
   ToArray(): owned Array<T>;
   ToDictionary<TKey>(key: (T) -> TKey): owned Dictionary<TKey, T>         where TKey: hashable;
@@ -1446,6 +1448,7 @@ The integer types (`Int32`, `Int64`, `Byte`, `SByte`, `Int16`, `UInt16`, `UInt32
 ```bezel
 public class String: IEnumerable<char>, IComparable<string>, IEquatable<string>
   pure readonly property Length: int;   IsEmpty: bool;   IsAscii: bool;
+                                     // ⚠ `s.IsEmpty` NOT YET IMPLEMENTED (#2348); `s?.IsEmpty` is — write `s.Length = 0`
   pure readonly property [i: int]: char;      pure readonly property [r: Range<int>]: string;
   static pure From(value: char): string;   static pure From(buffer: Array<char>, start: int, length: int): string;
   static From(value: CString|WString): string;   static FromCStringPointer/FromWStringPointer(p: IntPtr): string;
@@ -1741,7 +1744,7 @@ end SampleWindow;
 
 **Strings.** `var sb := new StringBuilder();` (trivial-dispose: plain `var`, no warning), `sb.Append(w).Append(' ');`, `sb.ToString().Trim()`. Casts are call syntax — `double(hits)` — and interpolation carries alignment then format: `$"|{line,-20}| {pct,6:F1}%"`.
 
-**Declaring, throwing and catching an exception type.** Derive from `Exception` (or any built-in exception type) and chain the message to the base; list `IFailure` when the environment or a peer produces the condition, or when the application's boundary should take it as one — under any base but `OperationCanceledException`, and a class deriving from an `IFailure`-marked class such as `IOException` needs no listing; an unmarked class makes no statement (§31.4); a caught exception is a **borrow** valid inside its arm only, so copy out what you keep. Offer the non-throwing form beside the throwing one where a caller may expect the absence (`PortOr`), and catch at the boundary, once:
+**Declaring, throwing and catching an exception type.** Derive from `Exception` (or any built-in exception type) and chain the message to the base; list `IFailure` when the environment or a peer produces the condition, or when the application's boundary should take it as one — under any base but `OperationCanceledException`, and a class deriving from an `IFailure`-marked class such as `IOException` needs no listing; an unmarked class makes no statement (§31.4; ⚠ `IFailure` is not implemented yet, #8414: today the name does not resolve, so the `ConfigError` below compiles only without it); a caught exception is a **borrow** valid inside its arm only, so copy out what you keep. Offer the non-throwing form beside the throwing one where a caller may expect the absence (`PortOr`), and catch at the boundary, once:
 
 ```bezel
 public class ConfigError(message: string): Exception(message), IFailure   // the deployment's settings disagreed
@@ -1780,7 +1783,7 @@ Never write `PortOr` as a `try` around `Port` that catches `ConfigError` one fra
 
 To wrap a lower-level fault, declare the class without a primary constructor and give it `public constructor(message: string, cause: Exception) base(message, cause); end constructor;` — beside a primary constructor, every other constructor must chain `this(…)` (§11.1). The cause is snapshotted into `CauseChain`, never retained (§31.4); there is no user `InnerException`.
 
-**Catching at a boundary.** Name what the boundary expects, not `Exception`: the classes it can answer by name, and `IFailure` for what the environment and peers raise; an `IFailure` binding is an ordinary `Exception` (§31.2.1).
+**Catching at a boundary.** Name what the boundary expects, not `Exception`: the classes it can answer by name, and `IFailure` for what the environment and peers raise; an `IFailure` binding is an ordinary `Exception` (§31.2.1). (⚠ The compiler does not implement `IFailure` yet, #8414: an `IFailure` arm is rejected as an unresolved type name. The arm is the code the spec requires; until it compiles, name the classes it stands for, `IOException` and `TimeoutException` among them.)
 
 ```bezel
 try

@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.359 — November 2026**
+**Companion to the Bezel Language Specification, v0.360 — November 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -16386,5 +16386,19 @@ These adaptations have not had an adversarial critique of their own; the composi
   - Guide 05's `ReportEach` is in block form.
 
 **Checks.** `scripts/check_docs.sh` (all phases), `check_proposals.sh`, `build_book.py --check`, `check_src_citations.py`, `gen_editor_grammars.py --check`, `corpus.py lint --strict` (5,865 cases) and `corpus.py check`, the harness unit tests (170) and `check_commit_trailers.py --strict`. The meaning gate (an adversarial critique) runs on this branch before it is pushed.
+
+---
+
+### v0.360 changelog (v0.359 → v0.360)
+
+**Editorial: spec-ahead-of-implementation markers found by the r42 ergonomics recheck.** At the owner's direction (2026-11-24). The [r42 recheck](research/ergonomics-study/r42/README.md) (`bezelc 0.0.0-8ccf7ff0`) found documented stdlib surfaces that the compiler rejects and that no document marked as not implemented. Each now carries the in-document marker of spec-change process §5 item 3. Class: **editorial** (spec-change process §2). No rule, verdict or signature changes. Each absence was confirmed with a minimal program on r42 and by a `git grep` over `src/` and `tests/` (§5 item 3b).
+
+- **`string.IsEmpty`** ([#2348](https://github.com/s8lap/bezel-lang/issues/2348)): stdlib §9.6 and the reference's §5.9 index. Only the `.` spelling is missing: `s.IsEmpty` is rejected in codegen, and `s?.IsEmpty` is implemented. The marker says so and names `s.Length = 0` as the spelling that compiles.
+- **`IFailure`** ([#8414](https://github.com/s8lap/bezel-lang/issues/8414)) **and `DomainFailedException`** ([#8442](https://github.com/s8lap/bezel-lang/issues/8442)): stdlib §1 (*The failure marker*), §2.17 (the table of marked classes) and §6.8 (the declaration). Both are unresolved type names, so a class that lists the marker and an `IFailure` catch arm do not compile. The same caveat is in the reference's §5.2 hierarchy and its two §6 exception idioms, and in Guide 02 §4, in the guide's own caveat style (the form it uses for `ScopeGuard`, #4669).
+- **A stored `GroupBy` result** ([#4694](https://github.com/s8lap/bezel-lang/issues/4694)): stdlib §5 (*`GroupBy` semantics*), the reference's §5.5 index and Guide 05 §5. Measured on r42: a `var` or `using var` binding of the call is rejected, and so is a binding of a lazy chain that continues past it (`xs.GroupBy(…).Where(…)`). Iterating the call in place and ending it with a terminal operator (`ToArray()`, `Count()`) both work, as does binding a group inside the loop. The marker names only the rejected shape.
+
+Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change process §5 item 5).
+
+**Migration.** Doc-only. *Spec-ahead-of-impl:* no new delta. The four trackers above were already open, and this revision only marks them in the documents.
 
 ---
