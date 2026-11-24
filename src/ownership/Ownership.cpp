@@ -21486,12 +21486,20 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
             {
                 MethodOwnership mo(ctx);
                 for (const ast::Param& p : nt->decl->positionalFields)
-                    if (p.defaultValue)
+                    if (p.defaultValue) {
                         mo.markCaseExprOwnedScrutineeInExpr(*p.defaultValue);
+                        // fix #8963 (§28.3 closure bullet, *Provenance*
+                        // clause 3 / *Set-erasing positions*, v0.359): the same
+                        // declaration-site position, for the §28.3 *Set-erasing
+                        // positions* rule.
+                        mo.checkSetErasingPositionsInExpr(*p.defaultValue);
+                    }
                 for (const ast::ChoiceCase& cc : nt->decl->choiceCases)
                     for (const ast::Param& p : cc.payload)
-                        if (p.defaultValue)
+                        if (p.defaultValue) {
                             mo.markCaseExprOwnedScrutineeInExpr(*p.defaultValue);
+                            mo.checkSetErasingPositionsInExpr(*p.defaultValue);
+                        }
             }
         }
     } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m)) {
@@ -21676,6 +21684,16 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
     checkMemberFlow(m, ctx, enclosingType, enclosingExtension);
     MethodOwnership mo(ctx);
     mo.scanMemberForFieldReadArgs(m);
+    // fix #8963 (§28.3 closure bullet, *Provenance* clause 3 / *Set-erasing
+    // positions*, v0.359): the §28.3 *Set-erasing positions* rule reached a
+    // BLOCK method / constructor / operator body only — a field initializer, a
+    // static field initializer, an auto-property initializer, a parameter's
+    // default value, a contract clause, a class invariant and an EXPRESSION
+    // body (`=> E`) were never classified, and a lambda written there had its
+    // own plain function-typed parameters read as UNTRACED instead of
+    // NON-EMPTY (Provenance clause 3). Drive the rule at those positions
+    // here, beside the member-level structural walk above. // per §28.3
+    mo.scanMemberForSetErasingPositions(m);
     // fix #8031 (§28.3 K8, v0.353): a PARAMETER's DEFAULT VALUE is a
     // DECLARATION-SITE expression — it is not part of any method body, so the
     // three method-body walkers (the discharge walk, the read walk, the §35.5
@@ -22000,14 +22018,22 @@ void checkTopDecl(const ast::TopDecl& d, sema::SemaContext& ctx) {
         {
             MethodOwnership mo(ctx);
             for (const ast::Param& p : td->positionalFields)
-                if (p.defaultValue)
+                if (p.defaultValue) {
                     mo.markCaseExprOwnedScrutineeInExpr(*p.defaultValue);
+                    // fix #8963 (§28.3 closure bullet, *Provenance* clause 3
+                    // / *Set-erasing positions*, v0.359): the same
+                    // declaration-site position, for the §28.3 *Set-erasing
+                    // positions* rule.
+                    mo.checkSetErasingPositionsInExpr(*p.defaultValue);
+                }
             // A CHOICE CASE's payload field is a declaration-site parameter
             // position too (§35.1) — same hook, same reason.
             for (const ast::ChoiceCase& cc : td->choiceCases)
                 for (const ast::Param& p : cc.payload)
-                    if (p.defaultValue)
+                    if (p.defaultValue) {
                         mo.markCaseExprOwnedScrutineeInExpr(*p.defaultValue);
+                        mo.checkSetErasingPositionsInExpr(*p.defaultValue);
+                    }
         }
     } else if (auto* ext = dynamic_cast<const ast::ExtensionDecl*>(&d)) {
         // §28.3 v0.235 (#1666, #2381): an ExtensionDecl carries no `genericParams`

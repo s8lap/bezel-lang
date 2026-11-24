@@ -835,6 +835,39 @@ public:
                                const ast::TypeDecl* enclosingType = nullptr);
     void checkAutoPropertyInitializer(const ast::PropertyDecl& pd);
 
+    // fix #8963 (§28.3 closure bullet, *Provenance* clause 3 / *Set-erasing
+    // positions*, v0.359): the §28.3 *Set-erasing positions* rule for a
+    // DECLARATION-SITE expression — a field initializer, a static field
+    // initializer, an auto-property initializer, a parameter's default value
+    // — and for an EXPRESSION body.
+    //
+    // THE GAP.  The rule is reached from ONE walker (`scopedPreScanExpr`,
+    // queued into `setErasingCheckQueue_` and judged by
+    // `reportSetErasingPosition`), and that walker runs only from
+    // `MethodOwnership::run` — i.e. only for a BLOCK method / constructor /
+    // operator body.  And a LAMBDA's own plain function-typed parameters are
+    // seeded as call-bounded only there too (`callBoundedScan` →
+    // `seedLambdaCallBoundedParams`), so a lambda written outside a block
+    // body had its parameters read as UNTRACED instead of NON-EMPTY —
+    // Provenance clause 3: "A plain function-typed parameter of the enclosing
+    // body contributes itself: its signature announces no set, so the value is
+    // bounded by the call, §28.14's call-bounded tier".  A function value
+    // with a non-empty source set was therefore stored where no rule could
+    // bound it (an `Object` parameter), and it was then invoked after its
+    // capture was freed (MEASURED: heap-use-after-free).
+    //
+    // This entry point drives the rule at those positions: it seeds each
+    // lambda's own call-bounded parameters and classifies the set-erasing
+    // positions the expression meets.  It REUSES the ownership pass's own
+    // structural expression / statement walk, so no second spelling of that
+    // grammar is added, and it adds NO other diagnostic — the two
+    // field-read recorders the shared walk also drives are suppressed while
+    // it runs. // per §28.3, v0.359
+    void checkSetErasingPositionsInExpr(const ast::Expr& e);
+    // The member-level driver: the declaration-site and expression-body
+    // positions of ONE member.
+    void scanMemberForSetErasingPositions(const ast::Member& m);
+
     // fix #8031 (§28.3 K8, v0.353): the DECLARATION-SITE expression positions.
     // The three walkers that reach a `case` EXPRESSION inside a method body
     // (the discharge walk, the read walk, and the §35.5 arm-borrow-source
@@ -7804,6 +7837,24 @@ private:
     };
     std::vector<SetErasingCheck> setErasingCheckQueue_;
     void reportSetErasingPosition(const SetErasingCheck& c);
+    // fix #8963 (§28.3 closure bullet, *Provenance* clause 3 / *Set-erasing
+    // positions*, v0.359): the set-erasing positions the DECLARATION-SITE and
+    // EXPRESSION-BODY walk meets are queued in the SAME queue
+    // `scopedPreScanExpr` fills and judged by the SAME
+    // `reportSetErasingPosition`, so the two walks cannot disagree about a
+    // verdict.
+    //
+    // Queue the set-erasing position of ONE argument at ONE formal — the
+    // same two positions `scopedPreScanExpr` queues (a parameter declared
+    // `Object`, and a bare type parameter), read off the SAME `CalleeFormals`
+    // view, so the two walks cannot disagree about which argument sits at
+    // which formal. // per §28.3
+    void queueSetErasingPosition(const CalleeFormals& f, std::size_t bp,
+                                 const ast::Expr& value);
+    // True while the declaration-site / expression-body set-erasing walk
+    // runs: it seeds each lambda's own call-bounded parameters and queues the
+    // set-erasing positions it meets.
+    bool setErasingDeclWalk_ = false;
     // fix #8871 (§28.3 closure bullet, *Provenance* clauses 1 and 6, v0.359):
     // the flow facts the set-erasing verdict reads a local or parameter
     // through. "A local or parameter contributes, at each read, the union of

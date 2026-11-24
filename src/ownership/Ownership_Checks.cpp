@@ -13312,12 +13312,25 @@ void MethodOwnership::scanFieldReadArgsInCall(
             const std::size_t bp = boundParamIndex(args, at, formals);
             if (bp >= formals.size()) continue;
             owned = formals.modifier(bp) == "owned";
+            // fix #8963 (§28.3 closure bullet, *Provenance* clause 3 /
+            // *Set-erasing positions*, v0.359): the set-erasing classification
+            // of THIS argument at THIS formal, for the declaration-site and
+            // expression-body walk only (the block-body walk classifies the
+            // same positions through `scopedPreScanExpr`).
+            if (setErasingDeclWalk_)
+                queueSetErasingPosition(formals, bp, *a.value);
         } else {
             if (at >= fnTy->funcParams.size()) continue;
             const std::string_view mod = fnTy->funcParams[at].modifier;
             if (!mod.empty() && mod != "owned") continue;
             owned = mod == "owned";
         }
+        // fix #8963: the two field-read recorders below are the MEMBER-level
+        // walk's business (`scanMemberForFieldReadArgs`, which visits every
+        // member's expression positions). The declaration-site /
+        // expression-body walk adds ONLY the set-erasing classification, so it
+        // must not run them a second time.
+        if (setErasingDeclWalk_) continue;
         if (rejectMoveOnlyFieldReadArg(a, callee, owned)) continue;
         if (!owned) continue;
         // The owned-sink leg, restricted to the state-free shape: a bare read
@@ -13364,6 +13377,20 @@ void MethodOwnership::scanFieldReadArgsInExpr(const ast::Expr& e) {
         return;
     }
     if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // fix #8963 (§28.3 closure bullet, *Provenance* clause 3, v0.359):
+        // a LAMBDA's OWN plain function-typed parameters are call-bounded in
+        // its own body (§28.14) and so contribute a NON-EMPTY source set
+        // (Provenance clause 3: "A plain function-typed parameter of the
+        // enclosing body contributes itself: its signature announces no set,
+        // so the value is bounded by the call"). The block-body walk seeds them
+        // in `callBoundedScan`; a lambda written outside a block body — in a
+        // field initializer, an auto-property initializer, a parameter's
+        // default value, an EXPRESSION body — was never seeded, so a read of
+        // such a parameter read as UNTRACED and the `Object`-parameter
+        // argument it was passed at was admitted. Seed it here, before the
+        // walk descends into the lambda's body, so the positions INSIDE that
+        // body are judged against the seeded classification.
+        if (setErasingDeclWalk_) seedLambdaCallBoundedParams(*lam);
         sub(lam->exprBody);
         scanFieldReadArgsInStmts(lam->stmts);
         return;
@@ -13579,6 +13606,120 @@ void MethodOwnership::scanMemberForFieldReadArgs(const ast::Member& m) {
         }
         return;
     }
+}
+
+// fix #8963 (§28.3 closure bullet, *Provenance* clause 3 / *Set-erasing
+// positions*, v0.359): the §28.3 *Set-erasing positions* verdict for the
+// DECLARATION-SITE and EXPRESSION-BODY positions — the ones the block-body
+// walk (`run` → `callBoundedScan` + `scopedPreScan`) never reached. See the
+// declaration in Ownership_impl.hpp for the measurement and the two halves of
+// the hole this closes.
+//
+// The walk is the ownership pass's OWN structural expression walk
+// (`scanFieldReadArgsInExpr`), driven with `setErasingDeclWalk_` ON: it seeds
+// each lambda's own call-bounded parameters (Provenance clause 3) and queues
+// the set-erasing positions it meets. No flow facts are built here — a
+// declaration-site expression has no statements, and an expression body has
+// no assignment to reach a read through — so the trace stays
+// flow-insensitive (`seFlowComplete_` is false), which is the answer the
+// block-body walk gives for a position no assignment reaches.
+void MethodOwnership::checkSetErasingPositionsInExpr(const ast::Expr& e) {
+    const bool saved = setErasingDeclWalk_;
+    setErasingDeclWalk_ = true;
+    scanFieldReadArgsInExpr(e);
+    setErasingDeclWalk_ = saved;
+    for (const SetErasingCheck& c : setErasingCheckQueue_)
+        reportSetErasingPosition(c);
+    setErasingCheckQueue_.clear();
+}
+
+// fix #8963: the member-level driver for the positions above. The
+// DECLARATION-SITE positions of a member are the ones #8031's K8 mark already
+// reaches (a field initializer, an auto-property initializer, a parameter's
+// default value, a contract clause, a class invariant); the EXPRESSION-body
+// positions are the `=> E` bodies, which are not a block body and so never
+// reached `run`.
+//
+// A BLOCK body is deliberately NOT walked here: `run` classifies it already,
+// and walking it twice would report the same position twice. The same holds
+// for an accessor BLOCK body — a block getter runs the full pass
+// (`runGetterBody`) when its body is proved confined, and a `set(owned)`
+// accessor runs it always (`runOwnedSetterBody`); a plain setter's block body
+// is a MEMBER-body gap of its own (no ownership pass reaches it at all), not
+// this rule's declaration-site gap.
+void MethodOwnership::scanMemberForSetErasingPositions(const ast::Member& m) {
+    auto ex = [this](const std::unique_ptr<ast::Expr>& p) {
+        if (p) checkSetErasingPositionsInExpr(*p);
+    };
+    if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
+        if (md->bodyKind == ast::MethodBodyKind::Expression) ex(md->exprBody);
+    } else if (auto* od = dynamic_cast<const ast::OperatorDecl*>(&m)) {
+        if (od->bodyKind == ast::MethodBodyKind::Expression) ex(od->exprBody);
+    } else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
+        // An INSTANCE field initializer and a STATIC one alike: both are
+        // declaration-site expressions, and both run at a point where the
+        // stored closure can outlive the frame that formed it.
+        ex(fd->initializer);
+    } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m)) {
+        // The property's own `=> E` body, its auto-property initializer, and
+        // each accessor's `=> E` body.
+        if (pd->bodyKind == ast::PropertyBodyKind::Expression)
+            ex(pd->exprBody);
+        ex(pd->autoInitializer);
+        for (const auto& acc : pd->accessors)
+            if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression)
+                ex(acc.exprBody);
+    }
+    // A PARAMETER's DEFAULT VALUE, a `requires` / `ensures` clause and a class
+    // `invariant` are declaration-site expressions too — the same positions
+    // #8031's K8 mark reaches.
+    const std::vector<ast::Param>* params = nullptr;
+    const std::vector<ast::ContractClause>* contracts = nullptr;
+    if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
+        params = &md->params;
+        contracts = &md->contractClauses;
+    } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
+        params = &cd->params;
+        contracts = &cd->contractClauses;
+    } else if (auto* od = dynamic_cast<const ast::OperatorDecl*>(&m)) {
+        params = &od->params;
+    } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m))
+        params = &pd->indexerParams;
+    if (params)
+        for (const ast::Param& p : *params)
+            if (p.defaultValue) ex(p.defaultValue);
+    if (contracts)
+        for (const ast::ContractClause& cc : *contracts)
+            if (cc.expr) ex(cc.expr);
+    if (auto* id = dynamic_cast<const ast::InvariantDecl*>(&m))
+        if (id->expr) ex(id->expr);
+}
+
+// fix #8963: the set-erasing classification of ONE argument at ONE formal.
+// The two positions are the ones `scopedPreScanExpr` queues — a parameter
+// declared `Object`, and a bare type parameter — read off the SAME
+// `CalleeFormals` view it reads, so the block-body walk and this one cannot
+// disagree about which argument sits at which formal. // per §28.3
+void MethodOwnership::queueSetErasingPosition(const CalleeFormals& f,
+                                              std::size_t bp,
+                                              const ast::Expr& value) {
+    const ast::Type* dType = f.declType(bp);
+    const sema::TypeRef* pt =
+        dType ? ctx_.resolvedType(*dType) : f.resolvedType(bp);
+    // A bare type parameter: kind=Named with declaration=nullptr per
+    // resolveNamed's type-param marker. `Object` is set-erasing as a
+    // Primitive.
+    const bool isBareTypeParam =
+        pt && pt->kind == sema::TypeRef::Kind::Named && !pt->declaration;
+    const bool isObject =
+        pt && pt->kind == sema::TypeRef::Kind::Primitive &&
+        pt->primitive == sema::PrimitiveType::Object;
+    if (isBareTypeParam)
+        setErasingCheckQueue_.push_back(
+            {SetErasingPosition::BareTypeParameter, &value});
+    else if (isObject)
+        setErasingCheckQueue_.push_back(
+            {SetErasingPosition::ObjectParameter, &value});
 }
 
 // fix #4803: see the declaration in Ownership_impl.hpp. MEASURED on the
