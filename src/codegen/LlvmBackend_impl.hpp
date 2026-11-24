@@ -28047,25 +28047,47 @@ private:
     // disagreement is a leak (consumer misses a mint) or an over-release
     // (consumer releases an unminted reference). Returns the concrete type the
     // result substitutes to when, and only when, `t` is a NON-nullable bare
-    // `T` (a `T?` is never minted: the substitution is nullable), `T` is bound
-    // here, is not a type parameter of the lambda's own callee, and its
-    // binding is a non-nullable `string` or function type. Otherwise nullptr.
+    // `T` (a DECLARED `T?` is never minted), `T` is bound here, is not a type
+    // parameter of the lambda's own callee, and its binding is a `string` or a
+    // function type. Otherwise nullptr.
     // A lookup only, so const predicates may call it.
+    //
+    // fix #9118 (§14.1, §27.5, §28.9, v0.359): the binding may be a NULLABLE
+    // `string` (`T = string?`). A `string?` is the SAME runtime-managed
+    // reference as a `string` with a null state (§28.9) and `bz_string_retain`
+    // / `bz_string_release` are null-safe, so the two forms need the SAME
+    // mint — the decision belongs to the INSTANTIATED type, not to the
+    // nullability of the binding. The exclusion this widens was the
+    // producer/consumer disagreement of issue #9118: the lambda's own mint
+    // (this predicate, read by `lowerLambda` and by the block-bodied
+    // `emitReturn` twin through `currentLambdaReturnSemaTy_`) declined the
+    // nullable binding, so `lambda(): T => p` at `T = string?` returned a +0
+    // borrow, while the CALL SITE — which sees the instantiated `string?` —
+    // classified the closure call as a +1 producer
+    // (`isPlusOneStringProducer`'s closure-call arm) and RELEASED a reference
+    // the lambda never minted:
+    //     M<T>(p: T): () -> T { return lambda(): T => p; }
+    //     M<string?>($"fr-{j}")   ->  "refcount over-release (string)", rc 134
+    // The non-nullable `string` binding (the #8946 twin) and every other kind
+    // (an `int` binding takes no mint) are unchanged. A NULLABLE FUNCTION
+    // binding stays excluded: the closure mint's consumer
+    // (`isLambdaClosureReturnCall`) requires a non-nullable function type, so
+    // admitting one here would make the producer mint without its release.
     const sema::TypeRef* mintedBareTypeParamResult(const sema::TypeRef* t) const {
         if (!t || t->nullable || genericSubstSemaTy_.empty() ||
             !isBareTypeParamRef(t) ||
             lambdaCalleeOwnTParams_.count(t->headName()))
             return nullptr;
         auto it = genericSubstSemaTy_.find(t->headName());
-        if (it == genericSubstSemaTy_.end() || !it->second ||
-            it->second->nullable)
+        if (it == genericSubstSemaTy_.end() || !it->second)
             return nullptr;
         const sema::TypeRef* sub = it->second;
         const bool isString =
             sub->kind == sema::TypeRef::Kind::Primitive &&
             sub->primitive == sema::PrimitiveType::String;
-        return (isString || sub->kind == sema::TypeRef::Kind::Function) ? sub
-                                                                        : nullptr;
+        if (isString) return sub;  // the NULLABLE form included (fix #9118)
+        if (sub->nullable) return nullptr;
+        return sub->kind == sema::TypeRef::Kind::Function ? sub : nullptr;
     }
 
     // fix #8393 (§14.5 phase 1, stdlib §9.8, v0.357): the §14.5 phase-1

@@ -31285,8 +31285,13 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                 // parameter owned by the callee itself is left alone, exactly
                 // as lowerLambda's mint predicate leaves it.
                 // The SAME predicate lowerLambda's mint uses
-                // (mintedBareTypeParamResult): a `T?` result is never
-                // minted, so it is never a producer here.
+                // (mintedBareTypeParamResult): a DECLARED `T?` result is never
+                // minted, so it is never a producer here. fix #9118
+                // (§14.1, §27.5, §28.9, v0.359): a binding of `T = string?`
+                // IS minted (the nullable `string` is the same runtime-managed
+                // reference), so the call is a producer here too — the two
+                // verdicts move together, which is the whole point of the
+                // shared predicate.
                 if (const sema::TypeRef* minted =
                         mintedBareTypeParamResult(resultTy))
                     resultTy = minted;
