@@ -24003,6 +24003,15 @@ private:
     std::unordered_map<const void*, TransparentForwardTarget3804>
     collectTransparentForwardTargets(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) const;
+    // fix #8922 (§27.5 / §28.9, v0.359): the forwarding TARGET of a
+    // transparent forwarder — the single lambda every call to `g` produces,
+    // or null when `g` is not a forwarder. The shape test lives HERE, once,
+    // so the local-callee spelling (collectTransparentForwardTargets) and the
+    // IMMEDIATELY-INVOKED spelling (the #3805 pre-pass in
+    // collectCellFreeEligible) cannot drift apart — the "one definition, N
+    // consumers" discipline this tree keeps elsewhere.
+    const ast::LambdaExpr* transparentForwardTargetOf(
+        const ast::LambdaExpr* g) const;
     // fix #2960 / §8.6 / §28.9: classify an expression stored into a managed
     // Object/interface local: +1 means boxForTarget creates (or a local
     // box-return method hands back) a fresh box; 0 means a statically non-box

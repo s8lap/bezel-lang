@@ -54342,6 +54342,90 @@ void Emitter::collectBoxCaptureLocals(
 // fix #3804 (§27.5 / §15.3 / §28.9, v0.294): see the header declaration's own
 // comment for the full contract. Pure query over `body` — writes no Emitter
 // state.
+// fix #8922 (§27.5 / §28.9, v0.359): the forwarding TARGET of a transparent
+// forwarder — the single lambda every call to `g` produces. Split out of
+// collectTransparentForwardTargets so the IMMEDIATELY-INVOKED spelling of the
+// same forwarder (#8922) asks the SAME question instead of duplicating the
+// shape test — the "one definition, N consumers" discipline this tree keeps
+// elsewhere (the `isCoalescedClosureTransfer` / `returnedClosureLocalOwns-
+// PlusOne` pair is the sibling example).
+//
+// `g` is a TRANSPARENT FORWARDER when every call to it constructs and yields
+// exactly one lambda:
+//   * a BARE EXPRESSION BODY whose own body is a lambda literal
+//     (`lambda() => lambda() => …`, fix #3805's original shape), or
+//   * a STRAIGHT-LINE BLOCK BODY with exactly one return, whose value is a
+//     lambda literal (fix #3804's shape; fix #3704 added the bare-literal
+//     `return lambda() => …;` spelling).
+// Anything else — a control-flow statement in the block body, a body that is
+// not a lambda at all — is DECLINED: the answer is "not a forwarder", the
+// conservative direction (a leak, never an over-free).
+const ast::LambdaExpr* Emitter::transparentForwardTargetOf(
+        const ast::LambdaExpr* g) const {
+    if (!g) return nullptr;
+    if (g->stmts.empty()) {
+        // Bare expression body (fix #3805's original shape): calling `L`
+        // constructs and evaluates to `g->exprBody`, nothing else.
+        return dynamic_cast<const ast::LambdaExpr*>(g->exprBody.get());
+    }
+    // fix #3804: straight-line block body. Decline (leave target
+    // null) the instant any control-flow statement appears — see
+    // the header comment for why that keeps the proof trivial.
+    bool decline = false;
+    int returnCount = 0;
+    const ast::LambdaExpr* found = nullptr;
+    for (auto& st : g->stmts) {
+        const ast::Stmt* stp = st.get();
+        if (dynamic_cast<const ast::LocalDecl*>(stp) ||
+            dynamic_cast<const ast::LocalConstDecl*>(stp) ||
+            dynamic_cast<const ast::ExpressionStmt*>(stp)) {
+            continue;
+        }
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(stp)) {
+            ++returnCount;
+            // fix #3704 (§27.5 / §15.3 / §28.9, v0.294): `return
+            // lambda() => …;` — a BARE LambdaExpr literal directly in
+            // the return, with no intermediate `var`/`const`
+            // binding. Mirror the bare-expression-body branch above
+            // (`target = g->exprBody` when THAT is itself a
+            // LambdaExpr) — the value every call to `g` produces is
+            // exactly as identifiable here as there. Before this arm,
+            // this shape fell through to the `else` below and forced
+            // `found` to null, so `g` was never recognized as a
+            // transparent forwarder: collectDefinitelyEscapingLambdas
+            // could not mark the literal as definitely-escaping via
+            // `return outer();`, leaking its capture cell.
+            if (auto* litLam =
+                    dynamic_cast<const ast::LambdaExpr*>(
+                        r->value.get())) {
+                found = litLam;
+                continue;
+            }
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                r->value.get());
+            auto* lsym = id ? dynamic_cast<sema::LocalSymbol*>(
+                                  ctx_.exprSymbol(*id))
+                             : nullptr;
+            if (lsym && lsym->decl) {
+                LocalDeclInitView iv = localDeclInitView(lsym->decl);
+                found = iv.init
+                    ? dynamic_cast<const ast::LambdaExpr*>(iv.init)
+                    : nullptr;
+            } else {
+                found = nullptr;
+            }
+            continue;
+        }
+        // Any other statement kind (if/while/for/try/case/do/
+        // assignment/throw) — decline rather than reason about it.
+        decline = true;
+        break;
+    }
+    if (!decline && returnCount == 1 && found) return found;
+    return nullptr;
+}
+
+
 std::unordered_map<const void*, Emitter::TransparentForwardTarget3804>
 Emitter::collectTransparentForwardTargets(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) const {
@@ -54351,67 +54435,7 @@ Emitter::collectTransparentForwardTargets(
         auto* g = v.init ? dynamic_cast<const ast::LambdaExpr*>(v.init)
                           : nullptr;
         if (!g) continue;
-        const ast::LambdaExpr* target = nullptr;
-        if (g->stmts.empty()) {
-            // Bare expression body (fix #3805's original shape): calling `L`
-            // constructs and evaluates to `g->exprBody`, nothing else.
-            target = dynamic_cast<const ast::LambdaExpr*>(g->exprBody.get());
-        } else {
-            // fix #3804: straight-line block body. Decline (leave target
-            // null) the instant any control-flow statement appears — see
-            // the header comment for why that keeps the proof trivial.
-            bool decline = false;
-            int returnCount = 0;
-            const ast::LambdaExpr* found = nullptr;
-            for (auto& st : g->stmts) {
-                const ast::Stmt* stp = st.get();
-                if (dynamic_cast<const ast::LocalDecl*>(stp) ||
-                    dynamic_cast<const ast::LocalConstDecl*>(stp) ||
-                    dynamic_cast<const ast::ExpressionStmt*>(stp)) {
-                    continue;
-                }
-                if (auto* r = dynamic_cast<const ast::ReturnStmt*>(stp)) {
-                    ++returnCount;
-                    // fix #3704 (§27.5 / §15.3 / §28.9, v0.294): `return
-                    // lambda() => …;` — a BARE LambdaExpr literal directly in
-                    // the return, with no intermediate `var`/`const`
-                    // binding. Mirror the bare-expression-body branch above
-                    // (`target = g->exprBody` when THAT is itself a
-                    // LambdaExpr) — the value every call to `g` produces is
-                    // exactly as identifiable here as there. Before this arm,
-                    // this shape fell through to the `else` below and forced
-                    // `found` to null, so `g` was never recognized as a
-                    // transparent forwarder: collectDefinitelyEscapingLambdas
-                    // could not mark the literal as definitely-escaping via
-                    // `return outer();`, leaking its capture cell.
-                    if (auto* litLam =
-                            dynamic_cast<const ast::LambdaExpr*>(
-                                r->value.get())) {
-                        found = litLam;
-                        continue;
-                    }
-                    auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                        r->value.get());
-                    auto* lsym = id ? dynamic_cast<sema::LocalSymbol*>(
-                                          ctx_.exprSymbol(*id))
-                                     : nullptr;
-                    if (lsym && lsym->decl) {
-                        LocalDeclInitView iv = localDeclInitView(lsym->decl);
-                        found = iv.init
-                            ? dynamic_cast<const ast::LambdaExpr*>(iv.init)
-                            : nullptr;
-                    } else {
-                        found = nullptr;
-                    }
-                    continue;
-                }
-                // Any other statement kind (if/while/for/try/case/do/
-                // assignment/throw) — decline rather than reason about it.
-                decline = true;
-                break;
-            }
-            if (!decline && returnCount == 1 && found) target = found;
-        }
+        const ast::LambdaExpr* target = transparentForwardTargetOf(g);
         if (!target) continue;
         // fix #3805's exactly-one-call proof, applied to `L` itself: TWO
         // calls to the same forwarding lambda would build two independent
@@ -56249,6 +56273,56 @@ void Emitter::collectCellFreeEligible(
             continue;
         auto* call = dynamic_cast<const ast::CallExpr*>(v.init);
         if (!call || !call->callee) continue;
+        // fix #8922 (§27.5 / §28.9, v0.359): the IMMEDIATELY-INVOKED spelling
+        // of the same transparent forwarder. The callee is a lambda LITERAL
+        // invoked at its own construction site (`(lambda() => lambda() => k)()`)
+        // instead of a local `L` — so `forwardTargets3804` (keyed by the
+        // forwarder lambda, and built only from a local's initializer) has no
+        // entry for it, and the §27.5 / #1135 nested-lambda widening
+        // classified the forwarded target `H` as ESCAPING. The consequence
+        // was that `H`'s captured local was in NEITHER reclaim route: not in
+        // `cellFreeEligible_` (the scope-end route declines a captured-by-
+        // escaping local) and not in `sharedCellEnvdtorFreeOwner_` (the
+        // envdtor route declines a `nestedWidenedKeys` local) — so the
+        // captured local's boxed cell was reclaimed by NOBODY.
+        //
+        // THE PROOF, and why it is the SAME proof the local-callee spelling
+        // above gets. `H` is the forwarding target of the IIFE's lambda `G`:
+        // every evaluation of the IIFE constructs exactly one `H` and yields
+        // it to the binding `M` this loop is looking at. The three facts the
+        // local-callee arm needs are all available here:
+        //   (1) `M` (the binding) is proven non-escaping — the guard above
+        //       (`closureReleaseEligible_.count(s)`) is the SAME guard, and
+        //       `isLambdaClosureReturnCall` admits an IIFE callee since
+        //       fix #8870 / #8893, so `M`'s scope-end release is armed and
+        //       `H`'s env is released at this frame's scope end;
+        //   (2) `G` is called at most once — an IIFE's callee is invoked by
+        //       the IIFE itself, exactly once per evaluation of the
+        //       expression, and this loop walks the frame body's TOP-LEVEL
+        //       statements only (`body` is a frame's statement list), so the
+        //       IIFE expression is evaluated at most once per frame
+        //       invocation. That is STRICTLY STRONGER than the local-callee
+        //       arm's `calledAtMostOnce` (a call-SITE count);
+        //   (3) `G` cannot escape — an IIFE's closure is released immediately
+        //       after the call (`emitClosureRelease(closureObj)` in
+        //       LlvmBackend_Calls2.cpp), so `G`'s env never outlives the
+        //       expression.
+        // Hence `H` is created and released entirely within THIS frame's
+        // lifetime, and `H`'s captures may be treated as NON-ESCAPING — the
+        // same verdict the local-callee spelling reaches, so the two
+        // spellings of one shape must agree.
+        //
+        // The forward-target question is asked through the SHARED helper
+        // (`transparentForwardTargetOf`), so the IIFE spelling admits exactly
+        // the forwarder shapes the local-callee spelling admits.
+        if (auto* iifeLam =
+                dynamic_cast<const ast::LambdaExpr*>(call->callee.get())) {
+            const ast::LambdaExpr* h = transparentForwardTargetOf(iifeLam);
+            if (h)
+                transparentTailNonEscaping3805.insert(
+                    static_cast<const void*>(h));
+            continue;
+        }
         auto* callee = dynamic_cast<const ast::IdentifierExpr*>(call->callee.get());
         if (!callee) continue;
         auto* lsym = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*callee));
@@ -56338,8 +56412,29 @@ void Emitter::collectCellFreeEligible(
     // non-escaping co-capturers may arm boxedCellFree — the escaping envdtor
     // reclaims the cell, and arming boxedCellFree would cause a double-free.
     // Key space: the same as cellFreeEligible_ (DeclSymbol* / ParameterSymbol*).
-    for (const auto& [decl, _] : escapingCapturersOf)
-        declsCapturedByEscaping_.insert(decl);
+    //
+    // fix #8922 (§27.5 / §28.9, v0.359): this set's own contract is "every
+    // captured entity that ANY escaping lambda captures", and it is read by
+    // the #4509 / #4523 COUNTING protocol's arming conjunct
+    // (LlvmBackend_Exprs2.cpp: `declsCapturedByEscaping_.count(dkey)`). It
+    // was populated from `escapingCapturersOf` — the ESCAPING lambda NODES
+    // that capture each key — so it held only the keys with an IDENTIFIABLE
+    // escaping capturer. The §27.5 / #1135 nested-lambda widening reaches
+    // the other keys: an outer local a NESTED lambda references is classified
+    // as captured-by-escaping (the nested lambda may escape the outer one,
+    // and the two share one heap cell) but has NO identifiable owner node —
+    // the nested lambda may be instantiated more than once over that cell
+    // (the #3804 arm's `calledAtMostOnce` proof) — so `escapingCapturersOf`
+    // cannot name it. Those keys were therefore in `capturedByEscaping` (the
+    // scope-end route declines them) and in NEITHER envdtor route
+    // (sharedCellEnvdtorFreeOwner_'s condition (d) declines a nested-widened
+    // key) and NOT in this set — so the counting protocol never armed for
+    // them and NOBODY reclaimed their cell. The set is populated from
+    // `capturedByEscaping` instead, which is exactly the classification the
+    // contract names; the nested-widened keys join it, and the counting
+    // protocol reclaims their cell with the closure that holds it.
+    for (const void* key : capturedByEscaping)
+        declsCapturedByEscaping_.insert(key);
 
     // A captured entity qualifies iff:
     //   - it appears in capturedByNonEscaping (at least one non-escaping lambda
