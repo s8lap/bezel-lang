@@ -1051,6 +1051,45 @@ public:
     void applyUsingVarBorrowPinInLambdas(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
+    // fix #8970 (§28.3.10, v0.359): the CLOSURE's own `owned` parameter.
+    //
+    // §28.3.10: "Undischarged `owned` parameters' implicit disposals are
+    // established at entry to the body, in declaration order — so, undischarged,
+    // they are disposed in reverse declaration order, for a method, a
+    // constructor, a LAMBDA and an uncaptured primary-constructor parameter
+    // alike". The METHOD half is implemented (the end-of-method sweep sets
+    // `ParameterSymbol::autoDropAtScopeEnd` for an `owned` parameter the body
+    // never discharges); the LAMBDA half was missing, and the value the caller
+    // transferred into the closure leaked.
+    //
+    // `checkLambdaOwnedParamDischargesInBody` is the body-level driver (it
+    // collects every LambdaExpr in the body, nested ones included);
+    // `checkLambdaOwnedParamDischarges` is the per-closure check — it flags
+    // the closure's `owned` parameters the body never discharges, and only
+    // those: an unclassified mention leaves the parameter alone (a bounded
+    // leak, never a double free). // per §28.3.10, v0.359
+    void checkLambdaOwnedParamDischargesInBody(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void checkLambdaOwnedParamDischarges(const ast::LambdaExpr& lam);
+
+    // fix #8970: the helper of `checkLambdaOwnedParamDischarges` — collect
+    // the parameter's mentions that are the RECEIVER of a member access
+    // (other than `.Dispose()`) or of an index, i.e. the positions the check
+    // can PROVE are borrows (§28.3 K3.13). A mention the walk never reaches
+    // is not collected, which makes the caller treat it as unclassified (the
+    // safe direction). // per §28.3.10, v0.359
+    void collectLambdaBorrowReceiverIdents(
+        const ast::LambdaExpr& lam, const sema::Symbol* psym,
+        std::set<const ast::IdentifierExpr*>& out);
+    void collectBorrowReceiverIdents(
+        const ast::Expr& e, const sema::Symbol* psym,
+        std::set<const ast::IdentifierExpr*>& out);
+    void collectBorrowReceiverIdentsStmt(
+        const ast::Stmt& s, const sema::Symbol* psym,
+        std::set<const ast::IdentifierExpr*>& out);
+    void noteBorrowReceiver(const ast::Expr* target, const sema::Symbol* psym,
+                             std::set<const ast::IdentifierExpr*>& out);
+
     // fix #2674 / §28.3 / §28.9 (v0.282): the four OWNERSHIP-pass-set
     // end-of-statement reclaim flags — DiscardStmt::disposeOwnedValue
     // (#1009), disposeOwnedCollectionValue (#1909), disposeOwnedBuilder-

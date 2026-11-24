@@ -3644,6 +3644,18 @@ private:
     // ROOT scope (the first scope it pushes) so they are auto-disposed on an
     // exception unwind out of the whole method. Cleared once registered.
     std::vector<std::pair<sema::Symbol*, llvm::AllocaInst*>> pendingOwnedParams_;
+    // fix #8970 (§28.3.10, v0.359): a CLOSURE's own `owned` parameters
+    // awaiting the same registration. A closure's parameters are bound by
+    // `lowerLambda`'s own prologue (not by `bindParameters`), so they never
+    // reached `pendingOwnedParams_` and the closure body's scope-end
+    // discharge (§28.3.10: an undischarged `owned` parameter is disposed "at
+    // the end of the method" — for a closure, at the end of its BODY) was
+    // never armed: the value the caller transferred into the closure leaked.
+    // Drained into the closure body's ROOT scope by the first
+    // `lowerScopedBlock` call inside that body, exactly as
+    // `pendingOwnedParams_` is.
+    std::vector<std::pair<sema::Symbol*, llvm::AllocaInst*>>
+        pendingLambdaOwnedParams_;
     // fix #4239 (§27.5 / §28.9, v0.300): a chained call `var w := C.Make()()`
     // in lowerLocalDecl — lowerExpr (CG60 arm) needs to store the closure-call
     // result through the local's OWN slot (not a temp), and register disposal on
@@ -19874,6 +19886,11 @@ private:
         // --- root-scope registration channels (#2731 item 3) ---
         std::vector<std::pair<sema::Symbol*, llvm::AllocaInst*>>
                              pendingOwnedParams_;
+        // fix #8970 (§28.3.10, v0.359): the same root-scope registration
+        // channel for a CLOSURE's own `owned` parameters — the nested body's
+        // own channel, never the caller's.
+        std::vector<std::pair<sema::Symbol*, llvm::AllocaInst*>>
+                             pendingLambdaOwnedParams_;
         std::optional<Disposal> pendingArgsDisposal_;
         std::vector<Disposal> pendingChainOutDisposals_;  // fix #4975
         // fix #8827 (§27.5 / §28.3, v0.359): the caller's pending capture cells
@@ -21400,7 +21417,16 @@ private:
     // disposal (same unwindOnly mechanism / eligibility as plain owned locals).
     // An owned param is owned at method entry (§28.8) and must reach a discharge
     // point on normal exit; on an unwind out of the method it is auto-disposed.
-    void registerUnwindOwnedParam(sema::Symbol* psym, llvm::AllocaInst* slot);
+    //
+    // fix #8970 (§28.3.10, v0.359): `lambdaBody` is true when the parameter
+    // belongs to a CLOSURE's own body rather than to a method. The
+    // `currentFn_ == unwindIneligibleFn_` gate exists because
+    // `unwindIneligible_` holds ONE function's body walk; a closure body is
+    // walked as part of its ENCLOSING method's body (the walker descends into
+    // `lam->stmts`), so the set already carries the closure body's own
+    // consumption verdicts and the gate must not reject them.
+    void registerUnwindOwnedParam(sema::Symbol* psym, llvm::AllocaInst* slot,
+                                  bool lambdaBody = false);
 
     // §28.3: is `ld`'s initializer an OWNED class/interface object that is
     // definitely assigned at the declaration (a `new T()`, or a call returning

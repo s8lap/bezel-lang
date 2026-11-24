@@ -721,6 +721,14 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // // per §28.3, §28.6, §28.9, v0.298, #4321
     collectReassignedOwnedLocalsInLambdaFrames(body);
     applyUsingVarBorrowPinInLambdas(body);
+    // fix #8970 (§28.3.10, v0.359): the CLOSURE's own `owned` parameter —
+    // flag the ones the closure body never discharges, so codegen's
+    // `registerUnwindOwnedParam` drops them at the closure body's scope end
+    // exactly as it drops a method's undischarged `owned` parameter. Runs
+    // BEFORE the dataflow (the flag is read by codegen) and AFTER
+    // `applyUsingVarBorrowPinInLambdas` (which settles the lambda body's own
+    // local flags). // per §28.3.10, v0.359
+    checkLambdaOwnedParamDischargesInBody(body);
     // fix #2674 / §28.3 / §17.13 / §28.9 (v0.282): the four OWNERSHIP-pass-
     // set end-of-statement reclaim flags (DiscardStmt::disposeOwnedValue /
     // disposeOwnedCollectionValue / disposeOwnedBuilderValue /
@@ -15669,6 +15677,340 @@ void MethodOwnership::seedCapturedLocalFromDecl(sema::LocalSymbol* ls) {
         }
     }
     states_[ls] = lo;
+}
+
+// fix #8970 (§28.3.10, v0.359): the CLOSURE's own `owned` parameter — does the
+// closure body DISCHARGE it?
+//
+// §28.3.10 *Owned-local discharge requirement* (v0.359): "Undischarged `owned`
+// parameters' implicit disposals are established at entry to the body, in
+// declaration order — so, undischarged, they are disposed in reverse
+// declaration order, for a method, a constructor, a LAMBDA and an uncaptured
+// primary-constructor parameter alike". The METHOD half is implemented: the
+// ownership pass's end-of-method sweep sets
+// `ParameterSymbol::autoDropAtScopeEnd` for an `owned` parameter the body
+// never discharges, and codegen's `registerUnwindOwnedParam` turns that flag
+// into the scope-end free.
+//
+// The LAMBDA half was missing. The ownership pass never runs its dataflow
+// over a lambda body — the cross-cutting fix #2674 records as deferred — so
+// nothing ever set that flag for a closure's own `owned` parameter, and the
+// value the CALLER transferred into the closure was never disposed: the
+// closure ended, the value was still owned, and it leaked (MEASURED on
+// r43-f45-toolchain: 160 bytes in 2 allocations for the issue's repro, 16
+// bytes for the user-class twin).
+//
+// THE QUESTION. §28.3's consume table names the positions at which a value
+// is DISCHARGED; every other position is a BORROW (K3.13) and discharges
+// nothing. This check asks the narrow question the flag needs — does the
+// closure body take the parameter away? — and answers it with the positions
+// it can PROVE are borrows:
+//
+//   * the RECEIVER of a member access (other than `.Dispose()`, which
+//     discharges the receiver), and
+//   * the RECEIVER of an index.
+//
+// A parameter that is never mentioned, or whose every mention is one of those
+// receivers, is never discharged; the flag is set and codegen drops it at the
+// closure body's scope end — the same discharge, on the same edges, the
+// method twin gets.
+//
+// THE BIAS IS THE SAFE ONE. Any mention this check cannot classify as a
+// borrow leaves the value alone: the parameter is treated as discharged, the
+// scope-end free is not armed, and the outcome is a bounded LEAK — never a
+// double free with a value the body already owns. That is the direction the
+// codebase's other lambda-body pre-passes take ("under-collecting here merely
+// misses a flag (a leak), so the pre-pass is conservative by construction",
+// #2674).
+//
+// SCOPE. The walk reaches the closure's own body and every nested closure in
+// it. A capture of the parameter by a NESTED closure is a borrow (§28.9), but
+// it is not one of the two receivers this check proves, so it is classified
+// as a discharge — the conservative answer.
+void MethodOwnership::checkLambdaOwnedParamDischarges(
+        const ast::LambdaExpr& lam) {
+    const std::vector<sema::Symbol*>* params = ctx_.lambdaParams(&lam);
+    if (!params) return;
+    for (sema::Symbol* sym : *params) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+        if (!ps) continue;
+        // §22.3: only an `owned` PARAMETER carries the disposal obligation
+        // (a borrow parameter is never Owned).
+        if (ps->modifier != "owned") continue;
+        // The parameter's MENTIONS in the closure body.
+        std::vector<const ast::IdentifierExpr*> ids;
+        collectLambdaIdentifiers(lam, ids);
+        std::set<const ast::IdentifierExpr*> mentions;
+        for (const ast::IdentifierExpr* id : ids)
+            if (id && ctx_.exprSymbol(*id) == sym) mentions.insert(id);
+        if (mentions.empty()) {
+            // The body never names the parameter: it cannot discharge it.
+            ps->autoDropAtScopeEnd = true;
+            continue;
+        }
+        // The mentions that are provably BORROWS.
+        std::set<const ast::IdentifierExpr*> borrows;
+        collectLambdaBorrowReceiverIdents(lam, sym, borrows);
+        if (borrows.size() != mentions.size()) return;  // an unclassified mention
+        for (const ast::IdentifierExpr* id : mentions)
+            if (!borrows.count(id)) return;               // an unclassified mention
+        // Every mention is a borrow receiver: the body never discharges it.
+        ps->autoDropAtScopeEnd = true;
+    }
+}
+
+// fix #8970 (§28.3.10, v0.359): the helper of
+// `checkLambdaOwnedParamDischarges` — collect the parameter's mentions that
+// are the RECEIVER of a member access (other than `.Dispose()`) or of an
+// index. Mirrors `collectIdentifiersIn`'s shape-for-shape so every mention is
+// REACHED; a mention the walk never reaches simply does not appear here,
+// which makes the caller treat it as unclassified (the safe direction).
+void MethodOwnership::collectLambdaBorrowReceiverIdents(
+        const ast::LambdaExpr& lam, const sema::Symbol* psym,
+        std::set<const ast::IdentifierExpr*>& out) {
+    if (lam.exprBody) {
+        collectBorrowReceiverIdents(*lam.exprBody, psym, out);
+        return;
+    }
+    for (const auto& st : lam.stmts)
+        if (st) collectBorrowReceiverIdentsStmt(*st, psym, out);
+}
+
+// fix #8970: the per-expression leg — see
+// `collectLambdaBorrowReceiverIdents`.
+void MethodOwnership::collectBorrowReceiverIdents(
+        const ast::Expr& e, const sema::Symbol* psym,
+        std::set<const ast::IdentifierExpr*>& out) {
+    if (dynamic_cast<const ast::IdentifierExpr*>(&e)) return;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        // `.Dispose()` DISCHARGES its receiver (§28.2) — not a borrow.
+        if (ma->member != "Dispose")
+            noteBorrowReceiver(ma->target.get(), psym, out);
+        if (ma->target) collectBorrowReceiverIdents(*ma->target, psym, out);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->member != "Dispose")
+            noteBorrowReceiver(nm->target.get(), psym, out);
+        if (nm->target) collectBorrowReceiverIdents(*nm->target, psym, out);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        noteBorrowReceiver(ix->target.get(), psym, out);
+        if (ix->target) collectBorrowReceiverIdents(*ix->target, psym, out);
+        for (const auto& a : ix->indices)
+            if (a.value) collectBorrowReceiverIdents(*a.value, psym, out);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee) collectBorrowReceiverIdents(*ce->callee, psym, out);
+        for (const auto& a : ce->args)
+            if (a.value) collectBorrowReceiverIdents(*a.value, psym, out);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (nc->callee) collectBorrowReceiverIdents(*nc->callee, psym, out);
+        for (const auto& a : nc->args)
+            if (a.value) collectBorrowReceiverIdents(*a.value, psym, out);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) collectBorrowReceiverIdents(*be->left, psym, out);
+        if (be->right) collectBorrowReceiverIdents(*be->right, psym, out);
+        return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (un->operand) collectBorrowReceiverIdents(*un->operand, psym, out);
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) collectBorrowReceiverIdents(*pb->operand, psym, out);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand) collectBorrowReceiverIdents(*tt->operand, psym, out);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition) collectBorrowReceiverIdents(*cd->condition, psym, out);
+        if (cd->thenValue) collectBorrowReceiverIdents(*cd->thenValue, psym, out);
+        if (cd->elseValue) collectBorrowReceiverIdents(*cd->elseValue, psym, out);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        for (const auto& a : ne->args)
+            if (a.value) collectBorrowReceiverIdents(*a.value, psym, out);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand) collectBorrowReceiverIdents(*th->operand, psym, out);
+        return;
+    }
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        collectLambdaBorrowReceiverIdents(*lam, psym, out);
+        return;
+    }
+    if (auto* cse = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (cse->scrutinee)
+            collectBorrowReceiverIdents(*cse->scrutinee, psym, out);
+        for (const auto& arm : cse->arms) {
+            if (arm.guard) collectBorrowReceiverIdents(*arm.guard, psym, out);
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
+                if (arm.exprBody)
+                    collectBorrowReceiverIdents(*arm.exprBody, psym, out);
+            } else {
+                for (const auto& st : arm.stmts)
+                    if (st) collectBorrowReceiverIdentsStmt(*st, psym, out);
+            }
+        }
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : is->parts)
+            if (part.expr) collectBorrowReceiverIdents(*part.expr, psym, out);
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        if (we->source) collectBorrowReceiverIdents(*we->source, psym, out);
+        for (const auto& ia : we->assigns)
+            if (ia.value) collectBorrowReceiverIdents(*ia.value, psym, out);
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys)
+            if (k) collectBorrowReceiverIdents(*k, psym, out);
+        for (const auto& v : cl->elements)
+            if (v) collectBorrowReceiverIdents(*v, psym, out);
+        return;
+    }
+    if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
+        if (re->lo) collectBorrowReceiverIdents(*re->lo, psym, out);
+        if (re->hi) collectBorrowReceiverIdents(*re->hi, psym, out);
+        if (re->step) collectBorrowReceiverIdents(*re->step, psym, out);
+        return;
+    }
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
+        for (const auto& c : bx->clauses)
+            if (c && c->initializer)
+                collectBorrowReceiverIdents(*c->initializer, psym, out);
+        if (bx->body) collectBorrowReceiverIdents(*bx->body, psym, out);
+        return;
+    }
+    // Literals, `default` / `typeof` / `nameof`, … carry no identifier.
+}
+
+// fix #8970: the per-statement leg — see
+// `collectLambdaBorrowReceiverIdents`.
+void MethodOwnership::collectBorrowReceiverIdentsStmt(
+        const ast::Stmt& s, const sema::Symbol* psym,
+        std::set<const ast::IdentifierExpr*>& out) {
+    forEachNestedStmt(s, [&](const ast::Stmt& cur) {
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&cur)) {
+            if (es->expr) collectBorrowReceiverIdents(*es->expr, psym, out);
+            return;
+        }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&cur)) {
+            if (rs->value) collectBorrowReceiverIdents(*rs->value, psym, out);
+            return;
+        }
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
+            if (ld->initializer)
+                collectBorrowReceiverIdents(*ld->initializer, psym, out);
+            return;
+        }
+        if (auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(&cur)) {
+            if (lcd->value) collectBorrowReceiverIdents(*lcd->value, psym, out);
+            return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
+            if (as->target) collectBorrowReceiverIdents(*as->target, psym, out);
+            if (as->value) collectBorrowReceiverIdents(*as->value, psym, out);
+            return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&cur)) {
+            if (ds->value) collectBorrowReceiverIdents(*ds->value, psym, out);
+            return;
+        }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&cur)) {
+            if (ts->value) collectBorrowReceiverIdents(*ts->value, psym, out);
+            return;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&cur)) {
+            if (ys->value) collectBorrowReceiverIdents(*ys->value, psym, out);
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&cur)) {
+            if (is->target) collectBorrowReceiverIdents(*is->target, psym, out);
+            return;
+        }
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&cur)) {
+            if (ifs->ifBranch.condition)
+                collectBorrowReceiverIdents(*ifs->ifBranch.condition, psym, out);
+            for (const auto& el : ifs->elifBranches)
+                if (el.condition)
+                    collectBorrowReceiverIdents(*el.condition, psym, out);
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&cur)) {
+            if (ws->condition)
+                collectBorrowReceiverIdents(*ws->condition, psym, out);
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(&cur)) {
+            if (fs->iterable)
+                collectBorrowReceiverIdents(*fs->iterable, psym, out);
+            if (fs->withExpr)
+                collectBorrowReceiverIdents(*fs->withExpr, psym, out);
+            return;
+        }
+        if (auto* trys = dynamic_cast<const ast::TryStmt*>(&cur)) {
+            for (const auto& arm : trys->catches)
+                if (arm.guard)
+                    collectBorrowReceiverIdents(*arm.guard, psym, out);
+            return;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&cur)) {
+            if (cs->scrutinee)
+                collectBorrowReceiverIdents(*cs->scrutinee, psym, out);
+            for (const auto& arm : cs->arms) {
+                if (arm.guard)
+                    collectBorrowReceiverIdents(*arm.guard, psym, out);
+                if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
+                    if (arm.exprBody)
+                        collectBorrowReceiverIdents(*arm.exprBody, psym, out);
+                }
+            }
+            return;
+        }
+        // DoEndBlock carries no expression. BreakStmt / ContinueStmt carry no
+        // sub-expression.
+    });
+}
+
+// fix #8970: the receiver-recognition helper — see
+// `collectLambdaBorrowReceiverIdents`.
+void MethodOwnership::noteBorrowReceiver(
+        const ast::Expr* target, const sema::Symbol* psym,
+        std::set<const ast::IdentifierExpr*>& out) {
+    if (!target) return;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(target);
+    if (!id) return;
+    if (ctx_.exprSymbol(*id) != psym) return;
+    out.insert(id);
+}
+
+// fix #8970 (§28.3.10, v0.359): the body-level driver — collect every
+// LambdaExpr in the body (the same collector `applyUsingVarBorrowPinInLambdas`
+// uses; it descends into nested lambdas, so the flat list covers every
+// nesting depth) and check each closure's own `owned` parameter.
+void MethodOwnership::checkLambdaOwnedParamDischargesInBody(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    std::vector<const ast::LambdaExpr*> lambdas;
+    for (const auto& s : body) {
+        if (s) collectBodyLambdas(*s, lambdas);
+    }
+    for (const ast::LambdaExpr* lam : lambdas)
+        checkLambdaOwnedParamDischarges(*lam);
 }
 
 void MethodOwnership::applyUsingVarBorrowPinInLambdas(

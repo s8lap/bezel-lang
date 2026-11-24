@@ -3982,6 +3982,16 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     }
 
     // Bind user lambda params (args 1..N).
+    // fix #8970 (§28.3.10, v0.359): the CLOSURE's own `owned` parameters the
+    // ownership pass flagged as never discharged — collected here and armed
+    // into the closure body's scope below. §28.3.10: "Undischarged `owned`
+    // parameters' implicit disposals are established at entry to the body, in
+    // declaration order — so, undischarged, they are disposed in reverse
+    // declaration order, for a method, a constructor, a LAMBDA and an
+    // uncaptured primary-constructor parameter alike". The flag is the SAME
+    // `ParameterSymbol::autoDropAtScopeEnd` the method path's end-of-method
+    // sweep sets; `registerUnwindOwnedParam` turns it into the scope-end free.
+    std::vector<std::pair<sema::Symbol*, llvm::AllocaInst*>> lambdaOwnedParams;
     if (paramSyms) {
         std::size_t idx = 0;
         for (auto it = std::next(fn->args().begin()); it != fn->args().end();
@@ -4013,6 +4023,11 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             auto* slot = entryAlloca(it->getType());
             builder_.CreateStore(&*it, slot);
             paramSlots_[psym] = slot;
+            // fix #8970 (§28.3.10, v0.359): an `owned` parameter the ownership
+            // pass flagged as NEVER discharged by this closure body — the
+            // closure's twin of the method's auto-dropped `owned` parameter.
+            if (par && par->modifier == "owned" && par->autoDropAtScopeEnd)
+                lambdaOwnedParams.push_back({psym, slot});
         }
     }
 
@@ -4889,6 +4904,15 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // registrations have somewhere to land, and emit its disposals before
         // the `ret` (below).
         disposeStack_.emplace_back();
+        // fix #8970 (§28.3.10, v0.359): the CLOSURE's own `owned` parameter the
+        // ownership pass flagged as never discharged. The expression body opens
+        // its scope HERE (not through `lowerScopedBlock`, which is the block
+        // body's channel), so the registration is armed directly — into the
+        // scope just opened, which is the closure body's own root scope.
+        if (!lambdaOwnedParams.empty()) {
+            for (auto& [psym, slot] : lambdaOwnedParams)
+                registerUnwindOwnedParam(psym, slot, /*lambdaBody=*/true);
+        }
         llvm::Value* v = nullptr;
         // §15.4 (#1825): a lambda's expression body that is a collection literal
         // has no standalone type — lowerExpr returns null for a
@@ -5149,6 +5173,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // `emitUnwindDisposals` already fired them), and the null-result one.
         disposeStack_.pop_back();
     } else {
+        // fix #8970 (§28.3.10, v0.359): the CLOSURE's own `owned` parameter the
+        // ownership pass flagged as never discharged. The block body opens its
+        // ROOT scope through `lowerScopedBlock`, which drains the pending
+        // channel into it — the same channel `bindParameters` uses for a
+        // method's `owned` parameters, so the closure's own root scope is where
+        // the discharge lands (§28.3.10: an undischarged `owned` parameter is
+        // disposed at the end of its body).
+        pendingLambdaOwnedParams_ = lambdaOwnedParams;
         lowerScopedBlock(lam.stmts);
         // Fall-through terminator: must match the lambda's actual return type.
         // A block-bodied handler/lambda whose declared return type is non-void

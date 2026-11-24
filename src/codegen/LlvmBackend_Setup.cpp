@@ -27420,13 +27420,21 @@ void Emitter::collectPlainMoveOnlyForwardSites() {
 
 
 void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
-                                       llvm::AllocaInst* slot) {
+                                       llvm::AllocaInst* slot,
+                                       bool lambdaBody) {
     // §28.3: an `owned` parameter is auto-disposed when an exception
     // unwinds out of its method (same unwindOnly mechanism as plain owned
     // locals). Registered in the outermost scope so it covers the whole body.
     if (disposeStack_.empty()) return;
     if (emittingDisposerBody_) return;
-    if (currentFn_ != unwindIneligibleFn_) return;
+    // fix #8970 (§28.3.10, v0.359): the gate below matches the
+    // `unwindIneligible_` set to the function whose body walk produced it.
+    // A CLOSURE's body is walked as part of its ENCLOSING method's body
+    // (`UnwindIneligibleWalker` descends into `lam->stmts`), so the set
+    // already carries the closure body's own verdicts and the gate must not
+    // reject them — the closure's own `owned` parameter is registered with
+    // `lambdaBody` set for exactly that reason.
+    if (!lambdaBody && currentFn_ != unwindIneligibleFn_) return;
     // fix #3035 / §28.3 / §28.10 (v0.240): the unwinding-INELIGIBLE bail moved
     // DOWN below the autoDropAtScopeEnd branch. The walker stays
     // over-conservative for the unwindOnly path (it can't distinguish a real
@@ -60567,6 +60575,16 @@ bool Emitter::lowerScopedBlock(const std::vector<std::unique_ptr<ast::Stmt>>& bo
         pendingOwnedParams_.clear();
         for (auto& [psym, slot] : pending)
             registerUnwindOwnedParam(psym, slot);
+    }
+    // fix #8970 (§28.3.10, v0.359): the same registration for a CLOSURE's own
+    // `owned` parameters — the closure body opens its OWN root scope (its
+    // `disposeStack_` is cleared before the body is lowered), so the drain
+    // lands in the closure body's scope, not the enclosing method's.
+    if (disposeStack_.size() == 1 && !pendingLambdaOwnedParams_.empty()) {
+        auto pending = std::move(pendingLambdaOwnedParams_);
+        pendingLambdaOwnedParams_.clear();
+        for (auto& [psym, slot] : pending)
+            registerUnwindOwnedParam(psym, slot, /*lambdaBody=*/true);
     }
     // fix #633 / §33.4: Main(args: Array<string>) prolog built the args array
     // before any scope opened.  Consume the pending Disposal here (ROOT scope

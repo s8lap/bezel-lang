@@ -7222,6 +7222,7 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
       asyncBorrowedReturn_(e.asyncBorrowedReturn_),
       inStandalonePropBlockGetter_(e.inStandalonePropBlockGetter_),  // fix #6449
       pendingOwnedParams_(e.pendingOwnedParams_),
+      pendingLambdaOwnedParams_(e.pendingLambdaOwnedParams_),  // fix #8970
       pendingArgsDisposal_(e.pendingArgsDisposal_),
       pendingChainOutDisposals_(e.pendingChainOutDisposals_),  // fix #4975
       lastLambdaCells_(std::move(e.lastLambdaCapturedCells_)),  // fix #8827
@@ -7244,6 +7245,7 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
     // lambda, a nested getter) is not the standalone getter's own body, so it
     // must not inherit its +1 mint.
     e.pendingOwnedParams_.clear();
+    e.pendingLambdaOwnedParams_.clear();  // fix #8970 (§28.3.10, v0.359)
     e.pendingArgsDisposal_.reset();
     e.pendingChainOutDisposals_.clear();  // fix #4975
     e.lastLambdaCapturedCells_.clear();   // fix #8827 (§27.5 / §28.3, v0.359)
@@ -7288,6 +7290,7 @@ Emitter::NestedBodyScope::~NestedBodyScope() {
     e_.asyncBorrowedReturn_       = asyncBorrowedReturn_;
     e_.inStandalonePropBlockGetter_ = inStandalonePropBlockGetter_;  // fix #6449
     e_.pendingOwnedParams_        = std::move(pendingOwnedParams_);
+    e_.pendingLambdaOwnedParams_  = std::move(pendingLambdaOwnedParams_);  // fix #8970
     e_.pendingArgsDisposal_       = std::move(pendingArgsDisposal_);
     e_.pendingChainOutDisposals_  = std::move(pendingChainOutDisposals_);  // fix #4975
     e_.lastLambdaCapturedCells_   = std::move(lastLambdaCells_);  // fix #8827
