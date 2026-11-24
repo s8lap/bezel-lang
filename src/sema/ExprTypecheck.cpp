@@ -10158,6 +10158,39 @@ void ExprTC::checkAssignable(
                 return;
             }
         }
+        // fix #9105 (§28.3.5 row 4, v0.359; §27.1.1 fourth bullet): the RETURN
+        // slot's `owned` marker is a modifier slot too ("Modifier slots
+        // (`owned`/`ref`/`out`/`out owned`/`scoped`) must match exactly"), and
+        // row 4's function-value-invocation cell reads the TARGET slot: a call
+        // through a plain concrete class/interface slot `() -> K` is "Borrow …
+        // The result is never owned". A value whose return slot is `owned`
+        // (a local closure `var f := lambda() => new K(5)` — typed
+        // `() -> owned K` — a method-group reference to an `owned K` producer,
+        // or any variable of an `() -> owned K` type) retyped to that plain
+        // slot would hand the caller a FRESH frame every invocation that the
+        // row says nobody ever disposes — the same leak #9040 closed for the
+        // direct lambda spelling (`checkConcreteSlotLambdaBody`). A fresh
+        // lambda literal is that direct spelling and keeps its own check, so it
+        // is skipped here. Keyed on the TARGET slot via the same predicate
+        // (`isConcreteSlotReturnType`: not `Task`-family, not an iterable head,
+        // not a bare type parameter) the callee-side check reads; the other
+        // direction, and the family / bare-`T` rows, are not touched.
+        if (!freshLambda && selFrom->funcReturnOwned &&
+            !to->funcReturnOwned && isConcreteSlotReturnType(to->funcReturn)) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("the ") + what + " has a function type whose "
+                "return slot is `owned` but the target's is the plain `" +
+                std::string(to->funcReturn->headName()) +
+                "` \xe2\x80\x94 a call through a plain concrete class/interface "
+                "slot is a borrow whose result is never owned, so no caller "
+                "would dispose the fresh value each invocation mints; "
+                "modifier slots are part of a function signature's identity "
+                "and there is no conversion between them (\xc2\xa7""28.3.5 row 4, "
+                "\xc2\xa7""27.1.1 v0.359); spell the target's return slot "
+                "`owned` to transfer");
+            return;
+        }
         // §27.3 (v0.217, #2101): a fresh lambda's param/return SHAPES stay
         // target-typed (the skipShapeCheck carve above) — EXCEPT that a
         // return-type ASCRIPTION, when written, must agree with the target's
