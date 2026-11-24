@@ -2028,6 +2028,30 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     const unsigned CURRENT_VAL_OWNED_FIELD = CURRENT_VAL_FIELD + 1;  // §29 (#1120)
     const unsigned SPILL_PTR_FIELD = CURRENT_VAL_FIELD + 2;          // #747
 
+    // fix #9071 (§14.1 / §27.5 / §28.9 / §29.3, v0.359): is frame capture
+    // `ps` a FUNCTION-TYPED parameter — a closure capture the frame holds
+    // its OWN +1 on (#1864)? The type is read AT THE CURRENT SUBSTITUTION
+    // (`resolveTypeParamRef`, the SAME read the string twin
+    // `isIteratorFrameStringPinCapture` uses), so a GENERIC method's `p: T`
+    // parameter qualifies at the instantiation whose type argument is a
+    // function type. The DECLARED type alone (`paramTypeOf`) answers "not a
+    // function type" for `T`, and the frame then took no +1: the caller's
+    // argument-pass release dropped the cell to 0 while the frame still held
+    // the pointer, the capture inside the body retained the FREED cell (an
+    // atomic RMW ASan cannot see), and the envdtor released it again — a
+    // double-free (§28.9: a function value is runtime-managed, one reference
+    // per co-owner; §27.5: the capture cell owns the captured value).
+    //
+    // The three sites that read this predicate — the construction retain
+    // (below), the GetEnumerator clone's retain, and the Dispose release —
+    // MUST agree: a retain without its matching release leaks the cell, a
+    // release without its matching retain over-releases it.
+    auto isClosureFrameParam = [&](sema::ParameterSymbol* ps) {
+        if (!ps) return false;
+        const sema::TypeRef* pt = resolveTypeParamRef(paramTypeOf(ps));
+        return pt && pt->kind == sema::TypeRef::Kind::Function;
+    };
+
     bool isInstance = !isStaticMethod(ms);
     // fix #3536: qualify with the owning class (the same `mangledTypeName`
     // convention as the ordinary per-class member spellings, e.g.
@@ -2276,8 +2300,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                 frame.captures[ci].first);
             if (!ps) continue;                       // 'this' capture — skip
-            sema::TypeRef* pt = paramTypeOf(ps);
-            if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
+            if (!isClosureFrameParam(ps)) continue;
             unsigned fieldIdx = frame.captureStart + (unsigned)ci;
             llvm::Value* fptr =
                 builder_.CreateStructGEP(frame.structTy, st, fieldIdx);
@@ -2428,8 +2451,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                     frame.captures[i].first);
                 if (!ps) continue;                   // 'this' capture — skip
-                sema::TypeRef* pt = paramTypeOf(ps);
-                if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
+                if (!isClosureFrameParam(ps)) continue;
                 if (cloneDisposesOwnedCaptures && cloneOwnsParam(ps)) continue;
                 unsigned fieldIdx = frame.captureStart + (unsigned)i;
                 llvm::Value* fptr =
@@ -3397,8 +3419,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                     frame.captures[i].first);
                 if (!ps) continue;
-                sema::TypeRef* pt = paramTypeOf(ps);
-                if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
+                if (!isClosureFrameParam(ps)) continue;
                 unsigned fieldIdx = frame.captureStart + (unsigned)i;
                 llvm::Value* fptr =
                     builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
