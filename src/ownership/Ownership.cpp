@@ -2041,8 +2041,29 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // collected into the conditional-discharge state machine the
             // same way (their scope-bound disposal is the same `using var`
             // path the auto-drop already emits here).
+            //
+            // fix #9016 (§28.3.10 *Owned local discharge requirement*, v0.359):
+            // the LAMBDA BODY's analogue of the function-exit gate. A lambda
+            // body has no `endState`, so its own locals reach THIS syntactic
+            // sweep, and the monotone `everDischarged_` set read "discharged
+            // on SOME path" as "discharged on EVERY path": a lambda-body local
+            // disposed on one branch and still owned on another got NO
+            // scope-end auto-drop, and the still-owned path LEAKED (the
+            // byte-identical METHOD twin does not leak — its `endState` join
+            // keeps `Owned` with `disposedOnSomePath`, and the scope-end drop
+            // is null-guarded, so it disposes only the still-owned branch).
+            // `lambdaBodyExitOwnedLocals_` carries the SAME per-path fact the
+            // method's endState arm reads (the lambda body's exit-state join
+            // says `Owned` && !`maybeConsumed`), so the gate stands down for
+            // exactly those locals and the scope-end auto-drop is armed —
+            // with this sweep's own §28.3 must-use warning, so the lambda
+            // body draws the same lint the method twin draws.
+            // `maybeConsumed` (the Owned ⊓ MovedFrom split) is NOT in that
+            // set: it is #9011's shape, which the method twin rejects and
+            // the pinned rows keep admitted in a lambda body.
             if (everDischarged_.count(sym) != 0 &&
-                definitelyRestoredLocals_.count(sym) == 0) continue;
+                definitelyRestoredLocals_.count(sym) == 0 &&
+                lambdaBodyExitOwnedLocals_.count(sym) == 0) continue;
             if (reassignedLocals.count(sym) != 0 &&
                 reassignedDropCovered_.count(sym) == 0) continue;
             auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
@@ -16069,6 +16090,15 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdas(
             if (s) applyUsingVarBorrowPinInLambdaStmt(*s);
         }
         checkLambdaBodyOwnedLocalsAtExit(*lam);
+        // fix #9016 (§28.3.10, §28.3 K3.9, v0.359): the lambda body's PER-PATH
+        // scope-end auto-drop decision, from the same exit-state join the
+        // sibling check above reads — the lambda body's analogue of the METHOD
+        // body's `endState` arm. Runs here, inside the lambda's window, so
+        // `lambdaExitStates_` is THIS body's and `states_` is its fall-off
+        // state. (The NESTED-lambda driver
+        // `applyUsingVarBorrowPinInLambdaBody` runs the same call.)
+        // per §28.3.10, v0.359
+        recordLambdaBodyExitOwnedLocals(*lam);
         lambdaExitStates_ = std::move(savedLambdaExits);
         lambdaExitUncertain_ = savedExitUncertain;
         // prep #4146 Stage 2-A (§28.3, v0.298): when the experimental lambda
@@ -17222,6 +17252,109 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
         if (ds->value) {
+            // fix #9016 (§17.13, §28.3 K3.9, §28.3.10, v0.359): the
+            // ANNOUNCED CONSUME of a NAMED OWNED BINDING — the lambda
+            // body's mirror of the method-level `visitStmt` DiscardStmt arm
+            // (Ownership.cpp: "§17.13 / §28.3 v0.184 (#1651): `_ := x;` where
+            // `x` is a named owned binding ... is an ANNOUNCED CONSUME ... the
+            // value is disposed at the end of the discard statement and `x`
+            // is left explicitly-disposed, exactly as `x.Dispose()` would
+            // leave it").
+            //
+            // The METHOD body's arm did this; the LAMBDA body's arm did
+            // NOT: it recorded no ownership fact at all, so
+            // `ast::DiscardStmt::discardOutOwnedVar` stayed false, codegen
+            // (LlvmBackend_Stmts.cpp's `discardOutOwnedVar` arm) emitted NO
+            // disposal, and the binding's value was reclaimed by whatever
+            // else reached it — or, when a sibling path discharged it, by
+            // NOTHING (the #9016 leak: `_ := x;` on one branch and
+            // `x.Dispose()` on another leaked 160 B in 10 allocations over 20
+            // iterations under LeakSanitizer; the byte-identical method twin
+            // does not leak).
+            //
+            // The #2674 pre-pass's comment claimed this could not be
+            // replicated here because "the lambda body's dataflow state is
+            // empty" — that premise is STALE: the pre-pass maintains
+            // `states_` for the lambda body's own locals (`handleLocalDecl`
+            // → `states_[lsym] = lo`), so `lookupStateFor` does answer
+            // `Owned` here. What the pre-pass set were the FOUR
+            // end-of-statement reclaim FLAGS for a FRESH PRODUCER
+            // (`disposeOwnedValue` & siblings); the NAMED-BINDING
+            // announced-consume was the one shape it left out.
+            //
+            // §28.3's consume table K3.9 and §17.13 are body-kind
+            // uniform ("the rule is uniform across body kinds", §28.3.10),
+            // so the lambda body disposes the binding at the discard
+            // statement exactly as the method body does.
+            //
+            // SCOPE, deliberately narrow — only the shape the method's arm
+            // treats as an announced consume of a LOCAL:
+            //   * the operand is a plain identifier naming an OWNED local
+            //     (a read of a BORROW is cosmetic per §17.13);
+            //   * NOT a CAPTURED outer binding: a closure never owns one
+            //     (§28.3 *Captured owned bindings*), so the outer scope keeps
+            //     the obligation and this body must not dispose it;
+            //   * NOT a §28.10 borrow-pin (`using var alias := <owned
+            //     source>;`) — the alias carries no obligation, its source's
+            //     owner keeps it (#3253);
+            //   * NOT an `owned` PARAMETER — parameters are out of band for
+            //     this pass (the method's own arm treats them separately).
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                    ds->value.get())) {
+                if (id->name != "this" && id->name != "base") {
+                    sema::Symbol* sym = ctx_.exprSymbol(*id);
+                    // A captured outer binding is not this body's to dispose.
+                    const bool captured =
+                        sym && lambdaCapturedSyms_.count(sym) > 0;
+                    if (!captured) {
+                        auto* dstate = lookupStateFor(*id);
+                        if (dstate && dstate->state == OwnershipState::Owned) {
+                            bool aliasIsBorrowPin = false;
+                            if (auto* loc =
+                                    dynamic_cast<sema::LocalSymbol*>(sym))
+                                if (auto* ld =
+                                        dynamic_cast<const ast::LocalDecl*>(
+                                            loc->decl))
+                                    if (ld->isUsing &&
+                                        ld->usingVarSourceIsBorrow)
+                                        aliasIsBorrowPin = true;
+                            if (!aliasIsBorrowPin) {
+                                // §28.2 (v0.357): "or a discard of the
+                                // binding" is an explicit disposal — the
+                                // holder kill of #7435 / #7441 runs with it.
+                                // // per §28.2, §17.13, §28.3 K3.9
+                                markExplicitlyDisposed(*id);
+                                const_cast<ast::DiscardStmt*>(ds)
+                                    ->discardOutOwnedVar = true;
+                                // §17.13 / §28.5 / #1892: a plain (non-
+                                // `using`) owning-COLLECTION local records
+                                // `dischargedByDiscard`, so codegen registers
+                                // the collection's scope-end/unwind disposal
+                                // alongside the discard-point reclaim (the
+                                // discard nulls the slot, so both edges stay
+                                // null-safe). Mirrors the method-level arm.
+                                if (const sema::TypeRef* rt =
+                                        ctx_.exprType(*ds->value))
+                                    if (rt->kind ==
+                                            sema::TypeRef::Kind::Named &&
+                                        isOwningCollectionNameHead(
+                                            rt->headName()))
+                                        if (auto* loc =
+                                                dynamic_cast<sema::LocalSymbol*>(
+                                                    sym))
+                                            if (auto* ld =
+                                                    dynamic_cast<
+                                                        const ast::LocalDecl*>(
+                                                        loc->decl))
+                                                if (!ld->isUsing)
+                                                    const_cast<ast::LocalDecl*>(ld)
+                                                        ->dischargedByDiscard =
+                                                            true;
+                            }
+                        }
+                    }
+                }
+            }
             std::vector<const ast::LambdaExpr*> nestedLambdas;
             collectBodyLambdasExpr(*ds->value, nestedLambdas);
             for (const ast::LambdaExpr* nested : nestedLambdas)
@@ -17591,6 +17724,13 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaBody(
     for (const auto& s : lam.stmts)
         if (s) applyUsingVarBorrowPinInLambdaStmt(*s);
     checkLambdaBodyOwnedLocalsAtExit(lam);
+    // fix #9016 (§28.3.10, §28.3 K3.9, v0.359): the lambda body's PER-PATH
+    // scope-end auto-drop decision, from the same exit-state join the
+    // sibling check above reads — the lambda body's analogue of the METHOD
+    // body's `endState` arm. Runs here, inside the lambda's window, so
+    // `lambdaExitStates_` is THIS body's and `states_` is its fall-off
+    // state. // per §28.3.10, v0.359
+    recordLambdaBodyExitOwnedLocals(lam);
     lambdaExitStates_ = std::move(savedLambdaExits);
     lambdaExitUncertain_ = savedExitUncertain;
     states_ = std::move(savedStates);
@@ -17723,6 +17863,83 @@ void MethodOwnership::checkLambdaBodyOwnedLocalsAtExit(
                 "` would be dropped here without disposal "
                 "(§28.3 — consider `using var`, explicit "
                 "`.Dispose()`, `move`, or `return`)");
+    }
+}
+
+
+// fix #9016 (§28.3.10 *Owned local discharge requirement*, §28.3 K3.9,
+// §17.13, §28.9, v0.359): the LAMBDA BODY's per-path scope-end auto-drop
+// decision — the lambda-body analogue of the METHOD body's `endState` arm.
+//
+// A METHOD body's owned local is auto-dropped at its scope end when the
+// per-path dataflow's `endState` says the local is `Owned` and NOT
+// maybe-consumed (Ownership.cpp's function-exit arm: `(!st.maybeConsumed ||
+// perPathAutoDrop)` ⇒ arm `autoDropAtScopeEnd`). The `Owned ⊓ Disposed`
+// join keeps `Owned` with `disposedOnSomePath` and NO maybe-consumed marker
+// (§28.3 #1626's Disposed-half rework) — because an explicit `Dispose()`
+// NULLS the slot, so the null-guarded scope-end drop skips the
+// disposed-on-this-path branch and disposes only the still-owned branch.
+// The `Owned ⊓ MovedFrom` split DOES set maybe-consumed (the move/transfer
+// danger) and is NOT auto-dropped.
+//
+// A LAMBDA BODY has no `endState`: the ownership pass does not run the
+// dataflow over lambda bodies, so the lambda body's own locals fall to the
+// method-level SYNTACTIC sweep over `everOwnedPlainLocals_`, whose gate is
+// the MONOTONE `everDischarged_` set — "discharged on SOME path" read as
+// "discharged on EVERY path". A lambda-body local disposed on one branch
+// and still owned on another therefore got NO scope-end auto-drop at all,
+// and the still-owned path LEAKED (measured: 160 B in 10 allocations over
+// 20 iterations under LeakSanitizer; the byte-identical METHOD twin does
+// not leak). The method twin's own endState arm is what makes the
+// difference, so the lambda body's decision is taken here, from the SAME
+// per-path fact the method uses: the join of the body's exit states.
+//
+// `lambdaExitStates_` holds the walker's `states_` at every `return` of
+// the body being walked (collected by `applyUsingVarBorrowPinInLambdaStmt`'s
+// ReturnStmt arm); the fall-off state is added when the body does not end
+// in a terminator. The join is the same `joinInto` the sibling
+// `checkLambdaBodyOwnedLocalsAtExit` uses, so the two read one fact.
+//
+// The recorded set is consulted by the sweep's `everDischarged_` gate, which
+// then stands down for exactly these locals and lets the scope-end auto-drop
+// be armed — with the sweep's own §28.3 must-use warning, so the LAMBDA
+// body draws the same lint the METHOD twin draws.
+//
+// NOT recorded:
+//   * the `Owned ⊓ MovedFrom` (maybe-consumed) split — that is #9011's
+//     shape; the method twin REJECTS it rather than auto-dropping it, and
+//     the pinned rows (#4141 / #8813) keep it admitted in a lambda body;
+//   * a CAPTURED outer local — a closure never owns one (§28.3 *Captured
+//     owned bindings*), so its scope end is the OUTER scope's;
+//   * a `using var` — its scope-bound disposal is its own registration.
+void MethodOwnership::recordLambdaBodyExitOwnedLocals(
+        const ast::LambdaExpr& lam) {
+    if (lam.stmts.empty() || lam.isAsync || lambdaExitUncertain_) return;
+    std::vector<BlockState> exits = lambdaExitStates_;
+    if (!armNeverFallsThrough(lam.stmts)) exits.push_back(states_);
+    if (exits.empty()) return;
+    BlockState joined = exits.front();
+    for (std::size_t i = 1; i < exits.size(); ++i)
+        joinInto(joined, exits[i], lam.span.begin, /*emitClash=*/false,
+                 /*unionKeys=*/false);
+    for (const auto& [sym, st] : joined) {
+        if (st.state != OwnershipState::Owned) continue;
+        // The method's own gate: a maybe-consumed local (the Owned ⊓
+        // MovedFrom split) is not auto-dropped — #9011's shape, and the
+        // method twin rejects it.
+        if (st.maybeConsumed) continue;
+        // A closure never owns a captured outer binding (§28.3 *Captured
+        // owned bindings*): the outer scope's obligation, not this body's.
+        if (lambdaCapturedSyms_.count(sym)) continue;
+        // Only a plain `var` local of THIS body carries an end-of-scope
+        // obligation: a `using var` disposes through its own scope-bound
+        // registration, and a move-only value type has its own per-path
+        // disposal (§28.3 / #3575).
+        auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+        if (!ls) continue;
+        auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+        if (!ld || ld->isUsing) continue;
+        lambdaBodyExitOwnedLocals_.insert(sym);
     }
 }
 

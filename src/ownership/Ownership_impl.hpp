@@ -2779,6 +2779,29 @@ private:
     void checkLambdaBodyOwnedLocalsAtExit(const ast::LambdaExpr& lam);
     std::vector<BlockState> lambdaExitStates_;
     bool lambdaExitUncertain_ = false;
+    // fix #9016 (§28.3.10 *Owned local discharge requirement*, §28.3 K3.9,
+    // §17.13, §28.9, v0.359): the LAMBDA BODY's per-path scope-end
+    // auto-drop decision. A lambda body has no `endState` — the METHOD
+    // body's end-of-scope auto-drop is decided from the per-path dataflow's
+    // `endState` (Ownership.cpp's function-exit arm: `Owned` && !
+    // `maybeConsumed` ⇒ arm `autoDropAtScopeEnd`), while a lambda body's own
+    // locals fall to the method-level SYNTACTIC sweep over
+    // `everOwnedPlainLocals_`, whose gate is the MONOTONE, path-BLIND
+    // `everDischarged_` set. A lambda-body local DISPOSED ON ONE PATH was
+    // therefore treated as discharged on EVERY path: the scope-end auto-drop
+    // was suppressed and the path that still owned the value LEAKED (the
+    // method twin does not leak — its `endState` join keeps `Owned` with
+    // `disposedOnSomePath`, and the scope-end drop is null-guarded, so it
+    // disposes only the still-owned branch).
+    // `lambdaBodyExitOwnedLocals_` holds the lambda-body locals whose
+    // PER-PATH exit join says `Owned` && !`maybeConsumed` — the method's
+    // own endState condition — so the sweep's `everDischarged_` gate can
+    // stand down for exactly those and let the scope-end drop be armed.
+    // The `maybeConsumed` (Owned ⊓ MovedFrom) split is NOT in the set: that
+    // is #9011's shape, and the method twin REJECTS it rather than
+    // auto-dropping it.
+    void recordLambdaBodyExitOwnedLocals(const ast::LambdaExpr& lam);
+    std::unordered_set<sema::Symbol*> lambdaBodyExitOwnedLocals_;
     // fix #3571 (§28.3 SB01-B / §31.1, v0.286): the ONE traversal reaching
     // every `return E;` statement in a body without crossing a nested lambda
     // (a pure statement walk never enters a lambda body, which lives inside a
