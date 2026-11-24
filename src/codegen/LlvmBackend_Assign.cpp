@@ -5514,8 +5514,48 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
              k < idxSlots.size(); ++k) {
             if (!idxSlots[k]) continue;
             paramSlots_[ps->indexerParams[k]] = idxSlots[k];
+            // fix #8941 (§23.4 / §27.5, v0.359): the indexer parameter is
+            // bound FRESH per INVOCATION of this compound assignment (§23.4:
+            // an indexer's parameters are its accessor's parameters, and
+            // §6.6's "the statement `x op= e` is equivalent to `x := x op e`
+            // with the target evaluated once" evaluates the accessor ONCE),
+            // so a capture of it must see THIS invocation's value. This
+            // getter body is INLINED into the caller's function, so the
+            // binding store above re-executes in the caller's function each
+            // time the compound assignment does (a loop body included) —
+            // exactly like a local declared inside a loop body, which §27.5
+            // says binds a fresh variable per execution ("each execution of
+            // its declaration binds a fresh variable, so a lambda formed
+            // after it captures that execution's variable").
+            //
+            // Without this mark, boxLocalSlot picks fresh-each-pass boxing
+            // only when the binding store sits in the capture's own basic
+            // block; a call earlier in the getter body (the first lambda's
+            // `g()`) splits the block, the GUARDED strategy then allocates
+            // the capture cell ONCE, and every later pass hands the capturing
+            // lambda the FIRST pass's index parameter. MEASURED: `h[i] += 1`
+            // over i in 0..49 read `i` as 0 on every pass (200 where §27.5
+            // requires 1425). This is the #8864 mark, applied to the GETTER
+            // half of the compound path (#8864 marked the SETTER half, and
+            // lowerIndexerGet / lowerIndexerSet their own bindings).
+            loopBodyDeclaredSlots_.insert(idxSlots[k]);
         }
-        cur = lowerExpr(*getterExpr);
+        {
+            // fix #8941 (§23.4 / §27.5, v0.359): this expression body opens
+            // no scope, so its indexer parameters are declared in the CURRENT
+            // one — the depth #3403's captured-parameter guard compares
+            // against. The twin of `lowerIndexerGet`'s expression-body arm and
+            // of `lowerIndexerSet`'s; the compound path's getter arm was the
+            // only inlined accessor body missing the statement, so the three
+            // paths now agree on where an accessor's parameters are declared.
+            // MEASURED: this statement alone is behaviour-NEUTRAL on the
+            // issue's repro (stdout `200` and the ASan totals unchanged with
+            // it alone) — the mark above is what fixes the value. It is kept
+            // because the guard's threshold is the accessor's declaring scope
+            // and this path was the one that did not state it.
+            CapturedParamScopeDepth idxParamScopeDepth(this, disposeStack_.size());
+            cur = lowerExpr(*getterExpr);
+        }
         thisRecvScope.close();  // fix-forward #8127
         currentThis_ = savedThis;
         locals_ = std::move(savedLocals);
