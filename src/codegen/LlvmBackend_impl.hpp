@@ -1020,6 +1020,16 @@ bool calleeBodyUsesFormalOnlyByInvocationOrInspection(
 // its name) fails the walk closed, so a declined shape keeps leaking — a
 // leak, never an early release.
 //
+// fix #8983 (§28.14 / §28.9, v0.359): the alias admission covers the OTHER
+// spellings and uses the same sentence admits: the `using var` / `await using
+// var` spelling of the binding, the `const` spelling (a different AST node),
+// a SECOND-LEVEL binding (an alias bound from an alias), and an INVOCATION
+// of the alias (§28.14 lists the invocation first among the admitted uses:
+// "the callback may be invoked, bound to locals, and passed on as an argument
+// to another call-bounded parameter"). A binding inside a lambda stays
+// DECLINED (a lambda naming the formal captures it, and the capture holds
+// the callback past the call).
+//
 // The proof is RECURSIVE and needs the sema context (the forwarded callee's
 // signature and, for a method target, its body):
 //   * a forwarded ARGUMENT is admitted only at a PLAIN function-typed

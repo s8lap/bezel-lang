@@ -21581,12 +21581,17 @@ struct FormalInvocationOnlyWalk {
     // FORWARD to another call-bounded parameter is the same forward the
     // formal's own use would be.
     //
+    // fix #8983 (§28.14 / §28.9, v0.359): an alias may be bound in any
+    // spelling §28.14 admits (`var`, `using var`, `const`) and from another
+    // ALIAS as well as from the formal, and it may be INVOKED as well as
+    // forwarded — see the LocalDecl / LocalConstDecl / CallExpr arms below.
+    //
     // The list is the walk's OWN record of the aliases it admitted; every
     // other use of an alias name fails the walk closed (a bare read, an
     // assignment, a store, a return, a capture), so an alias can only ever
-    // be a forward. A name already on the list may not be bound again (a
-    // re-binding breaks the "bound once" half of the purity), which also
-    // covers a nested scope that shadows an alias.
+    // be a forward or an invocation. A name already on the list may not be
+    // bound again (a re-binding breaks the "bound once" half of the purity),
+    // which also covers a nested scope that shadows an alias.
     std::vector<std::string_view> aliasNames{};
     // fix #8972: is `n` one of the walk's admitted aliases?
     bool isAliasName(std::string_view n) const {
@@ -21598,6 +21603,15 @@ struct FormalInvocationOnlyWalk {
     bool isAliasIdentifier(const ast::Expr* e) const {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
         return id && isAliasName(id->name);
+    }
+    // fix #8983 (§28.14 / §28.9, v0.359): is `e` a bare read of the FORMAL
+    // or of one of the walk's admitted ALIASES? §28.14 admits the callback
+    // being "invoked, bound to locals, and passed on as an argument to
+    // another call-bounded parameter" — the three uses a name of the
+    // callback may have — so every one of them reads a name, and the name
+    // may be the formal's or an alias's.
+    bool isFormalOrAlias(const ast::Expr* e) const {
+        return isName(e) || isAliasIdentifier(e);
     }
     bool isNullTestOfName(const ast::BinaryExpr& be) const {
         if (be.op != "=" && be.op != "<>") return false;
@@ -21662,13 +21676,28 @@ struct FormalInvocationOnlyWalk {
             // do with it is hand the callback on, exactly as it could with
             // the formal itself.
             //
-            // The `using var` spelling is DECLINED: a `using var` local of
-            // function type is disposed at scope end as a no-op (§28.9) and
-            // the borrow-initialized arm of the release scan excludes that
-            // spelling (LlvmBackend_Setup.cpp), so the alias's own reference
-            // story differs from a plain `var`'s. A plain `var` only.
-            if (allowForwarding && lambdaDepth == 0 && !ld->isUsing &&
-                !ld->isAwaitUsing && isName(ld->initializer.get())) {
+            // fix #8983 (§28.14 / §28.9, v0.359): the admission is widened to
+            // the OTHER SPELLINGS the same sentence admits, each with its own
+            // reference story:
+            //   * the `using var` / `await using var` spelling — §28.9 gives
+            //     a function-typed local no disposal obligation (its
+            //     scope-end disposal is a no-op), and the release scan's
+            //     borrow arm leaves that spelling out (a borrow-initialized
+            //     function-typed local's slot owns nothing at bind), so the
+            //     alias holds no reference of its own and the callee keeps
+            //     nothing past its call;
+            //   * a SECOND-LEVEL binding (`var j := h;`) — the alias of an
+            //     alias is the same alias: §28.14's "bound to locals" is not
+            //     limited to one level, and the purity proof is the same
+            //     (bound once, never reassigned, used only as a forward);
+            //   * an INVOCATION of the alias (`h();`) — §28.14 lists the
+            //     invocation FIRST among the admitted uses ("the callback may
+            //     be invoked, bound to locals, and passed on …"), so an
+            //     invocation through an alias is the invocation through the
+            //     formal. (The forward of an alias was already admitted by
+            //     #8972.)
+            if (allowForwarding && lambdaDepth == 0 &&
+                isFormalOrAlias(ld->initializer.get())) {
                 aliasNames.push_back(ld->name);
                 return;
             }
@@ -21677,6 +21706,24 @@ struct FormalInvocationOnlyWalk {
         }
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
             if (lc->name == name) { ok = false; return; }
+            // fix #8983: re-binding a name the walk already admitted as an
+            // ALIAS breaks its purity — the LocalDecl arm's twin. Fail
+            // closed.
+            if (isAliasName(lc->name)) { ok = false; return; }
+            // fix #8983 (§28.14 / §28.9, v0.359): the `const` SPELLING of the
+            // alias binding. §21.1's `const` is a runtime const — a binding
+            // that is not an assignable location — so the alias's purity
+            // ("bound once, never reassigned") holds by construction, and
+            // §28.14's "bound to locals" admits it as much as a plain `var`.
+            // Its reference story is the plain `var`'s: a `const` binding
+            // takes no disposal obligation (§28.9), and the release scan
+            // admits the `const` node on the same arms as the `var` node
+            // (LlvmBackend_Setup.cpp, #3402 / #8479).
+            if (allowForwarding && lambdaDepth == 0 &&
+                isFormalOrAlias(lc->value.get())) {
+                aliasNames.push_back(lc->name);
+                return;
+            }
             expr(lc->value.get());
             return;
         }
@@ -21771,7 +21818,13 @@ struct FormalInvocationOnlyWalk {
         }
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
             // fix #8482: inside a lambda body the invocation is a capture.
-            if (!isName(c->callee.get()) || lambdaDepth > 0)
+            // fix #8983 (§28.14 / §28.9, v0.359): an INVOCATION through an
+            // admitted ALIAS is the invocation through the formal — §28.14
+            // lists the invocation first among the admitted uses ("the
+            // callback may be invoked, bound to locals, and passed on as an
+            // argument to another call-bounded parameter"), and an alias
+            // names the same callback.
+            if (!isFormalOrAlias(c->callee.get()) || lambdaDepth > 0)
                 expr(c->callee.get());
             // fix #8933: a call's arguments may carry the formal FORWARDED to
             // another call-bounded parameter (§28.14) — callArgs admits that
@@ -21967,9 +22020,23 @@ bool calleeBodyUsesFormalOnlyByInvocationOrInspection(
 // never stored, returned or captured, and used only as a forward at a
 // call-bounded position (the SAME recursive proof the formal's own forward
 // uses). Every other use of the alias — a bare read, an assignment, a store,
-// a return, a capture, a re-binding of its name, a `using var` or `const`
-// spelling, a binding inside a lambda — fails the walk closed, so a declined
-// shape keeps leaking: a leak, never an early release.
+// a return, a capture, a re-binding of its name, a binding inside a lambda
+// — fails the walk closed, so a declined shape keeps leaking: a leak, never
+// an early release.
+//
+// fix #8983 (§28.14 / §28.9, v0.359): the admission is widened to the other
+// spellings and uses the same sentence admits: the `using var` / `await using
+// var` spelling of the binding, the `const` spelling (a different AST node),
+// a SECOND-LEVEL binding (an alias bound from an alias), and an INVOCATION
+// of the alias — §28.14 lists the invocation FIRST among the admitted uses
+// ("the callback may be invoked, bound to locals, and passed on as an
+// argument to another call-bounded parameter"), so an invocation through an
+// alias is the invocation through the formal. The binding inside a lambda
+// stays DECLINED (a lambda that names the formal CAPTURES it, and the
+// capture holds the callback past the call), and so does every use that is
+// not an invocation or a forward (a bare read, an assignment, a store, a
+// return, a capture): those fail the walk closed, so a declined shape keeps
+// leaking — a leak, never an early release.
 //
 // THE PROOF IS RECURSIVE, and it fails closed at every step (see the
 // declaration comment above for the clause-by-clause list):
