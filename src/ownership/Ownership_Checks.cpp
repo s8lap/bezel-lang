@@ -6510,6 +6510,12 @@ void MethodOwnership::reportCapturedThrowOperand(const ast::Expr& operand) {
         // base); asking again would report it twice.
         if (const auto* cid = dynamic_cast<const ast::IdentifierExpr*>(op))
             if (isCatchBorrow(ctx_.exprSymbol(*cid))) return;
+        // fix #8958 (§28.3 *Captured owned bindings*, §31.1 *The throw
+        // operand*, v0.359): a COMPOSITE operand — a conditional expression's
+        // arms. The bare-identifier classification above never sees an arm, so
+        // `throw (if n > 0 then c else c)` of a captured owned `c` was
+        // admitted. The arms are asked the same question the bare form asks.
+        reportCapturedThrowCompositeOperand(operand);
         // fix #8873 (§28.3 *Captured owned bindings*, §31.1, v0.359): an OWNED
         // local of an ENCLOSING LAMBDA captured by this (nested) lambda. It
         // has no entry in the method frame's `states_`, so the test above
@@ -6520,6 +6526,98 @@ void MethodOwnership::reportCapturedThrowOperand(const ast::Expr& operand) {
     }
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(op);
     reportCapturedOwnedConsume(id->name, id->span.begin, "throw");
+}
+
+// fix #8958 (§28.3 *Captured owned bindings*, §31.1 *The throw operand*,
+// v0.359): a COMPOSITE throw operand — a conditional expression's arms.
+//
+// §31.1 "The throw operand": "The operand is consumed as an owned value under
+// the ownership rules below" — the operand's VALUE is what the throw
+// consumes. A conditional expression's arms are that value: exactly one of
+// them is selected, and the selected one is what the operand evaluates to, so
+// an arm that names a captured owned binding IS an owned-consuming use of it
+// (§28.3 "Captured owned bindings": "every other owned-consuming use of it
+// [is a] compile error").
+//
+// The #7920 rule classified the operand only when it was a BARE IDENTIFIER
+// (it peels a `!`, but not a composite expression), so the conditional
+// spelling was admitted: the closure threw the enclosing scope's owned value,
+// the runtime disposed it after the catch arm and the enclosing scope still
+// held the disposal obligation — a double dispose. MEASURED on r30-c1 @
+// 3c85905f0: the program compiled (rc=0), printed "caught" and died with a
+// heap-use-after-free (ASan).
+//
+// The arms are classified by the SAME predicates the bare form uses, so the
+// two spellings cannot drift apart: `isCapturedOwnedBinding` (an enclosing
+// BODY binding still in the Owned state — §28.3's captured owned binding) and
+// `reportEnclosingLambdaOwnedThrow` (an owned local / `owned` parameter of an
+// ENCLOSING LAMBDA — #8873 / #8926). A lambda's OWN owned local is neither —
+// it is not in `states_` and its owner is the throwing lambda — so it stays
+// admitted, exactly as the bare form admits it.
+//
+// The diagnostic is the DIRECT form's own (`reportCapturedOwnedConsume` with
+// the verb "throw"), so the two spellings draw byte-identical text.
+//
+// The `??` spelling is NOT handled here: the meet is computed by §28.3 K7's
+// own rule (an owned arm makes the meet owned; a mixed meet has its own
+// diagnostic), and the method arm's own classifier answers it — the spelling
+// is already rejected there (MEASURED on the base: `throw (c ?? d)` in a
+// closure draws "the thrown value must be an OWNED exception"), so it is not
+// an admitting twin and this fix does not touch it.
+//
+// The `case` spelling is not handled either: the method arm's own classifier
+// has no `CaseExpr` arm (fix #4008 deferred it), so a `case` operand is
+// admitted in the METHOD body too and must stay admitted here.
+//
+// per §28.3, §31.1, v0.359, #8958
+void MethodOwnership::reportCapturedThrowCompositeOperand(
+    const ast::Expr& operand) {
+    const ast::Expr* op = lookThroughForceUnwrap(&operand);
+    if (!op) return;
+    const auto* ce = dynamic_cast<const ast::ConditionalExpr*>(op);
+    if (!ce) return;
+    // The arms are MUTUALLY EXCLUSIVE (exactly one is selected), so the first
+    // offending arm is the whole verdict: ONE diagnostic, at the binding's
+    // own position — the direct form's position.
+    if (reportCapturedThrowArm(ce->thenValue.get())) return;
+    reportCapturedThrowArm(ce->elseValue.get());
+}
+
+// fix #8958 (§28.3 *Captured owned bindings*, §31.1 *The throw operand*,
+// v0.359): one ARM of a composite throw operand.
+//
+// The arm is classified exactly as the bare operand is: a `!` is peeled
+// (§17.8 classifies `c!` as `c`), and the binding is asked the captured-owned
+// question by the two predicates the bare form uses. A `move` arm is NOT
+// peeled: the marked transfer of a captured owned binding has its own
+// diagnostic ("cannot transfer captured owned binding") and asking the throw
+// question of it as well would report the same program twice.
+//
+// An arm that is ITSELF a conditional is walked again: its arms are the
+// operand's values too. An `elif` chain right-nests in `elseValue` (§20) and
+// a conditional written in an arm position nests the same way, so the
+// recursion reaches every arm of an arbitrary nesting.
+//
+// Returns true when it reported.
+// per §28.3, §31.1, v0.359, #8958
+bool MethodOwnership::reportCapturedThrowArm(const ast::Expr* arm) {
+    if (!arm) return false;
+    const ast::Expr* core = lookThroughForceUnwrap(arm);
+    if (!core) return false;
+    if (const auto* ce = dynamic_cast<const ast::ConditionalExpr*>(core)) {
+        if (reportCapturedThrowArm(ce->thenValue.get())) return true;
+        return reportCapturedThrowArm(ce->elseValue.get());
+    }
+    if (isCapturedOwnedBinding(*core)) {
+        const auto* id = dynamic_cast<const ast::IdentifierExpr*>(core);
+        reportCapturedOwnedConsume(id->name, id->span.begin, "throw");
+        return true;
+    }
+    // fix #8873 / #8926 (§28.3 *Captured owned bindings*, §31.1, v0.359): the
+    // ENCLOSING-LAMBDA half of the same rule, in its composite spelling — an
+    // owned local / `owned` parameter of an enclosing closure's body. The
+    // diagnostic is the same text (the verb is "throw" in both).
+    return reportEnclosingLambdaOwnedThrow(*core);
 }
 
 // fix #8873 (§28.3 *Captured owned bindings*, §31.1 *The throw operand*,

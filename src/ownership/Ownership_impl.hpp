@@ -3426,6 +3426,16 @@ private:
                                     const char* verb);
     // fix #7920 (§28.3, §31.1, v0.359): `throw c` over a captured owned `c`.
     void reportCapturedThrowOperand(const ast::Expr& operand);
+    // fix #8958 (§28.3 *Captured owned bindings*, §31.1 *The throw operand*,
+    // v0.359): the COMPOSITE operand — a conditional expression's arms. The
+    // bare-identifier classification above never sees an arm, so the
+    // conditional spelling of the #7920 shape was admitted. The arms are asked
+    // the same question the bare form asks, with the same predicates, so the
+    // two spellings cannot drift apart.
+    void reportCapturedThrowCompositeOperand(const ast::Expr& operand);
+    // fix #8958 (§28.3, §31.1, v0.359): one ARM of a composite throw operand.
+    // Returns true when it reported.
+    bool reportCapturedThrowArm(const ast::Expr* arm);
     // fix #7891 (§28.3 *Captured owned bindings*, §15.3, §35.4, v0.357): the
     // MOVE-ONLY half of the in-closure consume rule. For an owning-classified
     // choice the UNMARKED read at an owned-consuming position is itself the
