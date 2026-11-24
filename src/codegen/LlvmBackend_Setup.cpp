@@ -22196,10 +22196,57 @@ void Emitter::consumeLastLambdaCapturedCells(
         // leaked the cell past the captured local's scope end. The narrowly-
         // widened gate below admits only the original-shape SKIP and falls
         // through to register `boxedCellFree` for ours.
+        //
+        // fix #8978 (§27.5 / §28.9, v0.359): the `singleCaptureLocals_` arm
+        // dropped the `definitelyEscapingLambdas_` conjunct that #694's arm
+        // actually requires, so it was NOT an oracle for "the envdtor frees
+        // this cell" — it was a much weaker fact ("exactly one env captures
+        // it"). The envdtor's cell-free is `ce.freeCellInEnvdtor`, and BOTH
+        // of the arms that set it require a DEFINITELY-ESCAPING capturer:
+        // #694's (LlvmBackend_Exprs2.cpp) is gated on
+        // `definitelyEscapingLambdas_.count(&lam) &&
+        // singleCaptureLocals_.count(decl)`, and #3426's on
+        // `definitelyEscapingLambdas_.count(&lam) &&
+        // isSharedCellEnvdtorFreeOwner(decl, &lam)`. A `LastCellEntry` — the
+        // entry this loop consumes — is pushed only for a key that is in
+        // `cellFreeEligible_`, and that set holds exactly the entities NO
+        // escaping lambda captures (`collectCellFreeEligible`: a key enters
+        // it only when `!capturedByEscaping.count(key)`), so the capturer of
+        // such an entry's cell is never a definitely-escaping one and the
+        // #694 arm could not fire for it at all. #4509's own arming code
+        // spells the SAME test correctly
+        // (`!sharedCellEnvdtorFreeOwner_.count(dkey) &&
+        // !(singleCaptureLocals_.count(dkey) &&
+        // definitelyEscapingLambdas_.count(&lam))`), so the two spellings
+        // disagreed.
+        //
+        // The consequence was a LEAK, not a double free: with the scope-end
+        // `boxedCellFree` skipped and no envdtor free, and with the #4509
+        // refcount route declined for a FUNCTION-typed capture
+        // (`contentsAlsoManaged` — Exprs2.cpp), NOTHING freed the cell. The
+        // issue's own repro — a captured function-typed local REASSIGNED from
+        // inside the capturing closure's own body — measured
+        // "SUMMARY: AddressSanitizer: 1600 byte(s) leaked in 200
+        // allocation(s)" (8 B per call, the boxed capture cell allocated by
+        // `calloc` in `bz$M.C$Run`), while the no-reassignment twin (the same
+        // program with a READ of the captured local) measured clean. #4434's
+        // shape — the same one with a `mutate()` call and a later read of the
+        // captured local — measured the SAME 1600 B / 200 allocations and no
+        // crash, so the double free the #4434 comment feared is not what the
+        // skip was buying.
+        //
+        // The fix drops the `singleCaptureLocals_` disjunct and keeps the
+        // `sharedCellEnvdtorFreeOwner_` one: that map names the ONE
+        // definitely-escaping owner whose envdtor provably frees the cell
+        // (#3426), so it is the one arm of the old gate that can mean "the
+        // envdtor owns the cell" (an ancestor frame's entry, merged into this
+        // body by #3804, is how a key reaches it). With the disjunct gone, a
+        // captured-cell local whose reassignment leaves the envdtor without
+        // the cell registers its scope-end `boxedCellFree` again — the
+        // reclaim the no-reassignment twin already had.
         if (ce.key && closureLocalCapturedCellReassigned_.count(ce.key) &&
             !returnedCaptureVars_.count(ce.key) &&
-            (singleCaptureLocals_.count(ce.key) ||
-             sharedCellEnvdtorFreeOwner_.count(ce.key))) {
+            sharedCellEnvdtorFreeOwner_.count(ce.key)) {
             continue;
         }
         Disposal dc{ce.newSlot, nullptr};
