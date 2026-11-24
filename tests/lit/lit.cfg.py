@@ -132,7 +132,16 @@ config.substitutions.append(("FileCheck", filecheck))
 # `config` parses, lints, and does nothing at all.  Measured on lit 18.1.8
 # against a 3-second sleep: `lit_config.… = 1` reports `TIMEOUT` after 1 s;
 # `config.… = 1` reports `PASSED` after 3.19 s.
-lit_config.maxIndividualTestTime = 300
+#
+# lit 23 (Fedora 45) inverted that: its `LitConfig.maxIndividualTestTime`
+# setter raises AttributeError ("read-only. Use config.maxIndividualTestTime
+# instead"), and the per-suite `config` value is the one honoured.  Measured on
+# lit 23.1.6 against a 3-second sleep: `config.… = 1` reports `TIMEOUT` after
+# 1 s.  So try the old object first and fall back to the new one.
+try:
+    lit_config.maxIndividualTestTime = 300
+except AttributeError:
+    config.maxIndividualTestTime = 300
 
 # A minimal, hermetic environment is fine: `bezelc -c` neither reads config
 # files nor needs a populated PATH.  Keep HOME/TMPDIR so tmp-file creation
