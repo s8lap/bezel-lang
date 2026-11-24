@@ -31221,6 +31221,23 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                 // If that result is string (nullable OR non-nullable, fix #2196),
                 // this call is a +1 producer.
                 const sema::TypeRef* resultTy = ctx_.exprType(*init);
+                // fix #9007 / §14.1 / §27.5 / §28.9 (v0.359): inside a generic
+                // instantiation sema typed the call at the bare `T`, but
+                // lowerLambda (fix #8946) now mints +1 for a lambda whose
+                // result substitutes to `string` — so the call is a +1
+                // producer at the CONCRETE type. Classify it there, or the
+                // consumer treats the minted reference as a borrow and leaks
+                // it. A lookup only (this predicate is const): a bare
+                // parameter owned by the callee itself is left alone, exactly
+                // as lowerLambda's mint predicate leaves it.
+                if (resultTy && !genericSubstSemaTy_.empty() &&
+                    isBareTypeParamRef(resultTy) &&
+                    !lambdaCalleeOwnTParams_.count(resultTy->headName())) {
+                    auto it = genericSubstSemaTy_.find(resultTy->headName());
+                    if (it != genericSubstSemaTy_.end() && it->second &&
+                        !it->second->nullable)
+                        resultTy = it->second;
+                }
                 if (resultTy &&
                     resultTy->kind == sema::TypeRef::Kind::Primitive &&
                     resultTy->primitive == sema::PrimitiveType::String)
@@ -38817,9 +38834,25 @@ bool Emitter::isLambdaClosureReturnCall(const ast::Expr* init) const {
     } else if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
         if (ps->declType) rt = ctx_.resolvedType(*ps->declType);
     }
+    // fix #9007 / §14.1 / §27.5 / §28.9 (v0.359): inside a generic
+    // instantiation the callee's declared result is the bare `T`; at
+    // T = a function type the lambda's body mints +1 for it (fix #8946 —
+    // lowerLambda classifies the result at the concrete substitution), so the
+    // call is a closure producer at the CONCRETE type. Lookup only (this
+    // predicate is const); the lambda's own callee type parameters are left
+    // alone, exactly as lowerLambda's mint predicate leaves them.
+    const sema::TypeRef* funcRet = rt ? rt->funcReturn : nullptr;
+    if (funcRet && !genericSubstSemaTy_.empty() &&
+        isBareTypeParamRef(funcRet) &&
+        !lambdaCalleeOwnTParams_.count(funcRet->headName())) {
+        auto it = genericSubstSemaTy_.find(funcRet->headName());
+        if (it != genericSubstSemaTy_.end() && it->second &&
+            !it->second->nullable)
+            funcRet = it->second;
+    }
     if (rt && !rt->nullable && rt->kind == sema::TypeRef::Kind::Function &&
-        rt->funcReturn && !rt->funcReturn->nullable &&
-        rt->funcReturn->kind == sema::TypeRef::Kind::Function) {
+        funcRet && !funcRet->nullable &&
+        funcRet->kind == sema::TypeRef::Kind::Function) {
         return true;
     }
     return false;
@@ -46734,6 +46767,34 @@ void Emitter::collectStringReleaseEligible(
                     const sema::TypeRef* lt = nullptr;
                     if (v.type) lt = ctx_.resolvedType(*v.type);
                     if (!lt) lt = ctx_.exprType(*v.init);
+                    // fix #9007 / §14.1 / §28.9 (v0.359): inside a generic
+                    // instantiation a local typed by the bare `T` is a
+                    // `string` at T = string. A producer local of that type
+                    // (`var r := f();`, a +1 since fix #8946) is released at
+                    // scope end only while the walk below sees every COPY of
+                    // it (`var q := r;`) as a tracked borrow; an unclassified
+                    // copy tainted the source as escaping and its +1 leaked.
+                    // Narrow to a COPY OF A TRACKED LOCAL: widening every
+                    // bare-`T` borrow (`var x := a;` over a parameter) would
+                    // retarget a long-settled shape (#9007 review: gp_pick).
+                    const auto* copyOf =
+                        dynamic_cast<const ast::IdentifierExpr*>(v.init);
+                    const auto* copySrc = copyOf
+                        ? dynamic_cast<sema::LocalSymbol*>(
+                              ctx_.exprSymbol(*copyOf))
+                        : nullptr;
+                    if (lt && copySrc && copySrc->decl &&
+                        stringLocalCandidates_.count(
+                            static_cast<const void*>(copySrc->decl)) &&
+                        !genericSubstSemaTy_.empty() &&
+                        isBareTypeParamRef(lt) &&
+                        !lambdaCalleeOwnTParams_.count(lt->headName())) {
+                        const sema::TypeRef* sub =
+                            substituteTypeRefLocal(lt, genericSubstSemaTy_);
+                        if (sub && sub->kind == sema::TypeRef::Kind::Primitive &&
+                            sub->primitive == sema::PrimitiveType::String)
+                            lt = sub;
+                    }
                     // fix #5245 (§4.6 / §28.9, v0.313): a `string?` borrow
                     // local is admitted too. It used to be left alone, so it
                     // took NO +1 and dangled when the aliased field was stored
