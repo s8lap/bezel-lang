@@ -11701,6 +11701,13 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // impossible — but clearing here matches the sibling sets' contract and
     // makes the per-function-scope reset explicit.)
     closureLocalCallCounts_.clear();
+    // fix #9032 (§14.1, §27.5, v0.359): `lastCallGenericSubst_` is a transient
+    // call -> next-`var`-decl channel, but a call whose result is not bound by a
+    // `var` (`t := t + Use<string>(s)`) never consumes it, so the substitution
+    // survived into whichever body was emitted next and was recorded as the
+    // first pointer local's `localGenericSubst_` there. A body starts with
+    // nothing published.
+    lastCallGenericSubst_.clear();
     // fix #3757 follow-up (review nit): closureLocalCandidates_ must clear
     // alongside closureReleaseEligible_ HERE too, not only inside
     // collectClosureReleaseEligible below — an EXPRESSION-bodied method
@@ -20083,6 +20090,17 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // args even when the sema type is still generic. Prefer the active
     // genericSubst_ (set during field access), but fall back to
     // lastCallGenericSubst_ (set during method calls that return generic types).
+    //
+    // fix #9032 (§14.1, §27.5, v0.359): the map is keyed on the AST decl node,
+    // which every instantiation of a generic body shares, so an earlier
+    // instantiation's entry (`Use$spec` at T = string: {T -> ptr}) outlived its
+    // function and was read back while lowering the NEXT emission of the same
+    // body (the default `T`-placeholder one, whose genericSubst_ is empty and so
+    // never overwrote it). `f()` through `var f := lambda() => p` then lowered
+    // as `call ptr` in the placeholder body's `i32`-returning lambda — an IR
+    // verifier failure that depended only on which emission came first. A local
+    // belongs to ONE emission: drop whatever a previous emission recorded.
+    localGenericSubst_.erase(declNode);
     if (slotTy->isPointerTy()) {
         if (!genericSubst_.empty())
             localGenericSubst_[declNode] = genericSubst_;
