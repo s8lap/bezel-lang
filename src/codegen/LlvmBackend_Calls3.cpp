@@ -7207,7 +7207,7 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
                         // Load integer value, bswap if BE, bitcast to float/double.
                         llvm::Value* raw = builder_.CreateLoad(intTy, rawPtr, "bba.raw");
                         if (isBE) {
-                            auto* bswapFn = llvm::Intrinsic::getDeclaration(
+                            auto* bswapFn = llvm::Intrinsic::getOrInsertDeclaration(
                                 module_.get(), llvm::Intrinsic::bswap, {intTy});
                             raw = builder_.CreateCall(bswapFn, {raw}, "bba.bswap");
                         }
@@ -7236,7 +7236,7 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
                             }
                         }
                         if (isBE) {
-                            auto* bswapFn = llvm::Intrinsic::getDeclaration(
+                            auto* bswapFn = llvm::Intrinsic::getOrInsertDeclaration(
                                 module_.get(), llvm::Intrinsic::bswap, {intTy});
                             val = builder_.CreateCall(bswapFn, {val}, "bba.bswap");
                         }
@@ -7311,7 +7311,7 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
                         llvm::Value* raw =
                             builder_.CreateLoad(intTy, rawPtr, "bba.tryraw");
                         if (isBE) {
-                            auto* bswapFn = llvm::Intrinsic::getDeclaration(
+                            auto* bswapFn = llvm::Intrinsic::getOrInsertDeclaration(
                                 module_.get(), llvm::Intrinsic::bswap, {intTy});
                             raw = builder_.CreateCall(bswapFn, {raw}, "bba.tbswap");
                         }
@@ -7380,7 +7380,7 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
                                 toStore = builder_.CreateZExt(toStore, intTy);
                         }
                         if (isBE) {
-                            auto* bswapFn = llvm::Intrinsic::getDeclaration(
+                            auto* bswapFn = llvm::Intrinsic::getOrInsertDeclaration(
                                 module_.get(), llvm::Intrinsic::bswap, {intTy});
                             toStore = builder_.CreateCall(
                                 bswapFn, {toStore}, "bba.twbswap");

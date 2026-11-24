@@ -18988,7 +18988,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                                       llvm::Intrinsic::rint;
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
                 arg = mathToDouble(arg, call.args[0].value.get());
-                auto* fn = llvm::Intrinsic::getDeclaration(module_.get(), iid, {dbl});
+                auto* fn = llvm::Intrinsic::getOrInsertDeclaration(module_.get(), iid, {dbl});
                 return builder_.CreateCall(fn, {arg}, std::string(m) + ".result");
             }
         }
@@ -19126,7 +19126,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         : llvm::Type::getDoubleTy(llvm_);
                     if (!a->getType()->isFloatingPointTy()) a = builder_.CreateSIToFP(a, dbl);
                     if (!b->getType()->isFloatingPointTy()) b = builder_.CreateSIToFP(b, dbl);
-                    auto* fn = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::minnum, {dbl});
+                    auto* fn = llvm::Intrinsic::getOrInsertDeclaration(module_.get(), llvm::Intrinsic::minnum, {dbl});
                     return builder_.CreateCall(fn, {a, b}, "fmin.result");
                 }
             }
@@ -19185,7 +19185,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         : llvm::Type::getDoubleTy(llvm_);
                     if (!a->getType()->isFloatingPointTy()) a = builder_.CreateSIToFP(a, dbl);
                     if (!b->getType()->isFloatingPointTy()) b = builder_.CreateSIToFP(b, dbl);
-                    auto* fn = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::maxnum, {dbl});
+                    auto* fn = llvm::Intrinsic::getOrInsertDeclaration(module_.get(), llvm::Intrinsic::maxnum, {dbl});
                     return builder_.CreateCall(fn, {a, b}, "fmax.result");
                 }
             }
@@ -19218,7 +19218,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 llvm::Value* scale = builder_.CreateCall(
                     powFn, {llvm::ConstantFP::get(dbl, 10.0), digD}, "round.scale");
                 llvm::Value* scaled = builder_.CreateFMul(a, scale, "round.scaled");
-                auto* reFn = llvm::Intrinsic::getDeclaration(
+                auto* reFn = llvm::Intrinsic::getOrInsertDeclaration(
                     module_.get(), llvm::Intrinsic::rint, {dbl});
                 llvm::Value* rounded = builder_.CreateCall(reFn, {scaled}, "round.re");
                 return builder_.CreateFDiv(rounded, scale, "round.result");

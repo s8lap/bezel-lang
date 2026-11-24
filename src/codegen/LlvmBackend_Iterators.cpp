@@ -133,7 +133,7 @@ llvm::Value* Emitter::erasedCollBackingIsTakeReversed(
         // shares it.
         std::string prefix =
             std::string(vtablelessBuiltinQualifiedName(head, nullptr)) + "<";
-        llvm::Value* pref = builder_.CreateGlobalStringPtr(prefix);
+        llvm::Value* pref = builder_.CreateGlobalString(prefix);
         llvm::Value* cmp = builder_.CreateCall(
             strncmpFn,
             {nameData, pref, builder_.getInt64((int64_t)prefix.size())},

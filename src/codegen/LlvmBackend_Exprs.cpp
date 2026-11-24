@@ -2975,7 +2975,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                 llvm::Value* recv = lowerExpr(*ma->target);
                                 if (!recv) return nullptr;
                                 if (recv->getType()->isFloatingPointTy()) {
-                                    auto* fn = llvm::Intrinsic::getDeclaration(
+                                    auto* fn = llvm::Intrinsic::getOrInsertDeclaration(
                                         module_.get(), llvm::Intrinsic::fabs, {recv->getType()});
                                     return builder_.CreateCall(fn, {recv}, "fabs");
                                 } else {

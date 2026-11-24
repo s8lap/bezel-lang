@@ -7,6 +7,7 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/FileSystem.h"
@@ -36,8 +37,14 @@ static std::unique_ptr<llvm::TargetMachine> createHostTargetMachine() {
     llvm::InitializeNativeTargetAsmPrinter();
     llvm::Triple triple(llvm::sys::getDefaultTargetTriple());
     std::string err;
+    // LLVM 22+ dropped the string-triple overload; the dev build uses Fedora
+    // 45's LLVM 23 and the static release still builds with Alpine's LLVM 21.
+#if LLVM_VERSION_MAJOR >= 22
+    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
+#else
     const llvm::Target* target =
         llvm::TargetRegistry::lookupTarget(triple.str(), err);
+#endif
     if (!target) return std::unique_ptr<llvm::TargetMachine>{};
     llvm::TargetOptions opts;
     // fix #7737: a default-constructed TargetOptions leaves UseInitArray off,
