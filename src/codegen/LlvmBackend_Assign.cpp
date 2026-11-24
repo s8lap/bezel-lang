@@ -4516,6 +4516,8 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
             // INLINED into the enclosing function, so the enclosing body's fn
             // tokens stay and only the SETS are replaced for the duration of
             // the body.
+            // narrow #9019: the string-local twin, for the same inlined body.
+            InlinedSetterStringScope setterStringScope(*this, *setterStmts);
             AccessorClosureScope setterClosureScope(*this, *setterStmts,
                                                      nullptr);
             // fix #8864 (§23.4 / §27.5, v0.359): the indexer parameters and
@@ -9908,6 +9910,8 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
             // fix #8762 (§27.5 / §28.9, v0.359): the closure-local scope-end
             // analysis for THIS setter body — the STATIC-property twin of the
             // instance path's block below. Same mechanism, same reason.
+            // narrow #9019: and the string-local twin, for the same body.
+            InlinedSetterStringScope setterStringScope(*this, setter->stmts);
             AccessorClosureScope setterClosureScope(*this, setter->stmts,
                                                      nullptr);
             if (setter->bodyKind == ast::PropertyAccessorBodyKind::Expression &&
@@ -10136,6 +10140,9 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
         // comment. Without it, a lambda-valued local in a setter body had no
         // scope-end release registered: MEASURED 4196 B in 149 allocations
         // over 50 calls of the issue's literal repro.
+        // narrow #9019 (§23.3 / §28.9, v0.359): the string-local twin — see
+        // InlinedSetterStringScope's declaration comment.
+        InlinedSetterStringScope setterStringScope(*this, setter->stmts);
         AccessorClosureScope setterClosureScope(*this, setter->stmts, nullptr);
         if (setter->bodyKind == ast::PropertyAccessorBodyKind::Expression &&
             setter->exprBody)

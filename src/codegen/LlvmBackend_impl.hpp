@@ -19757,6 +19757,62 @@ private:
         llvm::Function* stringReleaseEligibleFn_;
     };
 
+    // narrow #9019 (§23.3 / §28.9, v0.359): the string-local scope-end
+    // analysis for an INLINED block setter body (`set => do ... end;` lowered
+    // into the assignment site's function by lowerPropertySetValue's static
+    // and instance arms and by lowerIndexerSet). The body was never analysed:
+    // the enclosing body's sets name only the enclosing body's LocalDecls, so
+    // every `string` local the setter declared took no scope-end release —
+    // `var r := value + "q";` leaked per assignment, and so did the +1 a
+    // closure call over `value` returns (`var r := k();`, the issue's shape:
+    // 7290 B in 400 allocations over 200 assignments, instance and static
+    // setter alike). That leak is what kept #8942's capture retain of `value`
+    // from netting out once the lambda was called; the retain itself is right
+    // (`value` is a borrow, §23.3).
+    //
+    // Same contract as inlineCtorBody's inlined-constructor string analysis:
+    // the sets are replaced by the setter body's own for the body's duration
+    // and restored afterwards (they are keyed on AST nodes, so the two bodies'
+    // verdicts cannot collide), the fn TOKEN is left alone because the inlined
+    // body's locals are lowered with `currentFn_` == the enclosing function,
+    // and the analysis runs ONLY when the enclosing body is already the
+    // analysed one — otherwise the bind-time halves are inert there and arming
+    // a release would pair with nothing. The two constructor-borrow maps and
+    // the analysed-body pin are repopulated by collectStringReleaseEligible
+    // too, so they travel with the sets.
+    struct InlinedSetterStringScope {
+        InlinedSetterStringScope(
+            Emitter& e, const std::vector<std::unique_ptr<ast::Stmt>>& body)
+            : e_(e), sets_(e) {
+            if (body.empty() || e.currentFn_ != e.stringReleaseEligibleFn_)
+                return;
+            analysed_ = true;
+            savedBody_ = e.stringReleaseAnalyzedBody_;
+            savedSpan_ = e.ctorSpanBorrowDecl_;
+            savedRecord_ = e.ctorRecordBorrowDecl_;
+            e.collectStringReleaseEligible(body);
+        }
+        ~InlinedSetterStringScope() {
+            if (!analysed_) return;
+            e_.stringReleaseAnalyzedBody_ = savedBody_;
+            e_.ctorSpanBorrowDecl_ = std::move(savedSpan_);
+            e_.ctorRecordBorrowDecl_ = std::move(savedRecord_);
+            // `sets_` restores the five string sets and the token.
+        }
+        InlinedSetterStringScope(const InlinedSetterStringScope&) = delete;
+        InlinedSetterStringScope& operator=(const InlinedSetterStringScope&) =
+            delete;
+
+    private:
+        Emitter& e_;
+        StringReclaimSetScope sets_;
+        bool analysed_ = false;
+        const std::vector<std::unique_ptr<ast::Stmt>>* savedBody_ = nullptr;
+        std::unordered_map<const void*, const void*> savedSpan_;
+        std::unordered_map<const void*, std::unordered_set<const void*>>
+            savedRecord_;
+    };
+
     // fix #3926 (§28.3 / §28.4 / §28.5 / §28.9, v0.294): the BOX-release
     // twin of `CaptureReclaimSetScope` / `StringReclaimSetScope` above — save
     // and restore the two §28.9 box-release eligibility SETS and the one
