@@ -8635,7 +8635,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         if (oma->member == "ReferenceEquals" && oma->target) {
             if (auto* oid =
                     dynamic_cast<const ast::IdentifierExpr*>(oma->target.get())) {
-                if (oid->name == "Object" && ce.args.size() == 2) {
+                // fix #8795 (§8.4 / §22.12, v0.359): the CLASS-type-name
+                // spelling of the SAME call — `K.ReferenceEquals(a, b)`, the
+                // inherited static (§22.12) — warns on a value-type argument
+                // too. §8.4: "The compiler warns on any value-typed argument",
+                // and the argument's boxing is the root `Object`'s whichever
+                // type name reaches the static. The ROOT spelling keeps its
+                // own (name-based) test: `Object` is a primitive TypeRef, not
+                // a TypeSymbol, so it is not a class type name.
+                bool rootOrClassTypeName = oid->name == "Object";
+                if (!rootOrClassTypeName) {
+                    if (auto* ts =
+                            dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*oid)))
+                        rootOrClassTypeName =
+                            ts->kind == ast::TypeDeclKind::Class;
+                }
+                if (rootOrClassTypeName && ce.args.size() == 2) {
                     auto isValueTypeArg = [](const TypeRef* t) -> bool {
                         if (!t) return false;  // untyped/error/`null` → no warn
                         switch (t->kind) {
@@ -48114,6 +48129,62 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 case BuiltinExcMember::None:
                     break;
             }
+        }
+        // fix #8795 (§8.1 / §22.12 / §2.7 rule 1 / §26.5 rule 2 / §12 /
+        // §11.7, v0.359): the INHERITED static `Object.ReferenceEquals`, named
+        // through a CLASS type name — `K.ReferenceEquals(a, b)` and
+        // `G<int>.ReferenceEquals(a, b)`.
+        //
+        // §12: "If no base class is specified, the implicit base is `Object`"
+        // — so every class derives from `Object` (§8.1: "classes ... directly
+        // through the inheritance chain"), and §11.7 says it outright for the
+        // static: "`Object`'s static `ReferenceEquals` (§8.1) is inherited by
+        // a static class as by every class". §2.7 rule 1 resolves a chain head
+        // that is a TYPE against "that type's members, declared or inherited
+        // (... a static member ...; an inherited static per §22.12)", and
+        // §22.12: "A static member declared on a base class is a member of
+        // every class derived from it ... and may be named through a derived
+        // type". So `K.ReferenceEquals(a, b)` names the INHERITED static and
+        // is the same call as `Object.ReferenceEquals(a, b)` — the receiver's
+        // type does not enter the comparison (§8.4).
+        //
+        // WITHOUT this, the universal-member exemption below (the five names
+        // §8.1's `Object` declaration lists) suppressed the "no member"
+        // diagnostic for this name, so the access stayed UNTYPED, reached
+        // codegen and degraded to the #3079 "failed to lower" warning —
+        // printing NOTHING.
+        //
+        // The TYPE-NAME receiver is the discriminator, never the spelling: a
+        // VALUE receiver is the #8043 / #7270 / #8776 refusal (a static
+        // member is reached through its type, §22.12), and a type name that
+        // is not a CLASS supplies no such member — a record, an enum, a
+        // choice and an interface reach `Object` by BOXING (§8.6) or not at
+        // all (§11.2), so §26.5 rule 2's "no member" answer is theirs.
+        if (receiverIsTypeName && ma.member == "ReferenceEquals" &&
+            knownCompleteUserType && targetType &&
+            targetType->kind == ast::TypeDeclKind::Class) {
+            // §8.1's DECLARED FORM: `public static method ReferenceEquals(a:
+            // Object?, b: Object?): bool;`. The CALL form's result is `bool`;
+            // the READ form is a §27.6 method reference over the static, whose
+            // type is the `(Object, Object) -> bool` pair the root spelling
+            // forms (the primitive-keyword block above).
+            if (&ma == calleeOfCallCtx_) {
+                ctx_.setExprType(&ma,
+                                 ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            } else {
+                auto* ft = ctx_.makeTypeRef();
+                ft->kind = TypeRef::Kind::Function;
+                for (TypeRef* p : {ctx_.primitiveTypeRef(PrimitiveType::Object),
+                                   ctx_.primitiveTypeRef(
+                                       PrimitiveType::Object)}) {
+                    TypeRef::FuncParam fp;
+                    fp.type = p;
+                    ft->funcParams.push_back(fp);
+                }
+                ft->funcReturn = ctx_.primitiveTypeRef(PrimitiveType::Bool);
+                ctx_.setExprType(&ma, ft);
+            }
+            return;
         }
         if (knownCompleteUserType && !isUniversalObjectMember &&
                 !isBuiltinExInheritedMember &&

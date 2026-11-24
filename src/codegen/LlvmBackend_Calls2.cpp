@@ -1330,6 +1330,26 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             sit->second->kind == sema::TypeRef::Kind::Primitive)
             pt = sit->second->primitive;
     }
+    // fix #8795 (§8.1 / §22.12 / §2.7 rule 1 / §26.5 rule 2 / §12 / §11.7,
+    // v0.359): the INHERITED static `Object.ReferenceEquals`, named through a
+    // CLASS type name — `K.ReferenceEquals(a, b)`, `G<int>.ReferenceEquals(a,
+    // b)`. §12: "If no base class is specified, the implicit base is
+    // `Object`" — so every class derives from `Object` (§8.1) and §11.7:
+    // "`Object`'s static `ReferenceEquals` (§8.1) is inherited by a static
+    // class as by every class"; §2.7 rule 1 + §22.12 name an inherited static
+    // through the derived type's name.
+    //
+    // The comparison is the ROOT `Object`'s and does not read the receiver's
+    // type (§8.4: "compares object identity"), so the receiver is treated as
+    // the root `Object` HERE and the ONE lowering below serves both
+    // spellings — there is no second identity compare to keep in step.
+    if (pt == sema::PrimitiveType::None && id &&
+        ma->member == "ReferenceEquals") {
+        if (auto* ts =
+                dynamic_cast<sema::TypeSymbol*>(ctx_.exprSymbol(*id)))
+            if (ts->kind == ast::TypeDeclKind::Class)
+                pt = sema::PrimitiveType::Object;
+    }
     if (pt == sema::PrimitiveType::None) return nullptr;
     const auto& m = ma->member;
     using P = sema::PrimitiveType;
