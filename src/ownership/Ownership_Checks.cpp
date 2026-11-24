@@ -13644,9 +13644,19 @@ void MethodOwnership::checkSetErasingPositionsInExpr(const ast::Expr& e) {
     setErasingDeclWalk_ = true;
     scanFieldReadArgsInExpr(e);
     setErasingDeclWalk_ = saved;
+    // fix #9044 (§28.3 closure bullet, *Provenance* clauses 1 and 6, v0.359):
+    // a BLOCK-bodied lambda written at a declaration site has statements, and
+    // so has locals: `var f: () -> int := q; rg.Keep(f);` routes the
+    // call-bounded parameter `q` through a local. The flow facts the
+    // block-body walk builds (`setErasingFlowBuild`) are built here over the
+    // same expression, so the verdict on `f` is the one its method-body twin
+    // gets. Without them the local read as UNTRACED and the program was
+    // admitted. // per §28.3
+    if (!setErasingCheckQueue_.empty()) setErasingFlowBuildExpr(e);
     for (const SetErasingCheck& c : setErasingCheckQueue_)
         reportSetErasingPosition(c);
     setErasingCheckQueue_.clear();
+    seFlowComplete_ = false;
 }
 
 // fix #8963: the member-level driver for the positions above. The
@@ -32217,6 +32227,19 @@ MethodOwnership::SetErasingSourceSet MethodOwnership::setErasingSourceSet(
 // `body` (see `seFlowNodes_`). // per §28.3
 void MethodOwnership::setErasingFlowBuild(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    setErasingFlowReset();
+    setErasingFlowStmts(body);
+}
+
+// fix #9044 (§28.3 *Provenance* clauses 1 and 6, v0.359): the same flow facts
+// for a DECLARATION-SITE or EXPRESSION-body expression, whose lambda bodies
+// carry the statements. // per §28.3
+void MethodOwnership::setErasingFlowBuildExpr(const ast::Expr& e) {
+    setErasingFlowReset();
+    setErasingFlowExpr(&e);
+}
+
+void MethodOwnership::setErasingFlowReset() {
     seFlowNodes_.clear();
     seFlowNodes_.push_back({-1, SetErasingFlowKind::Root, nullptr, 0});
     seFlowCur_ = 0;
@@ -32227,7 +32250,6 @@ void MethodOwnership::setErasingFlowBuild(
     seFlowReads_.clear();
     seFlowParamLambda_.clear();
     seFlowCaptured_.clear();
-    setErasingFlowStmts(body);
 }
 
 void MethodOwnership::setErasingFlowStmts(

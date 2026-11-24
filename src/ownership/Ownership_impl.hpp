@@ -7911,6 +7911,8 @@ private:
     std::unordered_set<const sema::Symbol*> seFlowCaptured_;
     void setErasingFlowBuild(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void setErasingFlowBuildExpr(const ast::Expr& e);
+    void setErasingFlowReset();
     void setErasingFlowStmt(const ast::Stmt& s);
     void setErasingFlowStmts(const std::vector<std::unique_ptr<ast::Stmt>>& ss);
     void setErasingFlowExpr(const ast::Expr* e);
