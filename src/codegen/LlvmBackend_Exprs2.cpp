@@ -2157,6 +2157,78 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // accesses of the parameter's value.
         std::vector<llvm::User*> preCaptureUsers;
         for (llvm::User* u : slot->users()) preCaptureUsers.push_back(u);
+        // #429/#672: resolve sema type for retain/release classification.
+        // Resolved BEFORE boxing so the cell-seed decision below can be handed
+        // to boxLocalSlot's allocation branch.
+        if (auto* par = dynamic_cast<const sema::ParameterSymbol*>(sym)) {
+            if (par->resolvedDeclType)
+                ce.semaTy = par->resolvedDeclType;
+            else if (par->declType)
+                ce.semaTy = ctx_.resolvedType(*par->declType);
+            // fix #8946 / §14.1 / §28.9: inside a generic instantiation a
+            // parameter declared `T` classifies at its CONCRETE substitution.
+            if (ce.semaTy && !genericSubstSemaTy_.empty())
+                ce.semaTy = substituteTypeRefLocal(ce.semaTy, genericSubstSemaTy_);
+        }
+        // fix #9025 / #9026 / §27.5 / §28.1 / §28.9 (v0.359): a captured
+        // `string` PARAMETER whose cell is WRITTEN, and whose per-capture
+        // retain (#2689) is suppressed below (the #2706 mutated-shared cell,
+        // or the #4198 returned-by-name capture), gives its CELL one reference
+        // of its own, taken when the cell is ALLOCATED (boxLocalSlot's
+        // allocation branch, so once per cell however many capture sites or
+        // loop passes reach it).
+        //
+        // THE OWNERSHIP QUESTION. A capture cell's content is claimed by the
+        // write's drop-on-overwrite release (lowerStringLocalReassign, the
+        // §4.6 `+=` branch), which releases the value each write DISPLACES.
+        // That release is sound only if the cell owns a reference to every
+        // value it ever holds. Every value a write stores is a +1 the cell
+        // owns (a producer's, or the write's own retain-new). The ONE value it
+        // does not otherwise own is the SEED: §28.1 makes `owned` a compile
+        // error on a `string`, so a `string` parameter is an unmodified
+        // BORROW whose single reference belongs to the CALLER, and with the
+        // per-capture retain suppressed nobody minted the cell a reference to
+        // it. Three defects followed from that one missing reference:
+        //
+        //   - #9005: the first write released the CALLER's reference (a
+        //     double free at the caller's scope end). #9005's narrow fix then
+        //     skipped the release for EVERY write through such a cell.
+        //   - #9026: that skip leaks every displaced value — including the
+        //     cell's own +1s after the first write — so the leak grew with
+        //     the number of writes (8000 allocations for 200 calls of a loop
+        //     of 20 writes).
+        //   - #9025: an ESCAPING closure reads the cell after the call
+        //     returns. With no reference of its own, the cell's seed is a
+        //     pure borrow of an argument the caller has already freed (a
+        //     fresh temporary such as `Ident($"fr-{j}")`): a
+        //     heap-use-after-free.
+        //
+        // Minting the seed's reference closes #9025: an escaping closure reads
+        // a value the cell keeps alive. (#9005's skip of the write's release
+        // — unownedCellContentSlots_ — is still in place here, so the
+        // displaced values of #9026 still leak; with the seed owned, the skip
+        // is no longer needed.) The envdtor release
+        // stays suppressed (#2706 — the cell is shared, and no one env is its
+        // last holder), so the cell's FINAL value is leaked: one string per
+        // call, the bounded #2706 / #2718 trade, exactly as for a captured
+        // LOCAL, whose cell inherits the local's producer +1 the same way.
+        //
+        // NOT taken when this frame already owns a +1 of its own
+        // (isOwnedStringParamSlot — #2696's bind-time retain for a parameter
+        // THIS body assigns to): the cell inherits that one, as before. NOT
+        // taken when the cell is never written: then nothing releases a
+        // displaced value and the borrow is balanced as is (the reference
+        // would only leak).
+        if (isStringTypeRefNonNull(ce.semaTy) && !alreadyBoxed &&
+            currentFn_ == boxCaptureLocalsFn_ &&
+            assignedCaptureVars_.count(static_cast<const void*>(sym)) &&
+            !isOwnedStringParamSlot(sym) &&
+            (mutatedSharedCaptureCell(static_cast<const void*>(sym),
+                                      ce.semaTy,
+                                      /*freshCellPerIteration=*/false) ||
+             capturedLocalReturnedByName(static_cast<const void*>(sym),
+                                         ce.semaTy)))
+            cellSeedRetainSlots_.insert(slot);
         ce.envValue = boxLocalSlot(slot, newSlot, /*forLoopVar=*/false,
                                    &wasGuardedParam);  // the shared cell pointer
         // fix #9004 (§27.5, v0.359): a capture site INSIDE A LOOP makes the
@@ -2256,17 +2328,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             lce.pushScopeDepth = disposeStack_.size();  // fix #4261 §28.3
             lastLambdaCapturedCells_.push_back(lce);
         }
-        // #429/#672: resolve sema type for retain/release classification.
-        if (auto* par = dynamic_cast<const sema::ParameterSymbol*>(sym)) {
-            if (par->resolvedDeclType)
-                ce.semaTy = par->resolvedDeclType;
-            else if (par->declType)
-                ce.semaTy = ctx_.resolvedType(*par->declType);
-            // fix #8946 / §14.1 / §28.9: inside a generic instantiation a
-            // parameter declared `T` classifies at its CONCRETE substitution.
-            if (ce.semaTy && !genericSubstSemaTy_.empty())
-                ce.semaTy = substituteTypeRefLocal(ce.semaTy, genericSubstSemaTy_);
-        }
+        // (ce.semaTy was resolved above, before boxing.)
         // fix #2689 / §28.1 / §28.9 / §27.5: a captured PARAMETER of
         // runtime-managed type takes a retain at EVERY capture — where a
         // captured LOCAL takes one only on the 2nd-and-later capture (the

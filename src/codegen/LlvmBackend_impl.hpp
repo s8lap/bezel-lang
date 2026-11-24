@@ -23741,6 +23741,39 @@ private:
     // makes, and the same one #2718 records as the price of not refcounting the
     // cell).
     std::unordered_set<const void*> unownedCellContentSlots_;
+    // fix #9025 / #9026 / §27.5 / §28.1 / §28.9 (v0.359): the PRE-BOXING
+    // slots of captured `string` PARAMETERS whose capture CELL mints one
+    // reference to its SEED (the value the cell is initialised from) when it
+    // is allocated. Filled by lowerLambda's captured-PARAMS loop, before the
+    // boxing, for a parameter whose cell is WRITTEN and whose #2689
+    // per-capture retain is suppressed (the #2706 mutated-shared cell or the
+    // #4198 returned-by-name capture) in a frame that holds no +1 of its own
+    // (isOwnedStringParamSlot). Consulted by boxLocalSlot at each of its
+    // ALLOCATION branches — keyed on the pre-boxing slot, which the
+    // already-boxed path reaches through cellVarSyncSlot_ — so the reference
+    // is taken once per allocated cell, however many capture sites or loop
+    // passes reach it.
+    //
+    // WHY THE CELL NEEDS IT. Every write into the cell releases the value it
+    // displaces (lowerStringLocalReassign, the §4.6 `+=` branch), and every
+    // value a write stores is a +1 the cell owns. The SEED is the exception:
+    // §28.1 makes `owned` a compile error on a `string`, so the parameter is a
+    // BORROW whose one reference is the CALLER's. Unminted, the first write
+    // released the caller's reference (#9005), and an escaping closure read a
+    // seed the caller had already freed (#9025, a fresh-temporary argument).
+    // #9005's earlier remedy — skip the release for every write through such
+    // a cell — leaked every displaced value (#9026). With the seed minted the
+    // cell owns exactly one reference to whatever it holds; its FINAL value
+    // still leaks, because the envdtor release stays suppressed (#2706: the
+    // cell is shared and no one env is its last holder — the #2718 trade).
+    std::unordered_set<const llvm::AllocaInst*> cellSeedRetainSlots_;
+    // fix #9025: mint the cell's reference to its seed `seed`, read from the
+    // pre-boxing slot `origSlot`, if lowerLambda armed that slot above.
+    void emitCellSeedRetain(const llvm::AllocaInst* origSlot,
+                            llvm::Value* seed) {
+        if (origSlot && cellSeedRetainSlots_.count(origSlot))
+            emitStringRetain(seed);
+    }
     // fix #2706 / §27.5 / §28.9 (v0.240): does this capture's cell need BOTH its
     // per-capture retain and its envdtor release suppressed? True iff
     //   (a) the capture is of a runtime-managed type the envdtor releases at all

@@ -7156,6 +7156,10 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
             llvm::Value* cur = builder_.CreateLoad(
                 valTy, syncIt->second, "preboxed");
             builder_.CreateStore(cur, cell);
+            // fix #9025 / §27.5 / §28.9 (v0.359): the cell's own reference
+            // to its seed (cellSeedRetainSlots_) — this branch allocates the
+            // cell when the first capture site's allocation did not run.
+            emitCellSeedRetain(syncIt->second, cur);
         }
         builder_.CreateStore(cell, newSlot);
         builder_.CreateBr(doneBB);
@@ -7264,6 +7268,7 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
                                                 {builder_.getInt64(1), cellSize});
         llvm::Value* cur2 = builder_.CreateLoad(valTy, slot, "preboxed");
         builder_.CreateStore(cur2, cell);
+        emitCellSeedRetain(slot, cur2);  // fix #9025: see cellSeedRetainSlots_
         // Deliberately a BARE `entryAlloca`: this path's holder is NOT
         // null-initialised here (except for `prevHolder`, above). On a path that never reaches this capture site
         // its content is undef, which `fix #4612` repairs — but only for the
@@ -7353,6 +7358,7 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
                                             {builder_.getInt64(1), cellSize});
     llvm::Value* cur = builder_.CreateLoad(valTy, slot, "preboxed");
     builder_.CreateStore(cur, cell);
+    emitCellSeedRetain(slot, cur);  // fix #9025: see cellSeedRetainSlots_
     builder_.CreateStore(cell, newSlot);
     builder_.CreateBr(doneBB);
 
