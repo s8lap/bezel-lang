@@ -12388,7 +12388,16 @@ namespace {
 
 // The spelled name of a Named TypeRef (its last path segment, or the imported
 // name for a metadata-reconstructed reference).
+//
+// fix #8728 (§14.2 *Interface conformance* rule 2, §27.8, v0.359): the name is
+// ALIAS-TRANSPARENT. §27.8: "a type alias is a pure synonym — it does not
+// create a new type", and §14.2 compares a constraint's instantiation "after
+// type-alias resolution". A declaration-less built-in reached through a user
+// alias (`type MyDT := DateTime`) keeps the USE-SITE node (`MyDT`) as its
+// `astNode`; the underlying head is `aliasResolvedHead`, which the reader of
+// every identity comparison below must consult first.
 std::string_view namedLeafName(const TypeRef* t) {
+    if (!t->aliasResolvedHead.empty()) return t->aliasResolvedHead;
     if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
         return t->astNode->name->parts.back();
     return t->importedName;
