@@ -39091,7 +39091,31 @@ bool Emitter::returnedClosureLocalOwnsPlusOne(const ast::Expr* e) const {
     // reference, so the cell's count never reached 0 (52 bytes / 3 allocations
     // measured, where the `var` twin was clean).
     LocalDeclInitView dv = localDeclInitView(loc->decl);
-    if (dv.init && !dv.isUsing && isPlusOneClosureProducer(dv.init)) {
+    // fix #8925 (§27.5 / §28.9, v0.359): the producer arm must recognise the
+    // SAME producers the candidate walk admits. `collectClosureReleaseEligible`'s
+    // producer walk (LlvmBackend_Setup.cpp ~L44283) has read
+    //     isPlusOneClosureProducer || isUserMethodClosureReturnCall ||
+    //     isLambdaClosureReturnCall || isAwaitedClosureReturnCall
+    // since fix #2714, so a closure local initialised from a CLOSURE-RETURNING
+    // CALL (`var f: () -> int := g();`) is a candidate whose slot holds the
+    // CALL's single +1 — the callee's own body minted it and transferred it
+    // (#2714's reasoning). This arm recognised only `isPlusOneClosureProducer`,
+    // which DELIBERATELY declines every `CallExpr`, so for a call-initialised
+    // local it answered "does not own": the return site then MINTED a second
+    // +1 (the retain at LlvmBackend_Stmts.cpp ~L4794) while the slot's own +1
+    // was never dropped — the caller dropped the minted one and the slot's
+    // leaked (MEASURED on r43-f45-toolchain @ 86ced0bec: 64 B in 1 allocation
+    // per call). The PRODUCER-initialised twin (`var f: () -> int := lambda()
+    // => 3; return f;`) was clean because this arm DID fire for it, so the
+    // return TRANSFERRED the slot's reference instead of minting a second one.
+    // The two spellings must agree; the fix is to mirror the candidate walk's
+    // producer set here, exactly as fix #8969 did for the REASSIGNMENT path
+    // (`lowerClosureLocalReassign`'s own `isProducer`).
+    if (dv.init && !dv.isUsing &&
+        (isPlusOneClosureProducer(dv.init) ||
+         isUserMethodClosureReturnCall(dv.init) ||
+         isLambdaClosureReturnCall(dv.init) ||
+         isAwaitedClosureReturnCall(dv.init))) {
         const sema::TypeRef* lt = nullptr;
         if (dv.type) lt = ctx_.resolvedType(*dv.type);
         if (!lt) lt = ctx_.exprType(*dv.init);
