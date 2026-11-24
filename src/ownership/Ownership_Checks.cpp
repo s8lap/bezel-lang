@@ -13718,12 +13718,15 @@ void MethodOwnership::scanMemberForSetErasingPositions(
     } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m)) {
         // The property's own `=> E` body, its auto-property initializer, and
         // each accessor's `=> E` body.
+        // fix #9063 (§28.3 *Provenance* clause 3, v0.359): an INDEXER's own
+        // plain function-typed formals are the enclosing body's parameters
+        // for its `=>` bodies exactly as a method's are (#9045).
         if (pd->bodyKind == ast::PropertyBodyKind::Expression)
-            ex(pd->exprBody);
+            exBody(pd->exprBody);
         ex(pd->autoInitializer);
         for (const auto& acc : pd->accessors)
             if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression)
-                ex(acc.exprBody);
+                exBody(acc.exprBody);
     }
     // A PARAMETER's DEFAULT VALUE, a `requires` / `ensures` clause and a class
     // `invariant` are declaration-site expressions too — the same positions

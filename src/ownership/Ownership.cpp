@@ -20710,6 +20710,10 @@ const std::vector<sema::Symbol*>* paramSymsOf(
             return &ms->params;
         if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(s.get()))
             return &cs->params;
+        // fix #9063 (§28.3, v0.359): an INDEXER's formals are the enclosing
+        // body's own parameters for its `=>` accessor bodies.
+        if (auto* ps = dynamic_cast<sema::PropertySymbol*>(s.get()))
+            if (ps->isIndexer) return &ps->indexerParams;
     }
     return nullptr;
 }
