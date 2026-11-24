@@ -2233,6 +2233,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 ce.semaTy = par->resolvedDeclType;
             else if (par->declType)
                 ce.semaTy = ctx_.resolvedType(*par->declType);
+            // fix #8946 / §14.1 / §28.9: inside a generic instantiation a
+            // parameter declared `T` classifies at its CONCRETE substitution.
+            if (ce.semaTy && !genericSubstSemaTy_.empty())
+                ce.semaTy = substituteTypeRefLocal(ce.semaTy, genericSubstSemaTy_);
         }
         // fix #2689 / §28.1 / §28.9 / §27.5: a captured PARAMETER of
         // runtime-managed type takes a retain at EVERY capture — where a
@@ -3886,8 +3890,29 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // expr-body path does. `retSemaTy` is already null for an async lambda
     // (cleared above — its declared return is the outer Task, minted by the
     // async machinery), so this is scoped to synchronous lambdas.
+    // fix #8946 / §14.1 / §28.9 / §27.5: inside a generic instantiation the
+    // body's own type is the bare `T` (sema types the body once), so the +1
+    // mint predicates below — keyed on `string` / function-typed results —
+    // never fired for `lambda() => p` over `p: T` at T = string, and the caller
+    // released a reference the lambda never minted (the over-release). Classify
+    // the RETAIN at the concrete substitution; only a result that substitutes to
+    // `string` or a function type changes (every other kind keeps `retSemaTy`,
+    // so boxing and carrier logic are untouched), and a bare type parameter that
+    // belongs to the lambda's CALLEE is left alone (lambdaCalleeOwnTParams_).
+    const sema::TypeRef* retRcSemaTy = retSemaTy;
+    if (retSemaTy && !genericSubstSemaTy_.empty() &&
+        isBareTypeParamRef(retSemaTy) &&
+        !lambdaCalleeOwnTParams_.count(retSemaTy->headName())) {
+        const sema::TypeRef* sub =
+            substituteTypeRefLocal(retSemaTy, genericSubstSemaTy_);
+        if (sub && !sub->nullable &&
+            ((sub->kind == sema::TypeRef::Kind::Primitive &&
+              sub->primitive == sema::PrimitiveType::String) ||
+             sub->kind == sema::TypeRef::Kind::Function))
+            retRcSemaTy = sub;
+    }
     const sema::TypeRef* savedLambdaRetSemaTy = currentLambdaReturnSemaTy_;
-    currentLambdaReturnSemaTy_ = retSemaTy;
+    currentLambdaReturnSemaTy_ = retRcSemaTy;
     currentReturnTypeNode_ = nullptr;
     locals_.clear();
     paramSlots_.clear();
@@ -4989,9 +5014,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // null carry. The block-body twin (emitReturn's lambda arm,
                 // LlvmBackend_Stmts.cpp) is kept in lockstep.
                 if (v && v->getType()->isPointerTy() &&
-                    retSemaTy &&
-                    retSemaTy->kind == sema::TypeRef::Kind::Primitive &&
-                    retSemaTy->primitive == sema::PrimitiveType::String &&
+                    retRcSemaTy &&
+                    retRcSemaTy->kind == sema::TypeRef::Kind::Primitive &&
+                    retRcSemaTy->primitive == sema::PrimitiveType::String &&
                     !isPlusOneStringProducer(lam.exprBody.get()) &&
                     !returnedStringLocalOwnsPlusOne(lam.exprBody.get()))
                     emitStringRetain(v);
@@ -5003,8 +5028,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 //   (lambda / method-ref / user-method-closure-return) or is an
                 //   identifier naming a closure local that owns +1.
                 if (v && v->getType()->isPointerTy() &&
-                    retSemaTy &&
-                    retSemaTy->kind == sema::TypeRef::Kind::Function &&
+                    retRcSemaTy &&
+                    retRcSemaTy->kind == sema::TypeRef::Kind::Function &&
                     !isPlusOneClosureProducer(lam.exprBody.get()) &&
                     !isUserMethodClosureReturnCall(lam.exprBody.get()) &&
                     !returnedClosureLocalOwnsPlusOne(lam.exprBody.get()))

@@ -24498,6 +24498,10 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // root is restored on every exit path (a specialization is built
     // mid-emission of the body that first calls it).
     OpaqueSlotScanRootGuard opaqueSlotRootGuard{*this, ci.stmts, ci.exprBody};
+    // fix #8946: the box/single-capture/escaping-lambda sets this build now
+    // recomputes below (see its comment) belong to the OUTER body when this
+    // runs mid-emission; leave them as found.
+    CaptureReclaimSetScope captureReclaimScope(*this);
     // fix #2807 / #429 / §4.6 / §28.9: the same save/restore for the `var`
     // STRING-local refcount state, for the same reason #1483 needed it for the
     // unwind sets — this wrapper may run MID-EMISSION of an outer body (a lazy
@@ -24875,6 +24879,23 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
         sharedCellEnvdtorFreeOwner_.clear();
         cellFreeEligibleFn_ = specFn;
         collectCellFreeEligible(*ci.stmts);
+        // fix #8946 (§27.5 / §28.9, v0.359): the SOLE-ESCAPING-CAPTURE twin.
+        // A captured parameter's cell is freed by its one escaping env's
+        // envdtor only when `currentFn_ == boxCaptureLocalsFn_` and the
+        // parameter is in `singleCaptureLocals_` while its lambda is in
+        // `definitelyEscapingLambdas_` (lowerLambda, "#4261-FORWARD"). This
+        // path never ran those two scans, so `Id<T>(p: T): () -> T { return
+        // lambda() => p; }` leaked one cell per call at every T, while its
+        // non-generic twin freed it. Mirror emitFunctionBody's prolog (clear,
+        // pin, collect); the sets are restored by `captureReclaimScope`.
+        boxCaptureLocals_.clear();
+        singleCaptureLocals_.clear();
+        assignedCaptureVars_.clear();
+        returnedCaptureVars_.clear();
+        definitelyEscapingLambdas_.clear();
+        boxCaptureLocalsFn_ = specFn;
+        collectBoxCaptureLocals(*ci.stmts);
+        collectDefinitelyEscapingLambdas(*ci.stmts);
         // fix #4174 follow-up: the closure twin of the string parameter
         // retain above — see retainAssignedClosureParams' own comment.
         // Paired with the closureReleaseEligibleFn_ = specFn pin just above,
