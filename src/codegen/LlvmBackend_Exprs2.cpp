@@ -5363,11 +5363,27 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // Closure: retain unless the body is a +1 closure producer
                 //   (lambda / method-ref / user-method-closure-return) or is an
                 //   identifier naming a closure local that owns +1.
+                // fix #8921 (§27.5 / §28.9, v0.359): `!isLambdaClosureReturnCall`
+                // joins the transfer exclusions — this is the EXPRESSION-bodied
+                // twin of the block-body return site (LlvmBackend_Stmts.cpp
+                // ~L4706, fix #3804) and of the METHOD return site (~L4796),
+                // and the two body forms must agree on the exclusion list.
+                // A closure-returning CALL whose callee is a lambda-typed local
+                // or parameter (`lambda(): () -> int => h();`) already carries
+                // the callee's SINGLE +1 — that callee's own body minted it
+                // and transferred it (fix #2714's reasoning, which is what
+                // `isLambdaClosureReturnCall` recognises). Without the
+                // exclusion this site RETAINS that reference a second time,
+                // so the returned closure's refcount never reaches zero, its
+                // envdtor never runs, and the closure header, its env and
+                // every capture cell leak (MEASURED on r43-f45-toolchain @
+                // 86ced0bec: 64 B in 1 allocation per call).
                 if (v && v->getType()->isPointerTy() &&
                     retRcSemaTy &&
                     retRcSemaTy->kind == sema::TypeRef::Kind::Function &&
                     !isPlusOneClosureProducer(lam.exprBody.get()) &&
                     !isUserMethodClosureReturnCall(lam.exprBody.get()) &&
+                    !isLambdaClosureReturnCall(lam.exprBody.get()) &&
                     !returnedClosureLocalOwnsPlusOne(lam.exprBody.get()))
                     emitClosureRetain(v);
                 // fix #6480 / §28.3.11 (v0.359): the scope's disposals run
