@@ -17,9 +17,8 @@
 //
 // ROWS.  The two admitted rows are RED on the base tree (rejected there with
 // the set-erasing diagnostic); they run 200 loops and pin exact stdout.  They
-// use `runAot`, not `runAotChecked`, because converting a closure local to
-// `Object` leaks the closure independently of this rule (issue #9061); the
-// ASan run of these programs shows no use-after-free, only that leak.  The two REJECT rows are
+// run on `runAotChecked` (ASan + leak check; the closure leak that once forced
+// `runAot` here, issue #9061, is fixed).  The two REJECT rows are
 // base-green boundary controls: the overwrite lives in only ONE arm of an
 // `if` (the alias reaches the read through the other arm), and there is no
 // overwrite at all (#8963 / #9044's shape).
@@ -31,6 +30,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 namespace {
 
@@ -87,7 +87,7 @@ std::string expected9() {
 // capture-free lambda, and passes it at `Object`.  RED on base (rejected).
 BEZEL_TEST(call_bounded_alias_overwrite_9059,
            lambda_param_alias_overwritten_capture_free_admitted_spec_28_3) {
-    auto r = runAot(program(
+    auto r = runAotChecked(program(
         "  return; ",
         "    var h: (Reg2, () -> int) -> () := "
         "      lambda(rg: Reg2, q: () -> int) => do "
@@ -105,7 +105,7 @@ BEZEL_TEST(call_bounded_alias_overwrite_9059,
 // RED on base (rejected).
 BEZEL_TEST(call_bounded_alias_overwrite_9059,
            method_param_alias_overwritten_capture_free_admitted_spec_28_3) {
-    auto r = runAot(program(
+    auto r = runAotChecked(program(
         "    var f: () -> int := q; "
         "    f := lambda() => 9; "
         "    rg.Keep(f); ",
@@ -144,7 +144,7 @@ BEZEL_TEST(call_bounded_alias_overwrite_9059,
 // 6: "the assignments that reach the read").  RED on base (rejected).
 BEZEL_TEST(call_bounded_alias_overwrite_9059,
            overwrite_in_both_branches_admitted_spec_28_3) {
-    auto r = runAot(program(
+    auto r = runAotChecked(program(
         "    var f: () -> int := q; "
         "    if c then f := lambda() => 9; else f := lambda() => 9; end if; "
         "    rg.Keep(f); ",

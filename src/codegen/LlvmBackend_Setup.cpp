@@ -39056,7 +39056,11 @@ bool Emitter::isObjectFormalInspectOnlyArgPosition(const ast::CallExpr& call,
     if (!ft || ft->kind != sema::TypeRef::Kind::Primitive ||
         ft->primitive != sema::PrimitiveType::Object)
         return false;
-    return calleeBodyUsesFormalOnlyByInvocationOrInspection(*md, p.name);
+    // fix #9061 (§28.9 / §8.1 / §27.5, v0.359): also a callee that STORES the
+    // formal into a dynamic function-value field, whose store retains.
+    return calleeBodyUsesFormalOnlyByInvocationOrInspection(*md, p.name) ||
+           calleeBodyUsesFormalOnlyByInvocationInspectionOrFnvalFieldStore(
+               ctx_, *md, p.name);
 }
 
 
@@ -39849,8 +39853,56 @@ bool Emitter::lowerDynBoxFieldStore(const ast::Expr& target,
     if (isObjectStringFieldLvalue(target, valueExpr)) return false;
     llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), fieldAddr, "dynbox.old");
     emitObjectSlotBoxOp(newVal, /*retain=*/true);
+    // fix #9061: the field may also hold a function value (see
+    // dynFnvalStorageFields_): the same retain / release, on a run-time test.
+    const bool alsoFnval = isDynFnvalStorageMember(sym);
+    if (alsoFnval && !isPlusOneClosureProducer(valueExpr) &&
+        !isUserMethodClosureReturnCall(valueExpr))
+        emitObjectSlotFnvalOp(newVal, /*retain=*/true);
     builder_.CreateStore(newVal, fieldAddr);
     emitObjectSlotBoxOp(oldVal, /*retain=*/false);
+    if (alsoFnval) emitObjectSlotFnvalOp(oldVal, /*retain=*/false);
+    return true;
+}
+
+
+// fix #9061 (§28.9 / §8.1 / §27.5, v0.359): a `:=` store into a DYNAMIC
+// function-value storage field (see dynFnvalStorageFields_) that is not also a
+// dynamic box field (lowerDynBoxFieldStore carries both disciplines for one
+// that is):
+//
+//   load-old -> retain-new (iff a function value, and not a +1 producer) ->
+//   store-new -> release-old (iff a function value)
+//
+// The retain precedes the release so a self-assignment is transiently safe. A
+// +1 producer (a lambda, a method reference, a user closure-returning call) is
+// TRANSFERRED, as lowerClosureFieldStore does for a function-typed field. A
+// class instance, a string, a box or a built-in fails the run-time test and
+// is left alone.
+bool Emitter::lowerDynFnvalFieldStore(const ast::Expr& target,
+                                      llvm::Value* fieldAddr,
+                                      llvm::Value* newVal,
+                                      const ast::Expr* valueExpr) {
+    if (dynFnvalStorageFields_.empty()) return false;
+    if (!fieldAddr || !newVal || !valueExpr) return false;
+    if (!newVal->getType()->isPointerTy()) return false;
+    const sema::TypeRef* rt = ctx_.exprType(target);
+    if (!rt || !isObjectOrInterfaceTarget(rt)) return false;
+    if (localSlot(target)) return false;
+    {
+        llvm::Type* dummy = nullptr;
+        if (refParamAddr(target, dummy)) return false;
+    }
+    if (staticFieldGlobal(target)) return false;
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    if (!sym || !isDynFnvalStorageMember(sym)) return false;
+    if (isDynBoxStorageMember(sym)) return false;  // lowerDynBoxFieldStore's
+    llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), fieldAddr, "dynfn.old");
+    if (!isPlusOneClosureProducer(valueExpr) &&
+        !isUserMethodClosureReturnCall(valueExpr))
+        emitObjectSlotFnvalOp(newVal, /*retain=*/true);
+    builder_.CreateStore(newVal, fieldAddr);
+    emitObjectSlotFnvalOp(oldVal, /*retain=*/false);
     return true;
 }
 
@@ -41294,8 +41346,14 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
         const sema::TypeRef* ft = ctx.resolvedType(*p.type);
         if (ft && ft->kind == sema::TypeRef::Kind::Primitive &&
             ft->primitive == sema::PrimitiveType::Object)
+            // fix #9061 (§28.9 / §8.1 / §27.5, v0.359): a callee that also
+            // STORES the formal into a dynamic function-value field keeps a
+            // reference of its own (the store retains), so the caller's
+            // scope-end release is still the one that balances its own.
             return calleeBodyUsesFormalOnlyByInvocationOrInspection(*md,
-                                                                   p.name);
+                                                                   p.name) ||
+                   calleeBodyUsesFormalOnlyByInvocationInspectionOrFnvalFieldStore(
+                       ctx, *md, p.name);
     }
     // arm (a) — narrow #5129: a bare METHOD-OWN generic `U` instantiated at
     // this call site to a non-nullable function type.
@@ -56974,6 +57032,12 @@ void Emitter::collectBoxStorageFields() {
     // has `sawBox && !dynBlocked` is a DYNAMIC box-storage field.
     std::unordered_map<const sema::Symbol*, bool> sawBox;
     std::unordered_map<const sema::Symbol*, bool> dynBlocked;
+    // fix #9061 (§28.9 / §8.1, v0.359): the FUNCTION-VALUE twin of `sawBox`:
+    // some write can put a function value in the slot (a function-typed
+    // source, or an `Object`-typed source of unknown provenance).
+    // `fnvalBlocked`: an initializer takes no reference of its own on one.
+    std::unordered_map<const sema::Symbol*, bool> sawFnval;
+    std::unordered_map<const sema::Symbol*, bool> fnvalBlocked;
     auto blockDyn = [&](const ast::Expr* target) {
         if (!target) return;
         sema::Symbol* fsym = ctx_.exprSymbol(*target);
@@ -57005,6 +57069,12 @@ void Emitter::collectBoxStorageFields() {
             sawBox[fsym] = true;
         else
             it->second = false;
+        // fix #9061: a function value reaches the slot from a function-typed
+        // source or an `Object`-typed one of unknown provenance.
+        if (srcTy->kind == sema::TypeRef::Kind::Function ||
+            (srcTy->kind == sema::TypeRef::Kind::Primitive &&
+             srcTy->primitive == sema::PrimitiveType::Object))
+            sawFnval[fsym] = true;
     };
 
     // PHASE 2 — the recursive scanner for stores.
@@ -57320,6 +57390,12 @@ void Emitter::collectBoxStorageFields() {
         bool isBoxableSource =
             isBoxableValueType(srcTy) || isNullableValueTy(srcTy);
         bool isBoxReturnCall = isUserMethodBoxReturnCall(init);
+        // fix #9061: an initializer that is, or may be, a function value
+        // takes no reference of its own on it (emitInstanceInit).
+        if (srcTy->kind == sema::TypeRef::Kind::Function ||
+            (srcTy->kind == sema::TypeRef::Kind::Primitive &&
+             srcTy->primitive == sema::PrimitiveType::Object))
+            fnvalBlocked[m] = true;
         if (isBoxableSource || isBoxReturnCall) {
             sawBox[m] = true;
         } else {
@@ -57354,6 +57430,13 @@ void Emitter::collectBoxStorageFields() {
         // released: every Holder leaked its last box.
         else if ((sawBox[m] || extDyn) && !dynBlocked[m])
             dynBoxStorageFields_.insert(static_cast<const void*>(m));
+        // fix #9061 (§28.9 / §8.1, v0.359): a field a function value can
+        // reach gets the dynamic function-value discipline, provided every
+        // write is one the store sites see, no importer can write it (its
+        // stores would take no reference), and no initializer needs one.
+        if (!isOk && sawFnval[m] && !dynBlocked[m] && !fnvalBlocked[m] &&
+            !isExternallyWritableBoxField(m))
+            dynFnvalStorageFields_.insert(static_cast<const void*>(m));
     }
 }
 

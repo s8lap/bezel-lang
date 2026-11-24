@@ -2403,7 +2403,9 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                 continue;  // fix #3152 — see the string walk above
             if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
             const bool dynBox = isDynBoxStorageMember(m);
-            if (!isBoxStorageMember(m) && !dynBox) continue;
+            // fix #9061: a dynamic function-value field is released below.
+            const bool dynFnval = isDynFnvalStorageMember(m);
+            if (!isBoxStorageMember(m) && !dynBox && !dynFnval) continue;
             unsigned idx = fieldIndex_[m];
             llvm::Value* addr = builder_.CreateStructGEP(bst, currentThis_, idx,
                                                          "boxf.addr");
@@ -2413,8 +2415,11 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // guarded by the run-time box test.
             if (dynBox)
                 emitObjectSlotBoxOp(val, /*retain=*/false);
-            else
+            else if (!dynFnval)
                 emitBoxRelease(val);
+            // fix #9061 (§28.9, v0.359): the field's own reference to a
+            // function value it holds (see dynFnvalStorageFields_).
+            if (dynFnval) emitObjectSlotFnvalOp(val, /*retain=*/false);
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
         }
     }
@@ -4222,6 +4227,48 @@ void Emitter::emitObjectSlotBoxOp(llvm::Value* obj, bool retain,
     builder_.CreateCall(fn, {obj});
     // fix #8444: report the box this call operated on (see the header).
     if (pinOut) builder_.CreateStore(obj, pinOut);
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+}
+
+
+// fix #9061 (§28.9 / §8.1 / §27.5, v0.359): retain or release the closure cell
+// behind `obj` iff the run-time value of the slot IS a function value.
+//
+// §28.9: "Runtime management governs the *function value itself* -- the
+// heap-allocated closure object that backs it", and §8.1 makes a function
+// value reach `Object` "via [its] reference-type heap representation", so an
+// `Object` slot that holds one holds the cell's object view and must hold a
+// reference of its own to keep the cell alive. The slot's occupant is told
+// apart at run time (null, then `bz_obj_is_fnval`); every other occupant (a
+// class instance, a string, a box, a built-in) is left alone, so a wrong
+// guess is a LEAK, never a release of a non-closure. `bz_closure_retain` /
+// `bz_closure_release` accept the object view (bz_closure_base).
+void Emitter::emitObjectSlotFnvalOp(llvm::Value* obj, bool retain) {
+    if (!obj) return;
+    auto bb = [&](const char* n) {
+        return llvm::BasicBlock::Create(llvm_, n, currentFn_);
+    };
+    auto* nonNullBB = bb("fnvalop.nonnull");
+    auto* opBB = bb("fnvalop.do");
+    auto* contBB = bb("fnvalop.cont");
+    builder_.CreateCondBr(builder_.CreateIsNotNull(obj, "fnvalop.notnull"),
+                          nonNullBB, contBB);
+    builder_.SetInsertPoint(nonNullBB);
+    auto* isStrFn = declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
+    llvm::Value* isStr = builder_.CreateCall(
+        isStrFn, {obj, vtableTablePtr()}, "fnvalop.isstr");
+    auto* vtBB = bb("fnvalop.vt");
+    builder_.CreateCondBr(builder_.CreateICmpNE(isStr, builder_.getInt32(0)),
+                          contBB, vtBB);
+    builder_.SetInsertPoint(vtBB);
+    auto* fnvalFn = declareC("bz_obj_is_fnval", i32(), {ptrTy()});
+    llvm::Value* isFnval = builder_.CreateCall(fnvalFn, {obj}, "fnvalop.fnval");
+    builder_.CreateCondBr(builder_.CreateICmpNE(isFnval, builder_.getInt32(0)),
+                          opBB, contBB);
+    builder_.SetInsertPoint(opBB);
+    if (retain) emitClosureRetain(obj);
+    else emitClosureRelease(obj);
     builder_.CreateBr(contBB);
     builder_.SetInsertPoint(contBB);
 }

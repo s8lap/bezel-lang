@@ -2233,6 +2233,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!handled && as->op == ":=")
                     handled = lowerDynBoxFieldStore(*as->target, addr, rhs,
                                                     as->value.get());
+                // fix #9061 (§28.9 / §8.1, v0.359): the function-value twin.
+                if (!handled && as->op == ":=")
+                    handled = lowerDynFnvalFieldStore(*as->target, addr, rhs,
+                                                      as->value.get());
                 // #824 / §28.5 / §28.9: a store into a CLASS `owned` collection
                 // field (OwningArray<T>/OwningStack<T>/OwningQueue<T>/OwningSet<T>/
                 // OwningLinkedList<T>/OwningBuffer<T>/OwningDictionary<T> etc.)

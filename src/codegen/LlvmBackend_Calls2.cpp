@@ -21575,6 +21575,10 @@ struct FormalInvocationOnlyWalk {
     // strict walk (calleeBodyUsesFormalOnlyByInvocation) and the inspection
     // walk keep their verdicts.
     bool allowForwarding = false;
+    // fix #9061 (§28.9 / §8.1, v0.359): admit `field := formal;` into a
+    // dynamic function-value storage field (needs `ctx`). See
+    // calleeBodyUsesFormalOnlyByInvocationInspectionOrFnvalFieldStore.
+    bool allowFnvalFieldStore = false;
     // fix #8933: the depth of the forwarding chain already walked (a cycle
     // in the call graph must not recurse forever; the limit fails closed).
     int forwardDepth = 0;
@@ -21839,6 +21843,19 @@ struct FormalInvocationOnlyWalk {
             return;
         }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            // fix #9061: the one admitted store of the formal -- a plain `:=`
+            // of the bare formal into a dynamic function-value storage
+            // field, outside any lambda, whose store retains it.
+            if (allowFnvalFieldStore && ctx && gDynFnvalStorageFields &&
+                lambdaDepth == 0 && as->op == ":=" && as->target &&
+                isName(as->value.get())) {
+                const sema::Symbol* fs = ctx->exprSymbol(*as->target);
+                if (fs && gDynFnvalStorageFields->count(
+                              static_cast<const void*>(fs))) {
+                    expr(as->target.get());
+                    return;
+                }
+            }
             expr(as->target.get());
             expr(as->value.get());
             return;
@@ -22178,6 +22195,31 @@ static bool captureClosureLocalEscapes(const ast::MethodDecl& md,
     return !scan.ok;
 }
 
+
+const std::unordered_set<const void*>* gDynFnvalStorageFields = nullptr;
+
+// fix #9061 (§28.9 / §8.1 / §27.5, v0.359): see the declaration.
+bool calleeBodyUsesFormalOnlyByInvocationInspectionOrFnvalFieldStore(
+        const sema::SemaContext& ctx, const ast::MethodDecl& md,
+        std::string_view name) {
+    if (name.empty() || !gDynFnvalStorageFields) return false;
+    for (auto mod : md.modifiers)
+        if (mod == "virtual" || mod == "abstract" || mod == "override")
+            return false;
+    FormalInvocationOnlyWalk w{name};
+    w.allowInspection = true;
+    w.allowFnvalFieldStore = true;
+    w.ctx = &ctx;
+    if (md.bodyKind == ast::MethodBodyKind::Expression) {
+        if (!md.exprBody) return false;
+        w.expr(md.exprBody.get());
+    } else if (md.bodyKind == ast::MethodBodyKind::Block) {
+        w.stmts(md.stmts);
+    } else {
+        return false;
+    }
+    return w.ok;
+}
 
 // fix #8933 (§28.14 / §28.9, v0.359): the FORWARDING admission — the same
 // fail-closed walk, plus §28.14's "the callee may be invoked, bound to

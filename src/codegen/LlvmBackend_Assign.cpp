@@ -8813,8 +8813,26 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                     llvm::Value* oldVal = builder_.CreateLoad(
                         ptrTy(), slot, "propset.dynbox.old");
                     emitObjectSlotBoxOp(&valArg, /*retain=*/true);
+                    // fix #9061: the field may also hold a function value.
+                    const bool alsoFnval = isDynFnvalStorageMember(ps);
+                    if (alsoFnval)
+                        emitObjectSlotFnvalOp(&valArg, /*retain=*/true);
                     builder_.CreateStore(&valArg, slot);
                     emitObjectSlotBoxOp(oldVal, /*retain=*/false);
+                    if (alsoFnval)
+                        emitObjectSlotFnvalOp(oldVal, /*retain=*/false);
+                } else if (classField && !strField && !tpStrField &&
+                           !closureField && !boxField &&
+                           isDynFnvalStorageMember(ps) &&
+                           valArg.getType()->isPointerTy()) {
+                    // fix #9061 (§28.9 / §8.1, v0.359): a dynamic function-
+                    // value auto-property (see dynFnvalStorageFields_). The
+                    // setter's `value` is a borrow, so it is retained.
+                    llvm::Value* oldVal = builder_.CreateLoad(
+                        ptrTy(), slot, "propset.dynfn.old");
+                    emitObjectSlotFnvalOp(&valArg, /*retain=*/true);
+                    builder_.CreateStore(&valArg, slot);
+                    emitObjectSlotFnvalOp(oldVal, /*retain=*/false);
                 } else if (boxField) {
                     // §23.3/§28.9: load-old -> retain-new -> store-new ->
                     // release-old, mirroring the string/closure order (retain

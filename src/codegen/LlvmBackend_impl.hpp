@@ -1005,6 +1005,19 @@ bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
 bool calleeBodyUsesFormalOnlyByInvocationOrInspection(
         const ast::MethodDecl& md, std::string_view name);
 
+// fix #9061 (§28.9 / §8.1 / §27.5, v0.359): the dynamic function-value storage
+// fields (Emitter::dynFnvalStorageFields_) of the module being lowered, for the
+// free-function walks below; set by the Emitter once the pre-pass has run.
+extern const std::unordered_set<const void*>* gDynFnvalStorageFields;
+// The invocation-or-inspection walk, which ALSO admits `field := formal;` where
+// the target is a dynamic function-value storage field: that store takes the
+// field's own reference on a function value (a run-time retain), so the callee
+// keeps no reference it did not take, and the caller's local may still release
+// the reference it holds at its own scope end. Every other use fails closed.
+bool calleeBodyUsesFormalOnlyByInvocationInspectionOrFnvalFieldStore(
+        const sema::SemaContext& ctx, const ast::MethodDecl& md,
+        std::string_view name);
+
 // fix #8933 (§28.14 / §28.9, v0.359): the same fail-closed walk, PLUS
 // §28.14's "passed on as an argument to another call-bounded parameter" —
 // a callee that HANDS ITS OWN call-bounded formal on to another call-bounded
@@ -1247,6 +1260,7 @@ public:
         // consulted only at emission time below).
         collectObjectStringReturnMethods();
         collectBoxStorageFields();
+        gDynFnvalStorageFields = &dynFnvalStorageFields_;  // fix #9061
         // fix #8214 (§28.9 / §4.6 / §8.6, v0.355): the OBJECT-STRING STORAGE
         // twin of collectBoxStorageFields above. Must run BEFORE the
         // method-body emission loop (the store site consults the set) and
@@ -24297,6 +24311,34 @@ private:
         return m &&
                dynBoxStorageFields_.count(static_cast<const void*>(m)) != 0;
     }
+
+    // fix #9061 (§28.9 / §8.1 / §27.5, v0.359): the DYNAMIC FUNCTION-VALUE
+    // storage fields -- an Object-typed class field some write of which can
+    // put a FUNCTION VALUE in the slot (a function-typed source, or an
+    // `Object`-typed source of unknown provenance such as `Keep(o: Object)
+    // _o := o;`). A function value at `Object` is the object view of its
+    // heap closure cell and is "runtime-managed" (§28.9), so the field must
+    // hold a reference of its own: every store retains the cell iff the
+    // run-time value IS a function value (emitObjectSlotFnvalOp), the
+    // displaced value and the disposer release it iff it is one, and the
+    // caller's own reference is then released at its scope end. Before this
+    // the field held the cell WITHOUT a reference, so the caller could never
+    // release it (the walk had to call the argument an escape) and the cell
+    // leaked. Every other occupant of the slot is left alone. Disjoint from
+    // nothing: a field may be both a dynamic box field and this.
+    std::unordered_set<const void*> dynFnvalStorageFields_;
+    bool isDynFnvalStorageMember(const sema::Symbol* m) {
+        return m &&
+               dynFnvalStorageFields_.count(static_cast<const void*>(m)) != 0;
+    }
+    // `bz_closure_retain` (retain=true) / `bz_closure_release` (false) on the
+    // cell behind `obj` IFF the run-time value of `obj` is a function value
+    // (null-safe; every other occupant is left alone).
+    void emitObjectSlotFnvalOp(llvm::Value* obj, bool retain);
+    // retain-new / store / release-old over a dynamic function-value field.
+    bool lowerDynFnvalFieldStore(const ast::Expr& target,
+                                 llvm::Value* fieldAddr, llvm::Value* newVal,
+                                 const ast::Expr* valueExpr);
 
     // fix #8215: `bz_box_retain` (retain=true) / `bz_box_release` (false) on
     // `obj` IFF its runtime value is a genuine §8.6 box -- not null, not a
