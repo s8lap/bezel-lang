@@ -19773,6 +19773,23 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
         if (rs->value) recordBorrowUseExpr(*rs->value);
         return;
     }
+    // issue #9078 (§28.3.9, v0.359): this walk had NO arm for the yield
+    // statement, so a read of a borrow holder that appears ONLY in a
+    // `yield return` operand was never recorded — the holder's later use went
+    // unseen and the consume of its source was admitted. Measured: an
+    // iterator with `var f := lambda(): int => a.N;` (f a closure over the
+    // owned local a), `var t := Sink.Take(move a);` and then
+    // `yield return f();` compiled clean and SEGV'd in `lam$0` at run time —
+    // §28.3.9's rule ("a borrow is live at a consume site when some path from
+    // the site reaches a later use of it — … traced … through a closure value
+    // that is itself still live") makes the `f()` read a LATER USE of the
+    // borrow, so the `move a` must be frozen. The yield operand is an ordinary
+    // operand read, exactly like the `return` operand above: record its reads.
+    // `yield break;` carries no operand and is a no-op here.
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) recordBorrowUseExpr(*ys->value);
+        return;
+    }
     if (auto* ths = dynamic_cast<const ast::ThrowStmt*>(&s)) {
         if (ths->value) recordBorrowUseExpr(*ths->value);
         return;
