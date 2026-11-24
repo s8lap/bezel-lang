@@ -2708,6 +2708,18 @@ private:
     // `states_` and `fieldMovedFrom_` (the lambda body is its own scope) and
     // descends into the lambda's stmts and any nested lambdas.
     void applyUsingVarBorrowPinInLambdaBody(const ast::LambdaExpr& lam);
+    // fix #8939 (§28.3, v0.359): the lambda-body END-OF-BODY discharge check.
+    // `lambdaExitStates_` collects the walker's `states_` at every `return`
+    // of the lambda body being walked (the walkers above save / clear /
+    // restore it per lambda); `checkLambdaBodyOwnedLocalsAtExit` joins them
+    // with the fall-off state and rejects an owned own local that the join
+    // leaves maybe-consumed — the verdict the METHOD body's end-of-method
+    // check gives the same statements. `lambdaExitUncertain_` is set when the
+    // body has a shape this walker does not route exits through (a `finally`),
+    // which turns the check off for that body.
+    void checkLambdaBodyOwnedLocalsAtExit(const ast::LambdaExpr& lam);
+    std::vector<BlockState> lambdaExitStates_;
+    bool lambdaExitUncertain_ = false;
     // fix #3571 (§28.3 SB01-B / §31.1, v0.286): the ONE traversal reaching
     // every `return E;` statement in a body without crossing a nested lambda
     // (a pure statement walk never enters a lambda body, which lives inside a

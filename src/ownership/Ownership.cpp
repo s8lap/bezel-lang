@@ -16057,9 +16057,20 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdas(
                 applyUsingVarBorrowPinInLambdaBody(*nested);
             }
         }
+        // fix #8939 (§28.3, v0.359): collect the exit states of THIS lambda
+        // body for the end-of-body discharge check (see
+        // `checkLambdaBodyOwnedLocalsAtExit`); a nested lambda walked from
+        // inside gets its own window.
+        auto savedLambdaExits = std::move(lambdaExitStates_);
+        lambdaExitStates_.clear();
+        const bool savedExitUncertain = lambdaExitUncertain_;
+        lambdaExitUncertain_ = false;
         for (const auto& s : lam->stmts) {
             if (s) applyUsingVarBorrowPinInLambdaStmt(*s);
         }
+        checkLambdaBodyOwnedLocalsAtExit(*lam);
+        lambdaExitStates_ = std::move(savedLambdaExits);
+        lambdaExitUncertain_ = savedExitUncertain;
         // prep #4146 Stage 2-A (§28.3, v0.298): when the experimental lambda
         // dataflow flag is set, ALSO run the CFG-based dataflow walk over the
         // lambda body, seeded with the captured states. The pre-pass walk above
@@ -16228,6 +16239,36 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             collectBodyLambdasExpr(*rs->value, nestedLambdas);
             for (const ast::LambdaExpr* nested : nestedLambdas)
                 applyUsingVarBorrowPinInLambdaBody(*nested);
+        }
+        // fix #8939 (§28.3 K3.2, v0.359): record the state this `return` LEAVES
+        // the body with, for the end-of-body discharge check
+        // (`checkLambdaBodyOwnedLocalsAtExit`). A `return x` of a bare owned
+        // local TRANSFERS it out (K3.2: the return is a discharge), so the
+        // recorded copy marks it Disposed — `states_` itself is left alone,
+        // this path ends here.
+        {
+            BlockState exitState = states_;
+            if (rs->value) {
+                const auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+                    lookThroughForceUnwrap(rs->value.get()));
+                if (!rid) {
+                    if (const auto* un = dynamic_cast<const ast::UnaryExpr*>(
+                            rs->value.get()))
+                        if (un->op == "move")
+                            rid = dynamic_cast<const ast::IdentifierExpr*>(
+                                lookThroughForceUnwrap(un->operand.get()));
+                }
+                if (rid)
+                    if (sema::Symbol* rsym = ctx_.exprSymbol(*rid)) {
+                        auto it = exitState.find(rsym);
+                        if (it != exitState.end() &&
+                            it->second.state == OwnershipState::Owned) {
+                            it->second.state = OwnershipState::Disposed;
+                            it->second.maybeConsumed = false;
+                        }
+                    }
+            }
+            lambdaExitStates_.push_back(std::move(exitState));
         }
         return;
     }
@@ -17259,6 +17300,11 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         // generalized to the {body-normal-completion} ∪ {catch arms} ∪
         // {finally-always-runs} control shape. // per §21.7, §28.3 K1.4,
         // §28.8.1, v0.298, #4142, #4138
+        // fix #8939 (§28.3, v0.359): a `return` inside a `try` that has a
+        // `finally` runs the `finally` BEFORE it leaves, but this walker
+        // records the exit state at the `return` itself, so the end-of-body
+        // exit join cannot be trusted for this body — turn it off.
+        if (trys->hasFinally) lambdaExitUncertain_ = true;
         BlockState savedTryStates = states_;
         for (const auto& bs : trys->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
@@ -17537,11 +17583,104 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaBody(
         for (const ast::LambdaExpr* nested : nestedLambdas)
             applyUsingVarBorrowPinInLambdaBody(*nested);
     }
+    // fix #8939 (§28.3, v0.359): this body's own exit-state window.
+    auto savedLambdaExits = std::move(lambdaExitStates_);
+    lambdaExitStates_.clear();
+    const bool savedExitUncertain = lambdaExitUncertain_;
+    lambdaExitUncertain_ = false;
     for (const auto& s : lam.stmts)
         if (s) applyUsingVarBorrowPinInLambdaStmt(*s);
+    checkLambdaBodyOwnedLocalsAtExit(lam);
+    lambdaExitStates_ = std::move(savedLambdaExits);
+    lambdaExitUncertain_ = savedExitUncertain;
     states_ = std::move(savedStates);
     fieldMovedFrom_ = std::move(savedFieldMovedFrom);
     lambdaCapturedSyms_ = std::move(savedCaptured);
+}
+
+// fix #8939 (§28.3 *Owned local discharge requirement*, K7.4, K3.2, v0.359):
+// the END-OF-BODY discharge check of a block-bodied LAMBDA.
+//
+// The METHOD body's dataflow joins the state of every path that reaches the
+// exit and rejects an owned class local left maybe-consumed ("owned value in
+// `x` would be dropped here without disposal"): `var x := new Res(1); if f
+// then k := Take(move x); return k; end; return x.tag;` is rejected there. A
+// lambda body is walked by the structural pre-pass above, which had NO
+// end-of-body check at all: the syntactic scope-end sweep (`run()`, the
+// `everOwnedPlainLocals_` loop) skips a local it saw moved on SOME path
+// (`everDischarged_`), so on the path that returned with `x` still owned no
+// disposal was ever armed and the instance leaked (100 objects over 200
+// calls under LeakSanitizer).
+//
+// The walker already keeps per-path `states_` (the if/loop/case joins use the
+// same `joinInto` as the method dataflow), so this joins the state recorded at
+// every `return` (`lambdaExitStates_`) with the fall-off state and reports
+// each of the body's OWN plain `var` locals the join leaves Owned and
+// maybe-consumed, with the method twin's text. It is deliberately NARROW:
+//   * the disagreement must be BETWEEN exits (one exit leaves the local
+//     plainly Owned, another discharged it): a local already maybe-consumed
+//     WITHIN a single exit's path (`if c then move x; end; <exit>`, a move
+//     inside a loop) is the shape the #4141 / #8813 rows pin as admitted in
+//     a lambda body and is left to a follow-up;
+//   * only locals PRESENT in every exit state (a local declared after an
+//     early `return`, or inside a branch, is not judged here);
+//   * not a captured outer local (a closure never owns one, §28.3 *Captured
+//     owned bindings*), not a parameter, not a `using var`;
+//   * not a move-only value type (its per-path scope-end disposal is
+//     exactly-once by construction, #3575 — the method's own carve-out);
+//   * not an async lambda, and not a body with a `finally` (the exit state is
+//     recorded before the `finally` runs).
+// // per §28.3, K7.4, K3.2, v0.359
+void MethodOwnership::checkLambdaBodyOwnedLocalsAtExit(
+        const ast::LambdaExpr& lam) {
+    if (lam.stmts.empty() || lam.isAsync || lambdaExitUncertain_) return;
+    std::vector<BlockState> exits = lambdaExitStates_;
+    if (!armNeverFallsThrough(lam.stmts)) exits.push_back(states_);
+    if (exits.size() < 2) return;
+    BlockState joined = exits.front();
+    for (std::size_t i = 1; i < exits.size(); ++i)
+        joinInto(joined, exits[i], lam.span.begin, /*emitClash=*/false,
+                 /*unionKeys=*/false);
+    for (const auto& [sym, st] : joined) {
+        if (st.state != OwnershipState::Owned || !st.maybeConsumed) continue;
+        if (lambdaCapturedSyms_.count(sym)) continue;
+        auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+        if (!ls) continue;
+        const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+        if (!ld || ld->isUsing) continue;
+        // The disagreement must be BETWEEN exits: at least one exit leaves
+        // the local plainly Owned and at least one leaves it discharged, and
+        // no single exit already carries a maybe-consumed state (that
+        // within-path join is the shape the #4141 / #8813 rows pin as
+        // admitted in a lambda body).
+        bool inEveryExit = true, ownedExit = false, dischargedExit = false,
+             withinPath = false;
+        for (const auto& e : exits) {
+            auto it = e.find(sym);
+            if (it == e.end()) { inEveryExit = false; break; }
+            if (it->second.state == OwnershipState::Owned) {
+                if (it->second.maybeConsumed) withinPath = true;
+                else ownedExit = true;
+            } else if (it->second.state == OwnershipState::MovedFrom ||
+                       it->second.state == OwnershipState::Disposed) {
+                dischargedExit = true;
+            }
+        }
+        if (!inEveryExit || withinPath || !ownedExit || !dischargedExit)
+            continue;
+        const sema::TypeRef* dt =
+            ld->type ? ctx_.resolvedType(*ld->type)
+                     : (ld->initializer ? ctx_.exprType(*ld->initializer)
+                                        : nullptr);
+        const char* moveOnlyKind = nullptr;
+        if (common::isMoveOnlyValueType(dt, ctx_, moveOnlyKind)) continue;
+        reportOnce(
+            Severity::Error, obligationDiagLoc(sym, st),
+            std::string("owned value in `") + std::string(sym->name) +
+                "` would be dropped here without disposal "
+                "(§28.3 — consider `using var`, explicit "
+                "`.Dispose()`, `move`, or `return`)");
+    }
 }
 
 
