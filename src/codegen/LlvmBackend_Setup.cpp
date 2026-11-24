@@ -1,5 +1,6 @@
 #include "codegen/LlvmBackend_impl.hpp"
 #include "codegen/LlvmBackend_EnumMembers.hpp"  // fix #3862 (§10.4, v0.357): the ONE enum-member gate (lowering + ownership walk)
+#include "codegen/LlvmBackend_IndexerParams.hpp"  // fix #9102: the ONE indexer index-parameter shape (lowering + escape walk)
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 #include "common/DisposalKind.hpp"   // §28.9/§28.12: the shared disposal anchor
@@ -43084,7 +43085,41 @@ struct ClosureEscapeWalker {
         }
         if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
             expr(ix->target.get(), /*safeRead=*/false);
-            for (auto& a : ix->indices) expr(a.value.get(), /*safeRead=*/false);
+            // fix #9102 (§23.4 / §23.5 / §28.14 / §28.9, v0.359): an index
+            // argument at a CALL-BOUNDED indexer parameter is a NON-ESCAPING
+            // read. §23.5 forbids `ref`/`out` on an indexer parameter list, so
+            // an indexer's function-typed parameter is plain, and §28.14's
+            // call-bounded default applies: "the callee receives the callback
+            // for the duration of the call only". The caller keeps its own
+            // +1 and releases it at scope end — exactly as at a METHOD's plain
+            // function-typed formal (the twin `closureArgBindsMethodOwnTypeParamBorrow`
+            // arm (b) admits). Before this, EVERY index argument was walked as
+            // an escape, so a closure local passed as the index argument never
+            // got its scope-end release armed and its +1 leaked (12800 B / 200
+            // allocations over the issue's own 200-iteration repro).
+            //
+            // The relief is the walker's OWN, not a per-walk hook: it is the
+            // index-argument twin of the METHOD twin, which lives in this
+            // walker's CallExpr arm and so applies to EVERY walk over the
+            // body — the producer walk that decides the scope-end release,
+            // the KEPT walk that decides whether the value survives the scope,
+            // and the alias walks in between. A hook set on one walk only
+            // would leave the KEPT walk marking the same read as a "keep"
+            // (the value survives the scope) and so erase the local from
+            // `closureReleaseEligible_` again — the leak, unchanged.
+            //
+            // The predicate fails closed on every shape it cannot read: a
+            // non-plain (`scoped`) parameter, a non-function-typed parameter,
+            // an indexer whose ELEMENT type is a function type (the `return`
+            // sink — an accessor that hands its own callback back out of the
+            // call), and an index argument that is not the tracked target.
+            for (std::size_t k = 0; k < ix->indices.size(); ++k) {
+                const ast::Expr* a = ix->indices[k].value.get();
+                const bool callBounded =
+                    a && argIsTarget(a) &&
+                    indexArgBindsCallBoundedIndexerParam(ctx, *ix, k);
+                expr(a, /*safeRead=*/callBounded);
+            }
             return;
         }
         // Everything that can carry the value to a longer-lived location is an

@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "codegen/LlvmBackend_IndexerParams.hpp"  // fix #9102: the ONE indexer index-parameter shape (lowering + escape walk)
 #include "llvm/ADT/STLFunctionalExtras.h"  // llvm::function_ref (fix #4901)
 #include "common/OwnershipFacts.hpp"  // fix #3189: calleeReturnsOwned — the M2 owned-return channel
 
@@ -79,27 +80,9 @@ bool indexerArgMatches(const sema::TypeRef* p, const sema::TypeRef* a) {
 // indexer, well before codegen even reached the getter/setter dispatch).
 // Mirrors the identically-shaped fallback added to
 // ExprTypecheck_Exprs.cpp's sema-side overload matcher.
-const sema::TypeRef* indexerParamType(sema::SemaContext& ctx,
-                                      const sema::PropertySymbol* ps,
-                                      std::size_t k) {
-    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
-        return (k < pd->indexerParams.size() && pd->indexerParams[k].type)
-                   ? ctx.resolvedType(*pd->indexerParams[k].type)
-                   : nullptr;
-    }
-    if (k < ps->indexerParams.size()) {
-        if (auto* p =
-                dynamic_cast<sema::ParameterSymbol*>(ps->indexerParams[k]))
-            return p->resolvedDeclType;
-    }
-    return nullptr;
-}
-
-std::size_t indexerParamCount(const sema::PropertySymbol* ps) {
-    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
-        return pd->indexerParams.size();
-    return ps->indexerParams.size();
-}
+// fix #9102 (§23.4 / §23.5 / §28.14, v0.359): the three index-parameter
+// readers now live in codegen/LlvmBackend_IndexerParams.hpp — the ONE place
+// the LOWERING and the ESCAPE WALK both read them, so the two cannot drift.
 
 // fix #2832 (§12.3, v0.240): is this indexer access `base[...]`? §12.3 —
 // "Inside a derived member, `base.Name(...)` calls the base class's
