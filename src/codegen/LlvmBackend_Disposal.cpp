@@ -7590,29 +7590,23 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
         if (elemPol.disposerThunk) {
             elemDisposer = elemPol.disposerThunk;
         } else if (elemPol.cat == ElementPolicy::Category::RuntimeManaged &&
-                   elemForDisposer->kind == sema::TypeRef::Kind::Primitive &&
-                   elemForDisposer->primitive == sema::PrimitiveType::String &&
-                   // fix #2692 / §28.11: `!nullable` — every one of the retain
-                   // guards on the construction side excludes a NULLABLE string
-                   // element (`litIsStrArr` / `llitIsStrElem` in
-                   // materializeHeapCollectionLiteral, `dictIsStringValue` in
-                   // materializeHeapDictLiteral, `llIsStrElem` in
-                   // LlvmBackend_Calls3.cpp, `arrIsStringElem` in
-                   // LlvmBackend_Calls.cpp), because elementPolicyFor does NOT
-                   // look at `nullable` and still reports RuntimeManaged for a
-                   // `string?`. This site was the only release site WITHOUT the
-                   // matching guard, so an `Array<string?>` / `LinkedList<string?>`
-                   // Pattern-A task result released a +1 nothing retained — an
-                   // unpaired release, i.e. the double-free direction. Dropping
-                   // it leaves a `string?` element leaking instead, which is the
-                   // standing safe direction of this file. Pre-existing and
-                   // family-wide; found while completing #2692's LinkedList half.
-                   !elemForDisposer->nullable) {
+                   isStringElementTypeRef(elemForDisposer)) {
             // Borrowing Array<string> / Dictionary<string, int> / etc. —
             // release each string element. Mirrors the
             // collectionElemDisposer wiring in LlvmBackend_Setup.cpp
             // (which sets stringElementReleaseThunk for string-element
             // collections).
+            //
+            // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate
+            // is GONE. A `string?` element is the same §28.11 *runtime-managed
+            // reference* row as a `string` one (§3.6's *Nullable forms* rule
+            // reads the element category of `V?` as `V`, nullability stripped),
+            // so the collection co-owns a +1 per element and the free gives one
+            // back per slot (`null` is the null-safe release no-op). The gate
+            // was issue #9064 (a +1 producer stored by `Array<string?>.Add` was
+            // neither retained nor TRANSFERRED — its +1 was orphaned) and issue
+            // #8485 (a BORROWED string stored by the same call was stored
+            // without a reference — a use-after-free once the source died).
             elemDisposer = stringElementReleaseThunk();
         }
     }

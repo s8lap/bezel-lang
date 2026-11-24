@@ -2605,13 +2605,18 @@ llvm::Value* Emitter::materializeVtableIEnumerableToArray(
     // mat_arr's retains here are orphaned unless the outer retain is skipped
     // for this path). The conditional outer-retain skip below (line ~1718)
     // matches this conditional retain so the two stay in lockstep. Gated on
-    // the same non-nullable string primitive predicate as the iterElemSemaTy
-    // checks elsewhere so nullable strings / class elements / value primitives
+    // the same string primitive predicate as the iterElemSemaTy
+    // checks elsewhere so class elements / value primitives
     // are unaffected (they don't mint a +1 refcount on yield).
+    // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate is
+    // GONE — a `string?` element is the same §28.11 *runtime-managed
+    // reference* row as a `string` one, so this materialize drain takes the
+    // +1 the outer ToArray's skip defers to it, and the result array's free
+    // gives it back. The gate was issue #9064.
     if (elemRef &&
         elemRef->kind == sema::TypeRef::Kind::Primitive &&
         elemRef->primitive == sema::PrimitiveType::String &&
-        !elemRef->nullable && elemTy->isPointerTy()) {
+        elemTy->isPointerTy()) {
         emitStringRetain(curVal);
     }
     // Spill the by-value element to a stack slot and append its bytes.
@@ -4054,10 +4059,16 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // gates match the materialize drain's retain above exactly.
         {
             bool skipOuterRetain = false;
+            // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable`
+            // gate is GONE — a `string?` element is the same §28.11
+            // *runtime-managed reference* row as a `string` one (§3.6's
+            // *Nullable forms* rule reads the element category of `V?` as
+            // `V`, nullability stripped), so the result array co-owns a +1
+            // per element exactly as `Array<string>`'s does — and its free
+            // gives one back per slot. The gate was issue #9064.
             if (elemRef &&
                 elemRef->kind == sema::TypeRef::Kind::Primitive &&
-                elemRef->primitive == sema::PrimitiveType::String &&
-                !elemRef->nullable) {
+                elemRef->primitive == sema::PrimitiveType::String) {
                 if (auto* recvTy = ctx_.exprType(*ma->target)) {
                     if (isVtableBackedIEnumerableType(recvTy))
                         skipOuterRetain = true;
@@ -4069,8 +4080,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                 toArrPol.cat == ElementPolicy::Category::RuntimeManaged &&
                 elemRef &&
                 elemRef->kind == sema::TypeRef::Kind::Primitive &&
-                elemRef->primitive == sema::PrimitiveType::String &&
-                !elemRef->nullable) {
+                elemRef->primitive == sema::PrimitiveType::String) {
                 auto* rf = declareC("bz_array_retain_strings",
                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(rf, {arr});
@@ -9836,10 +9846,13 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
             // §15.1.2 / #1342: string elements — after filling, retain each
             // element +1 so the Array<string> co-owns a refcount per slot.
             // Mirrors the LINQ ToArray string path (tryLowerLazyLinqCall).
+            // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate
+            // is GONE — a `string?` element is the same §28.11 *runtime-managed
+            // reference* row as a `string` one, so the result array co-owns a
+            // +1 per element and its free gives one back per slot.
             if (elemRef &&
                 elemRef->kind == sema::TypeRef::Kind::Primitive &&
-                elemRef->primitive == sema::PrimitiveType::String &&
-                !elemRef->nullable) {
+                elemRef->primitive == sema::PrimitiveType::String) {
                 auto* rf = declareC("bz_array_retain_strings",
                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(rf, {result});

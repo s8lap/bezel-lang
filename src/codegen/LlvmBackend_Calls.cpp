@@ -10059,7 +10059,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // Convenience predicates derived from the policy (replacing the old
         // delegate calls; behavior preserved exactly):
         //
-        //   arrIsStringElem: RuntimeManaged + non-nullable string primitive
+        //   arrIsStringElem: RuntimeManaged + string primitive
         //     (same guard as emitArrayRetainStringsIfStringArray; the collection-
         //     name guard is already enforced above: the Set/OwningSet branch
         //     returned, so we are in an array-backed collection; Owned* is
@@ -10067,16 +10067,28 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         //     #602 batch 4: isStringElementArray was deleted; the RuntimeManaged
         //     check here directly mirrors the policy.
         //
+        //     fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate
+        //     is GONE. §3.6's *Nullable forms* rule reads the ELEMENT CATEGORY of
+        //     a nullable type `V?` as `V`, nullability stripped, so a `string?`
+        //     element is the same §28.11 *runtime-managed reference* row as a
+        //     `string` one — a shared-reference slot, whose borrowing-family
+        //     column is "shared references": the collection owns a +1 of its own
+        //     on the element and releases it when the slot goes away (`null` is
+        //     the null-safe retain/release no-op). The gate was issue #9064 (a +1
+        //     producer stored by `Array<string?>.Add` was neither retained nor
+        //     TRANSFERRED — its +1 was orphaned: 6912 B / 384 allocations over
+        //     200 iterations) and issue #8485 (a BORROWED string stored by the
+        //     same call was stored without a reference — a use-after-free once
+        //     the source died). The same reading #8207 applied to a
+        //     `Dictionary<K, string?>` value.
+        //
         // per §28.11 v0.135 / fix #619: arrElemPol is derived from
         // elementPolicyFor which now correctly covers both Class and Interface
         // element types.  No DIVERGENCE — the factory handles the full
         // class/interface row of the §28.11 table.
         bool arrIsStringElem =
             arrElemPol.cat == ElementPolicy::Category::RuntimeManaged &&
-            arrElemRef &&
-            arrElemRef->kind == sema::TypeRef::Kind::Primitive &&
-            arrElemRef->primitive == sema::PrimitiveType::String &&
-            !arrElemRef->nullable;
+            isStringElementTypeRef(arrElemRef);
         // arrElemIsClass: whether the element is a class-or-interface type —
         // drives both the ClassOwned disposer (for owning arrays) and ClassBorrow
         // reference identity (for emitRemoveElementEquality).  Per §28.11 v0.135

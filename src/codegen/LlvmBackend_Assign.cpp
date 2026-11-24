@@ -2094,9 +2094,15 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             bool isStrElemArr =
                 !arrIsOwning &&
                 arrPol.cat == ElementPolicy::Category::RuntimeManaged &&
-                arrEl && !arrEl->nullable &&
-                arrEl->kind == sema::TypeRef::Kind::Primitive &&
-                arrEl->primitive == sema::PrimitiveType::String &&
+                // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable`
+                // gate is GONE — a `string?` element is the same §28.11
+                // *runtime-managed reference* row as a `string` one (§3.6's
+                // *Nullable forms* rule reads the element category of `V?` as
+                // `V`, nullability stripped), so the slot co-owns a +1 of its
+                // own (a +1 producer's reference is TRANSFERRED, anything else
+                // is retained) and releases the displaced old value (`null` is
+                // the null-safe retain/release no-op).
+                isStringElementTypeRef(arrEl) &&
                 [](std::string_view n){
                     // #2598: IList<T> is array-backed + borrowing (issue #401),
                     // same bz_array_set ABI as Array<T>; admitted alongside the
@@ -6301,9 +6307,13 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
         bool isStrElemArr =
             !sArrIsOwning &&
             sArrPol.cat == ElementPolicy::Category::RuntimeManaged &&
-            sArrEl && !sArrEl->nullable &&
-            sArrEl->kind == sema::TypeRef::Kind::Primitive &&
-            sArrEl->primitive == sema::PrimitiveType::String &&
+            // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate
+            // is GONE — a `string?` element is the same §28.11 *runtime-managed
+            // reference* row as a `string` one (§3.6's *Nullable forms* rule
+            // reads the element category of `V?` as `V`, nullability stripped),
+            // so the slot co-owns a +1 of its own and releases the displaced
+            // old value (`null` is the null-safe retain/release no-op).
+            isStringElementTypeRef(sArrEl) &&
             [](std::string_view n){
                 // #2598: IList<T> is array-backed + borrowing (issue #401),
                 // same bz_array_set ABI as Array<T>; admitted alongside the
@@ -12454,8 +12464,13 @@ void Emitter::freeCollectionSourceNow(llvm::Value* v,
         elemDisp = elPol.disposerThunk;
         bool arrIsStringElem =
             elPol.cat == ElementPolicy::Category::RuntimeManaged &&
-            elTy && elTy->kind == sema::TypeRef::Kind::Primitive &&
-            elTy->primitive == sema::PrimitiveType::String && !elTy->nullable;
+            // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate
+            // is GONE — a `string?` element is the same §28.11 *runtime-managed
+            // reference* row as a `string` one (§3.6's *Nullable forms* rule
+            // reads the element category of `V?` as `V`, nullability stripped),
+            // so the source array co-owns a +1 per element and releases it
+            // here (`null` is the null-safe release no-op).
+            isStringElementTypeRef(elTy);
         if (!elemDisp && arrIsStringElem)
             elemDisp = stringElementReleaseThunk();
     }
@@ -12965,8 +12980,13 @@ llvm::Function* Emitter::ownedWrapElementDisposer(const sema::TypeRef* iEnumTy) 
     if (pol.disposerThunk) return pol.disposerThunk;
     bool isStringElem =
         pol.cat == ElementPolicy::Category::RuntimeManaged &&
-        elTy && elTy->kind == sema::TypeRef::Kind::Primitive &&
-        elTy->primitive == sema::PrimitiveType::String && !elTy->nullable;
+        // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate is
+        // GONE — a `string?` element is the same §28.11 *runtime-managed
+        // reference* row as a `string` one (§3.6's *Nullable forms* rule reads
+        // the element category of `V?` as `V`, nullability stripped), so the
+        // wrapped collection co-owns a +1 per element and releases it at the
+        // wrap's Dispose (`null` is the null-safe release no-op).
+        isStringElementTypeRef(elTy);
     return isStringElem ? stringElementReleaseThunk() : nullptr;
 }
 

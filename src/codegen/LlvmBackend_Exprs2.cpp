@@ -9521,7 +9521,17 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         const bool fillIsString =
                             fillVal->getType()->isPointerTy() &&
                             !rt->genericArgs.empty() &&
-                            isStringTypeRefNonNull(rt->genericArgs[0]);
+                            // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the
+                            // `!nullable` gate is GONE — a `string?` element is
+                            // the same §28.11 *runtime-managed reference* row as
+                            // a `string` one (§3.6's *Nullable forms* rule reads
+                            // the element category of `V?` as `V`, nullability
+                            // stripped), so an `Array<string?>` holds ONE
+                            // reference per slot exactly as `Array<string>`
+                            // does — and its free gives one back per slot. The
+                            // per-slot retain below is the matching half (the
+                            // `!nullable` gate was issue #9064 / #8485).
+                            isStringElementTypeRef(rt->genericArgs[0]);
                         // for i = 0 ..<  sizeArg: bz_array_set(buf, i, fillSlot, esz)
                         llvm::AllocaInst* iSlot = entryAlloca(i64());
                         builder_.CreateStore(builder_.getInt64(0), iSlot);

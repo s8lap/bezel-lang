@@ -8885,15 +8885,17 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             // same bz_array_t* as the concrete Array<T> arm
             // above, so the string-element disposer fallback
             // (#2710's Site 1) applies here verbatim. The
-            // `!nullable` guard mirrors Site 3 and the
-            // `litIsStrArr` / `arrIsStringElem` siblings.
+            // `!nullable` gate is GONE (fix #9064 / §3.6 / §28.9 /
+            // §28.11, v0.359): a `string?` element is the same
+            // §28.11 *runtime-managed reference* row as a `string` one
+            // (§3.6's *Nullable forms* rule reads the element category of
+            // `V?` as `V`, nullability stripped), so the collection
+            // co-owns a +1 per element and releases it here too (`null` is
+            // the null-safe release no-op).
             bool arrIsStringElem =
                 arrElemPol.cat ==
                     ElementPolicy::Category::RuntimeManaged &&
-                arrElem &&
-                arrElem->kind == sema::TypeRef::Kind::Primitive &&
-                arrElem->primitive == sema::PrimitiveType::String &&
-                !arrElem->nullable;
+                isStringElementTypeRef(arrElem);
             if (!elemDisp && arrIsStringElem)
                 elemDisp = stringElementReleaseThunk();
             llvm::Value* disp = elemDisp
@@ -9016,17 +9018,21 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             ElementPolicy arrElemPol =
                 elementPolicyFor(arrElem, arrIsOwning);
             llvm::Function* elemDisp = arrElemPol.disposerThunk;
-            // RuntimeManaged + non-nullable string primitive —
+            // RuntimeManaged + string primitive —
             // verbatim mirror of `arrIsStringElem` at
             // LlvmBackend_Calls.cpp (the predicate the existing
             // retain / `.Remove*` / `.Clear` releases use).
+            // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the
+            // `!nullable` gate is GONE — a `string?` element is the same
+            // §28.11 *runtime-managed reference* row as a `string` one
+            // (§3.6's *Nullable forms* rule reads the element category of
+            // `V?` as `V`, nullability stripped), so the collection co-owns
+            // a +1 per element and releases it here too (`null` is the
+            // null-safe release no-op).
             bool arrIsStringElem =
                 arrElemPol.cat ==
                     ElementPolicy::Category::RuntimeManaged &&
-                arrElem &&
-                arrElem->kind == sema::TypeRef::Kind::Primitive &&
-                arrElem->primitive == sema::PrimitiveType::String &&
-                !arrElem->nullable;
+                isStringElementTypeRef(arrElem);
             if (!elemDisp && arrIsStringElem)
                 elemDisp = stringElementReleaseThunk();
             llvm::Value* disp = elemDisp

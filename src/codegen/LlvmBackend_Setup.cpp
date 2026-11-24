@@ -18676,11 +18676,19 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         // (~13983-13990). Non-string RuntimeManaged elements
                         // (closures) are still excluded by isBorrowingArrayLiteralLocal,
                         // so this branch only fires for strings.
+                        // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): a
+                        // `string?` element is the same §28.11 *runtime-managed
+                        // reference* row as a `string` one (§3.6's *Nullable forms*
+                        // rule reads the element category of `V?` as `V`,
+                        // nullability stripped), so a literal-built
+                        // `Array<string?>` co-owns a +1 per element exactly as
+                        // `Array<string>` does. The `!nullable` gate was issue
+                        // #9064 / #8485.
                         if (!d.collectionElemDisposer) {
                             const sema::TypeRef* elt =
                                 (!collTy->genericArgs.empty())
                                     ? collTy->genericArgs[0] : nullptr;
-                            if (isStringTypeRefNonNull(elt))
+                            if (isStringElementTypeRef(elt))
                                 d.collectionElemDisposer = stringElementReleaseThunk();
                         }
                         // fix #5173 / §28.11: for a borrowing Array<T> with
@@ -20882,10 +20890,15 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             (rt && !rt->genericArgs.empty()) ? rt->genericArgs[0] : nullptr;
         ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/false);
         d.collectionElemDisposer = ep.disposerThunk;
+        // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): a `string?` element is
+        // the same §28.11 *runtime-managed reference* row as a `string` one
+        // (§3.6's *Nullable forms* rule reads the element category of `V?` as
+        // `V`, nullability stripped), so the array co-owns a +1 per element
+        // and releases it here (`null` is the null-safe release no-op). The
+        // `!nullable` gate was issue #9064 / #8485.
         if (!d.collectionElemDisposer &&
-                ep.cat == ElementPolicy::Category::RuntimeManaged && el &&
-                el->kind == sema::TypeRef::Kind::Primitive &&
-                el->primitive == sema::PrimitiveType::String && !el->nullable) {
+                ep.cat == ElementPolicy::Category::RuntimeManaged &&
+                isStringElementTypeRef(el)) {
             d.collectionElemDisposer = stringElementReleaseThunk();
         }
         disposeStack_.back().push_back(d);
@@ -23852,11 +23865,17 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                             (!collTy->genericArgs.empty()) ? collTy->genericArgs[0] : nullptr;
                         ElementPolicy cp = elementPolicyFor(collEl, collIsOwning);
                         d.collectionElemDisposer = cp.disposerThunk;
-                        if (!d.collectionElemDisposer && !collIsOwning && collEl &&
-                            !collEl->nullable &&
-                            collEl->kind == sema::TypeRef::Kind::Primitive &&
-                            collEl->primitive == sema::PrimitiveType::String &&
-                            cp.cat == ElementPolicy::Category::RuntimeManaged)
+                        // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): a
+                        // `string?` element is the same §28.11 *runtime-managed
+                        // reference* row as a `string` one (§3.6's *Nullable
+                        // forms* rule reads the element category of `V?` as `V`,
+                        // nullability stripped), so the collection co-owns a +1
+                        // per element and releases it here (`null` is the
+                        // null-safe release no-op). The `!nullable` gate was
+                        // issue #9064 / #8485.
+                        if (!d.collectionElemDisposer && !collIsOwning &&
+                            cp.cat == ElementPolicy::Category::RuntimeManaged &&
+                            isStringElementTypeRef(collEl))
                             d.collectionElemDisposer = stringElementReleaseThunk();
                         disposeStack_.back().push_back(d);
                     }
@@ -24948,12 +24967,22 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 // #429 / §4.6 / §28.9: a borrowing Array/Stack/Queue<string>
                 // co-owns a +1 per element — use the string-release thunk.
                 // Mutually exclusive with the class-disposer above.
+                // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable`
+                // gate is GONE — a `string?` element is the same
+                // §28.11 *runtime-managed reference* row as a `string` one
+                // (§3.6's *Nullable forms* rule reads the element category of
+                // `V?` as `V`, nullability stripped), so `Array<string?>` co-owns
+                // a +1 per element exactly as `Array<string>` does and releases
+                // it here (`null` is the null-safe release no-op). The gate was
+                // issue #9064 (a +1 producer stored by `Array<string?>.Add` was
+                // neither retained nor TRANSFERRED — its +1 was orphaned) and
+                // issue #8485 (a BORROWED string stored by the same call was
+                // stored without a reference — a use-after-free once the source
+                // died). The same reading #8207 applied to a
+                // `Dictionary<K, string?>` value.
                 if (!d.collectionElemDisposer &&
                         cp.cat == ElementPolicy::Category::RuntimeManaged &&
-                        collEl &&
-                        collEl->kind == sema::TypeRef::Kind::Primitive &&
-                        collEl->primitive == sema::PrimitiveType::String &&
-                        !collEl->nullable) {
+                        isStringElementTypeRef(collEl)) {
                     d.collectionElemDisposer = stringElementReleaseThunk();
                 }
             }
@@ -35966,7 +35995,13 @@ struct StringEscapeWalker {
             rt->genericArgs.size() == 1 && rt->genericArgs[0] &&
             rt->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
             rt->genericArgs[0]->primitive == sema::PrimitiveType::String &&
-            !rt->genericArgs[0]->nullable && ne->args.size() == 2) {
+            // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate
+            // is GONE — a `string?` element is the same §28.11 *runtime-managed
+            // reference* row as a `string` one (§3.6's *Nullable forms* rule
+            // reads the element category of `V?` as `V`, nullability stripped),
+            // so the fill constructor's per-slot retain applies to
+            // `Array<string?>` too and the local keeps its own reference.
+            ne->args.size() == 2) {
             for (const ast::CallArgument& a : ne->args)
                 expr(a.value.get(),
                      a.modifier.empty() && !a.isDiscard);
@@ -51567,8 +51602,15 @@ bool Emitter::isBorrowingArrayLiteralLocal(const LocalDeclInitView& view) {
     const sema::TypeRef* el =
         (!rt->genericArgs.empty()) ? rt->genericArgs[0] : nullptr;
     ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/false);
+    // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): a `string?` element is the
+    // same §28.11 *runtime-managed reference* row as a `string` one (§3.6's
+    // *Nullable forms* rule reads the element category of `V?` as `V`,
+    // nullability stripped), so a literal-built `Array<string?>` is admitted
+    // here exactly as `Array<string>` is — the literal arm retains a +1 per
+    // element and the reclaim block releases each one. The `!nullable` gate
+    // was issue #9064 / #8485.
     if (ep.cat == ElementPolicy::Category::RuntimeManaged &&
-        !isStringTypeRefNonNull(el)) return false;
+        !isStringElementTypeRef(el)) return false;
     return true;
 }
 
@@ -60388,11 +60430,17 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
         // #602 / §28.11 v0.135: derive string-element classification from
         // elementPolicyFor (RuntimeManaged + string primitive + non-owning
         // array-backed collection).
+        // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate is
+        // GONE — a `string?` element is the same §28.11 *runtime-managed
+        // reference* row as a `string` one (§3.6's *Nullable forms* rule reads
+        // the element category of `V?` as `V`, nullability stripped), so a
+        // literal-built `Array<string?>` co-owns a +1 per element exactly as
+        // `Array<string>` does (transfer a +1 producer, retain anything else)
+        // and its scope-end free releases each one (`null` is the null-safe
+        // retain/release no-op). The `!nullable` gate was issue #9064 / #8485.
         {
             bool litIsStrArr =
-                elemRef && !elemRef->nullable &&
-                elemRef->kind == sema::TypeRef::Kind::Primitive &&
-                elemRef->primitive == sema::PrimitiveType::String &&
+                isStringElementTypeRef(elemRef) &&
                 elementPolicyFor(elemRef, /*owning=*/false).cat ==
                     ElementPolicy::Category::RuntimeManaged &&
                 (name == "Array" || name == "Stack" || name == "Queue");
@@ -61093,6 +61141,25 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
                el->kind == sema::TypeRef::Kind::Primitive &&
                el->primitive == sema::PrimitiveType::String;
     };
+    // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): the same test with the
+    // `!nullable` gate GONE — a `string?` element is the same §28.11
+    // *runtime-managed reference* row as a `string` one (§3.6's *Nullable forms*
+    // rule reads the element category of `V?` as `V`, nullability stripped), so
+    // the collection co-owns a +1 per element and releases it at its free
+    // (`null` is the null-safe retain/release no-op). Used ONLY where the
+    // matching per-element RETAIN is also in place: the array-backed family
+    // (`arrIsStringElem` in LlvmBackend_Calls.cpp, `litIsStrArr` in
+    // materializeHeapCollectionLiteral) and the borrowing dictionary's value
+    // (`dictIsStringValue`, #8207). The LINKED-LIST and dict-backed-SET arms
+    // keep the `!nullable` gate above — their per-element retain is still
+    // `!nullable`-gated, so releasing a `string?` there would be an unpaired
+    // release (the double-free direction).
+    auto isStrElemCoOwned = [&](const sema::TypeRef* el, bool owning) {
+        if (!el) return false;
+        ElementPolicy p = elementPolicyFor(el, owning);
+        return p.cat == ElementPolicy::Category::RuntimeManaged &&
+               isStringElementTypeRef(el);
+    };
 
     // LinkedList / OwningLinkedList → bz_llist_free.
     if (isLinkedListTypeName(collTy)) {
@@ -61166,7 +61233,14 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
     Disposal d{alloca, nullptr};
     d.collection = true;
     d.collectionElemDisposer = elementPolicyFor(el, isOwning).disposerThunk;
-    if (!d.collectionElemDisposer && isStrElem(el, /*owning=*/false))
+    // fix #9064 / §3.6 / §28.11 (v0.359): the ARRAY-backed family takes a +1
+    // per string element (the `arrIsStringElem` retain in
+    // LlvmBackend_Calls.cpp and the `litIsStrArr` retain in
+    // materializeHeapCollectionLiteral), so its free gives one back per slot
+    // — a `string?` element included (the same §28.11 *runtime-managed
+    // reference* row as `string`; null is the null-safe retain/release
+    // no-op).
+    if (!d.collectionElemDisposer && isStrElemCoOwned(el, /*owning=*/false))
         d.collectionElemDisposer = stringElementReleaseThunk();
     return d;
 }

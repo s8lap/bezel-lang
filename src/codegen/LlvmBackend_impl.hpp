@@ -16265,12 +16265,18 @@ private:
         if (cn != "Array" && cn != "Stack" && cn != "Queue") return;
         if (collTy->genericArgs.empty() || !collTy->genericArgs[0]) return;
         const sema::TypeRef* el = collTy->genericArgs[0];
-        if (el->nullable) return;
+        // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): a `string?` element is
+        // the same §28.11 *runtime-managed reference* row as a `string` one
+        // (§3.6's *Nullable forms* rule reads the element category of `V?` as
+        // `V`, nullability stripped), so a copied / materialized `Array<string?>`
+        // co-owns a +1 per element exactly as `Array<string>` does — matching
+        // the per-element release its later free/dispose issues. `null` is the
+        // null-safe retain no-op. The `!nullable` gate that excluded it left
+        // the copied array ALIASING its source's strings (no +1 of its own).
         // per §28.11 v0.135: RuntimeManaged AND specifically `string` (not fn type).
         ElementPolicy pol = elementPolicyFor(el, /*owningFamily=*/false);
         if (pol.cat != ElementPolicy::Category::RuntimeManaged) return;
-        if (el->kind != sema::TypeRef::Kind::Primitive ||
-            el->primitive != sema::PrimitiveType::String) return;
+        if (!isStringElementTypeRef(el)) return;
         auto* fn = declareC("bz_array_retain_strings",
                             llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(fn, {arr});
@@ -18175,6 +18181,35 @@ private:
     // else (a `var s: string;` slot's zero-initialisation), wrong where it
     // only decides whether the value is a runtime-managed string at all.
     bool isStringTypeRef(const sema::TypeRef* rt) {
+        return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+               rt->primitive == sema::PrimitiveType::String;
+    }
+
+    // fix #9064 / §3.6 / §28.9 / §28.11 (v0.359): is `rt` the `string`
+    // ELEMENT type of a BORROWING collection — NULLABILITY INCLUDED?
+    //
+    // §3.6's *Nullable forms* rule (v0.359) reads the ELEMENT CATEGORY of a
+    // nullable type `V?` as `V`, nullability stripped: "For borrow-bearing,
+    // holds-borrows, the choice classification, trivial-dispose, the element
+    // category and sendable, a nullable type `V?` is read as `V`, nullability
+    // stripped". So a `string?` element is the same §28.11 *runtime-managed
+    // reference* row as a `string` one, and that row's borrowing-family column
+    // is "shared references": the collection owns a +1 of its own on the
+    // element and releases it when the slot goes away. `null` is the
+    // null-safe retain/release no-op (§28.9's runtime-managed tier; `bz_string_
+    // retain`/`bz_string_release` are both null- and sentinel-safe) — the same
+    // reading #8207 applied to a `Dictionary<K, string?>` value.
+    //
+    // The `!nullable` gate that used to exclude a `string?` element from
+    // every string co-ownership site is issue #9064 (a +1 producer stored by
+    // `Array<string?>.Add` was neither retained nor TRANSFERRED, so its +1
+    // was orphaned — 6912 B / 384 allocations over 200 iterations) and issue
+    // #8485 (a BORROWED string stored by the same call was stored without a
+    // reference — a use-after-free once the source died). This predicate is
+    // the ONE place that reads the element's string-ness for the
+    // co-ownership sites, so the `string?` element now takes the same
+    // retain/transfer + release treatment as the `string` one.
+    bool isStringElementTypeRef(const sema::TypeRef* rt) const {
         return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
                rt->primitive == sema::PrimitiveType::String;
     }
