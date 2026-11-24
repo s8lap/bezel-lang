@@ -17200,6 +17200,12 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // receiver's production point below and retired by the reclaim at the end
     // of this function. Null when the receiver is not such a temporary.
     llvm::AllocaInst* recvUnwindSlot = nullptr;
+    // fix #9009 / §28.3.11 *Unbound owned temporaries* (v0.359): the same
+    // handle for an OWNING-CHOICE receiver temporary — the receiver's own
+    // §35.2 spill slot, which holds the choice value for the whole call.
+    // Registered at the receiver's production point below and reclaimed at the
+    // end of this function. Null when the receiver is not such a temporary.
+    llvm::AllocaInst* owningChoiceRecvSlot = nullptr;
     bool baseQualified = false;  // `base.M()` → non-virtual (§12.3)
     // fix #4597 (§22.16, v0.306): "A call whose receiver is `this` — explicit
     // or implicit — from inside any instance member of the class or a
@@ -17516,6 +17522,25 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 registerFreshNewReceiverTempK8(recvTempExpr, recv,
                                                ctx_.exprType(call));
             }
+            // fix #9009 / §28.3.11 *Unbound owned temporaries* (v0.359): the
+            // OWNING-CHOICE receiver temporary. §28.3.11 lists "as the
+            // receiver of a further call" among the borrowing uses that make
+            // an owned production an unbound owned temporary, and the class
+            // family's reclaim for that position is registered right above.
+            // The OWNING-CHOICE family had no such registration, so
+            // `h.Make().Count()` left the choice's active case's `owned`
+            // payload owned by nothing (MEASURED on r30-c1 @ 2e44cab96:
+            // "3200 byte(s) leaked in 200 allocation(s)" over the issue's
+            // 200-iteration loop).
+            //
+            // REGISTERED AT THE RECEIVER'S PRODUCTION POINT, before the
+            // arguments are evaluated and before the call runs, so a throw
+            // from an argument or from the callee itself disposes the
+            // temporary while unwinding (§28.3.11's *Exception-path
+            // discharge*). The normal-edge reclaim is at the end of this
+            // function, next to the class family's.
+            owningChoiceRecvSlot = registerOwningChoiceReceiverTempUnwind(
+                recvTempExpr, recv, ctx_.exprType(call));
         }
     }
     // per §14.1/§14.2 (issue #505): a generic *method* with a closure-typed
@@ -19690,6 +19715,22 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         const bool calleeReturnsOwned = sema::methodReturnsOwned(*ms, ctx_);
         disposeFreshNewReceiverTemp(recvExpr, args[0], ctx_.exprType(call),
                                     calleeReturnsOwned, recvUnwindSlot);
+        // fix #9009 / §28.3.11 *Unbound owned temporaries* (v0.359): the
+        // OWNING-CHOICE sibling of the class family's reclaim above. The
+        // class family disposes a fresh owned-CLASS producer used only as the
+        // receiver of this call; the OWNING-CHOICE family had no such
+        // reclaim, so `h.Make().Count()` left the choice's active case's
+        // `owned` payload owned by nothing (MEASURED on r30-c1 @ 2e44cab96:
+        // "3200 byte(s) leaked in 200 allocation(s)" over the issue's
+        // 200-iteration loop).
+        //
+        // The disposal is §35.4's active-case disposal, emitted right here —
+        // after the call, which was the receiver's only use within the
+        // expression — and the moved-from zero-store it ends with retires the
+        // exception-edge entry registered at the receiver's production point.
+        if (owningChoiceRecvSlot)
+            disposeOwningChoiceReceiverTemp(recvExpr, owningChoiceRecvSlot,
+                                            ctx_.exprType(call));
     }
 
     // #1467 / §22.4 / §28.3: dispose each `out owned` (class/interface) value

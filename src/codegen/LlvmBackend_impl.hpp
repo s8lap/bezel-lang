@@ -26409,6 +26409,56 @@ private:
     // body, so an erasure at the reclaim would lose it.
     void dischargeFreshNewReceiverTempUnwind(llvm::AllocaInst* slot);
 
+    // fix #9009 / §28.3.11 *Unbound owned temporaries* (v0.359): the
+    // OWNING-CHOICE sibling of the class-receiver reclaim above.
+    //
+    // §28.3.11 (v0.359): "An owned value may also be produced as an **unbound
+    // temporary**: the result of an `owned`-returning call (or other owned
+    // producer) that is not bound to any name, not `move`d, and not returned …,
+    // but used only by *borrowing* operations within the expression — **as the
+    // receiver of a further call**, as a non-`owned` argument, as an operator
+    // operand, as a member or index access, or as the scrutinee of a `case` …;
+    // Such a temporary is disposed at the **end of the full expression** in
+    // which it is produced, after every use of it within that expression has
+    // completed."
+    //
+    // The CLASS family implements that position (`disposeFreshNewReceiverTemp`
+    // above: a fresh owned-class producer used only as a receiver is disposed
+    // after the call). The OWNING-CHOICE family did not: `h.Make().Count()`,
+    // where `Make` returns an owning-classified choice (§35.4), left the
+    // choice's active case's `owned` payload owned by NOTHING — every
+    // iteration leaked it (MEASURED on r30-c1 @ 2e44cab96: "3200 byte(s)
+    // leaked in 200 allocation(s)" over the issue's 200-iteration loop, and
+    // the counting destructor never ran).
+    //
+    // THE GATE is the backend's own owning-choice authority,
+    // `unboundOwningChoiceTemp` — the same gate the §17.13 `DiscardStmt` arm
+    // (#7861) and the §35.5 scrutinee temporary read, so the owning-choice
+    // disposal sites cannot drift apart — plus the "the result cannot alias
+    // the receiver" fact, read with `typeIsRefFreeData` (#7728): a result
+    // that holds no reference of any kind cannot alias the receiver's owned
+    // payloads, so the receiver may be disposed as soon as the call has
+    // returned.
+    //
+    // `registerOwningChoiceReceiverTempUnwind` is the EXCEPTION-edge half
+    // (§28.3.11's *Exception-path discharge*): an `unwindOnly` `owningChoice`
+    // disposeStack_ entry, registered at the receiver's PRODUCTION point
+    // (before the arguments are evaluated and before the call runs).
+    // `disposeOwningChoiceReceiverTemp` is the NORMAL-edge half (§35.4's
+    // active-case disposal, emitted right after the call, plus the
+    // moved-from zero-store that retires the exception-edge entry).
+    bool owningChoiceReceiverTempEligible(const ast::Expr* recvExpr,
+                                          llvm::Value* recvSlot,
+                                          const sema::TypeRef* resultTy);
+
+    llvm::AllocaInst* registerOwningChoiceReceiverTempUnwind(
+        const ast::Expr* recvExpr, llvm::Value* recvSlot,
+        const sema::TypeRef* resultTy);
+
+    void disposeOwningChoiceReceiverTemp(const ast::Expr* recvExpr,
+                                         llvm::Value* recvSlot,
+                                         const sema::TypeRef* resultTy);
+
     // fix #4320 (§26.1 / §4.6 / §28.9, v0.298): the STRING-RECEIVER sibling of
     // `disposeFreshNewReceiverTemp`. The class-receiver reclaim only fires for
     // a heap-CLASS producer (`isFreshOwnedClassProducer`'s TypeDeclKind::Class

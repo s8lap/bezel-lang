@@ -6406,6 +6406,187 @@ void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
 }
 
 
+// fix #9009 / §28.3.11 *Unbound owned temporaries* (v0.359): the
+// OWNING-CHOICE sibling of the class-receiver reclaim above.
+//
+// §28.3.11 (v0.359): "An owned value may also be produced as an **unbound
+// temporary**: the result of an `owned`-returning call (or other owned
+// producer) that is not bound to any name, not `move`d, and not returned …,
+// but used only by *borrowing* operations within the expression — **as the
+// receiver of a further call**, as a non-`owned` argument, as an operator
+// operand, as a member or index access, or as the scrutinee of a `case` …;
+// Such a temporary is disposed at the **end of the full expression** in which
+// it is produced, after every use of it within that expression has completed."
+//
+// THE DEFECT. The CLASS family implements that position — a fresh owned-class
+// producer used only as a receiver is disposed after the call
+// (`disposeFreshNewReceiverTemp`, above) — and the OWNING-CHOICE family did
+// not. `h.Make().Count()`, where `Make` returns an owning-classified choice
+// (§35.4: a choice with an `owned`-marked payload), left the choice's active
+// case's `owned` payload owned by NOTHING.
+//
+// MEASURED on this fix's base (r30-c1 @ 2e44cab96), the issue's own program,
+// 200 iterations, under LeakSanitizer:
+//
+//   `h.Make().Count();`   → stdout `0` (the counting destructor never ran),
+//                            "Direct leak of 3200 byte(s) in 200 object(s)",
+//                            allocated from `bz$M.H$Make`;
+//   `new Res().Count();`  → stdout `200`, no leak — the CLASS twin of the
+//                            same shape, the issue's own control.
+//
+// That asymmetry is the same class-vs-choice asymmetry #8959 found at the
+// SIBLING position (the expression statement's own RESULT — `h.Make();` —
+// fixed on this base by 30b44422a): the reclaim fires for the class family
+// and not for the owning-choice family.
+//
+// THE GATE is the backend's own owning-choice authority,
+// `unboundOwningChoiceTemp` — the same gate the §17.13 `DiscardStmt` arm
+// (#7861) and the §35.5 scrutinee temporary read, so the owning-choice
+// disposal sites cannot drift apart. It admits a CALL whose result type is an
+// owning-classified CHOICE (§35.4), which covers `h.Make().Count()` and
+// `OChoice.Text(new Res()).Count()`.
+//
+// THE "THE RESULT CANNOT ALIAS THE RECEIVER" FACT is read with
+// `typeIsRefFreeData` (#7728) rather than with the class family's
+// `freshReceiverResultIsValueLike`: a result that holds NO reference of any
+// kind (a numeric/bool/char/decimal primitive, an enum, a reference-free
+// record or inline array — or unit) cannot alias the receiver's owned
+// payloads, so the receiver may be disposed as soon as the call has returned.
+// A result that DOES hold a reference (a `string`, a class, an interface, a
+// collection, a choice) keeps the temporary alive — the leak is the sound
+// direction, the same one the class family keeps for the result shapes
+// `freshReceiverResultIsValueLike` declines.
+//
+// THE RECEIVER'S SLOT. A choice is a VALUE type (§35.2): its instance method
+// receives `this` as a pointer to a spilled copy of the value, and that
+// spill slot (`entryAlloca(recv->getType())`, the receiver lowering's own) is
+// where the value lives for the whole call. It is the slot this reclaim
+// reads the tag from (§35.4's active-case disposal) and the slot the
+// exception-edge entry reads on an unwind.
+bool Emitter::owningChoiceReceiverTempEligible(
+        const ast::Expr* recvExpr, llvm::Value* recvSlot,
+        const sema::TypeRef* resultTy) {
+    if (!recvExpr || !recvSlot || !resultTy) return false;
+    // The slot must be the §35.2 SPILL of the choice VALUE. A BOX of the
+    // value (the extension-method / Object-target receiver path, which
+    // heap-boxes the receiver) is a different shape and is declined here.
+    auto* slot = dyn_cast<llvm::AllocaInst>(recvSlot);
+    if (!slot) return false;
+    const sema::TypeRef* recvTy = ctx_.exprType(*recvExpr);
+    if (!unboundOwningChoiceTemp(recvExpr, recvTy)) return false;
+    recvTy = resolveTypeParamRef(recvTy);
+    if (!recvTy || !recvTy->declaration) return false;
+    // The slot's type must be the CHOICE STRUCT — the type the receiver
+    // value was lowered to (`lowerTypeRef` of the receiver's own type). A
+    // box slot, or a slot of some other shape, is not this one.
+    if (slot->getAllocatedType() != lowerTypeRef(recvTy)) return false;
+    // THE RESULT MUST NOT ALIAS THE RECEIVER. Unit holds no reference; every
+    // other admitted result is one `typeIsRefFreeData` proves reference-free.
+    if (resultTy->kind == sema::TypeRef::Kind::Unit) return true;
+    return typeIsRefFreeData(resultTy);
+}
+
+
+// fix #9009 / §28.3.11 (v0.359): the EXCEPTION-edge half of the
+// owning-choice receiver reclaim. See `owningChoiceReceiverTempEligible` for
+// the gate and the shape.
+//
+// §28.3.11's *Exception-path discharge*: "When the full expression is instead
+// exited by an **exception** — an operand or argument evaluated later throws
+// before the temporary's transfer or consumption point — every already-
+// produced, not-yet-consumed unbound owned temporary is disposed during
+// unwinding by the same implicit `try`/`finally` mechanism as named locals …
+// each temporary's disposal is established at its production, so the pass runs
+// in reverse order of production on the establishment-ordered cleanup stack".
+//
+// The entry is `unwindOnly`, so it fires on the UNWIND edge only (the
+// `owningChoice` arm of `emitDisposals` skips an `unwindOnly` entry on a
+// normal pass). The NORMAL edge is the reclaim
+// (`disposeOwningChoiceReceiverTemp`), which retires this entry with the
+// moved-from zero-store — so a LATER unwind in the same scope reads a
+// zeroed slot and disposes nothing (exactly once on either edge).
+//
+// The slot is the receiver's OWN §35.2 spill slot, not a fresh one: the value
+// is already in it (the receiver lowering stored it there before the call),
+// and the callee read it through that very pointer.
+llvm::AllocaInst* Emitter::registerOwningChoiceReceiverTempUnwind(
+        const ast::Expr* recvExpr, llvm::Value* recvSlot,
+        const sema::TypeRef* resultTy) {
+    if (!owningChoiceReceiverTempEligible(recvExpr, recvSlot, resultTy))
+        return nullptr;
+    auto* slot = dyn_cast<llvm::AllocaInst>(recvSlot);
+    if (!slot) return nullptr;
+    // No enclosing scope to unwind through (a disposer body, or a function
+    // whose scopes are not yet established) — nothing to register against.
+    if (disposeStack_.empty()) return nullptr;
+    if (emittingDisposerBody_) return nullptr;
+    const sema::TypeRef* recvTy =
+        resolveTypeParamRef(ctx_.exprType(*recvExpr));
+    if (!recvTy || !recvTy->declaration) return nullptr;
+    Disposal d{slot, nullptr};
+    d.unwindOnly = true;      // the normal edge is the reclaim below
+    d.owningChoice = true;
+    d.owningChoiceTy = recvTy->declaration;
+    d.owningChoiceRef = recvTy;
+    disposeStack_.back().push_back(d);
+    return slot;
+}
+
+
+// fix #9009 / §28.3.11 (v0.359): the NORMAL-edge half of the owning-choice
+// receiver reclaim — emitted right after the call, where the receiver's only
+// use (the call itself) has completed.
+//
+// THE DISPOSAL IS §35.4's ACTIVE-CASE DISPOSAL: the choice is a VALUE (a
+// struct), so the disposal walks the value's runtime tag and disposes the
+// active case's `owned` payloads in payload declaration order ("Disposal is
+// defined by the active case") — the same disposal the scope-end pass runs
+// for an owning-choice local, the §17.13 discard arm runs for a discarded
+// one, and the §35.5 scrutinee temporary runs for a matched one. It is
+// emitted through the `owningChoice` entry of `emitDisposals` (the one home
+// for that disposal), so the nullable `C?` wrapper is unwrapped there
+// (§35.9) rather than here.
+//
+// WHY THE DISPOSAL SCOPE IS OPENED HERE (and not at the production point):
+// the entry must not be re-homed into the statement's own scope, or the
+// statement's scope-end pass would dispose the temporary at the END OF THE
+// SCOPE instead of at the end of the full expression (§28.3.11's boundary).
+// A one-entry scope, disposed right here, is the §28.3.11 boundary for this
+// shape.
+//
+// NOT A DOUBLE FREE: the disposed value is a FRESH production (a call's
+// result) that nothing else owns — the same argument the §17.13 discard arm
+// makes. The moved-from zero-store below then retires the exception-edge
+// entry, so the payload is disposed exactly once on either edge.
+void Emitter::disposeOwningChoiceReceiverTemp(
+        const ast::Expr* recvExpr, llvm::Value* recvSlot,
+        const sema::TypeRef* resultTy) {
+    if (!owningChoiceReceiverTempEligible(recvExpr, recvSlot, resultTy))
+        return;
+    auto* slot = dyn_cast<llvm::AllocaInst>(recvSlot);
+    if (!slot) return;
+    const sema::TypeRef* recvTy =
+        resolveTypeParamRef(ctx_.exprType(*recvExpr));
+    if (!recvTy || !recvTy->declaration) return;
+    Disposal d{slot, nullptr};
+    d.owningChoice = true;
+    d.owningChoiceTy = recvTy->declaration;
+    d.owningChoiceRef = recvTy;
+    disposeStack_.emplace_back();
+    disposeStack_.back().push_back(d);
+    emitDisposals(disposeStack_.back());
+    disposeStack_.pop_back();
+    // THE MOVED-FROM MARK: the exception-edge entry registered at the
+    // receiver's production point reads this slot on any LATER unwind (an
+    // exception thrown by a LATER statement of the same scope), so the slot
+    // is zeroed here — the same encoding #4566 uses for a moved-from choice
+    // (tag 0, null payload pointers), which every downstream walk skips
+    // (the active-case disposal null-guards each payload pointer).
+    builder_.CreateStore(
+        llvm::Constant::getNullValue(slot->getAllocatedType()), slot);
+}
+
+
 // fix #7728 / §28.3 K8.1 (v0.350): is `t` a value whose copy holds no
 // reference of any kind (no string, Object, class, interface, function or
 // choice anywhere in it)? Such a copy is independent of the receiver it was
