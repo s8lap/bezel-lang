@@ -31230,14 +31230,12 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                 // it. A lookup only (this predicate is const): a bare
                 // parameter owned by the callee itself is left alone, exactly
                 // as lowerLambda's mint predicate leaves it.
-                if (resultTy && !genericSubstSemaTy_.empty() &&
-                    isBareTypeParamRef(resultTy) &&
-                    !lambdaCalleeOwnTParams_.count(resultTy->headName())) {
-                    auto it = genericSubstSemaTy_.find(resultTy->headName());
-                    if (it != genericSubstSemaTy_.end() && it->second &&
-                        !it->second->nullable)
-                        resultTy = it->second;
-                }
+                // The SAME predicate lowerLambda's mint uses
+                // (mintedBareTypeParamResult): a `T?` result is never
+                // minted, so it is never a producer here.
+                if (const sema::TypeRef* minted =
+                        mintedBareTypeParamResult(resultTy))
+                    resultTy = minted;
                 if (resultTy &&
                     resultTy->kind == sema::TypeRef::Kind::Primitive &&
                     resultTy->primitive == sema::PrimitiveType::String)
@@ -38842,14 +38840,8 @@ bool Emitter::isLambdaClosureReturnCall(const ast::Expr* init) const {
     // predicate is const); the lambda's own callee type parameters are left
     // alone, exactly as lowerLambda's mint predicate leaves them.
     const sema::TypeRef* funcRet = rt ? rt->funcReturn : nullptr;
-    if (funcRet && !genericSubstSemaTy_.empty() &&
-        isBareTypeParamRef(funcRet) &&
-        !lambdaCalleeOwnTParams_.count(funcRet->headName())) {
-        auto it = genericSubstSemaTy_.find(funcRet->headName());
-        if (it != genericSubstSemaTy_.end() && it->second &&
-            !it->second->nullable)
-            funcRet = it->second;
-    }
+    if (const sema::TypeRef* minted = mintedBareTypeParamResult(funcRet))
+        funcRet = minted;
     if (rt && !rt->nullable && rt->kind == sema::TypeRef::Kind::Function &&
         funcRet && !funcRet->nullable &&
         funcRet->kind == sema::TypeRef::Kind::Function) {
@@ -46789,6 +46781,13 @@ void Emitter::collectStringReleaseEligible(
                         !genericSubstSemaTy_.empty() &&
                         isBareTypeParamRef(lt) &&
                         !lambdaCalleeOwnTParams_.count(lt->headName())) {
+                        // A TYPING of the copy, not a mint decision: whether
+                        // the source local owns a +1 was settled when it was
+                        // admitted to stringLocalCandidates_ (through
+                        // mintedBareTypeParamResult for its producer), so a
+                        // `T?`-typed copy (`var r: T? := f(); var q := r;`)
+                        // is a string copy too — nullability is irrelevant
+                        // here (a `string?` borrow local is admitted, #5245).
                         const sema::TypeRef* sub =
                             substituteTypeRefLocal(lt, genericSubstSemaTy_);
                         if (sub && sub->kind == sema::TypeRef::Kind::Primitive &&

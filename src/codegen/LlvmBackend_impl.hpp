@@ -27579,6 +27579,36 @@ private:
         return !isBuiltinTypeRefName(t->headName());
     }
 
+    // fix #8946 / #9007 (§14.1, §27.5, §28.9, v0.359): THE ONE predicate that
+    // decides whether a lambda result typed by a bare type parameter takes the
+    // +1 string / closure MINT in this instantiation, shared by the mint
+    // (lowerLambda) and by every consumer that must agree with it
+    // (isPlusOneStringProducer's closure-call arm, isLambdaClosureReturnCall,
+    // collectStringReleaseEligible's copy arm). A producer/consumer
+    // disagreement is a leak (consumer misses a mint) or an over-release
+    // (consumer releases an unminted reference). Returns the concrete type the
+    // result substitutes to when, and only when, `t` is a NON-nullable bare
+    // `T` (a `T?` is never minted: the substitution is nullable), `T` is bound
+    // here, is not a type parameter of the lambda's own callee, and its
+    // binding is a non-nullable `string` or function type. Otherwise nullptr.
+    // A lookup only, so const predicates may call it.
+    const sema::TypeRef* mintedBareTypeParamResult(const sema::TypeRef* t) const {
+        if (!t || t->nullable || genericSubstSemaTy_.empty() ||
+            !isBareTypeParamRef(t) ||
+            lambdaCalleeOwnTParams_.count(t->headName()))
+            return nullptr;
+        auto it = genericSubstSemaTy_.find(t->headName());
+        if (it == genericSubstSemaTy_.end() || !it->second ||
+            it->second->nullable)
+            return nullptr;
+        const sema::TypeRef* sub = it->second;
+        const bool isString =
+            sub->kind == sema::TypeRef::Kind::Primitive &&
+            sub->primitive == sema::PrimitiveType::String;
+        return (isString || sub->kind == sema::TypeRef::Kind::Function) ? sub
+                                                                        : nullptr;
+    }
+
     // fix #8393 (§14.5 phase 1, stdlib §9.8, v0.357): the §14.5 phase-1
     // rule that a constructed parameter type `G<P1, …, Pn>` unifies against
     // "the unique instantiation of `G` that the argument's type implements

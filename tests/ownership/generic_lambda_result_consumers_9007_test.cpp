@@ -79,10 +79,11 @@ void expectClean(const JitResult& r, int exitCode, const std::string& out) {
 
 // `Use<T>(p: T): int` with the given body, and a `Run` that executes `call`
 // 200 times.
-std::string program(const std::string& useBody, const std::string& call) {
+std::string program(const std::string& useBody, const std::string& call,
+                    const std::string& paramType = "T") {
     return "module P; public class Program "
            "  public static method Sink<U>(u: U): int return 1; end Sink; "
-           "  public static method Use<T>(p: T): int " + useBody +
+           "  public static method Use<T>(p: " + paramType + "): int " + useBody +
            "  end Use; "
            "  public static method Run(): int "
            "    var t := 0; "
@@ -132,6 +133,54 @@ BEZEL_TEST(generic_lambda_result_consumers_9007,
            string_result_passed_as_an_argument) {
     const std::string src = program(
         "var f := lambda() => p; Program.Sink<T>(f()); return 1; ", kStringCall);
+    expectClean(runAotChecked(src), 0, "200\n");
+}
+
+// `p: T?` at T = string: the lambda's result is a NULLABLE bare `T`, which the
+// lambda side never mints (lowerLambda mints only a non-nullable string /
+// function result), so the consumers must not release it either. The first
+// version of this fix classified it as a +1 producer and aborted 200 of 200
+// runs with "refcount over-release (string)" (review r43-rev-c08-9007, probe
+// n5). The non-generic twin `Use(p: string?)` and the base were clean.
+// RED on 577be17aa: exit 134.
+BEZEL_TEST(generic_lambda_result_consumers_9007,
+           nullable_t_result_is_not_released_by_the_consumer) {
+    const std::string src = program(
+        "var f := lambda() => p; f(); return 1; ", kStringCall, "T?");
+    expectClean(runAotChecked(src), 0, "200\n");
+}
+
+// The same with the result BOUND (`var r := f();`) and a BLOCK-bodied lambda,
+// the other two consumer spellings the review aborted. RED on 577be17aa.
+BEZEL_TEST(generic_lambda_result_consumers_9007,
+           nullable_t_result_bound_from_a_block_bodied_lambda) {
+    const std::string src = program(
+        "var f := lambda() => do return p; end; var r := f(); return 1; ",
+        kStringCall, "T?");
+    expectClean(runAotChecked(src), 0, "200\n");
+}
+
+// CONTROL (clean on 577be17aa and on the base): a NULL argument at `p: T?`.
+BEZEL_TEST(generic_lambda_result_consumers_9007,
+           nullable_t_result_with_a_null_argument) {
+    const std::string src = program(
+        "var f := lambda() => p; var r := f(); return 1; ",
+        "t := t + Program.Use<string>(null); ", "T?");
+    expectClean(runAotChecked(src), 0, "200\n");
+}
+
+// `p: T` (non-null string) with the result bound to a `T?` local and copied:
+// the lambda mints +1 (its result `T` is non-nullable), the `T?`-typed copy
+// must still be read as a string copy so the +1 is released. A shared
+// nullability guard applied to the copy arm too would regress this to the
+// base's 7200 B leak (probe o6_nullable, review r43-rev-c08-9007). Red on the
+// parent, green on 577be17aa and on the fix-forward.
+BEZEL_TEST(generic_lambda_result_consumers_9007,
+           string_result_bound_to_a_nullable_local_and_copied) {
+    const std::string src = program(
+        "var f := lambda() => p; var r: T? := f(); var q := r; "
+        "if q = null then return 0; end; return 1; ",
+        kStringCall);
     expectClean(runAotChecked(src), 0, "200\n");
 }
 

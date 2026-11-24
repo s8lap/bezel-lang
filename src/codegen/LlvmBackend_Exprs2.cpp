@@ -4032,17 +4032,11 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // so boxing and carrier logic are untouched), and a bare type parameter that
     // belongs to the lambda's CALLEE is left alone (lambdaCalleeOwnTParams_).
     const sema::TypeRef* retRcSemaTy = retSemaTy;
-    if (retSemaTy && !genericSubstSemaTy_.empty() &&
-        isBareTypeParamRef(retSemaTy) &&
-        !lambdaCalleeOwnTParams_.count(retSemaTy->headName())) {
-        const sema::TypeRef* sub =
-            substituteTypeRefLocal(retSemaTy, genericSubstSemaTy_);
-        if (sub && !sub->nullable &&
-            ((sub->kind == sema::TypeRef::Kind::Primitive &&
-              sub->primitive == sema::PrimitiveType::String) ||
-             sub->kind == sema::TypeRef::Kind::Function))
-            retRcSemaTy = sub;
-    }
+    // fix #9007: the predicate is mintedBareTypeParamResult, shared with the
+    // consumers so the mint and the releases agree exactly (a `T?` is never
+    // minted).
+    if (const sema::TypeRef* minted = mintedBareTypeParamResult(retSemaTy))
+        retRcSemaTy = minted;
     const sema::TypeRef* savedLambdaRetSemaTy = currentLambdaReturnSemaTy_;
     currentLambdaReturnSemaTy_ = retRcSemaTy;
     currentReturnTypeNode_ = nullptr;
