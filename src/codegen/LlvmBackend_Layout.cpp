@@ -7215,7 +7215,16 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
                     reInitialises = true;
             }
         }
-        if (reInitialises && !accumulates) freshEachIteration = true;
+        // An async / iterator STATE MACHINE keeps the pre-#9004 choice: the
+        // by-CELL mode is only sound together with the redirection of the
+        // pre-capture accesses, which `redirectSlotToCellHolder` declines for a
+        // state machine (`smStateStruct_`, fix #3484's DECLINE 3), so an
+        // accumulating local there stays by-VALUE (measured: by-CELL without the
+        // redirect made the loop write one storage and the closure read another,
+        // 2000 for 7000 in an async method, 1600 for 4800 in an iterator).
+        if ((reInitialises && !accumulates) ||
+            ((reInitialises || accumulates) && smStateStruct_))
+            freshEachIteration = true;
     }
 
     if (freshEachIteration) {

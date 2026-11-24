@@ -197,4 +197,196 @@ BEZEL_TEST(loop_capture_shared_cell_9004,
     assertNoLeak(r);
 }
 
+// fix #9004 follow-up (§27.5, v0.359): an ASYNC method with an `await` INSIDE the loop that accumulates and captures a local.
+//
+// Hand trace per call (§27.5, one cell per binding): k = 2, 4, 7, 11 after
+// each pass and h() reads those, so s = 24 and the method returns s + k = 35;
+// 200 calls print 7000. The state-machine shape must keep the by-VALUE capture
+// the fix's by-CELL choice cannot serve there (the redirect of the pre-capture
+// accesses is declined for a state machine): by-CELL without the redirect
+// printed 2000.
+BEZEL_TEST(loop_capture_shared_cell_9004,
+           async_await_in_loop_keeps_accumulated_local) {
+    auto r = runAot(
+        "module M; public class C "
+        "  public static async method Run(): Task<int> "
+        "    var k := 1; var s := 0; "
+        "    var i := 0; "
+        "    while i < 4 do "
+        "      i := i + 1; "
+        "      k := k + i; "
+        "      var h := lambda() => k; "
+        "      s := s + h(); "
+        "    await Task.Delay(0); "
+        "    end; "
+        "    return s + k; "
+        "  end Run; "
+        "  public static method Main(): int "
+        "    var t := 0; "
+        "    for var n in 0..<200 do t := t + Run().Result; end; "
+        "    Console.WriteLine(t); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ");
+    expectOutput(r, 0, "7000\n");
+}
+
+// fix #9004 follow-up (§27.5, v0.359): an ASYNC method with the `await` AFTER the loop.
+//
+// Hand trace per call (§27.5, one cell per binding): k = 2, 4, 7, 11 after
+// each pass and h() reads those, so s = 24 and the method returns s + k = 35;
+// 200 calls print 7000. The state-machine shape must keep the by-VALUE capture
+// the fix's by-CELL choice cannot serve there (the redirect of the pre-capture
+// accesses is declined for a state machine): by-CELL without the redirect
+// printed 2000.
+BEZEL_TEST(loop_capture_shared_cell_9004,
+           async_await_after_loop_keeps_accumulated_local) {
+    auto r = runAot(
+        "module M; public class C "
+        "  public static async method Run(): Task<int> "
+        "    var k := 1; var s := 0; "
+        "    var i := 0; "
+        "    while i < 4 do "
+        "      i := i + 1; "
+        "      k := k + i; "
+        "      var h := lambda() => k; "
+        "      s := s + h(); "
+        "    end; "
+        "    await Task.Delay(0); "
+        "    return s + k; "
+        "  end Run; "
+        "  public static method Main(): int "
+        "    var t := 0; "
+        "    for var n in 0..<200 do t := t + Run().Result; end; "
+        "    Console.WriteLine(t); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ");
+    expectOutput(r, 0, "7000\n");
+}
+
+// fix #9004 follow-up (§27.5, v0.359): an ASYNC method with the `await` BEFORE the loop.
+//
+// Hand trace per call (§27.5, one cell per binding): k = 2, 4, 7, 11 after
+// each pass and h() reads those, so s = 24 and the method returns s + k = 35;
+// 200 calls print 7000. The state-machine shape must keep the by-VALUE capture
+// the fix's by-CELL choice cannot serve there (the redirect of the pre-capture
+// accesses is declined for a state machine): by-CELL without the redirect
+// printed 2000.
+BEZEL_TEST(loop_capture_shared_cell_9004,
+           async_await_before_loop_keeps_accumulated_local) {
+    auto r = runAot(
+        "module M; public class C "
+        "  public static async method Run(): Task<int> "
+        "    await Task.Delay(0); "
+        "    var k := 1; var s := 0; "
+        "    var i := 0; "
+        "    while i < 4 do "
+        "      i := i + 1; "
+        "      k := k + i; "
+        "      var h := lambda() => k; "
+        "      s := s + h(); "
+        "    end; "
+        "    return s + k; "
+        "  end Run; "
+        "  public static method Main(): int "
+        "    var t := 0; "
+        "    for var n in 0..<200 do t := t + Run().Result; end; "
+        "    Console.WriteLine(t); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ");
+    expectOutput(r, 0, "7000\n");
+}
+
+// fix #9004 follow-up (§27.5, v0.359): a sync ITERATOR (`yield return h()`)
+// whose loop accumulates and captures a local.
+//
+// Hand trace per run: k = 2, 4, 7, 11 and h() yields each, so the run sums to
+// 24; 200 runs print 4800. By-CELL without the redirect (declined for a state
+// machine) printed 1600.
+BEZEL_TEST(loop_capture_shared_cell_9004,
+           iterator_yield_in_loop_keeps_accumulated_local) {
+    auto r = runAot(
+        "module M; public class C "
+        "  public static method Gen(): IEnumerable<int> "
+        "    var k := 1; "
+        "    var i := 0; "
+        "    while i < 4 do "
+        "      i := i + 1; "
+        "      k := k + i; "
+        "      var h := lambda() => k; "
+        "      yield return h(); "
+        "    end; "
+        "  end Gen; "
+        "  public static method Main(): int "
+        "    var t := 0; "
+        "    for var n in 0..<200 do "
+        "      for var v in C.Gen() do t := t + v; end; "
+        "    end; "
+        "    Console.WriteLine(t); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ");
+    expectOutput(r, 0, "4800\n");
+}
+
+// fix #9004 follow-up (§27.5, v0.359): an ASYNC loop whose lambda is formed
+// BEFORE an `await` and read AFTER it, the loop writing the captured local on
+// both sides of the suspension (the shape of corpus case s27_5_7914).
+//
+// Hand trace: k after the `k := k + i` of each pass is 3, 5, 8, 12, 17, and
+// the lambda reads that value after the await, so s = 3+5+8+12+17 = 45; the
+// `k := k + 1` after the read leaves k = 18 at the end; the method returns
+// 45 + 18 = 63. Prints 45, 18, 63. (1ca2802a6 alone: 25, 8, 33 — the write
+// after the await was lost.)
+BEZEL_TEST(loop_capture_shared_cell_9004,
+           async_lambda_before_await_read_after_keeps_loop_writes) {
+    auto r = runAot(
+        "module M; public class C "
+        "  public static async method Run(): Task<int> "
+        "    var k := 3; var s := 0; "
+        "    for var i in 0..<5 do "
+        "      k := k + i; "
+        "      var h := lambda() => k; "
+        "      await Task.Delay(0); "
+        "      s := s + h(); "
+        "      k := k + 1; "
+        "    end; "
+        "    Console.WriteLine(s); "
+        "    Console.WriteLine(k); "
+        "    return s + k; "
+        "  end Run; "
+        "  public static async method Main(): Task<int> "
+        "    var total := await C.Run(); "
+        "    Console.WriteLine(total); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ");
+    expectOutput(r, 0, "45\n18\n63\n");
+}
+
+// fix #9004 (§27.5, v0.359): the unconditional-capture `while` shape. The loop
+// writes the captured local, then a lambda formed in the same pass reads it.
+//
+// Hand trace: k = 3 + 0, 3 + 1, 4 + 2, 6 + 3 across i = 0..3, so the lambda
+// reads 3, 4, 6, 9 (§27.5: one cell per binding, the closure sees the loop's
+// writes). Base: 3, 3, 3, 3 (the by-VALUE snapshot seeded from a stale slot).
+BEZEL_TEST(loop_capture_shared_cell_9004,
+           while_unconditional_capture_sees_the_loop_write) {
+    auto r = runAot(
+        "module M; public class C "
+        "  public static method Main(): int "
+        "    var k := 3; var i := 0; "
+        "    while i < 4 do "
+        "      k := k + i; i := i + 1; "
+        "      var h := lambda() => k; "
+        "      Console.WriteLine(h()); "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end C; ");
+    expectOutput(r, 0, "3\n4\n6\n9\n");
+}
+
 }  // namespace
