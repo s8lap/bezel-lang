@@ -20939,7 +20939,14 @@ static void runGetterBody(const ast::PropertyDecl& pd,
     // bounded leak. The proof is an allow-list, so a route it does not know
     // lands on that side.
     GetterFlagSnapshot armed;
-    if (!getterBodyIsConfined(acc.stmts, params, ctx, armed)) return;
+    // fix #8944 (§28.3.3 item 2, §28.7, v0.359): with no dataflow, no store
+    // learns that its target was moved from, so codegen's drop-on-overwrite
+    // frees the value the new owner holds. The syntactic mark withholds only
+    // that free (see markGetterMovedFromReassignments).
+    if (!getterBodyIsConfined(acc.stmts, params, ctx, armed)) {
+        markGetterMovedFromReassignments(acc.stmts, ctx);
+        return;
+    }
     const std::size_t diagMark = ctx.diagnostics().diagnostics().size();
     MethodOwnership mo(ctx);
     mo.setGetterScopeOnly();
@@ -20957,6 +20964,7 @@ static void runGetterBody(const ast::PropertyDecl& pd,
     // spec-shaped change #8850 leaves open.
     if (!mo.getterSuppressedError()) return;
     armed.restore();
+    markGetterMovedFromReassignments(acc.stmts, ctx);  // fix #8944, as above
     mo.withdrawGetterSymbolAutoDrops();
     // The §28.3.10 must-use lint the run reported directly announces an
     // implicit drop at the scope end; with the drop withdrawn, so is its

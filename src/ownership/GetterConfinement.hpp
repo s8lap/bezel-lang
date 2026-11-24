@@ -57,4 +57,19 @@ bool getterBodyIsConfined(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                           const std::vector<sema::Symbol*>& indexerParams,
                           sema::SemaContext& ctx, GetterFlagSnapshot& snapshot);
 
+// fix #8944 (§28.3.3 *State match on reassignment* item 2, §28.7, v0.359):
+// for a getter body that does NOT get the method dataflow (not proved
+// confined, or confined but restored after a suppressed error), set
+// `AssignmentStmt::lhsMovedFromAtStore` on every `:=` store to a local that is
+// the operand of a `move` anywhere in the body. Codegen's drop-on-overwrite
+// pass (`disposeDisplacedOwnedClassLocal`) tests only the null half of §28.7's
+// "non-null and not moved-from", and a plain `var` local's slot keeps the
+// moved-out pointer, so without the flag the store frees the value the new
+// owner holds. The mark is path-insensitive, so it errs toward the LEAK side
+// (a store that in fact displaces a live value skips its disposal, the same
+// bounded leak an unconfined getter body already has); it never adds a free.
+void markGetterMovedFromReassignments(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body,
+    sema::SemaContext& ctx);
+
 } // namespace bezel::ownership

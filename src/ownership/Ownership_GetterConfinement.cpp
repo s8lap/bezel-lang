@@ -1076,4 +1076,182 @@ bool getterBodyIsConfined(const StmtList& body,
     return true;
 }
 
+
+namespace {
+
+// fix #8944 (§28.3.3 *State match on reassignment* item 2, §28.7, v0.359): the
+// syntactic walk behind `markGetterMovedFromReassignments`. It visits every
+// statement and every sub-expression of a getter body, a nested lambda's
+// body and a `case` arm included, and records (a) the locals that are the
+// operand of a `move` anywhere in the body and (b) the plain `:=` stores to a
+// bare local. The expression arms below name every `ast::Expr` kind; a leaf
+// kind (a literal, `typeof`, `nameof`, `default`, `()`, `owned x`) holds no
+// sub-expression.
+class MovedLocalScan {
+public:
+    explicit MovedLocalScan(sema::SemaContext& ctx) : ctx_(ctx) {}
+
+    void body(const StmtList& stmts) {
+        for (const auto& s : stmts)
+            if (s) stmt(*s);
+    }
+
+    // Set the §28.7 moved-from flag on every `:=` store to a local that is
+    // moved from somewhere in the body.
+    void apply() const {
+        for (const auto& [as, sym] : stores_)
+            if (moved_.count(sym)) as->lhsMovedFromAtStore = true;
+    }
+
+private:
+    sema::SemaContext& ctx_;
+    std::unordered_set<const sema::Symbol*> moved_;
+    std::vector<std::pair<ast::AssignmentStmt*, const sema::Symbol*>> stores_;
+
+    sema::LocalSymbol* localOfIdent(const ast::Expr* e) {
+        while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
+            e = pb->operand.get();
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id) return nullptr;
+        return dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    }
+
+    void args(const std::vector<ast::CallArgument>& as) {
+        for (const auto& a : as) expr(a.value.get());
+    }
+
+    void arm(const ast::CaseArm& a) {
+        expr(a.guard.get());
+        expr(a.exprBody.get());
+        body(a.stmts);
+    }
+
+    void expr(const ast::Expr* e) {
+        if (!e) return;
+        if (auto* x = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            if (x->op == "move")
+                if (sema::LocalSymbol* ls = localOfIdent(x->operand.get()))
+                    moved_.insert(ls);
+            expr(x->operand.get());
+            expr(x->replacement.get());
+        } else if (auto* x = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            expr(x->left.get());
+            expr(x->right.get());
+        } else if (auto* x = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            expr(x->target.get());
+        } else if (auto* x = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            expr(x->target.get());
+        } else if (auto* x = dynamic_cast<const ast::CallExpr*>(e)) {
+            expr(x->callee.get());
+            args(x->args);
+        } else if (auto* x = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            expr(x->callee.get());
+            args(x->args);
+        } else if (auto* x = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(x->target.get());
+            args(x->indices);
+        } else if (auto* x = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(x->operand.get());
+        } else if (auto* x = dynamic_cast<const ast::NewExpr*>(e)) {
+            args(x->args);
+        } else if (auto* x = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(x->operand.get());
+        } else if (auto* x = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(x->thenValue.get());
+            expr(x->condition.get());
+            expr(x->elseValue.get());
+        } else if (auto* x = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(x->operand.get());
+        } else if (auto* x = dynamic_cast<const ast::RangeExpr*>(e)) {
+            expr(x->lo.get());
+            expr(x->hi.get());
+            expr(x->step.get());
+        } else if (auto* x = dynamic_cast<const ast::WithExpr*>(e)) {
+            expr(x->source.get());
+            for (const auto& ia : x->assigns) expr(ia.value.get());
+        } else if (auto* x =
+                       dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (const auto& k : x->keys) expr(k.get());
+            for (const auto& v : x->elements) expr(v.get());
+        } else if (auto* x = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            for (const auto& p : x->params) expr(p.defaultValue.get());
+            expr(x->exprBody.get());
+            body(x->stmts);
+        } else if (auto* x = dynamic_cast<const ast::CaseExpr*>(e)) {
+            expr(x->scrutinee.get());
+            for (const auto& a : x->arms) arm(a);
+        } else if (auto* x = dynamic_cast<const ast::BindExpr*>(e)) {
+            for (const auto& c : x->clauses)
+                if (c) stmt(*c);
+            expr(x->body.get());
+        } else if (auto* x =
+                       dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (const auto& p : x->parts) expr(p.expr.get());
+        }
+    }
+
+    void stmt(const ast::Stmt& st) {
+        if (auto* s = dynamic_cast<const ast::LocalDecl*>(&st)) {
+            expr(s->initializer.get());
+        } else if (auto* s = dynamic_cast<const ast::LocalConstDecl*>(&st)) {
+            expr(s->value.get());
+        } else if (auto* s = dynamic_cast<const ast::ReturnStmt*>(&st)) {
+            expr(s->value.get());
+        } else if (auto* s = dynamic_cast<const ast::ExpressionStmt*>(&st)) {
+            expr(s->expr.get());
+        } else if (auto* s = dynamic_cast<const ast::AssignmentStmt*>(&st)) {
+            if (s->op == ":=")
+                if (sema::LocalSymbol* ls = localOfIdent(s->target.get()))
+                    stores_.emplace_back(
+                        const_cast<ast::AssignmentStmt*>(s), ls);
+            expr(s->target.get());
+            expr(s->value.get());
+        } else if (auto* s = dynamic_cast<const ast::ThrowStmt*>(&st)) {
+            expr(s->value.get());
+        } else if (auto* s = dynamic_cast<const ast::IfStmt*>(&st)) {
+            expr(s->ifBranch.condition.get());
+            body(s->ifBranch.body);
+            for (const auto& b : s->elifBranches) {
+                expr(b.condition.get());
+                body(b.body);
+            }
+            body(s->elseBody);
+        } else if (auto* s = dynamic_cast<const ast::WhileStmt*>(&st)) {
+            expr(s->condition.get());
+            body(s->body);
+        } else if (auto* s = dynamic_cast<const ast::ForStmt*>(&st)) {
+            expr(s->iterable.get());
+            expr(s->withExpr.get());
+            body(s->body);
+        } else if (auto* s = dynamic_cast<const ast::DoEndBlock*>(&st)) {
+            body(s->body);
+        } else if (auto* s = dynamic_cast<const ast::IncrementStmt*>(&st)) {
+            expr(s->target.get());
+        } else if (auto* s = dynamic_cast<const ast::DiscardStmt*>(&st)) {
+            expr(s->value.get());
+        } else if (auto* s = dynamic_cast<const ast::YieldStmt*>(&st)) {
+            expr(s->value.get());
+        } else if (auto* s = dynamic_cast<const ast::TryStmt*>(&st)) {
+            body(s->body);
+            for (const auto& c : s->catches) {
+                expr(c.guard.get());
+                if (c.body) stmt(*c.body);
+            }
+            body(s->finallyBody);
+        } else if (auto* s = dynamic_cast<const ast::CaseStmt*>(&st)) {
+            expr(s->scrutinee.get());
+            for (const auto& a : s->arms) arm(a);
+        }
+    }
+};
+
+} // namespace
+
+void markGetterMovedFromReassignments(const StmtList& body,
+                                      sema::SemaContext& ctx) {
+    MovedLocalScan scan(ctx);
+    scan.body(body);
+    scan.apply();
+}
+
 } // namespace bezel::ownership
