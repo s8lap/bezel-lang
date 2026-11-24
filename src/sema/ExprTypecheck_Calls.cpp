@@ -11035,7 +11035,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         } else if (item.kind == "value") {
                             // §14.2: non-nullable value type only.
                             int r = refKindOf(argRef);
-                            if (argRef->nullable || r == 1) report("value");
+                            // fix #8733 (stdlib §2.5/§2.6, v0.359): a stdlib
+                            // value builtin (`TimeSpan`...) is a value type,
+                            // though its TypeRef is a class symbol; mirrors the
+                            // `class` arm and the instantiation site.
+                            if (argRef->nullable ||
+                                (r == 1 && !isStdlibValueBuiltinType(argRef)))
+                                report("value");
                         } else if (item.kind == "notnull") {
                             if (argRef->nullable) report("notnull");
                         } else if (item.kind == "sendable") {

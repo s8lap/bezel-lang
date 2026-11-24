@@ -47,3 +47,21 @@ end Program;
                       "7\n");
 }
 
+
+// fix #8733 (CALL-SITE `value` arm, §14.2 bounds table, stdlib §2.5, v0.359):
+// the issue's literal repro, a stdlib value record against `where T: value`.
+BEZEL_TEST(sema_bound_conformance_8733, value_bound_admits_a_stdlib_value_builtin_at_a_call_site) {
+    BEZEL_EXPECT_EQ(out(R"(
+module Conf;
+public class Program
+  public static method Main(): int
+    return F(TimeSpan.FromTicks(5L));
+  end Main;
+  public static method F<T>(x: T): int where T: value
+    Console.WriteLine("accepted");
+    return 0;
+  end F;
+end Program;
+)"),
+                      "accepted\n");
+}
