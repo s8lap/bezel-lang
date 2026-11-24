@@ -41994,6 +41994,31 @@ struct ClosureEscapeWalker {
     // below (line ~28060); read by the post-walk override in
     // collectClosureReleaseEligible.
     bool escapedDueToAssignIntoClosureLocal_ = false;
+    // fix #9086 (§27.5 / §28.9, v0.359): set ONLY around the #4473 arm's
+    // `containsTargetAnywhere` call, so that ONE question — "does this
+    // assignment's RHS READ the tracked target?" — is answered PRECISELY
+    // for a LAMBDA LITERAL. `containsTargetAnywhere` answers "NOT PROVEN
+    // ABSENT" (= true) for a node kind it does not enumerate, and a lambda
+    // literal was one of those kinds: the predicate cannot see inside a
+    // lambda's body. So `x := lambda(…) => …;` looked like a READ of the
+    // target, the #4473 flag fired, and the post-walk override CLEARED the
+    // target's escape verdict — discarding the evidence that the target's
+    // value ALSO left the frame through a collection store. The target was
+    // then classified non-escaping, its capture cell was freed with the
+    // scope, and the closure that captured it and outlived the scope read
+    // the freed cell (issue #9086's heap-use-after-free).
+    //
+    // A lambda literal is a FRESH closure — a producer, not a borrow: it
+    // carries no part of the target's value into the position it appears
+    // in, so it does not read the target there. When the lambda's body DOES
+    // name the target, the target is CAPTURED (`isCapturedCellSlot_`) and
+    // the post-walk override's own `!isCapturedCellSlot_` guard already
+    // keeps the target escaping; the #4473 arm does not decide that case.
+    //
+    // Every other reader of `containsTargetAnywhere` keeps the conservative
+    // "not proven absent" answer: the flag is set only around this one
+    // call.
+    bool skipLambdaLiteral_ = false;
     // fix #8440 (§27.5 / §28.9, v0.357): the closure locals that take their
     // OWN reference at the bind (Emitter::closureAliasOwned_), or null.
     // Binding `target` into such a local (`var cmp := target;`) is not an
@@ -42457,7 +42482,21 @@ struct ClosureEscapeWalker {
                 if (containsTargetAnywhere(cl2->initializer.get())) return true;
             return containsTargetAnywhere(bx->body.get());
         }
-        // Anything else (CaseExpr, LambdaExpr, MarkedTransferExpr, or a
+        // fix #9086 (§27.5 / §28.9, v0.359): a LAMBDA LITERAL. The default
+        // answer below is "NOT PROVEN ABSENT" (= true) — the predicate
+        // cannot see inside a lambda's body. The #4473 arm below asks a
+        // sharper question ("is the target READ into this closure-typed
+        // local?"), and for a lambda literal the answer is NO: a lambda
+        // literal is a fresh closure, a producer, and it carries no part of
+        // the target's value into the position it appears in — so it does
+        // not read the target there. `skipLambdaLiteral_` turns that
+        // default into the precise answer for that one caller; every other
+        // reader of this predicate keeps the conservative one.
+        if (dynamic_cast<const ast::LambdaExpr*>(e)) {
+            if (skipLambdaLiteral_) return false;
+            return true;
+        }
+        // Anything else (CaseExpr, MarkedTransferExpr, or a
         // kind not yet added to this enumeration) — NOT PROVEN ABSENT.
         return true;
     }
@@ -43488,8 +43527,44 @@ struct ClosureEscapeWalker {
             // only continues now because the target is assigned to
             // somewhere (see `assignedSomewhere`). Keeps this arm's reach
             // exactly what it was.
+            //
+            // fix #9086 (§27.5 / §28.9, v0.359): the "the RHS contains
+            // target" test is answered PRECISELY for a LAMBDA LITERAL
+            // (`skipLambdaLiteral_`), because the blunt answer made this
+            // arm fire on an assignment that reads NOTHING of the target.
+            // A lambda literal is a fresh closure — a producer, not a
+            // borrow — so it carries no part of the target's value into
+            // the LHS and does not read the target there; the LHS takes
+            // the producer's own +1 and the target's slot is untouched,
+            // so this arm's whole premise (the RHS slot's +1 must be
+            // balanced by the target's scope-end release) does not hold.
+            //
+            // WHY IT MATTERED: the flag this arm sets makes the post-walk
+            // override CLEAR the target's `escaped` verdict UNCONDITIONALLY
+            // — and that verdict is the only record that the target's
+            // value ALSO left the frame through some OTHER site (a
+            // collection store). With the flag spuriously set, the target
+            // was classified non-escaping, its capture cell was freed with
+            // the scope (`boxedCellFree`), and a closure that captured it
+            // and outlived the scope read the freed cell — issue #9086's
+            // heap-use-after-free. MEASURED (issue #9086's own repro): on
+            // the base the `int` capture cell of the method's `k` parameter
+            // was allocated by `calloc` in the method, freed by `free` at
+            // the method's scope end, and read by the still-live closure
+            // that had captured it (`lam$1`, in `main`); with this fix the
+            // same capture takes the REFCOUNTED route (`bz_cell_retain` at
+            // the capture-store, `bz_cell_release` in the closure's envdtor
+            // and at the scope end), so the cell outlives every closure
+            // that captures it.
+            bool rhsReadsTarget = false;
+            {
+                const bool savedSkip = skipLambdaLiteral_;
+                skipLambdaLiteral_ = true;
+                rhsReadsTarget = containsTargetAnywhere(as->value.get());
+                skipLambdaLiteral_ = savedSkip;
+            }
             if (isClosureTypedLocalAssign(*as->target) &&
-                containsTargetAnywhere(as->value.get()) &&
+                rhsReadsTarget &&
                 !(escapeBeforeReassign_ && !reassignSeen_)) {
                 escapedDueToAssignIntoClosureLocal_ = true;
             }
