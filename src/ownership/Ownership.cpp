@@ -15466,6 +15466,37 @@ void MethodOwnership::seedCapturedOuterLocals(
         const ast::LambdaExpr& lam,
         const BlockState& outerStates) {
     (void)outerStates;  // see header — pre-pass runs before the dataflow
+    // fix #8992 (§28.3 K1.3, §28.8, §28.8.1, §22.9, v0.359): a lambda's OWN
+    // `owned` parameter enters the body in the Owned state, exactly as a
+    // method's `owned` parameter does (`run()`'s entry seed, "slice O10").
+    // The captured-local seed below covers only CAPTURED LocalSymbols
+    // ("parameters do not carry a LocalOwnership here"), so this walk had NO
+    // state entry for the lambda's own owned parameter: `Take(move p)` in a
+    // `try` body recorded nothing, and the catch arm's read of `p` (#8940's
+    // body-exit entry state) saw an untracked name and was admitted, then
+    // crashed on the moved-from slot. The METHOD twin's dataflow rejects it with "owned
+    // value in `p` was already moved out at this point (§28.3)". Same
+    // erasure carve-out as the method seed (§28.1, #1817 / #8118): a bare
+    // type-parameter slot substituted to a value type carries no obligation.
+    if (const std::vector<sema::Symbol*>* ownParams = ctx_.lambdaParams(&lam)) {
+        for (sema::Symbol* sym : *ownParams) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+            if (!ps || ps->modifier != "owned") continue;
+            const sema::TypeRef* prt =
+                ps->declType ? ctx_.resolvedType(*ps->declType)
+                             : ps->resolvedDeclType;
+            const bool declaredObjectClass =
+                prt && prt->kind == sema::TypeRef::Kind::Primitive &&
+                prt->primitive == sema::PrimitiveType::Object;
+            if (!declaredObjectClass && isValueSubstitutionErased(prt))
+                continue;
+            LocalOwnership lo;
+            lo.state = OwnershipState::Owned;
+            lo.implicitDischarge = false;
+            lo.obligationOrigin = ps->decl;
+            states_[sym] = lo;
+        }
+    }
     if (lam.exprBody) {
         // Expression-bodied lambdas carry no statements to capture locals —
         // every IdentifierExpr in the body references a captured outer-scope
