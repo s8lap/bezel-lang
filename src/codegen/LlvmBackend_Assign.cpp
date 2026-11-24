@@ -3132,6 +3132,46 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         emitPendingCheck();
         releaseIndexArgStringProducers(ix, ps, recvDecl, idxArgVals,
                                        /*accessorResultEscapes=*/true);
+        // fix #9083 (§28.14 / §27.5 / §28.9 / §23.4 / §23.5, v0.359): the
+        // closure-arg twin of the string release above, for the IMPORTED
+        // indexer path. #4078 (commit 504abbd49) wired
+        // `releaseIndexArgClosureProducers` — the caller's drop of the
+        // producer's +1 — into three of this function's getter call paths: the
+        // block-form getter's standalone call, the expression-bodied getter
+        // inlined at the call site, and (via #9068) the class-VTABLE dispatch.
+        // It did NOT wire it into this one, so a lambda literal passed as an
+        // index argument to an IMPORTED indexer kept its producer's +1
+        // forever (MEASURED on r30-c1 @ d3e4526e4, `bezelc --sanitize=address`
+        // over the issue's own 200-iteration two-module repro: 12800 B in 200
+        // allocations — the 64-byte closure object alone, the probe's lambda
+        // captures nothing — for the imported VIRTUAL indexer AND, identically,
+        // for the imported NON-VIRTUAL one).
+        //
+        // WHY THE RELEASE IS OWED HERE, AND WHY IT IS SAFE. §28.14: a
+        // function-typed parameter declared without `scoped` is
+        // CALL-BOUNDED — "the callee receives the callback for the duration of
+        // the call only". §23.5 forbids `ref`/`out` on indexer parameter
+        // lists, so an indexer's function-typed parameter is plain and
+        // therefore call-bounded. The callee here is the EXPORTED stub
+        // `bz$<Class>$idxget$<arity>` (emitExportedIndexerGetters), whose body
+        // only forwards to the owner's getter and returns — it stores no
+        // reference to the callback — so the producer's +1 is the caller's to
+        // drop on the normal-return edge, exactly as in the sibling paths
+        // #4078 wired. §28.9: the closure object is runtime-managed, so its
+        // own reference must be dropped exactly once.
+        //
+        // The predicate inside the helper is `isPlusOneClosureProducer`, so
+        // only a lambda literal or a method reference written AT the index
+        // position is released; a caller-owned local passed as the index
+        // (`var g := lambda() => …; t[g];`) is not matched, and its +1
+        // belongs to the local's own scope. Same discipline as
+        // `releaseIndexArgStringProducers`'s identifier exclusion.
+        //
+        // Gated on `!diverged_` (the getter threw), mirroring #429's
+        // `!diverged_` discipline and #9068's own gate on the VTABLE sibling:
+        // the release is not emitted into unreachable IR, and the unwind
+        // edge's leak is the safe direction.
+        if (!diverged_) releaseIndexArgClosureProducers(ix, ps, idxArgVals);
         // fix #2814 (§28.3 "Unbound owned temporaries", v0.240): the INDEX half
         // of the same sentence the property half (#2751) covers — "used only by
         // borrowing operations within the expression … as a member or INDEX
