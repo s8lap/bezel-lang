@@ -222,3 +222,89 @@ BEZEL_TEST(property_expr_getter_closure_release_8981,
         "end Program;"),
         "2400");
 }
+
+// ---------------------------------------------------------------------------
+// Fix-forward #8981 (review r43-rev-m02-8981): the widened predicate recursed
+// `propertyReadMintsClosureRef` <-> `isPlusOneClosureProducer` with no guard,
+// so a function-typed expression-bodied property whose getter reads a
+// property that (transitively) reads it again overflowed the COMPILER's
+// stack (exit 139). The base compiled and ran all three. These rows assert
+// the programs compile and run (runAot: no leak oracle — a cyclic read is
+// conservatively NOT a +1 producer, so at worst a leak, never a double free).
+//
+// per §23.2 (the body is the getter's value), §28.9 (v0.359)
+
+// Rows 7 and 8: a guarded self-/mutually-recursive getter; legal, terminates.
+BEZEL_TEST(property_expr_getter_closure_release_8981,
+           expr_getter_guarded_mutual_cycle_compiles_spec_23_2) {
+    auto r = bezel::test::runAot(
+        "module M; "
+        "public class H "
+        "  private _d: int; "
+        "  public constructor() _d := 3; end; "
+        "  public property A: (int) -> int => (if _d > 5 then B else lambda(x: int) => x + 1); "
+        "  public property B: (int) -> int => (if _d > 6 then A else lambda(x: int) => x + 2); "
+        "end H; "
+        "public static class Program "
+        "  public static method Main(args: Array<string>): int "
+        "    using var h := new H(); "
+        "    var tot := 0; "
+        "    var g := h.A; "
+        "    tot := tot + g(1); "
+        "    Console.WriteLine(\"RESULT \" + tot.ToString()); "
+        "    return 0; "
+        "  end; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "RESULT 2\n");
+}
+
+BEZEL_TEST(property_expr_getter_closure_release_8981,
+           expr_getter_guarded_self_cycle_compiles_spec_23_2) {
+    auto r = bezel::test::runAot(
+        "module M; "
+        "public class H "
+        "  private _d: int; "
+        "  public constructor() _d := 3; end; "
+        "  public property A: (int) -> int => (if _d > 5 then this.A else lambda(x: int) => x + 1); "
+        "end H; "
+        "public static class Program "
+        "  public static method Main(args: Array<string>): int "
+        "    using var h := new H(); "
+        "    var tot := 0; "
+        "    var g := h.A; "
+        "    tot := tot + g(1); "
+        "    Console.WriteLine(\"RESULT \" + tot.ToString()); "
+        "    return 0; "
+        "  end; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "RESULT 2\n");
+}
+
+// Row 9: an unguarded cycle READ in dead code; must still compile.
+BEZEL_TEST(property_expr_getter_closure_release_8981,
+           expr_getter_unguarded_cycle_read_compiles_spec_23_2) {
+    auto r = bezel::test::runAot(
+        "module M; "
+        "public class H "
+        "  public property A: (int) -> int => B; "
+        "  public property B: (int) -> int => A; "
+        "end H; "
+        "public static class Program "
+        "  public static method Main(args: Array<string>): int "
+        "    using var h := new H(); "
+        "    if args.Count > 100 then "
+        "      var g := h.A; "
+        "      Console.WriteLine(g(1).ToString()); "
+        "    end; "
+        "    Console.WriteLine(\"read-compiled\"); "
+        "    return 0; "
+        "  end; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "read-compiled\n");
+}

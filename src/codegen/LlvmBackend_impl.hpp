@@ -23039,6 +23039,10 @@ private:
     // `P`). The `?.` spelling is NOT: it lifts the result to §7.5's
     // always-nullable type, so it has its own nullable protocol.
     bool propertyReadMintsClosureRef(const ast::Expr* e) const;
+    // fix-forward #8981: properties whose expression getter is being classified
+    // by `propertyReadMintsClosureRef` right now (re-entrancy guard: a getter
+    // that reads a property that reads it again answers "does not mint").
+    mutable std::unordered_set<const sema::PropertySymbol*> mintsClassifying_;
 
     // fix #3195 / §28.14: walk an expression or statement collecting every
     // bare `IdentifierExpr` (a method/parameter/local reference) it contains,

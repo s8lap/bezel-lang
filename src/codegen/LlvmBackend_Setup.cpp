@@ -38118,7 +38118,17 @@ bool Emitter::propertyReadMintsClosureRef(const ast::Expr* e) const {
         return false;
     const ast::Expr* body = exprGetterBodyOfDecl(pd);
     if (!body) return false;
-    return isPlusOneClosureProducer(body) || isUserMethodClosureReturnCall(body);
+    // fix-forward #8981 (§23.2, §28.9, v0.359): a getter body that reads a
+    // function-typed property reaches this predicate again through
+    // `isPlusOneClosureProducer`; a cycle (A => B, B => A, or a guarded
+    // self-read) must terminate. A property already being classified answers
+    // "does not mint": the conservative side (at worst a leak, never a
+    // double free).
+    if (!mintsClassifying_.insert(ps).second) return false;
+    const bool r =
+        isPlusOneClosureProducer(body) || isUserMethodClosureReturnCall(body);
+    mintsClassifying_.erase(ps);
+    return r;
 }
 
 bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
