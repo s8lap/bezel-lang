@@ -18165,6 +18165,20 @@ private:
                rt->primitive == sema::PrimitiveType::String;
     }
 
+    // fix #9069 (§27.5 / §28.9, v0.359): is the resolved TypeRef `rt` the
+    // `string` primitive — the NULLABLE `string?` form INCLUDED? A `string?` is
+    // the SAME runtime-managed reference with a null state (§28.9), and every
+    // refcount helper (bz_string_retain / bz_string_release) is null-safe, so
+    // wherever a reference is TAKEN or DROPPED the two forms need the same
+    // treatment. isStringTypeRefNonNull above is the same question with the
+    // nullable form EXCLUDED — right where the nullability decides something
+    // else (a `var s: string;` slot's zero-initialisation), wrong where it
+    // only decides whether the value is a runtime-managed string at all.
+    bool isStringTypeRef(const sema::TypeRef* rt) {
+        return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+               rt->primitive == sema::PrimitiveType::String;
+    }
+
     // fix #4127 (§27.5 / §28.9, stdlib §4.8, v0.295): is `rt` the synthetic
     // DictionaryEntry<string,V> shape LlvmBackend_Calls.cpp's isDict block
     // rebuilds a fresh, independently-owned bz_string* Key for (field 0 of
@@ -23848,6 +23862,33 @@ private:
     enum class CellSeedKind { String, Closure };
     std::unordered_map<const llvm::AllocaInst*, CellSeedKind>
         cellSeedRetainSlots_;
+    // fix #9069 (§27.5 / §28.9, v0.359): the PARAMETER SYMBOLS whose capture
+    // CELL owns a reference to its CONTENT — the per-capture retain the cell
+    // takes when the capture site runs (or, when that retain is suppressed, the
+    // seed reference the cell minted when it was allocated). Keyed by the
+    // symbol, so a write into the cell can ask.
+    //
+    // WHY THE SYMBOL KEY. The write into such a cell is lowered by
+    // lowerStringLocalReassign, whose nullable guard asks whether the slot owns
+    // a reference the drop-on-overwrite release may drop. A capture CELL does
+    // own one, but the predicate could not see it: the frame's own +1
+    // (isOwnedStringParamSlot) is keyed by the FUNCTION that retained it, and a
+    // write from inside a lambda body is lowered with the LAMBDA's function
+    // current, so the frame's arm answered "no" there. For the non-nullable
+    // `string` the release was taken anyway (that guard is the nullable form's
+    // own); for the NULLABLE `string?` the whole reassignment was declined,
+    // leaving the cell's content a bare borrow of the caller's value — a
+    // heap-use-after-free for an escaping closure that reads it.
+    std::unordered_set<const sema::Symbol*> cellOwnedContentParams_;
+    // fix #9069 (§27.5 / §28.9, v0.359): does `target` name a CAPTURE CELL of a
+    // string parameter whose cell owns a reference to its content (the set
+    // above)? Such a cell may drop the value a write displaces.
+    bool captureCellOwnsItsContent(const ast::Expr& target) const {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(&target);
+        if (!id) return false;
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        return sym && cellOwnedContentParams_.count(sym) != 0;
+    }
     // fix #9025 / #9039: mint the cell's reference to its seed `seed`, read
     // from the pre-boxing slot `origSlot`, if lowerLambda armed that slot.
     void emitCellSeedRetain(const llvm::AllocaInst* origSlot,
@@ -23880,7 +23921,16 @@ private:
     bool mutatedSharedCaptureCell(const void* key, const sema::TypeRef* semaTy,
                                   bool freshCellPerIteration) {
         if (currentFn_ != boxCaptureLocalsFn_) return false;
-        if (!isStringTypeRefNonNull(semaTy) &&
+        // fix #9069 (§27.5 / §28.9, v0.359): the NULLABLE `string?` form is
+        // admitted here. It is the same runtime-managed reference with a null
+        // state (§28.9), so the hazard this gate suppresses — a write between
+        // the capture's retain and the envdtor's release, which would leave the
+        // retain on one string and the release on another — is the same for
+        // both forms. Excluding the nullable form left a written, shared
+        // `string?` cell with BOTH the per-capture retain and the envdtor
+        // release armed, and the write's plain store in between left the
+        // release naming a value the retain never took.
+        if (!isStringTypeRef(semaTy) &&
             !(semaTy && semaTy->kind == sema::TypeRef::Kind::Function))
             return false;
         if (!assignedCaptureVars_.count(key)) return false;
@@ -23941,7 +23991,13 @@ private:
     bool capturedLocalReturnedByName(const void* key,
                                       const sema::TypeRef* semaTy) {
         if (currentFn_ != boxCaptureLocalsFn_) return false;
-        if (!isStringTypeRefNonNull(semaTy) &&
+        // fix #9069 (§27.5 / §28.9, v0.359): the NULLABLE `string?` form is
+        // admitted, for the same reason as in mutatedSharedCaptureCell above —
+        // it is the same runtime-managed reference with a null state, and the
+        // hazard (the return's silent transfer and the envdtor's content
+        // release claiming the same reference) does not depend on the
+        // nullability.
+        if (!isStringTypeRef(semaTy) &&
             !(semaTy && semaTy->kind == sema::TypeRef::Kind::Function))
             return false;
         return returnedCaptureVars_.count(key) != 0;

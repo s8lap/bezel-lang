@@ -32367,7 +32367,22 @@ bool Emitter::lowerStringLocalReassign(const ast::Expr& target,
     // `string?` PARAMETER, the setter `value`, a for-in / pattern binding or an
     // un-pinned body's local takes no bind-time +1 (retainAssignedStringParams
     // covers the non-nullable parameter only), so those keep the plain store.
-    if (isNullableStringExprType(target) && !stringLocalSlotOwnsRef(target))
+    //
+    // fix #9069 (§27.5 / §28.9, v0.359): a CAPTURE CELL is the second kind of
+    // slot that owns a +1 — the cell took its own reference to its content when
+    // the capture site ran (the per-capture retain), or minted a seed
+    // reference when it was allocated. The frame's own +1 cannot answer it
+    // here: isOwnedStringParamSlot's set is keyed by the FUNCTION that
+    // retained it, and a write from inside a lambda body is lowered with the
+    // LAMBDA's function current. Without this arm the reassignment of a
+    // nullable string through such a cell was declined outright, leaving the
+    // cell's content a bare borrow of the caller's value: a heap-use-after-free
+    // for an escaping closure that reads it (the cell's own reference was
+    // never taken for the nullable form, and the write that displaced the
+    // value took none either).
+    if (isNullableStringExprType(target) &&
+        !stringLocalSlotOwnsRef(target) &&
+        !captureCellOwnsItsContent(target))
         return false;
     llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slotAddr, "strl.old");
     if (!isPlusOneStringProducer(valueExpr))

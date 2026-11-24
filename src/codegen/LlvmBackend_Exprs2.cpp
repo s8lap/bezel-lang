@@ -2251,7 +2251,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                                       /*freshCellPerIteration=*/false) ||
              capturedLocalReturnedByName(static_cast<const void*>(sym),
                                          ce.semaTy));
-        if (writtenSuppressedCell && isStringTypeRefNonNull(ce.semaTy) &&
+        // fix #9069 (§27.5 / §28.9, v0.359): the NULLABLE `string?` form is
+        // admitted here too. The cell's reference to its SEED is what makes the
+        // write's drop-on-overwrite release sound (the seed is the CALLER's
+        // borrow — §28.1 makes `owned` a compile error on a `string` — so
+        // without the minted reference the first write released the caller's
+        // value), and a `string?` is the same runtime-managed reference with a
+        // null state (§28.9).
+        if (writtenSuppressedCell && isStringTypeRef(ce.semaTy) &&
             !isOwnedStringParamSlot(sym))
             cellSeedRetainSlots_[slot] = CellSeedKind::String;
         else if (writtenSuppressedCell && declSemaTy &&
@@ -2296,6 +2303,16 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                     (!suppressed || cellSeedRetainSlots_.count(slot));
             }
         }
+        // fix #9069 (§27.5 / §28.9, v0.359): the capture CELL of a `string` /
+        // `string?` PARAMETER owns a reference to its CONTENT — the per-capture
+        // retain this loop takes (or, when that retain is suppressed, the
+        // cell's own seed reference above). Recorded per SYMBOL so that a
+        // write into the cell can ask: the drop-on-overwrite release of such a
+        // write drops the cell's own reference, and the frame's own +1
+        // (isOwnedStringParamSlot) is not visible from a write inside a
+        // lambda body (that set is keyed by the FUNCTION that retained it).
+        if (!alreadyBoxed && isStringTypeRef(ce.semaTy))
+            cellOwnedContentParams_.insert(sym);
         ce.envValue = boxLocalSlot(slot, newSlot, /*forLoopVar=*/false,
                                    &wasGuardedParam);  // the shared cell pointer
         // fix #9004 (§27.5, v0.359): a capture site INSIDE A LOOP makes the
@@ -2432,11 +2449,28 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // iterations — but each iteration still builds its own closure with its
         // own envdtor run, so one retain per iteration pairs with one release
         // per closure. Both helpers are null-safe, so a null cell content is a
-        // no-op. Nullable `string?` is excluded by isStringTypeRefNonNull on
-        // both sides, matching the envdtor exactly — agreement between the
-        // retain and release predicates is the invariant. A captured ref/out
-        // param is a different loop below and stays at semaTy = nullptr: it
-        // borrows the caller's storage and the envdtor releases nothing.
+        // no-op.
+        //
+        // fix #9069 (§27.5 / §28.9, v0.359): the NULLABLE `string?` form is
+        // ADMITTED here. It used to be excluded by isStringTypeRefNonNull on
+        // both sides — "agreement between the retain and release predicates is
+        // the invariant" — but the agreement was between two sides that BOTH
+        // declined: a captured `string?` PARAMETER took no reference of its
+        // own, so its cell held a PURE BORROW of the caller's value. §28.1
+        // makes `owned` a compile error on a `string`, so the parameter is an
+        // unmodified borrow and the CALLER releases the argument when the call
+        // returns; an ESCAPING closure then read the freed value —
+        // `Program.M($"fr-{j}")` → `heap-use-after-free` on r30-c1 @
+        // 3e1197d83 (the issue's own repro). A captured `string?` PARAMETER now
+        // takes the same own-reference the non-nullable one has (#2689), and
+        // the envdtor drops exactly that reference (see its string branch).
+        //
+        // The captured-LOCAL arms below keep the non-nullable-only predicate:
+        // a local's own +1 is what the envdtor drops there (the local's
+        // scope-end release is the suppressed one), and that accounting is the
+        // non-nullable `string`'s — untouched here. A captured ref/out param is
+        // a different loop below and stays at semaTy = nullptr: it borrows the
+        // caller's storage and the envdtor releases nothing.
         //
         // fix #2706: EXCEPT when the body WRITES this parameter's cell and more
         // than one env can share it — see armMutatedSharedCaptureCell. The
@@ -2455,7 +2489,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             capturedLocalReturnedByName(static_cast<const void*>(sym),
                                          ce.semaTy);
         if (!ce.suppressContentRcInEnvdtor) {
-            if (isStringTypeRefNonNull(ce.semaTy)) {
+            if (isStringTypeRef(ce.semaTy)) {
                 llvm::Value* str =
                     builder_.CreateLoad(ptrTy(), ce.envValue, "str.pcap");
                 emitStringRetain(str);
@@ -5870,8 +5904,18 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // value leaks instead — the bounded, non-over-releasing side.
                 if (ce.suppressContentRcInEnvdtor) {
                     // no content release: see above.
-                } else if (isStringTypeRefNonNull(ce.semaTy)) {
+                } else if (isStringTypeRef(ce.semaTy) &&
+                           (ce.sym != nullptr || !ce.semaTy->nullable)) {
                     // String capture: load and release the +1 we retained.
+                    //
+                    // fix #9069 (§27.5 / §28.9, v0.359): the NULLABLE `string?`
+                    // form is released for a PARAMETER capture (ce.sym is set
+                    // for a parameter and null for a local), whose capture site
+                    // took that own reference — #2689's per-capture retain,
+                    // widened to the nullable form. A captured LOCAL keeps the
+                    // non-nullable-only predicate: there the envdtor drops the
+                    // LOCAL's own +1 (the local's scope-end release is the
+                    // suppressed one), and that accounting is unchanged.
                     llvm::Value* str =
                         builder_.CreateLoad(ptrTy(), cell, "str");
                     emitStringRelease(str);
