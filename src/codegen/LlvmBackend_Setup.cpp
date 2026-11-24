@@ -32333,8 +32333,7 @@ bool Emitter::lowerStringLocalReassign(const ast::Expr& target,
     if (!slotAddr || !newVal) return false;
     if (!newVal->getType()->isPointerTy()) return false;
     // Must be an actual LOCAL/parameter slot, string-typed, a bare `ptr` slot.
-    llvm::AllocaInst* slot = localSlot(target);
-    if (!slot) return false;                       // not a local/param
+    if (!localSlot(target)) return false;          // not a local/param
     if (!elemTy || !elemTy->isPointerTy()) return false;  // not a `ptr` slot
     if (!isStringExprType(target)) return false;   // not string-typed
     // fix #5245 (§4.6 / §28.9, v0.313): a nullable `string?` target lowers to a
@@ -32351,23 +32350,13 @@ bool Emitter::lowerStringLocalReassign(const ast::Expr& target,
     if (!isPlusOneStringProducer(valueExpr))
         emitStringRetain(newVal);
     builder_.CreateStore(newVal, slotAddr);
-    // fix #9005 / §27.5 / §28.9 (v0.359): the displaced value of a CAPTURE
-    // CELL may not be released unless the CELL owns a reference to it. A
-    // captured LOCAL's cell inherits the local's producer +1 (the escape walk
-    // suppresses the local's scope-end release), so the release-old above is
-    // sound there. A captured PARAMETER's cell owns NOTHING once the
-    // per-capture retain of #2689 is suppressed (the #2706 mutated-shared-cell
-    // rule): the value in the cell is still the CALLER's reference (§28.1 — a
-    // `string` parameter is an unmodified borrow), and releasing it here
-    // dropped the caller's string — the caller's own scope-end release then
-    // freed it a second time (issue #9005's double free, SEGV in
-    // bz_string_release). The capture side records that fact per cell holder
-    // (unownedCellContentSlots_); where it holds, the release is skipped and
-    // the cell's final value is leaked instead — the same bounded-leak trade
-    // #2706 makes, and the same one #2718 records as the price of not
-    // refcounting the cell.
-    if (!unownedCellContentSlots_.count(static_cast<const void*>(slot)))
-        emitStringRelease(oldVal);
+    // fix #9025 / #9026 / §27.5 / §28.9 (v0.359): for a CAPTURE CELL this
+    // release is sound because the cell owns a reference to every value it
+    // holds — including its SEED, which for a written, shared captured
+    // `string` PARAMETER the cell mints when it is allocated (see
+    // cellSeedRetainSlots_). #9005's skip of this release, for such a cell,
+    // leaked every displaced value (#9026).
+    emitStringRelease(oldVal);
     return true;
 }
 

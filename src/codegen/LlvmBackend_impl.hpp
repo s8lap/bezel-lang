@@ -23707,40 +23707,6 @@ private:
     // to suppress BOTH the retain and the envdtor release for such a cell —
     // a bounded leak instead of an over-release.
     std::unordered_set<const void*> assignedCaptureVars_;
-    // fix #9005 / §27.5 / §28.9 (v0.359): the capture-cell HOLDER slots whose
-    // CONTENT the cell does NOT own — the capture cells of a captured PARAMETER
-    // whose per-capture retain was suppressed (the #2706 rule above, or the
-    // #4198 returned-by-name rule). Keyed by the frame-local holder alloca
-    // (`cellVars_`'s key), NOT by the symbol: the same cell has one holder per
-    // frame that can reach it (the capturing frame's holder, and the holder each
-    // capturing lambda binds from its env), and only the holder the WRITE
-    // happens through decides that write's release.
-    //
-    // WHY THE CELL OWNS NOTHING IN THAT CASE. §28.1: "`owned` is a compile
-    // error" on a `string`, so a by-value `string` PARAMETER is an unmodified
-    // BORROW whose single reference belongs to the CALLER — the frame holds no
-    // +1 of its own (and #2696's bind-time retain deliberately skips an
-    // assignment that appears only inside a LAMBDA body, so the nested-lambda
-    // shape has none either). The cell's ONLY possible owner-reference is the
-    // per-capture retain of #2689 — and where that retain is suppressed, the
-    // cell owns nothing at all: the value in it is still the CALLER's.
-    //
-    // WHY A WRITE MUST KNOW. The write path's drop-on-overwrite release
-    // (lowerStringLocalReassign for `s := e`, the §4.6 `s += e` branch) drops
-    // the DISPLACED value of the cell. That release is sound only if the cell
-    // owns a reference to it: for a captured LOCAL the cell inherits the local's
-    // producer +1 (the escape walk suppresses the local's scope-end release),
-    // so the write consumes a reference the cell really owns; for a captured
-    // PARAMETER with a suppressed retain the cell owns NOTHING, and the write's
-    // release drops the CALLER's reference — an over-release, and the caller's
-    // own scope-end release then frees the same string a second time (the
-    // double free of issue #9005). This set is the capture side's answer to
-    // "does this write release a reference the cell owns?", consulted by the
-    // write paths; where the answer is NO the release is skipped, which leaves
-    // the cell's final value leaked instead (the same bounded-leak trade #2706
-    // makes, and the same one #2718 records as the price of not refcounting the
-    // cell).
-    std::unordered_set<const void*> unownedCellContentSlots_;
     // fix #9025 / #9026 / §27.5 / §28.1 / §28.9 (v0.359): the PRE-BOXING
     // slots of captured `string` PARAMETERS whose capture CELL mints one
     // reference to its SEED (the value the cell is initialised from) when it

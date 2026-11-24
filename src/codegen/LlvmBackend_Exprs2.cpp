@@ -2203,11 +2203,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         //     fresh temporary such as `Ident($"fr-{j}")`): a
         //     heap-use-after-free.
         //
-        // Minting the seed's reference closes #9025: an escaping closure reads
-        // a value the cell keeps alive. (#9005's skip of the write's release
-        // — unownedCellContentSlots_ — is still in place here, so the
-        // displaced values of #9026 still leak; with the seed owned, the skip
-        // is no longer needed.) The envdtor release
+        // Minting the seed's reference answers all three: the cell owns
+        // exactly one reference to whatever it holds, so every write's
+        // release is sound (no skip, no per-write leak), and an escaping
+        // closure reads a value the cell keeps alive. The envdtor release
         // stays suppressed (#2706 — the cell is shared, and no one env is its
         // last holder), so the cell's FINAL value is leaked: one string per
         // call, the bounded #2706 / #2718 trade, exactly as for a captured
@@ -2397,33 +2396,6 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 emitClosureRetain(cl);
             }
         }
-        // fix #9005 / §27.5 / §28.9 (v0.359): the capture's per-capture retain
-        // was SUPPRESSED above, so the cell does NOT own a reference to the
-        // value in it. For a captured PARAMETER that means the value is still
-        // the CALLER's (§28.1: a `string` parameter is an unmodified borrow
-        // whose single reference belongs to the caller) and the suppressed
-        // #2689 retain was the cell's only possible owner-reference. Mark the
-        // frame-local cell HOLDER, so a WRITE into this cell knows that its
-        // drop-on-overwrite release must not drop a reference nobody owns —
-        // the over-release of issue #9005 (the caller's own scope-end release
-        // then freed the same string a second time).
-        //
-        // A captured LOCAL is NOT marked: there the cell inherits the local's
-        // producer +1 (the escape walk suppresses the local's scope-end
-        // release), so the write's release consumes a reference the cell really
-        // owns — unchanged behaviour, and the local case is leak-clean.
-        //
-        // AND ONLY WHEN THIS FRAME OWNS NO REFERENCE OF ITS OWN: #2696 gives a
-        // `string` parameter that THIS body ASSIGNS TO an independent +1 at
-        // bind (retainAssignedStringParams), and a write in this very frame
-        // consumes THAT reference — the shape of #2706's own parameter row,
-        // which must keep releasing there. A frame with no such +1 (the
-        // assignment lives inside a nested lambda's body, so #2696's walk
-        // deliberately does not count it) owns nothing, and its write would
-        // release the caller's reference.
-        if (ce.suppressContentRcInEnvdtor && ce.sym &&
-            !isOwnedStringParamSlot(sym))
-            unownedCellContentSlots_.insert(static_cast<const void*>(newSlot));
         // §27.5 / §28.9 / #694: free the capture CELL in the envdtor when this
         // PARAMETER is captured by exactly ONE env (singleCaptureLocals_, which
         // keys parameters by Symbol*) and THIS lambda DEFINITELY escapes
@@ -4197,15 +4169,6 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 auto* slot = entryAlloca(ptrTy());
                 builder_.CreateStore(ptrVal, slot);
                 cellVars_[slot] = ce.valTy;
-                // fix #9005 / §27.5 / §28.9 (v0.359): this LAMBDA's own holder
-                // for a captured PARAMETER whose capture-side retain was
-                // suppressed — the cell's content is the CALLER's reference, so
-                // a write in THIS body must not drop it (the write paths ask
-                // unownedCellContentSlots_ before their drop-on-overwrite
-                // release). The capturing frame's own holder is marked at the
-                // capture site above; this is the same cell seen from here.
-                if (ce.sym && ce.suppressContentRcInEnvdtor)
-                    unownedCellContentSlots_.insert(static_cast<const void*>(slot));
                 if (ce.sym) paramSlots_[ce.sym] = slot;
                 if (ce.decl) locals_[ce.decl] = slot;
             }

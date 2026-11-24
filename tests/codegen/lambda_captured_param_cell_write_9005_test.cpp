@@ -53,6 +53,13 @@
 // parameter this body assigns to — keeps its release: that reference is the one
 // the write consumes.
 //
+// SUPERSEDED by #9025 / #9026 (v0.359): that skip leaked every displaced value
+// (#9026), and left the cell's seed a pure borrow that an escaping closure
+// could outlive (#9025). The cell now mints one reference to its seed when it
+// is allocated (`cellSeedRetainSlots_`), and the write's release is no longer
+// skipped. The rows below pin the same double free and stay unchanged; see
+// lambda_captured_param_cell_9025_test.cpp.
+//
 // WHAT THE ROWS BELOW SEE. The cell's final value is then leaked rather than
 // over-released (the same bounded-leak trade #2706 makes, and the same one
 // #2718 records as the price of not refcounting the cell), so the rows run on
