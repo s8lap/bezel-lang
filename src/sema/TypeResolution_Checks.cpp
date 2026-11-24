@@ -13829,8 +13829,16 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
         // satisfy `value`; reject it regardless of underlying category. A
         // reference-typed argument is the other clear violation.
         if (arg->nullable) { report("value"); return; }
+        // fix #8733 (§14.2 bounds table; stdlib §2.5 `TimeSpan`, §2.6 `Guid`;
+        // v0.359): the mirror of the `class` arm above. A STDLIB VALUE
+        // BUILTIN is a `public record` (a value type) whose compiler-intrinsic
+        // symbol carries `kind = Class`, so `categorize` reads it as a
+        // REFERENCE type; `isStdlibValueBuiltinType` (SemaContext.hpp) is the
+        // discriminator that overrides the kind, and the `value` bound ADMITS
+        // it.
         TypeCategory c = categorize(arg);
-        if (c == TypeCategory::Reference) report("value");
+        if (c == TypeCategory::Reference && !isStdlibValueBuiltinType(arg))
+            report("value");
         return;
     }
     if (item.kind == "new") {
