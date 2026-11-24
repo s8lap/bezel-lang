@@ -82,6 +82,25 @@ std::string ifMoveReturnUnmoved() {
            "end C;";
 }
 
+// Fix-forward (non-author review of the first #8939 commit): lambdas whose
+// every path discharges `x` but whose LAST statement `armNeverFallsThrough`
+// cannot classify (a `case` / `try` whose arms all return, an unreachable
+// `return` after an if/else that both return) must stay ADMITTED, exactly as
+// on base and as the method twin admits them (§28.3: the discharge is
+// required on every path, and here every path discharges).
+std::string lambdaMain(const std::string& lam) {
+    return std::string(kPrelude) +
+           "class C "
+           "  public static method Main(): int "
+           "    var f := " + lam +
+           "    var s := 0; var i := 0; "
+           "    while i < 300 do s := s + f(i mod 3); i := i + 1; end; "
+           "    Console.WriteLine(s); "
+           "    return 0; "
+           "  end Main; "
+           "end C;";
+}
+
 }  // namespace
 
 BEZEL_TEST(lambda_body_conditionally_moved_local_returned_unmoved_8939,
@@ -96,4 +115,49 @@ BEZEL_TEST(lambda_body_conditionally_moved_local_returned_unmoved_8939,
     JitResult jr = runAot(ifMoveReturnUnmoved());
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
     BEZEL_EXPECT_TRUE(hasDropped(jr.diagnostics));
+}
+
+// Fix-forward rows: each is REJECTED by the first #8939 commit (phantom
+// fall-off exit) and ADMITTED with the fix-forward.
+BEZEL_TEST(lambda_body_conditionally_moved_local_returned_unmoved_8939,
+           case_all_arms_return_every_path_discharges_admitted_28_3) {
+    JitResult jr = runAot(lambdaMain(
+        "lambda(n: int): int => do "
+        "  var x := new Res(n); "
+        "  case n of "
+        "    0 => do return Sink.Take(move x); end, "
+        "    1 => do var t := x.tag; x.Dispose(); return t; end, "
+        "    _ => do x.Dispose(); return -1; end "
+        "  end case; "
+        "end; "));
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, 0);
+}
+
+BEZEL_TEST(lambda_body_conditionally_moved_local_returned_unmoved_8939,
+           if_else_both_return_then_unreachable_return_admitted_28_3) {
+    JitResult jr = runAot(lambdaMain(
+        "lambda(n: int): int => do "
+        "  var x := new Res(n); "
+        "  if n = 0 then return Sink.Take(move x); "
+        "  else x.Dispose(); return 1; end; "
+        "  return 9; "
+        "end; "));
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, 0);
+}
+
+BEZEL_TEST(lambda_body_conditionally_moved_local_returned_unmoved_8939,
+           try_catch_all_return_every_path_discharges_admitted_28_3) {
+    JitResult jr = runAot(lambdaMain(
+        "lambda(n: int): int => do "
+        "  var x := new Res(n); "
+        "  try "
+        "    if n = 0 then return Sink.Take(move x); end; "
+        "    x.Dispose(); return 1; "
+        "  catch ArgumentException => do return 2; end, "
+        "  end try; "
+        "end; "));
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, 0);
 }

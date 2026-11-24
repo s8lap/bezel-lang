@@ -17598,6 +17598,45 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaBody(
     lambdaCapturedSyms_ = std::move(savedCaptured);
 }
 
+// fix-forward #8939 (§28.3, v0.359): is this lambda body's exit structure one
+// the end-of-body check can judge EXACTLY? The check treats "the body falls off
+// its end" and every recorded `return` as a real exit; `armNeverFallsThrough`
+// is a deliberately under-approximating syntactic predicate, so a body whose
+// end (or a `return` after it) is really unreachable but not recognised as such
+// would contribute a PHANTOM exit with the local still Owned and the check
+// would reject a legal program. The safe direction is to ADMIT (the base
+// behaviour): the check judges only a body made of straight-line statements,
+// `if` / `do` blocks and `return` / `throw`, with no `case`, `try`, loop,
+// `break` / `continue`, and no statement after one that never falls through.
+// // per §28.3, K7.4, v0.359
+static bool lambdaExitShapeIsExact(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    bool afterTerminator = false;
+    for (const auto& sp : stmts) {
+        if (!sp) continue;
+        const ast::Stmt& st = *sp;
+        if (afterTerminator) return false;
+        if (dynamic_cast<const ast::CaseStmt*>(&st) ||
+            dynamic_cast<const ast::TryStmt*>(&st) ||
+            dynamic_cast<const ast::WhileStmt*>(&st) ||
+            dynamic_cast<const ast::ForStmt*>(&st) ||
+            dynamic_cast<const ast::BreakStmt*>(&st) ||
+            dynamic_cast<const ast::ContinueStmt*>(&st))
+            return false;
+        if (const auto* ifs = dynamic_cast<const ast::IfStmt*>(&st)) {
+            if (!lambdaExitShapeIsExact(ifs->ifBranch.body)) return false;
+            for (const auto& el : ifs->elifBranches)
+                if (!lambdaExitShapeIsExact(el.body)) return false;
+            if (!lambdaExitShapeIsExact(ifs->elseBody)) return false;
+        } else if (const auto* dob =
+                       dynamic_cast<const ast::DoEndBlock*>(&st)) {
+            if (!lambdaExitShapeIsExact(dob->body)) return false;
+        }
+        if (stmtNeverFallsThrough(st)) afterTerminator = true;
+    }
+    return true;
+}
+
 // fix #8939 (§28.3 *Owned local discharge requirement*, K7.4, K3.2, v0.359):
 // the END-OF-BODY discharge check of a block-bodied LAMBDA.
 //
@@ -17617,6 +17656,9 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaBody(
 // every `return` (`lambdaExitStates_`) with the fall-off state and reports
 // each of the body's OWN plain `var` locals the join leaves Owned and
 // maybe-consumed, with the method twin's text. It is deliberately NARROW:
+//   * only a body whose exit structure is EXACT (`lambdaExitShapeIsExact`: no
+//     case / try / loop / break, no statement after a terminator) — a shape
+//     `armNeverFallsThrough` cannot classify would add a phantom exit;
 //   * the disagreement must be BETWEEN exits (one exit leaves the local
 //     plainly Owned, another discharged it): a local already maybe-consumed
 //     WITHIN a single exit's path (`if c then move x; end; <exit>`, a move
@@ -17634,6 +17676,7 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaBody(
 void MethodOwnership::checkLambdaBodyOwnedLocalsAtExit(
         const ast::LambdaExpr& lam) {
     if (lam.stmts.empty() || lam.isAsync || lambdaExitUncertain_) return;
+    if (!lambdaExitShapeIsExact(lam.stmts)) return;
     std::vector<BlockState> exits = lambdaExitStates_;
     if (!armNeverFallsThrough(lam.stmts)) exits.push_back(states_);
     if (exits.size() < 2) return;
