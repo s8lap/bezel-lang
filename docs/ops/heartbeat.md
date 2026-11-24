@@ -137,6 +137,8 @@ IGNORED AND THE NEW SCHEDULE IS BORN WITH NO END.** The current instance is
 session restart** — the schedule lives in the orchestrator's server, not in the session
 (measured: the R38 heartbeat fired 17 times across a restart and kept its cadence).
 
+**R43 (2026-11-24).** The coordinator is a Claude Code session, so the heartbeat is a session `CronCreate` job (`7,27,47 * * * *`, id `a552b24e`). Its run end is **2026-11-27 02:00 NZDT**, and the prompt deletes the job once that time has passed. Its pool row uses `--pool 14` (6 Claude + 8 MiniMax). A session cron dies with the session: a resumed coordinator recreates it.
+
 ### The prompt, verbatim
 
 ```
