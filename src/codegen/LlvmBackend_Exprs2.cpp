@@ -4848,34 +4848,107 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // exactly as before. The walk below under-collects at worst (a statement
     // kind it does not descend into), which keeps the ancestor's verdict for
     // that local: a bounded leak, never an over-free.
+    //
+    // fix-forward #8948 (the #3743 row it turned red, §27.5 / §28.9,
+    // v0.359): NOT for a FUNCTION-TYPED local that a lambda NESTED in this
+    // body ASSIGNS (through the shared cell, §27.5). For such a cell,
+    // "single" flips mutatedSharedCaptureCell from "suppress the capture
+    // retain AND the envdtor release" to "suppress neither", and in a NESTED
+    // body that
+    // pairing is not balanced: the frame-side half of the method-frame
+    // accounting (`closureLocalCapturedCell_`, collected only for a METHOD
+    // body's top-level locals) is absent here, so the eager first-call
+    // release of a reassigned closure local still fires. MEASURED on #3743's
+    // `same_depth_target_in_enclosing_lambda_accepted_28_3` (`var f :=
+    // lambda() => 0; var mk := lambda() => do f := lambda() => r.V(); ...
+    // end; var t := mk(); return t + f();` inside a lambda): f's new value
+    // was released by the call `f()` AND by mk's envdtor, "refcount
+    // over-release (closure)", exit 134. Such a key keeps the ancestor's
+    // merge exactly as before #8948 (the shared verdict, both suppressed).
+    // NOT excluded, because MEASURED clean under the single verdict (and
+    // excluding them brings back the pre-#8948 leak): a written `string`
+    // local (there is no eager release for a string; 7490 B / 400
+    // allocations over 200 calls before #8948), and a closure local written
+    // only by THIS body (`f := ...` beside `mk`: 15200 B / 600 before #8948,
+    // 800 B / 200 with it). A local whose type cannot be read is treated as
+    // function-typed (the old merge: a bounded leak at worst). #8948's own
+    // shapes capture an UNWRITTEN local and keep its fix. The nested-write
+    // walk descends every compound STATEMENT kind; a write inside a
+    // statement block nested in an EXPRESSION of a nested lambda (a case-
+    // expression arm's statements) is not seen and keeps #8948's verdict.
     std::unordered_set<const void*> ownBodyDecls8948;
     if (!ancestorMultiCaptureLocals4240.empty()) {
-        std::function<void(const ast::Stmt*)> own = [&](const ast::Stmt* st) {
+        // Statement descent shared by both walks below; it does not enter a
+        // lambda body (collectAllLambdas enumerates those).
+        std::function<void(const ast::Stmt*,
+                           const std::function<void(const ast::Stmt*)>&)>
+            walk = [&](const ast::Stmt* st,
+                       const std::function<void(const ast::Stmt*)>& visit) {
             if (!st) return;
-            if (dynamic_cast<const ast::LocalDecl*>(st) ||
-                dynamic_cast<const ast::LocalConstDecl*>(st))
-                ownBodyDecls8948.insert(static_cast<const void*>(st));
+            visit(st);
             if (auto* is = dynamic_cast<const ast::IfStmt*>(st)) {
-                for (auto& b : is->ifBranch.body) own(b.get());
+                for (auto& b : is->ifBranch.body) walk(b.get(), visit);
                 for (auto& br : is->elifBranches)
-                    for (auto& b : br.body) own(b.get());
-                for (auto& b : is->elseBody) own(b.get());
+                    for (auto& b : br.body) walk(b.get(), visit);
+                for (auto& b : is->elseBody) walk(b.get(), visit);
             } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(st)) {
-                for (auto& b : ws->body) own(b.get());
+                for (auto& b : ws->body) walk(b.get(), visit);
             } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(st)) {
-                for (auto& b : fs->body) own(b.get());
+                for (auto& b : fs->body) walk(b.get(), visit);
             } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(st)) {
-                for (auto& b : d->body) own(b.get());
+                for (auto& b : d->body) walk(b.get(), visit);
             } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(st)) {
-                for (auto& b : ts->body) own(b.get());
-                for (auto& c : ts->catches) own(c.body.get());
-                for (auto& b : ts->finallyBody) own(b.get());
+                for (auto& b : ts->body) walk(b.get(), visit);
+                for (auto& c : ts->catches) walk(c.body.get(), visit);
+                for (auto& b : ts->finallyBody) walk(b.get(), visit);
             } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(st)) {
                 for (auto& arm : cs->arms)
-                    for (auto& a : arm.stmts) own(a.get());
+                    for (auto& a : arm.stmts) walk(a.get(), visit);
             }
         };
-        for (auto& st : lam.stmts) own(st.get());
+        // fix-forward #8948: the locals a lambda NESTED in this body assigns
+        // (`f := ...` inside `mk`), keyed like assignedCaptureVars_.
+        std::unordered_set<const void*> nestedWritten;
+        {
+            std::vector<const ast::LambdaExpr*> nested;
+            collectAllLambdas(lam.stmts, nested);
+            const std::function<void(const ast::Stmt*)> noteWrite =
+                [&](const ast::Stmt* st) {
+                    auto* as = dynamic_cast<const ast::AssignmentStmt*>(st);
+                    if (!as) return;
+                    auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(as->target.get());
+                    if (!id) return;
+                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                            ctx_.exprSymbol(*id)))
+                        if (loc->decl)
+                            nestedWritten.insert(
+                                static_cast<const void*>(loc->decl));
+                };
+            for (const ast::LambdaExpr* nl : nested)
+                for (auto& st : nl->stmts) walk(st.get(), noteWrite);
+        }
+        const std::function<void(const ast::Stmt*)> own =
+            [&](const ast::Stmt* st) {
+                if (auto* ld = dynamic_cast<const ast::LocalDecl*>(st)) {
+                    // fix-forward #8948: a function-typed local a NESTED
+                    // lambda writes keeps the ancestor merge (see above). The
+                    // type is read the way collectCapturedCellClosureLocals
+                    // reads it.
+                    const sema::TypeRef* lt = nullptr;
+                    if (ld->type) lt = ctx_.resolvedType(*ld->type);
+                    if (!lt && ld->initializer)
+                        lt = ctx_.exprType(*ld->initializer);
+                    const bool nestedWrittenClosure =
+                        nestedWritten.count(static_cast<const void*>(st)) &&
+                        (!lt || lt->kind == sema::TypeRef::Kind::Function);
+                    if (!nestedWrittenClosure)
+                        ownBodyDecls8948.insert(static_cast<const void*>(st));
+                } else if (dynamic_cast<const ast::LocalConstDecl*>(st)) {
+                    ownBodyDecls8948.insert(static_cast<const void*>(st));
+                }
+            };
+        for (auto& st : lam.stmts) walk(st.get(), own);
     }
     for (const void* k : ancestorMultiCaptureLocals4240) {
         if (ownBodyDecls8948.count(k)) continue;  // fix #8948: re-scan decides
