@@ -16954,6 +16954,19 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             // `tryBodyExitStates` comment above for the measurements.
             states_ = tryBodyExitStates;
             if (arm.guard) {
+                // fix #8991 (§28.3 K1.3, §28.8.1, §22.9, §31.2.1, v0.359):
+                // the arm's `when` guard is an ordinary expression position
+                // that runs on the SAME exception edge as the arm body, so a
+                // read of a local the `try` body moved is a read of a
+                // moved-from binding. The METHOD body's CFG routes the guard
+                // through `handleDischarge` (`block.catchGuard`, #1591) and
+                // rejects it with "owned value in `x` was already moved out
+                // at this point (§28.3)"; this walk only collected nested
+                // lambdas out of the guard, so #8940's body-exit entry state
+                // reached the arm BODY but never the guard. Same authority,
+                // same order as the ExpressionStmt arm (discharge first, then
+                // nested lambdas).
+                handleDischarge(*arm.guard);
                 std::vector<const ast::LambdaExpr*> nestedLambdas;
                 collectBodyLambdasExpr(*arm.guard, nestedLambdas);
                 for (const ast::LambdaExpr* nested : nestedLambdas)
