@@ -25197,6 +25197,45 @@ bool MethodOwnership::recordNewSelectsGeneratedPrimary(
            sema::SemaContext::NewCtorSelection::Primary;
 }
 
+// fix #8962 (§28.3 closure bullet, *Set-erasing positions*, v0.359): the
+// declared component type each construction argument binds to, by the §22.5
+// binding `checkRecordFnComponentStore` reads — a positional argument fills
+// the next §9.1 positional component, a named one the component of that name.
+// The set-erasing bullet lists "record component" among its positions and
+// names `new Box<Object>(f)` over `record Box<T>(V: T)` as its own example;
+// `resolveCtorParams` knows no record's generated primary constructor, so the
+// parameter route `scopedPreScanExpr` reads never reached it.
+std::vector<const sema::TypeRef*> MethodOwnership::recordCtorArgComponentTypes(
+    const ast::NewExpr& ne) const {
+    std::vector<const sema::TypeRef*> out(ne.args.size(), nullptr);
+    const sema::TypeRef* rt =
+        ne.type ? ctx_.resolvedType(*ne.type) : ctx_.exprType(ne);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return out;
+    const sema::TypeSymbol* ts = rt->declaration;
+    if (ts->kind != ast::TypeDeclKind::Record) return out;
+    if (!recordNewSelectsGeneratedPrimary(ne, ts)) return out;
+    std::vector<std::pair<std::string_view, const sema::TypeRef*>> positional;
+    std::vector<std::pair<std::string_view, const sema::TypeRef*>> byName;
+    recordStorageComponents(ts, positional, byName);
+    if (positional.empty()) return out;
+    std::size_t posSlot = 0;
+    for (std::size_t i = 0; i < ne.args.size(); ++i) {
+        const ast::CallArgument& a = ne.args[i];
+        if (!a.name.empty()) {
+            for (const auto& c : positional)
+                if (c.first == a.name) { out[i] = c.second; break; }
+            if (!out[i])
+                for (const auto& c : byName)
+                    if (c.first == a.name) { out[i] = c.second; break; }
+        } else {
+            if (posSlot < positional.size()) out[i] = positional[posSlot].second;
+            ++posSlot;
+        }
+    }
+    return out;
+}
+
 // fix #8852 (§9.7 / §28.3.8, v0.359): the store of a function value into a
 // record's FUNCTION-TYPED component, at the CONSTRUCTION site.
 //
@@ -30779,17 +30818,27 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
             f = resolveCtorParams(*ne, ctx_);
         else if (callee)
             f = calleeOrChainFormals(callee, *args);
+        // fix #8962 (§28.3 *Set-erasing positions*, v0.359): a record's
+        // generated primary constructor has no resolved formals; its
+        // parameters ARE the §9.1 components, read here by declared type.
+        std::vector<const sema::TypeRef*> recordComps;
+        if (ne && !f.valid()) recordComps = recordCtorArgComponentTypes(*ne);
         for (std::size_t i = 0; i < args->size(); ++i) {
             const auto& a = (*args)[i];
             if (!a.value) continue;
             const std::size_t bp = boundFormalIndex(*args, i, f);
-            if (bp < f.size()) {
-                const ast::Type* dType = f.declType(bp);
+            const bool recordComp = i < recordComps.size() && recordComps[i];
+            if (bp < f.size() || recordComp) {
                 const sema::TypeRef* pt = nullptr;
-                if (dType)
-                    pt = ctx_.resolvedType(*dType);
-                else
-                    pt = f.resolvedType(bp);
+                if (recordComp) {
+                    pt = recordComps[i];
+                } else {
+                    const ast::Type* dType = f.declType(bp);
+                    if (dType)
+                        pt = ctx_.resolvedType(*dType);
+                    else
+                        pt = f.resolvedType(bp);
+                }
                 // Set-erasing position: a parameter declared at Object, or a bare
                 // type parameter (the declared type is the type parameter, not a
                 // function type).  Per §28.3 closure bullet *Set-erasing
@@ -30961,8 +31010,38 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
     }
     if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
         if (we->source) scopedPreScanExpr(*we->source);
-        for (const auto& ia : we->assigns)
-            if (ia.value) scopedPreScanExpr(*ia.value);
+        // fix #8962 (§28.3 *Set-erasing positions*, v0.359): a `with`
+        // assignment to a record component declared `Object` or at a bare
+        // type parameter is a set-erasing position, like the component's
+        // argument at the generated primary constructor (§9.5: `with` stores
+        // into the component directly).
+        const sema::TypeSymbol* wts = nullptr;
+        if (we->source)
+            if (const sema::TypeRef* st = ctx_.exprType(*we->source))
+                if (st->kind == sema::TypeRef::Kind::Named)
+                    wts = st->declaration;
+        std::vector<std::pair<std::string_view, const sema::TypeRef*>> wpos,
+            wbyName;
+        if (wts && wts->kind == ast::TypeDeclKind::Record)
+            recordStorageComponents(wts, wpos, wbyName);
+        for (const auto& ia : we->assigns) {
+            if (!ia.value) continue;
+            for (const auto& c : wbyName) {
+                if (c.first != ia.name || !c.second) continue;
+                if (c.second->kind == sema::TypeRef::Kind::Named &&
+                    !c.second->declaration)
+                    setErasingCheckQueue_.push_back(
+                        {SetErasingPosition::BareTypeParameter,
+                         ia.value.get()});
+                else if (c.second->kind == sema::TypeRef::Kind::Primitive &&
+                         c.second->primitive == sema::PrimitiveType::Object)
+                    setErasingCheckQueue_.push_back(
+                        {SetErasingPosition::ObjectParameter,
+                         ia.value.get()});
+                break;
+            }
+            scopedPreScanExpr(*ia.value);
+        }
         return;
     }
     if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {

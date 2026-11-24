@@ -1252,6 +1252,16 @@ public:
         std::vector<std::pair<std::string_view, const sema::TypeRef*>>& positional,
         std::vector<std::pair<std::string_view, const sema::TypeRef*>>& byName)
         const;
+    // fix #8962 (§28.3 closure bullet, *Set-erasing positions*, v0.359): the
+    // DECLARED type of the record component each argument of `new R(...)`
+    // binds to at the record's GENERATED primary constructor (§9.1) — index-
+    // aligned with `ne.args`, null where an argument binds no component (an
+    // unmatched name, an overflow) or where the call is not the generated
+    // primary's. `scopedPreScanExpr` reads it to place a record component at
+    // a set-erasing position, as it places a resolved constructor's
+    // parameter. // per §9.1, §28.3
+    std::vector<const sema::TypeRef*> recordCtorArgComponentTypes(
+        const ast::NewExpr& ne) const;
     // The capture that makes a function value's source set NON-EMPTY, or null
     // when the value is capture-free. `why` receives the clause naming the
     // capture, for the diagnostic.
