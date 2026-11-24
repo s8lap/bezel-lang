@@ -25255,9 +25255,14 @@ private:
     // it is safe to free the cell at inner-scope exit (only fresh-path cells
     // are safe to free inside the loop; guarded cells must survive until the
     // captured variable's own scope exits).
+    // fix #8949 (§27.5 / §28.9, v0.359): `declaredOutsideLoop` says the
+    // captured local is declared OUTSIDE the innermost loop the capture sits
+    // in, so one cell is the right answer (the variable is ONE variable across
+    // the iterations): the current-BB-store freshness heuristic is skipped.
     llvm::Value* boxLocalSlot(llvm::AllocaInst* slot, llvm::AllocaInst*& newSlot,
                               bool forLoopVar = false,
-                              bool* wasGuardedBoxing = nullptr);
+                              bool* wasGuardedBoxing = nullptr,
+                              bool declaredOutsideLoop = false);
 
     // §27.5 / #673: after writing `val` to the cell of a boxed local (whose
     // cell-holder alloca is `newSlot`), also store `val` to

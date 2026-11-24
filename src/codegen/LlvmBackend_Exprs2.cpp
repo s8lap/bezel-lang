@@ -2585,8 +2585,28 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         bool forceFresh = isForVar ||
                           (isInlineOwnedArray && !loopStack_.empty());
         bool wasGuardedLocal = false;
+        // fix #8949 (§27.5 / §28.9, v0.359): a local declared OUTSIDE the
+        // innermost enclosing loop, captured by a NON-ESCAPING lambda inside
+        // it, is one variable across the iterations: tell boxLocalSlot so it
+        // does not mistake the loop's own reassignment of it for a per-pass
+        // re-initialisation (see the comment there). Limited to exactly the
+        // captures the deferred owner-scope free covers
+        // (`cellFreeEligible_`, not escaping), so every other capture keeps
+        // its boxing.
+        bool declaredOutsideLoop = false;
+        if (!forceFresh && !alreadyBoxed && !isPatternBinding &&
+            !loopStack_.empty() && currentFn_ == cellFreeEligibleFn_ &&
+            !definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
+            cellFreeEligible_.count(static_cast<const void*>(decl))) {
+            auto ddf = declScopeDepthFn_.find(static_cast<const void*>(decl));
+            auto dd = declScopeDepth_.find(static_cast<const void*>(decl));
+            declaredOutsideLoop =
+                ddf != declScopeDepthFn_.end() && ddf->second == currentFn_ &&
+                dd != declScopeDepth_.end() &&
+                dd->second <= loopStack_.back().scopeDepth;
+        }
         ce.envValue = boxLocalSlot(slot, newSlot, /*forLoopVar=*/forceFresh,
-                                   &wasGuardedLocal);
+                                   &wasGuardedLocal, declaredOutsideLoop);
         // A case-arm binding's source slot is written by pattern matching each
         // time the arm is entered. Guarded boxing intentionally reuses one
         // holder, so refresh its cell from the newly-bound slot on every arm

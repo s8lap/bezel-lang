@@ -7050,7 +7050,8 @@ void Emitter::fixupCapturedCellHolderReads() {
 llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
                                    llvm::AllocaInst*& newSlot,
                                    bool forLoopVar,
-                                   bool* wasGuardedBoxing) {
+                                   bool* wasGuardedBoxing,
+                                   bool declaredOutsideLoop) {
     auto it = cellVars_.find(slot);
     if (it != cellVars_.end()) {
         //
@@ -7175,6 +7176,30 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
         // pass (for-var loop variable fresh binding, or per-iteration re-init).
         // NOT guarded: a fresh cell is created every time this code runs.
         if (wasGuardedBoxing) *wasGuardedBoxing = false;
+        // fix #8949 (§27.5 / §28.9, v0.359): the local is declared OUTSIDE
+        // the loop this capture sits in and is only REASSIGNED by it (the
+        // current-BB store above is the loop's own `k := k + i`, not a
+        // re-initialisation), so this path allocates one cell per iteration
+        // for ONE variable, each overwriting the holder. The deferred
+        // owner-scope free reclaims the holder's LAST value only: MEASURED
+        // 4 of 5 cells leaked per call. The caller proved the lambda
+        // non-escaping, so by the time the NEXT pass reaches this capture
+        // site the previous pass's closure is gone and nothing reads the
+        // previous cell (the original slot is kept in sync, `cellVarSyncSlot_`
+        // below, and is what this pass seeds from): free it before it is
+        // overwritten. The holder is null-initialised in the entry block so
+        // the first pass frees nothing; every other path to this site leaves
+        // the holder either null or a live, not-yet-freed cell.
+        llvm::AllocaInst* prevHolder = nullptr;
+        if (declaredOutsideLoop && !forLoopVar) {
+            prevHolder = entryAlloca(ptrTy());
+            llvm::BasicBlock& entry = currentFn_->getEntryBlock();
+            llvm::IRBuilder<> eb(&entry, std::next(prevHolder->getIterator()));
+            eb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), prevHolder);
+            llvm::Value* old =
+                builder_.CreateLoad(ptrTy(), prevHolder, "cell.prev");
+            builder_.CreateCall(freeFn(), {old});
+        }
         llvm::Value* cellSize = builder_.CreatePtrToInt(
             builder_.CreateGEP(valTy, llvm::ConstantPointerNull::get(ptrTy()),
                                {builder_.getInt32(1)}),
@@ -7184,13 +7209,13 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
         llvm::Value* cur2 = builder_.CreateLoad(valTy, slot, "preboxed");
         builder_.CreateStore(cur2, cell);
         // Deliberately a BARE `entryAlloca`: this path's holder is NOT
-        // null-initialised here. On a path that never reaches this capture site
+        // null-initialised here (except for `prevHolder`, above). On a path that never reaches this capture site
         // its content is undef, which `fix #4612` repairs — but only for the
         // holders whose reads that fix actually guards, from
         // `fixupCapturedCellHolderReads`, so an unconditional capture keeps the
         // IR it had. An entry-block `store null` is not inert: see the measured
         // LeakSanitizer row quoted at that site.
-        newSlot = entryAlloca(ptrTy());
+        newSlot = prevHolder ? prevHolder : entryAlloca(ptrTy());
         builder_.CreateStore(cell, newSlot);
         cellVars_[newSlot] = valTy;
         // fix #3484: the fresh path stores unconditionally, so the holder is
