@@ -5398,6 +5398,18 @@ private:
                                              std::string_view name,
                                              SourceLocation loc);
 
+    // fix #8987 (§28.3, §28.9, §15.3, v0.359): an owned-consuming use of a
+    // MOVE-ONLY local (an owning inline array or an owning-classified
+    // choice, §15.3) that an ENCLOSING LAMBDA declares, written in a NESTED
+    // lambda; true when it reported. The LAMBDA-BODY sibling of the METHOD
+    // twin `reportMoveOnlyChoiceMoveInClosure` draws -- §28.3's "enclosing
+    // body" of a nested closure IS the enclosing lambda's body. Same owner
+    // resolution (`lambdaOwnerOfDeclaringLambda`), and the METHOD twin's own
+    // diagnostic (`reportCapturedOwnedConsume(..., "transfer")`), so the two
+    // scopes cannot drift apart in wording.
+    bool reportEnclosingLambdaMoveOnlyConsume(const ast::IdentifierExpr& id,
+                                               sema::Symbol* sym);
+
     // fix #8895 (§31.1, v0.359): the innermost ENCLOSING lambda whose own
     // source range declares `sym` (null when none does -- the symbol then
     // belongs to the method body, whose bindings live in `states_`).

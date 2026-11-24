@@ -6709,6 +6709,68 @@ void MethodOwnership::reportCapturedOwnedConsume(std::string_view name,
                "restructure so the closure only borrows it.");
 }
 
+// fix #8987 (§28.3 *Captured owned bindings*, §28.9, §15.3, v0.359). The
+// LAMBDA-BODY scope of the rule the METHOD twin (`reportMoveOnlyChoiceMoveInClosure`
+// below) draws.
+//
+// §28.3 *Captured owned bindings*: "Inside a closure, a captured owned binding
+// — an owned local or `owned` parameter of the enclosing body — is uniformly
+// in borrow state: reads borrow (the producers rows above), and assignment
+// to it, a marked transfer from it, an explicit `Dispose()` or discard of it,
+// and every other owned-consuming use of it are compile errors — a closure
+// cannot consume, reassign, or dispose a captured owned binding." The
+// "enclosing body" of a NESTED closure IS the ENCLOSING LAMBDA's body, so a
+// move-only local declared there and consumed by the nested closure is the
+// same rule the METHOD spelling draws.
+//
+// §28.9: "Capturing a *move-only* local (an owning inline array, §15.3)
+// follows the same rule: the closure captures a borrow whose source is the
+// local's enclosing scope, and may not outlive it ... a move-only capture
+// cannot be a copy (copying is forbidden) and cannot be a move (the local is
+// still in scope under its name ...)". §15.3 makes the PLAIN binding of a
+// move-only value a MOVE ("copies are forbidden, so the plain binding can
+// only move"), so the plain binding / assignment / argument / return of it —
+// the positions the METHOD twin is called at — are owned-consuming uses.
+//
+// ROOT CAUSE. The METHOD twin resolves the binding against the METHOD frame's
+// `states_`, and a local declared in an enclosing LAMBDA's body is in no
+// method-frame state map — so the nested closure's consume of it fell
+// through to the parameter-only carve-out and was admitted (the closure's
+// taker and the enclosing lambda's scope-end pass both disposed the one
+// payload: a heap-use-after-free).
+//
+// The binding must be the ENCLOSING lambda's own: it is CAPTURED by the
+// nested closure (its owner is not the innermost lambda on the scan stack),
+// and it is MOVE-ONLY, so the consume above is an owned-consuming use of a
+// captured owned binding. The diagnostic is the METHOD twin's own —
+// `reportCapturedOwnedConsume` with the verb "transfer" — so the two scopes
+// cannot drift apart in wording.
+//
+// per §28.3, §28.9, §15.3, v0.359
+bool MethodOwnership::reportEnclosingLambdaMoveOnlyConsume(
+        const ast::IdentifierExpr& id, sema::Symbol* sym) {
+    // A NESTED closure only: a closure's own local is consumed inside its
+    // own body, which is the closure's own business (§28.3's rule is about
+    // a CAPTURED binding).
+    if (closureScanStack_.size() < 2) return false;
+    if (!sym) return false;
+    if (id.name == "this" || id.name == "base") return false;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls || isCatchBorrow(sym)) return false;
+    const ast::LambdaExpr* owner = lambdaOwnerOfDeclaringLambda(sym);
+    // Not declared by an enclosing lambda (the METHOD-body case: the method
+    // twin's own arm, reported below), or declared by the consuming lambda
+    // itself (its own local: admitted — a closure may consume what it owns).
+    if (!owner || owner == closureScanStack_.back()) return false;
+    // Either move-only kind (§15.3): the owning inline array and the
+    // owning-classified choice.
+    const char* kind = nullptr;
+    if (!common::isMoveOnlyValueType(ctx_.exprType(id), ctx_, kind))
+        return false;
+    reportCapturedOwnedConsume(id.name, id.span.begin, "transfer");
+    return true;
+}
+
 // fix #7891 (§28.3 *Captured owned bindings*, §15.3, §35.4, v0.357).
 //
 // §28.3: "Inside a closure, a captured owned binding — an owned local or
@@ -6762,6 +6824,12 @@ void MethodOwnership::reportMoveOnlyChoiceMoveInClosure(const ast::Expr& e) {
     if (id->name == "this" || id->name == "base") return;
     sema::Symbol* sym = ctx_.exprSymbol(*id);
     if (!sym) return;
+    // fix #8987 (§28.3 *Captured owned bindings*, §28.9, §15.3, v0.359): the
+    // LAMBDA-BODY scope of the same rule — a MOVE-ONLY local of an ENCLOSING
+    // LAMBDA consumed by a NESTED closure. The method-frame resolution below
+    // cannot see it (a lambda-body local is in no `states_` map), so it is
+    // asked here, with the METHOD twin's own diagnostic.
+    if (reportEnclosingLambdaMoveOnlyConsume(*id, sym)) return;
     if (states_.find(sym) == states_.end()) {
         // Not a tracked enclosing local. A by-value-move PARAMETER of the
         // enclosing body is not in `states_` until something moves it
