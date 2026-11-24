@@ -1279,6 +1279,30 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     const StateMachineFrame* savedAsyncClosurePinFrame_ = asyncClosurePinFrame_;
     std::vector<unsigned> savedAsyncClosurePinFields_;
     savedAsyncClosurePinFields_.swap(asyncClosurePinFields_);
+    // fix #8954 (§30.1 / §28.9, v0.359): the STRING pin needs the SAME
+    // save/restore — it is the same publication, reached through the same
+    // nested emission (a generic async method monomorphized inside this
+    // body), but it had the plain CLEAR at the end of this function instead.
+    //
+    // WHY THE STRING PIN IS THE WORSE HALF. The closure twin's release reads
+    // the field indices through the PUBLISHED frame's own struct type
+    // (`asyncClosurePinFrame_->structTy`), so a stale publication can only
+    // mis-release a closure. The string twin's release GEPs the field indices
+    // through `smStateStruct_` — the CURRENTLY emitting method's struct type —
+    // while the field indices belong to the frame that PUBLISHED them. So a
+    // nested emission that inherits the enclosing method's indices releases
+    // the ENCLOSING frame's word against the NESTED frame's layout: a wild
+    // pointer, dereferenced by `bz_string_release` (§28.9) — the SEGV of
+    // #8954.
+    //
+    // Swapping the list out makes the nested emission's own list start EMPTY
+    // (exactly as the closure pin's swap above does), so the indices cannot
+    // mix; and RESTORING the enclosing publication at the end keeps the
+    // enclosing frame's own +1 reachable by the enclosing frame's teardown
+    // (without the restore, the enclosing frame's hold leaks).
+    const StateMachineFrame* savedAsyncStringPinFrame_ = asyncStringPinFrame_;
+    std::vector<unsigned> savedAsyncStringPinFields_;
+    savedAsyncStringPinFields_.swap(asyncStringPinFields_);
 
     // §30.9 / §31.2 (#438): `await` is now supported in a try BODY, a catch ARM
     // BODY, and a FINALLY (lowerTry lowers each handler's resume block in place
@@ -2294,8 +2318,24 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // generic-specialization emission completing its OWN frame cannot
         // release this frame's parameters, and so the field list cannot be
         // read against a frame that is no longer being emitted.
-        asyncStringPinFrame_ = nullptr;
-        asyncStringPinFields_.clear();
+        //
+        // fix #8954 (§30.1 / §28.9, v0.359): the publication is now RESTORED
+        // to whatever the enclosing emission had (null at the top level — so
+        // this is exactly the clear it replaces), instead of being cleared.
+        // `emitAsyncMethod` is re-entered by a nested emission (a generic
+        // async method monomorphized inside this body), and the nested
+        // emission publishes ITS frame's hold in the same two members. The
+        // plain CLEAR here was therefore doing two wrong things at once: it
+        // took the ENCLOSING method's publication away, so the enclosing
+        // frame's terminal edge dropped nothing and the borrowed `string`'s
+        // +1 LEAKED; and it let the nested frame's terminal edge release the
+        // ENCLOSING frame's field index against the NESTED frame's layout — a
+        // wild release, a SEGV in `bz_string_release` (#8954). §30.1: the
+        // frame "lives until the task settles", so the hold belongs to the
+        // frame that took it and each frame's terminal edge drops exactly its
+        // own.
+        asyncStringPinFrame_ = savedAsyncStringPinFrame_;
+        asyncStringPinFields_.swap(savedAsyncStringPinFields_);
         // fix #8867: the same discipline for the plain function-typed formal's
         // frame hold — the publication is RESTORED to whatever the enclosing
         // emission had (null at the top level), so a nested async-lambda or
