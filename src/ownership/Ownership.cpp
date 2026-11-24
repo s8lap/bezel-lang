@@ -21297,6 +21297,77 @@ static void runOwnedSetterBody(const ast::PropertyDecl& pd,
                !enclosingType->genericParams.empty());
 }
 
+// fix #9073 (§28.3.10 *Owned-local discharge requirement*, §28.3 *Borrow
+// lifetime rules*, §28.9, §23.3, v0.359): run the FULL ownership pass over a
+// PLAIN property setter's BLOCK body (`set => do … end;`) — the body the
+// `set(owned)` sibling above already runs, and the body a METHOD body runs.
+//
+// WHY.  §23.3: "The implicit setter parameter is `value`.  It is a parameter
+// of the setter" — a plain setter's block body is a BODY, with a parameter, and
+// §28.3's rules govern bodies, not body KINDS.  §28.3.10: "**The rule is
+// uniform across body kinds**" … "On a path that never moves it out, a plain
+// `var` owned local … thus behaves like a `using var`: reclaimed when its scope
+// ends."  §28.9: "**Accessor faces are uniform across type kinds.**"
+//
+// MEASURED on the base (r30-c1 @ 1e7e7b586), the issue's own repro verbatim:
+// the program compiles with NO diagnostic at all, the destructor NEVER runs and
+// LeakSanitizer reports "Direct leak of 3200 byte(s) in 200 object(s)" — 16 B
+// per setter call.  The same `var r := new Res();` in a METHOD body disposes
+// `r`; so does the `set(owned)` sibling (#5252) and a PROVED-CONFINED block
+// getter (#8767).  A plain setter's body reached NO ownership pass at all:
+// `ld->autoDropAtScopeEnd` — the flag codegen's scope-end free reads — is
+// armed only by the method-body dataflow's scope-exit sweep (`run`'s own
+// end-of-body arm), so the body's owned locals had no discharge obligation, no
+// §28.3.10 must-use lint and no §28.3 borrowed-field-store verdict.
+//
+// THE FIX.  The method-body pass, reused verbatim (`MethodOwnership::run`),
+// exactly as `runOwnedSetterBody` (#5252) reuses it for the `set(owned)`
+// spelling — so a setter body and a method body cannot disagree about a
+// verdict.  The implicit `value` parameter is NOT seeded Owned: a plain
+// setter takes a BORROW of the property's declared type (§23.3: "The setter's
+// implicit `value` parameter has no modifier by default and takes a borrow of
+// the property's declared type"), so the body keeps §23.3's rule that the
+// setter may store `value` into a field — §28.3's borrowed-field-store rule is
+// holder-kind-conditioned and a PARAMETER-sourced borrow is admissible there.
+//
+// The `set(owned)` spelling is EXCLUDED (the caller checks it): the full pass
+// above already reaches every rule there, and running it twice would report
+// every diagnostic twice.
+//
+// // per §28.3.10, §28.3, §28.9, §23.3, v0.359
+static void runPlainSetterBody(const ast::PropertyDecl& pd,
+                               const ast::PropertyAccessor& acc,
+                               sema::SemaContext& ctx,
+                               const ast::TypeDecl* enclosingType) {
+    const std::string_view vname = acc.setterParamName.empty()
+        ? std::string_view("value")
+        : acc.setterParamName;
+    sema::Symbol* valueSym = nullptr;
+    const std::vector<sema::Symbol*>* idxParams = nullptr;
+    for (const auto& up : ctx.symbols()) {
+        sema::Symbol* s = up.get();
+        if (!s || s->decl != &pd) continue;
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(s)) {
+            if (ls->name == vname) valueSym = ls;
+        } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(s)) {
+            if (ps->isIndexer) idxParams = &ps->indexerParams;
+        }
+    }
+    if (!valueSym) return;
+    std::vector<sema::Symbol*> params;
+    if (idxParams) params = *idxParams;
+    params.push_back(valueSym);
+    bool isStatic = false;
+    for (std::string_view mod : pd.modifiers)
+        if (mod == "static") isStatic = true;
+    MethodOwnership mo(ctx);
+    mo.run(acc.stmts, &params, /*isAsync=*/false, /*isDestructor=*/false,
+           /*returnType=*/nullptr, /*returnOwned=*/false, isStatic,
+           /*genericCtx=*/nullptr,
+           /*isGenericBody=*/enclosingType &&
+               !enclosingType->genericParams.empty());
+}
+
 // fix #8767 (§28.3.10 *Owned local discharge requirement*, §28.9, v0.359): a
 // GETTER accessor's block body never reached the ownership dataflow, so an
 // owned-state local declared in it got NO end-of-scope disposal obligation:
@@ -21883,6 +21954,33 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
                     acc.bodyKind == ast::PropertyAccessorBodyKind::Block) {
                     runOwnedSetterBody(*pd, acc, ctx, enclosingType);
                 }
+                // fix #9073 (§28.3.10 *Owned-local discharge requirement*,
+                // §28.3 *Borrow lifetime rules*, §28.9, §23.3, v0.359): a
+                // PLAIN setter's block body runs the FULL ownership pass, the
+                // method-body pass reused verbatim, exactly as the `set(owned)`
+                // spelling above does.  §23.3: "The implicit setter parameter
+                // is `value`.  It is a parameter of the setter" — the body is a
+                // BODY, and §28.3's rules govern bodies, not body kinds;
+                // §28.3.10: "The rule is uniform across body kinds".
+                //
+                // MEASURED on the base (r30-c1 @ 1e7e7b586), the issue's own
+                // repro verbatim: the program compiled with NO diagnostic, the
+                // destructor NEVER ran and LeakSanitizer reported "Direct leak
+                // of 3200 byte(s) in 200 object(s)" — the body's owned local
+                // had no discharge obligation (`ld->autoDropAtScopeEnd` is
+                // armed only by the method-body dataflow's scope-exit sweep),
+                // no §28.3.10 must-use lint and no §28.3 borrowed-field-store
+                // verdict, while the byte-identical METHOD-body twin both
+                // disposed the local and rejected the field store.
+                //
+                // The `set(owned)` spelling is EXCLUDED here: the full pass
+                // above already reaches every rule there, and running it twice
+                // would report every diagnostic twice.
+                // // per §28.3.10, §28.3, §28.9, §23.3, v0.359
+                if (acc.isSet && acc.setterParamMod != "owned" &&
+                    acc.bodyKind == ast::PropertyAccessorBodyKind::Block) {
+                    runPlainSetterBody(*pd, acc, ctx, enclosingType);
+                }
                 // fix #9034 (§28.3 closure bullet, *Provenance* clause 3 /
                 // *Set-erasing positions*, v0.359): the §28.3 *Set-erasing
                 // positions* rule at an ACCESSOR BLOCK body.  A plain
@@ -21902,9 +22000,18 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
                 // invoked).  A `set(owned)` accessor body is EXCLUDED: the
                 // full ownership pass above already reaches the rule there,
                 // and running it twice would report the same position twice.
+                //
+                // fix #9073 (§28.3, v0.359): a PLAIN setter's block body is
+                // EXCLUDED for the same reason now — fix #9073 put that body
+                // under the FULL ownership pass, which reaches the rule (and
+                // every other §28.3 rule) there, so the driver would report
+                // the same position twice.  The block GETTER's body still
+                // needs the driver: the getter's own pass (runGetterBody) runs
+                // only when the body is PROVED CONFINED and then in the
+                // getter-scope-only mode, whose diagnostics are suppressed.
                 // // per §28.3
                 if (acc.bodyKind == ast::PropertyAccessorBodyKind::Block &&
-                    !(acc.isSet && acc.setterParamMod == "owned")) {
+                    !acc.isSet) {
                     MethodOwnership setErasingMo(ctx);
                     setErasingMo.checkSetErasingPositionsInAccessorBody(
                         acc.stmts);
