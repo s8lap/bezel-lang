@@ -2532,9 +2532,9 @@ s27_5_7624	pass
 s27_5_7625	pass	
 s27_5_7631	pass	
 s27_5_7632	pass	
-s27_5_7915	fail	#9004
-s27_5_7916	fail	#9004
-s27_5_7917	fail	#9004
+s27_5_7915	pass	
+s27_5_7916	pass	
+s27_5_7917	pass	
 s27_6_0001	pass	
 s27_6_0002	fail	divergence
 s27_6_0003	pass	
