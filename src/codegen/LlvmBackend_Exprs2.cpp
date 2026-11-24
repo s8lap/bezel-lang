@@ -1307,6 +1307,15 @@ llvm::GlobalVariable* Emitter::getFreedSlotGlobal() {
 
 
 llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
+    // fix #8950 (§28.14 *Call-bounded × deferred activation*, shape (1) "Frame
+    // residence" / §27.5 / §28.9, v0.359): the ASYNC call-bounded signal
+    // names THIS lambda — the literal at a plain async callee's call-bounded
+    // formal. It is taken into a local and the member cleared, so a NESTED
+    // lambda inside this lambda's body (lowered while the body is emitted, far
+    // below) is not mistaken for the argument lambda: the nested one captures
+    // from this lambda's scope, not from the call site's.
+    const bool asyncCallBoundedArg = inAsyncCallBoundedArgLambda_;
+    inAsyncCallBoundedArgLambda_ = false;
     // fix #8794 (§27.3, v0.359): the assignment arm's target function type
     // reaches only the right-hand-side lambda literal it was computed for.
     struct AssignRhsSlot {
@@ -3522,12 +3531,61 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         //     conservative stack scan and flip that row's one-shot oracle.
         //     Reclaiming nothing is not worth unmasking somebody else's leak,
         //     so it waits for #4509's follow-up alongside #2718.
+        // fix #8950 (§28.14 *Call-bounded × deferred activation*, shape (1)
+        // "Frame residence" / §27.5 / §28.9, v0.359): the ASYNC CALL-BOUNDED
+        // shape is the ONE case where the exclusion above does not apply, and
+        // this is the arming it needs.
+        //
+        // The exclusion's own reason is #2718's open half — "rc(contents) must
+        // equal the LIVE ENV COUNT", a question about the CONTENT's refcount,
+        // which this arm does not touch: the env still owns the content's +1
+        // and the envdtor still releases it, exactly as before. What this arm
+        // adds is the CELL's own accounting, and the cell's accounting is a
+        // SEPARATE count with a SEPARATE protocol (the `bz_cell_retain` /
+        // `bz_cell_release` pair) — the one the note above calls "the narrow,
+        // cell-only half of the model #2718 sketches".
+        //
+        // Why the shape qualifies, where the general escaping case does not:
+        // the exclusion's second reason was that "for that shape the count
+        // cannot reach zero today anyway" — the escaping closure is never
+        // released, so the cell keeps a live holder and arming reclaims
+        // nothing. HERE the closure IS released: §28.14's frame residence
+        // bounds the callee's hold of the callback by the task's settlement
+        // (§30.1), and the async frame drops its own +1 at the task's terminal
+        // edge (#8867's `emitAsyncClosureParamRelease`), so the env's release
+        // DOES run — and the count reaches zero.
+        //
+        // Why the counted cell is the right reclaim (and not a scope-end
+        // free): the call site CANNOT consume the cell at the call, because
+        // the callee's frame still holds the closure across the call — the
+        // envdtor reads the cell to release the captured content, so freeing
+        // it there would be a use-after-free; and the frame's scope end may
+        // come BEFORE the task settles (an un-awaited task), so a scope-end
+        // free would be a use-after-free the other way. The counted cell
+        // takes the later of the two: the env's release (the settlement) and
+        // the frame's release (the scope end) each drop one reference, and
+        // the cell is freed by whichever lets go LAST.
+        //
+        // The shape is gated on the frame's own authority
+        // (`isAsyncCallBoundedArgPosition` -> `calleeFrameHoldsClosureParam`),
+        // the same predicate `emitAsyncMethod`'s entry retain and
+        // `prepareCallClosureArgRelease`'s `callBoundedAsync` arm read — so
+        // "the frame holds this callback" is one fact in the compiler, and the
+        // cell's reclaim cannot be armed for a callee whose frame does not
+        // hold the callback (where the closure, not the cell, is what leaks).
+        const bool asyncCallBoundedCell =
+            asyncCallBoundedArg && !ce.releaseBoxInEnvdtor &&
+            !ce.suppressContentRcInEnvdtor && ce.semaTy &&
+            ((ce.semaTy->kind == sema::TypeRef::Kind::Primitive &&
+              ce.semaTy->primitive == sema::PrimitiveType::String) ||
+             ce.semaTy->kind == sema::TypeRef::Kind::Function);
         const bool contentsAlsoManaged =
             ce.releaseBoxInEnvdtor || ce.suppressContentRcInEnvdtor ||
             (ce.semaTy &&
              ((ce.semaTy->kind == sema::TypeRef::Kind::Primitive &&
                ce.semaTy->primitive == sema::PrimitiveType::String) ||
-              ce.semaTy->kind == sema::TypeRef::Kind::Function));
+              ce.semaTy->kind == sema::TypeRef::Kind::Function) &&
+             !asyncCallBoundedCell);
         // fix #4523 (§27.5 / §28.9, v0.306): #4509's arming, restated as TWO
         // independent obligations instead of one.
         //
@@ -5778,6 +5836,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     }
 
     lastLambdaFnTy_ = fnTy;   // fix #8857: read by the IIFE call site
+    // fix #8950: restore the ASYNC call-bounded signal for the enclosing
+    // lowering (the call site that armed it).
+    inAsyncCallBoundedArgLambda_ = asyncCallBoundedArg;
     return closureObj;
 }
 

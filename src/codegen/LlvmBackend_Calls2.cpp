@@ -18016,11 +18016,30 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // walk `md`'s body. Cleared on every exit below (success, early
             // bail-out, post-CreateCall release emission).
             currentCallee_ = md;
+            // fix #8950: the callee's SEMANTIC symbol, for the captured-cell
+            // gate `buildOrderedArgs` arms (the frame-residence shape). It is
+            // read ONLY while the arguments are being lowered, so it is
+            // restored again right after `buildOrderedArgs` returns — a stale
+            // symbol must never reach another call's gate.
+            //
+            // The RESTORE (not a clear) is what a NESTED call needs: an
+            // argument that is itself a call runs a whole inner call —
+            // `lowerCallDispatch` installs the INNER callee here — and that
+            // inner call's own `buildOrderedArgs` would otherwise leave the
+            // symbol null, so the OUTER call's LATER arguments would read
+            // "no callee" and the captured-cell gate would silently decline
+            // (the leak would survive for a shape the issue's repro does not
+            // show: `Later(MakeIt(), lambda(v: int): int => ...)`).
+            sema::MethodSymbol* const savedCalleeSym8950 = currentCalleeSym_;
+            currentCalleeSym_ = ms;
             bareTParamUnwrapParams = &md->params;
             argBoxCallIdx = beginArgBoxCall();
-            if (!buildOrderedArgs(md->params, call.args, args, &argExprs,
-                                  /*nullTransferredOwned=*/true,
-                                  &accessorRefArgs)) {
+            const bool argsBuilt =
+                buildOrderedArgs(md->params, call.args, args, &argExprs,
+                                 /*nullTransferredOwned=*/true,
+                                 &accessorRefArgs);
+            currentCalleeSym_ = savedCalleeSym8950;
+            if (!argsBuilt) {
                 currentCallee_ = nullptr;
                 // fix #7998: the call never runs, so the box minted for its
                 // argument is garbage — DROP this call's record (the
@@ -19864,10 +19883,7 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
         // The async ITERATOR is EXCLUDED: its frame hold is #2609's and its
         // call-site release is the `rel.syncIter` arm above — arming both
         // would double-release.
-        const bool isPlainAsyncCallee =
-            isAsyncMethod(ms) &&
-            !(mdCb->bodyKind == ast::MethodBodyKind::Block &&
-              (containsYield(mdCb->stmts) || returnsAsyncIteratorType(ms)));
+        const bool isPlainAsyncCallee = isPlainAsyncCalleeMethod(ms);
         // (1) The DECLARED return type: `void` (nothing can carry the callback
         // out at all), or a single-part Named head that is neither a
         // deferred-activation frame nor a generic parameter of the method or
@@ -20497,6 +20513,45 @@ bool Emitter::calleeFrameHoldsClosureParam(sema::MethodSymbol* ms,
     if (!ps->modifier.empty()) return false;
     const sema::TypeRef* pt = paramTypeOf(ps);
     return pt && pt->kind == sema::TypeRef::Kind::Function;
+}
+
+// fix #8950 (§28.14 *Call-bounded × deferred activation*, shape (1) "Frame
+// residence" / §30.1 / §28.9, v0.359): the PLAIN-ASYNC callee predicate,
+// EXTRACTED from `prepareCallClosureArgRelease` so the call site's own gate
+// (the one that arms the captured cell's counted reclaim) and the release arm
+// read ONE definition and cannot drift.
+//
+// An ASYNC ITERATOR is excluded: its frame hold is #2609's (the frame retains
+// the closure cell at construction and drops it at Dispose) and its call-site
+// release is the `rel.syncIter` arm, so arming both would double-release.
+bool Emitter::isPlainAsyncCalleeMethod(sema::MethodSymbol* ms) const {
+    if (!ms || !isAsyncMethod(ms)) return false;
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md) return false;
+    return !(md->bodyKind == ast::MethodBodyKind::Block &&
+             (containsYield(md->stmts) || returnsAsyncIteratorType(ms)));
+}
+
+// fix #8950 (§28.14 / §27.5 / §28.9, v0.359): the argument at PARAMETER
+// index `idx` — is it a lambda LITERAL at a PLAIN ASYNC callee's call-bounded
+// formal?
+//
+// The callee's identity comes from `currentCalleeSym_` (the call path installs
+// it before `buildOrderedArgs`), and the "does the frame hold it" fact from
+// `calleeFrameHoldsClosureParam` — the SAME predicate `emitAsyncMethod`'s
+// entry retain and `prepareCallClosureArgRelease`'s `callBoundedAsync` arm
+// read. So "the frame holds this formal" is one fact in the compiler, not
+// three, and the cell-reclaim gate cannot drift from the release it belongs
+// to.
+//
+// A formal whose frame hold is absent (a bare `T` at a generic
+// instantiation, an alias-typed formal — §28.14 / #1921 / #2248) answers NO:
+// the frame does not hold the callback, so the caller's own +1 is the only
+// reference and the closure — not this gate — is what leaks.
+bool Emitter::isAsyncCallBoundedArgPosition(std::size_t idx) {
+    if (!currentCalleeSym_) return false;
+    if (!isPlainAsyncCalleeMethod(currentCalleeSym_)) return false;
+    return calleeFrameHoldsClosureParam(currentCalleeSym_, idx);
 }
 
 // fix #8624 (§7.5 / §28.14 / §28.9, v0.359): the NORMAL-return edge of
@@ -28111,6 +28166,14 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
         // §8.6 box escape analysis can walk `md`'s body. Cleared on every exit
         // below (success, early bail-out, post-CreateCall release emission).
         currentCallee_ = md;
+        // fix #8950: the callee's SEMANTIC symbol, for the captured-cell gate
+        // `buildOrderedArgs` arms (the frame-residence shape). Read only while
+        // the arguments are lowered, and restored right after — a stale symbol
+        // must never reach another call's gate, and a NESTED call (an argument
+        // that is itself a call) must not leave the symbol null for the
+        // OUTER call's later arguments. See the `.` path's twin comment.
+        sema::MethodSymbol* const savedNcCalleeSym8950 = currentCalleeSym_;
+        currentCalleeSym_ = ms;
         argBoxCallIdx = beginArgBoxCall();
         // fix #8527 (§14.1 / §14.5, v0.357): the `?.` twin of the `.` form's
         // #505 lambda pre-pass. The callee's method-level type parameters
@@ -28138,9 +28201,16 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                             std::move(savedNcArgSemaTy)};
         if (!md->genericParams.empty())
             applyMethodGenericSubst(call, ms);
-        if (!buildOrderedArgs(md->params, call.args, args, &argExprs,
-                              /*nullTransferredOwned=*/true,
-                              &accessorRefArgs)) {
+        const bool ncArgsBuilt =
+            buildOrderedArgs(md->params, call.args, args, &argExprs,
+                             /*nullTransferredOwned=*/true,
+                             &accessorRefArgs);
+        // fix #8950: the captured-cell gate's symbol is read only while the
+        // arguments are lowered, and RESTORED (not cleared) so a nested call
+        // in an earlier argument cannot leave it null for this call's later
+        // arguments.
+        currentCalleeSym_ = savedNcCalleeSym8950;
+        if (!ncArgsBuilt) {
             currentCallee_ = nullptr;
             // fix #7998: the call never runs — drop THIS call's record (the
             // conservative leak) and leave an enclosing call's record alone.

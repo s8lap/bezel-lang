@@ -18813,7 +18813,29 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             if (a.value &&
                 dynamic_cast<const ast::LambdaExpr*>(a.value.get()))
                 inArgumentLambda_ = true;
+            // fix #8950 (§28.14 *Call-bounded × deferred activation*, shape (1)
+            // "Frame residence" / §27.5 / §28.9, v0.359): the ASYNC twin of
+            // the signal above. A lambda LITERAL at a PLAIN ASYNC callee's
+            // call-bounded formal is a case the call site CANNOT discharge at
+            // the call: §28.14's frame residence makes the callee's frame hold
+            // the closure until the task's settlement (§30.1), so the captured
+            // CELL must outlive the call and `releaseCallClosureArgs` declines
+            // to consume it there. The cell's reclaim is the envdtor's (the
+            // #4509 counted cell), and `lowerLambda` arms it from this
+            // signal.
+            //
+            // The gate is the FRAME's own authority — `isAsyncCallBoundedArg
+            // Position` asks `calleeFrameHoldsClosureParam`, the same predicate
+            // `emitAsyncMethod`'s entry retain and `prepareCallClosureArgRelease`'s
+            // `callBoundedAsync` arm read — so the cell's reclaim and the
+            // closure's release are keyed on ONE fact and cannot drift.
+            const bool savedAsyncCbArg = inAsyncCallBoundedArgLambda_;
+            inAsyncCallBoundedArgLambda_ =
+                savedAsyncCbArg ||
+                (a.value && dynamic_cast<const ast::LambdaExpr*>(a.value.get()) &&
+                 isAsyncCallBoundedArgPosition(idx));
             v = lowerExpr(*a.value);
+            inAsyncCallBoundedArgLambda_ = savedAsyncCbArg;
             inArgumentLambda_ = savedInArg;
             expectedFunctionType_ = savedExpected;
         }

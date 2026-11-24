@@ -3957,6 +3957,40 @@ private:
     // (the same #3752 move, but for a same-depth capture whose lifetime
     // mismatch is a STATEMENT, not a deeper dispose scope).
     bool inArgumentLambda_ = false;
+    // fix #8950 (§28.14 *Call-bounded × deferred activation*, shape (1) "Frame
+    // residence" / §27.5 / §28.9, v0.359): set true while `buildOrderedArgs`
+    // is lowering an argument that is a `LambdaExpr` at a PLAIN ASYNC callee's
+    // call-bounded formal — the shape whose captured CELL the callee's frame
+    // holds past the call.
+    //
+    // §28.14's frame residence makes the callee's hold of the callback last
+    // until the task's settlement (§30.1), so the call site's release
+    // (`releaseCallClosureArgs`) does NOT consume the captured cells there:
+    // the cells must outlive the call. Before #8950 nobody else reclaimed
+    // them either — the capture is classified ESCAPING (the pre-scan's
+    // `isCallBoundedClosureArgPosition` declines an async callee), so the
+    // scope-end free is disarmed and the closure's envdtor never freed the
+    // cell: 8 B leaked per call (the issue's repro: 1600 B / 200 allocations).
+    //
+    // `lowerLambda` reads this signal to arm the #4509 COUNTED cell for the
+    // capture: the env announces itself with `bz_cell_retain` and drops that
+    // reference in its envdtor, and the declaring scope drops the frame's
+    // implicit one — so the cell is freed by whichever of the two lets go
+    // LAST, which is exactly the frame-residence bound. The signal names the
+    // ARGUMENT lambda only: `lowerLambda` takes it into a local and clears
+    // the member, so a NESTED lambda inside the argument lambda's body is
+    // not mistaken for it.
+    bool inAsyncCallBoundedArgLambda_ = false;
+    // fix #8950 (§28.14 / §28.9, v0.359): the callee's SEMANTIC symbol for
+    // the call whose arguments are being lowered. The `.` and `?.` user-method
+    // call paths install it alongside `currentCallee_`, before
+    // `buildOrderedArgs`, and clear it on every exit. `buildOrderedArgs` reads
+    // it to ask the FRAME's own authority — `calleeFrameHoldsClosureParam`,
+    // the same predicate `emitAsyncMethod`'s entry retain and
+    // `prepareCallClosureArgRelease`'s `callBoundedAsync` arm read — whether
+    // the callee's frame holds the formal at this argument's parameter index,
+    // so the gate and the release cannot drift.
+    sema::MethodSymbol* currentCalleeSym_ = nullptr;
     // #1467 / §22.4 / §28.3: scratch slots holding an `out owned`
     // (class/interface) value that a call passed via `out _` (discard). The
     // callee writes a fresh OWNED heap object into each such slot, but no
@@ -15599,6 +15633,30 @@ private:
     // alias the caller's location — each has its own discharge).
     bool calleeFrameHoldsClosureParam(sema::MethodSymbol* ms,
                                        std::size_t pi);
+
+    // fix #8950 (§28.14 *Call-bounded × deferred activation*, shape (1) "Frame
+    // residence" / §30.1 / §28.9, v0.359): is `ms` a PLAIN (non-iterator)
+    // ASYNC method — the callee shape #8867's `callBoundedAsync` arm names?
+    //
+    // The definition is EXTRACTED from `prepareCallClosureArgRelease` so the
+    // call site's own gate (the one `buildOrderedArgs` arms for the captured
+    // cell) and the release arm read ONE predicate and cannot drift — the
+    // "#5672 sibling trap" the surrounding code warns about. An ASYNC
+    // ITERATOR is excluded: its frame hold is #2609's and its call-site
+    // release is the `rel.syncIter` arm, so arming both would double-release.
+    bool isPlainAsyncCalleeMethod(sema::MethodSymbol* ms) const;
+
+    // fix #8950 (§28.14 / §27.5 / §28.9, v0.359): is the argument at
+    // PARAMETER index `idx` a lambda LITERAL at a PLAIN ASYNC callee's
+    // call-bounded formal — the shape whose captured CELL the callee's frame
+    // holds past the call, and which therefore cannot consume the cells at
+    // the call site?
+    //
+    // The answer is read off the frame's own authority
+    // (`calleeFrameHoldsClosureParam`), the same predicate `emitAsyncMethod`'s
+    // entry retain reads, so "the frame holds it" is one fact in the
+    // compiler and not two.
+    bool isAsyncCallBoundedArgPosition(std::size_t idx);
 
     // The NORMAL-return edge of the same discharge: releases each closure
     // the call site owns and consumes the lambda's captured cells (#3498).
