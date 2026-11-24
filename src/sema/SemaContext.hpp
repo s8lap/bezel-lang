@@ -1786,6 +1786,11 @@ inline bool isStdlibValueBuiltinType(const TypeRef* t) {
         if (isUserDeclaredTypeSym(t->declaration)) return false;  // a user type
         return t->declaration->isValueBuiltin;
     }
+    // fix #9033 (§27.8, v0.359): an alias is transparent, and the alias
+    // restore leaves the use-site name (`TS`) in `astNode`; the underlying
+    // head rides in `aliasResolvedHead`, so read it first.
+    if (!t->aliasResolvedHead.empty())
+        return isValueBuiltinByName(t->aliasResolvedHead);
     // The DECLARATION-LESS shape: the NAME decides. The LAST path part is
     // the head (`System.Guid` names the same built-in as `Guid`).
     if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())

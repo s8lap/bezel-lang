@@ -65,3 +65,75 @@ end Program;
 )"),
                       "accepted\n");
 }
+
+// fix #9033 (§27.8 alias transparency, §14.2, stdlib §2.5, v0.359): an alias
+// of a stdlib value record is admitted against `where T: value` exactly as
+// the record is, at the instantiation site and the call site.
+BEZEL_TEST(sema_bound_conformance_9033, value_bound_admits_an_alias_of_a_stdlib_value_builtin_at_an_instantiation) {
+    BEZEL_EXPECT_EQ(out(R"(
+module M;
+type TS := TimeSpan;
+public class Box<T> where T: value
+  public method N(): int => 7;
+end Box;
+public class P
+  public static method Main(): int
+    var b := new Box<TS>();
+    Console.WriteLine(b.N());
+    return 0;
+  end Main;
+end P;
+)"),
+                      "7\n");
+}
+
+BEZEL_TEST(sema_bound_conformance_9033, value_bound_admits_an_alias_of_a_stdlib_value_builtin_at_a_call_site) {
+    BEZEL_EXPECT_EQ(out(R"(
+module M;
+type TS := TimeSpan;
+public class P
+  public static method F<T>(x: T): int where T: value
+    return 1;
+  end F;
+  public static method Main(): int
+    var t: TS := TimeSpan.FromTicks(5L);
+    Console.WriteLine(F(t));
+    return 0;
+  end Main;
+end P;
+)"),
+                      "1\n");
+}
+
+BEZEL_TEST(sema_bound_conformance_9033, value_bound_admits_an_alias_of_a_stdlib_value_builtin_with_explicit_type_argument) {
+    BEZEL_EXPECT_EQ(out(R"(
+module M;
+type TS := TimeSpan;
+public class P
+  public static method F<T>(x: T): int where T: value => 1;
+  public static method Main(): int
+    Console.WriteLine(F<TS>(TimeSpan.FromTicks(5L)));
+    return 0;
+  end Main;
+end P;
+)"),
+                      "1\n");
+}
+
+// Controls (must not flip): an alias of a user class is still refused.
+BEZEL_TEST(sema_bound_conformance_9033, value_bound_still_rejects_an_alias_of_a_user_class) {
+    JitResult r = runAot(R"(
+module M;
+public class C end C; type CA := C;
+public class P
+  public static method F<T>(x: T): int where T: value
+    return 1;
+  end F;
+  public static method Main(): int
+    var c: CA := new C(); Console.WriteLine(F(c));
+    return 0;
+  end Main;
+end P;
+)");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+}
