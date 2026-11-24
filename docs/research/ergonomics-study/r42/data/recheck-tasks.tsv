@@ -1,0 +1,41 @@
+task	drafts	final_r40	final_r42	v1_r40	v1_r42	drafts_ok_r40	drafts_ok_r42	per_draft_r40	per_draft_r42	diagnostics_or_behaviour_change
+t01-wc	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	no change
+t02-wordfreq	6	ok	ok	reject	reject	1	5	v1:reject v2:wrong v3:wrong v4:wrong v5:wrong v6:ok final:ok	v1:reject v2:ok v3:ok v4:ok v5:ok v6:ok final:ok	v2-v5 now correct (B4/B5/B6/B7 fixed). v1 still degrades: `Console.In.ReadToEnd().ToLower()` lowers to nothing (B1 changed).
+t03-csv	4	ok	ok	reject	reject	1	2	v1:reject v2:reject v3:wrong v4:ok final:ok	v1:reject v2:reject v3:ok v4:ok final:ok	v3 now correct (B4/B6). v1/v2 now fail on an untyped lambda inside a group (`g.Sum(lambda(e) => e.Salary)`: "string member .Salary") — B3 changed; v1 still hits stored GroupBy (#755).
+t04-grep	3	ok	ok	reject	reject	1	1	v1:reject v2:reject v3:ok final:ok	v1:reject v2:reject v3:ok final:ok	unchanged: B8 (contested #6698).
+t05-ini	2	ok	ok	reject	reject	1	1	v1:reject v2:ok final:ok	v1:reject v2:ok final:ok	v1 loses the ParseOrNull error (B9 fixed); the owned-field / fresh-store errors (LANG-RULE) remain.
+t06-logsummary	2	ok	ok	wrong	ok	1	2	v1:wrong v2:ok final:ok	v1:ok v2:ok final:ok	v1 now correct (B6 fixed).
+t07-money	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	no change
+t08-shapes	2	ok	ok	wrong	ok	1	2	v1:wrong v2:ok final:ok	v1:ok v2:ok final:ok	v1 now correct (B4 fixed).
+t09-weekday	2	ok	ok	reject	reject	1	1	v1:reject v2:ok final:ok	v1:reject v2:ok final:ok	v1: NameOf/FromNameOrNull errors gone (B10 fixed); typeof (#3819) and the 2-argument Equals user error remain.
+t10-validate	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	B2 must-use warning gone.
+t11-groupby	3	ok	ok	reject	reject	1	2	v1:reject v2:wrong v3:ok final:ok	v1:reject v2:ok v3:ok final:ok	v2 now correct (B13, B4). v1 now fails on "string member .Amount" (B3 changed: untyped lambda inside a group) instead of the conversion error.
+t12-topn	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	no change
+t13-join	2	ok	ok	reject	reject	1	1	v1:reject v2:ok final:ok	v1:reject v2:ok final:ok	unchanged: Count(pred) shadowed (LANG-RULE).
+t14-histogram	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	no change
+t15-sets	6	wrong	ok	wrong	ok	0	6	v1:wrong v2:wrong v3:wrong v4:wrong v5:wrong v6:wrong final:wrong	v1:ok v2:ok v3:ok v4:ok v5:ok v6:ok final:ok	all 7 drafts now correct, 20/20 repeated runs (B11 fixed).
+t16-inventory	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	B23 must-use warning gone.
+t17-parsesum	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	no change
+t18-retry	2	ok	ok	reject	ok	1	2	v1:reject v2:ok final:ok	v1:ok v2:ok final:ok	v1 now compiles and is correct (B12 fixed).
+t19-result	2	ok	ok	reject	reject	1	1	v1:reject v2:ok final:ok	v1:reject v2:ok final:ok	v1: ParseOrNull error gone (B9); bare Ok/Error in an if-expression still rejected, with a better note.
+t20-exceptions	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	no change
+t21-numberlines	2	ok	ok	wrong	reject	1	1	v1:wrong v2:ok final:ok	v1:reject v2:ok final:ok	v1 now rejected correctly at compile time (B16); File.Delete warnings gone (B14).
+t22-binary	2	ok	ok	reject	ok	1	2	v1:reject v2:ok final:ok	v1:ok v2:ok final:ok	v1 (stream span I/O) now compiles and is correct (B15 fixed); unused-result warning gone.
+t23-dirlist	2	ok	ok	reject	reject	1	1	v1:reject v2:ok final:ok	v1:reject v2:ok final:ok	B2 warning gone; v1 still Count(pred).
+t24-json-roundtrip	3	ok	ok	reject	reject	1	1	v1:reject v2:reject v3:ok final:ok	v1:reject v2:reject v3:ok final:ok	v2 (class owning Array<string>) no longer hits B19; it now fails on its own constructor shape (user error). v1 still: record cannot hold a list; Json facade NYI.
+t25-json-read	5	ok	ok	wrong	wrong	1	1	v1:wrong v2:wrong v3:wrong v4:wrong v5:ok final:ok	v1:wrong v2:wrong v3:wrong v4:wrong v5:ok final:ok	unchanged: v1-v4 fail at run time on the object end (no end-of-object probe).
+t26-plugins	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	unchanged unused-result warning.
+t27-lru	2	ok	ok	reject	reject	1	1	v1:reject v2:ok final:ok	v1:reject v2:ok final:ok	unchanged: ?? across types; unused-result warnings.
+t28-comparer	3	ok	ok	reject	reject	1	1	v1:reject v2:reject v3:ok final:ok	v1:reject v2:reject v3:ok final:ok	unchanged (closures; generic comma in hole). B24 repro now correct.
+t29-partition	2	ok	ok	reject	reject	1	1	v1:reject v2:ok final:ok	v1:reject v2:ok final:ok	v1: B22 error gone; B17 (contested) remains. B18 internal warning gone in v2/final.
+t30-workers	3	ok	ok	reject	reject	2	2	v1:reject v2:ok v3:ok final:ok	v1:reject v2:ok v3:ok final:ok	unchanged: fresh tasks into an Array.
+t31-pipeline	3	ok	ok	reject	reject	1	1	v1:reject v2:reject v3:ok final:ok	v1:reject v2:reject v3:ok final:ok	unchanged: `out` keyword; captured sender in a closure; owned-parameter warnings at teardown.
+t32-timeout	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	no change
+t33-fanout	2	ok	ok	reject	reject	1	1	v1:reject v2:ok final:ok	v1:reject v2:ok final:ok	v1 loses the Stopwatch error (B12); WhenAll over fresh tasks remains.
+t34-statemachine	3	ok	ok	reject	reject	1	1	v1:reject v2:reject v3:ok final:ok	v1:reject v2:reject v3:ok final:ok	unchanged: v1 33 lines, v2 215 lines of parse errors after one correct first error.
+t35-calc	3	ok	ok	reject	reject	1	1	v1:reject v2:reject v3:ok final:ok	v1:reject v2:reject v3:ok final:ok	B20 warning gone; v1/v2 unchanged (return in an arm; recursive choice).
+t36-pool	2	ok	ok	reject	reject	1	1	v1:reject v2:ok final:ok	v1:reject v2:ok final:ok	unchanged: move at an owned argument.
+t37-table	2	ok	ok	wrong	ok	1	2	v1:wrong v2:ok final:ok	v1:ok v2:ok final:ok	v1 now correct (B13 fixed).
+t38-dates	2	ok	ok	reject	reject	1	1	v1:reject v2:ok final:ok	v1:reject v2:ok final:ok	v1 unchanged (DateOnly has no arithmetic). B21 repro now works.
+t39-ffi	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	no change
+t40-lockcounter	2	half	half	reject	reject	0	0	v1:reject v2:wrong final:wrong	v1:reject v2:wrong final:wrong	unchanged: Locked<T> not implemented (#1721), mutex half not expressible.

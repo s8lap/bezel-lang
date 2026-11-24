@@ -1,0 +1,97 @@
+id	task	construct	cause_r40	report_theme	bug_cluster	weight	r42_status	resolved_by	evidence_r42
+F001	t01-wc	whitespace split	MISSING	text-stdlib		1	still	-	stdlib §9.6 v0.359: Split keeps empties, no whitespace split
+F002	t01-wc	read all stdin	COMPILER-BUG		C-specified-missing	1	resolved	compiler fix	B1: ReadToEnd itself now correct; t01 final unchanged
+F003	t02-wordfreq	read all stdin	COMPILER-BUG		C-specified-missing	2	changed	compiler fix (partial)	B1 changed: ReadToEnd().ToLower() still degrades (t02 v1)
+F004	t02-wordfreq	diagnostic for B1	DIAGNOSTIC	diagnostics		2	still	-	t02 v1: same internal warning, then the error at the for loop
+F005	t02-wordfreq	word tally	COMPILER-BUG		C-documented-nyi	1	still	-	Counter<K> unresolved (#3848, #8472)
+F006	t02-wordfreq	split on non-letters	MISSING	text-stdlib		2	still	-	no regex / split-by-predicate (codegen §5.0 deferred list)
+F007	t02-wordfreq	OrderByDescending(...).ThenBy(string key)	COMPILER-BUG		C-silent-query	2	resolved	compiler fix	B4
+F008	t02-wordfreq	sort dictionary entries	COMPILER-BUG		C-silent-query	2	resolved	compiler fix	B5
+F009	t02-wordfreq	record from entry field	COMPILER-BUG		C-string-lifetime	2	resolved	compiler fix	B6
+F010	t02-wordfreq	untyped comparer lambda	COMPILER-BUG		C-silent-query	2	resolved	compiler fix	B7
+F011	t03-csv	GroupBy stored in a variable	COMPILER-BUG		C-documented-nyi	1	still	-	stored GroupBy still rejected citing closed #755
+F012	t03-csv	GroupBy with untyped key lambda	COMPILER-BUG		C-inference	2	changed	compiler fix (partial)	B3 key lambda fixed; inner untyped lambdas over a group now typed as the key (t03 v1/v2)
+F013	t03-csv	sort groups by key	COMPILER-BUG		C-silent-query	2	resolved	compiler fix	B4
+F014	t03-csv	record from array element	COMPILER-BUG		C-string-lifetime	3	resolved	compiler fix	B6
+F015	t03-csv	helper returning Array	COMPILER-BUG		C-ownership-false-positive	1	resolved	compiler fix	B2
+F016	t03-csv	CSV parsing	MISSING	text-stdlib		2	still	-	no CSV reader
+F017	t04-grep	if-expression over narrowed local	COMPILER-BUG		C-misc	2	still	-	B8 (contested #6698)
+F018	t04-grep	diagnostic for B8	DIAGNOSTIC	diagnostics		2	still	-	t04 v1/v2 same diagnostic at the later use
+F019	t05-ini	field holding a fresh collection	LANG-RULE	ownership-outside-resources		1	still	-	t05 v1 same owned-field error
+F020	t05-ini	nested collection	LANG-RULE	ownership-outside-resources		2	still	-	t05 v1 same fresh-store error
+F021	t05-ini	int parse with default	COMPILER-BUG		C-specified-missing	1	resolved	compiler fix	B9; ParseOrNull is also the doc doctrine for an expected absence (v0.359 codegen §5.1, Guide 2 §2)
+F022	t06-logsummary	record from Split parts	COMPILER-BUG		C-string-lifetime	2	resolved	compiler fix	B6
+F023	t08-shapes	largest by key	COMPILER-BUG		C-silent-query	2	resolved	compiler fix	B4: OrderBy over a double key works, so OrderByDescending(f).First() is now right
+F024	t08-shapes	max-by	MISSING	query-surface		2	still	-	no MaxBy/MinBy (codegen §5.11 lists them as absent)
+F025	t08-shapes	choice name	VERBOSE/AWKWARD	enum-case-names		1	still	-	by design; no choice case-name string
+F026	t09-weekday	enum names	COMPILER-BUG		C-specified-missing	2	resolved	compiler fix	B10
+F027	t09-weekday	case-insensitive compare (cascade)	DIAGNOSTIC	diagnostics		1	changed	compiler fix	t09 v1: 3 errors instead of 7 (the NameOf/FromNameOrNull errors are gone); the 2-argument Equals error remains and is a user error the message names
+F028	t09-weekday	enum ToString	LANG-RULE	enum-case-names		2	still	-	by design (ToString renders the qualified name; NameOf now works)
+F029	t09-weekday	enum iteration	COMPILER-BUG		C-documented-nyi	2	still	-	typeof(E).EnumValues not reachable (#3819)
+F030	t10-validate	owned Array return	COMPILER-BUG		C-ownership-false-positive	1	resolved	compiler fix	B2
+F031	t11-groupby	GroupBy -> Select(new record) untyped	COMPILER-BUG		C-inference	2	changed	compiler fix (partial)	t11 v1 now fails on "string member .Amount" (inner lambda over a group) instead of the conversion error
+F032	t11-groupby	Sum over decimal selector in group	COMPILER-BUG		C-silent-query	2	resolved	compiler fix	B13
+F033	t11-groupby	OrderByDescending decimal key	COMPILER-BUG		C-silent-query	1	resolved	compiler fix	B4
+F034	t11-groupby	group summary record	MISSING	tuples		2	still	-	no tuples (rationale §18 deferred)
+F035	t13-join	count with predicate on Array	LANG-RULE	query-surface		1	still	-	Count(pred) still shadowed; codegen §5.1 now states it
+F036	t14-histogram	tally	COMPILER-BUG		C-documented-nyi	1	still	-	Counter NYI
+F037	t15-sets	set algebra + subset	COMPILER-BUG		C-checked-mode-fault	3	resolved	compiler fix	B11: all t15 drafts correct
+F038	t16-inventory	bind a lazy query to a local	COMPILER-BUG		C-ownership-false-positive	1	resolved	compiler fix	B23
+F039	t16-inventory	ensure key exists	VERBOSE/AWKWARD	counting-upsert		1	still	-	upsert by design
+F040	t18-retry	owned local in async body	COMPILER-BUG		C-ownership-false-positive	1	resolved	compiler fix	B12
+F041	t18-retry	explicit type argument	USER-ERROR			1	still	-	user error (unchanged)
+F042	t19-result	bare Ok/Error in if-expression	LANG-RULE	expression-forms		1	still	-	t19 v1 still rejected; the note now explains the declared-result positions
+F043	t19-result	int.ParseOrNull	COMPILER-BUG		C-specified-missing	1	resolved	compiler fix	B9
+F044	t20-exceptions	wrapping exception class	VERBOSE/AWKWARD	exception-boilerplate		1	still	-	still a primary constructor cannot take (message, cause); recurred in n05
+F045	t21-numberlines	collection literal as an IEnumerable argument	COMPILER-BUG		C-misc	2	resolved	compiler fix	B16: now rejected at compile time with the remedy
+F046	t21-numberlines	unit-returning stdlib call flagged	COMPILER-BUG		C-misc	1	resolved	compiler fix	B14
+F047	t22-binary	write a span to a stream	COMPILER-BUG		C-specified-missing	2	resolved	compiler fix	B15
+F048	t22-binary	read a span from a stream	COMPILER-BUG		C-specified-missing	1	resolved	compiler fix	B15
+F049	t22-binary	bytes from int	USER-ERROR			1	still	-	user error (unchanged)
+F050	t23-dirlist	count with predicate on Array	LANG-RULE	query-surface		1	still	-	Count(pred) shadowed
+F051	t23-dirlist	file size	MISSING	io-gaps		2	still	-	no File.GetStatus (proposal 0071 not in stdlib v0.359)
+F052	t23-dirlist	owned Array from GetFiles	COMPILER-BUG		C-ownership-false-positive	1	resolved	compiler fix	B2
+F053	t24-json-roundtrip	record with a list component	LANG-RULE	serialization-shape		3	changed	compiler fix	a record still cannot hold a list (§9.8), but the class route now works (B19 fixed): n06 round-trips nested records in a class first time
+F054	t24-json-roundtrip	one-shot JSON facade	COMPILER-BUG		C-documented-nyi	2	still	-	Json facade NYI (#2349)
+F055	t24-json-roundtrip	class owning Array<string> as a serialized component	COMPILER-BUG		C-misc	3	resolved	compiler fix	B19
+F056	t24-json-roundtrip	auto-property without initializer	LANG-RULE	small-rules		1	still	-	rule unchanged
+F057	t25-json-read	strict deserializer by default	VERBOSE/AWKWARD	serialization-shape		1	still	-	JsonOptions still five positional components (stdlib §2.15 v0.359); recurred in n07
+F058	t25-json-read	discarding a returned count	LANG-RULE	unused-result		1	still	-	t25 v1 same warning
+F059	t25-json-read	iterate an object's fields of unknown count	MISSING	serialization-shape		3	still	-	no end-of-object probe in IDeserializer (stdlib §2.14 v0.359); t25 v1-v4 same run-time faults
+F060	t25-json-read	error at the end of an object	DIAGNOSTIC	diagnostics		2	still	-	same run-time messages
+F061	t25-json-read	field names	VERBOSE/AWKWARD	serialization-shape		1	still	-	no naming policy; recurred in n07
+F062	t26-plugins	ignoring an exit code	LANG-RULE	unused-result		1	still	-	t26 same warning
+F063	t27-lru	?? across types	LANG-RULE	nullable-coalesce		1	changed	doc change	rule unchanged; v0.359 adds the non-nullable-left rule (#8596): `i ?? 0` warns "never evaluated" and `i ?? "s"` is rejected, matching the docs
+F064	t27-lru	discarding mutator results	LANG-RULE	unused-result		1	still	-	t27 v1 same warnings
+F065	t28-comparer	comparer combinators returning closures	LANG-RULE	closures-escape		3	still	-	spec §28.14 Known v1 limitation; n11/n17 hit the same wall
+F066	t28-comparer	type inference through nested generic calls	DIAGNOSTIC	diagnostics		2	still	-	t28 v1 same 8 conversion errors
+F067	t28-comparer	generic call inside interpolation hole	LANG-RULE	small-rules		1	still	-	t28 v2 same (excellent) message
+F068	t28-comparer	MaxBy helper	MISSING	query-surface		1	still	-	no MaxBy
+F069	t28-comparer	explicit type args for a generic method with a lambda	COMPILER-BUG		C-inference	3	resolved	compiler fix	B24
+F070	t29-partition	multiple results	MISSING	tuples		2	still	-	no tuples
+F071	t29-partition	interpolation in a Select projection	COMPILER-BUG		C-string-lifetime	1	still	-	B17 (contested)
+F072	t29-partition	generic inference from a Range argument	COMPILER-BUG		C-inference	1	resolved	compiler fix	B22
+F073	t29-partition	ToString on T in a generic body	COMPILER-BUG		C-inference	1	resolved	compiler fix	B18
+F074	t30-workers	fresh tasks into an Array	LANG-RULE	ownership-outside-resources		2	still	-	t30 v1 same error; recurred in n15 (5 holder lines)
+F075	t30-workers	spawn argument shape	USER-ERROR			1	still	-	user error (unchanged)
+F076	t31-pipeline	parameter named out	LANG-RULE	small-rules		1	still	-	`out` reserved; recurred in n10 (the first error now names the rule)
+F077	t31-pipeline	diagnostic for keyword as name	DIAGNOSTIC	diagnostics		1	still	-	t31 v1 same 5-line cascade
+F078	t31-pipeline	hand an owned sender to a spawned closure	LANG-RULE	ownership-outside-resources		3	still	-	t31 v2 same closure-capture error
+F079	t31-pipeline	owned parameter auto-disposed at frame end	LANG-RULE	ownership-outside-resources		1	still	-	t31 final same two warnings
+F080	t33-fanout	Stopwatch in async body	COMPILER-BUG		C-ownership-false-positive	1	resolved	compiler fix	B12
+F081	t33-fanout	WhenAll over fresh tasks	LANG-RULE	ownership-outside-resources		2	still	-	t33 v1 same WhenAll error (Stopwatch error gone)
+F082	t33-fanout	result projection	COMPILER-BUG		C-string-lifetime	1	still	-	B17
+F083	t34-statemachine	statement bodies inside expression-case arms	LANG-RULE	expression-forms		2	still	-	rule unchanged
+F084	t34-statemachine	nested case statement as an arm body	LANG-RULE	expression-forms		1	still	-	rule unchanged
+F085	t34-statemachine	diagnostic for nested case	DIAGNOSTIC	diagnostics		2	still	-	t34 v2 still 215 lines; but n19 shows the single-case form now gives one error
+F086	t35-calc	return inside a statement-case arm	VERBOSE/AWKWARD	expression-forms		1	still	-	recurred in n22
+F087	t35-calc	recursive sum type for an AST	LANG-RULE	recursive-data		2	still	-	rule unchanged
+F088	t35-calc	owned return through a loop	COMPILER-BUG		C-ownership-false-positive	1	resolved	compiler fix	B20
+F089	t36-pool	owned argument from a named local	LANG-RULE	ownership-outside-resources		1	still	-	rule unchanged
+F090	t37-table	decimal Sum	COMPILER-BUG		C-silent-query	2	resolved	compiler fix	B13
+F091	t38-dates	date-only arithmetic	MISSING	dates		2	still	-	DateOnly still has no AddDays/DayNumber (t38 v1)
+F092	t38-dates	DateOnly.ToString(format)	COMPILER-BUG		C-specified-missing	1	resolved	compiler fix	B21
+F093	t38-dates	enum constant names	COMPILER-BUG		C-specified-missing	2	resolved	compiler fix	B10
+F094	t40-lockcounter	mutex-guarded shared state across domains	COMPILER-BUG		C-documented-nyi	3	still	-	Locked<T> NYI (#1721)
+F095	t40-lockcounter	diagnostic cascade for Locked	DIAGNOSTIC	diagnostics		1	still	-	t40 v1 same cascade
+F096	(all)	collection literal needs a declared target	VERBOSE/AWKWARD	literal-annotations		1	still	-	rule unchanged
