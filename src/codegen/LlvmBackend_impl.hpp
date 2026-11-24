@@ -25803,6 +25803,21 @@ private:
     // the same set, which is what makes the producer/consumer balance sound.
     bool isPrimIntrinsicMethodRef(const ast::Expr* e) const;
 
+    // fix #9028 (§8.1 / §8.4 / §11.7 / §22.12 / §27.6, v0.359): is `ma` the
+    // INHERITED static `Object.ReferenceEquals` named through a CLASS type name
+    // — `K.ReferenceEquals` — used as a method-group VALUE (`var f :=
+    // K.ReferenceEquals;`)? §11.7: "`Object`'s static `ReferenceEquals`
+    // (§8.1) is inherited by a static class as by every class"; §22.12: "A
+    // static member declared on a base class is a member of every class
+    // derived from it ... and may be named through a derived type". The
+    // spelling is the discriminator: the target must be a CLASS type name
+    // (§12's implicit `Object` base) and the member must be
+    // `ReferenceEquals` — the ONE static §8.1 declares. A record, an enum, a
+    // choice and an interface are NOT admitted here (#9021 owns those
+    // holes): they reach `Object` by BOXING (§8.6) or not at all (§11.2),
+    // so §26.5 rule 2's "no member" answer is theirs.
+    bool isClassTypeNameRefEqualsRef(const ast::MemberAccessExpr& ma) const;
+
     // fix #2781 (§8.1 / §14.2): a method-group reference to Object's universal
     // instance member on an Object-typed receiver — `o.ToString`, `o.Equals`,
     // `o.GetHashCode` — has no MethodSymbol (Object is a primitive, its

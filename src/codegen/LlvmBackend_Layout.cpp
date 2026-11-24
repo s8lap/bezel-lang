@@ -9372,6 +9372,19 @@ llvm::Value* Emitter::makePrimIntrinsicThunk(const ast::MemberAccessExpr& ma,
     // §27.6 (v0.338, #5814): the built-in `Math` selectors reference through
     // tryLowerBuiltinClassCall; one thunk per type argument (identity key).
     const bool isMath = id->name == "Math";
+    // fix #9028 (§8.1 / §8.4 / §11.7 / §22.12 / §27.6, v0.359): the INHERITED
+    // static `Object.ReferenceEquals` named through a CLASS type name — `var f
+    // := K.ReferenceEquals;`. §11.7: "`Object`'s static `ReferenceEquals`
+    // (§8.1) is inherited by a static class as by every class", and §22.12
+    // lets a derived type NAME it — so this is the ROOT's static, and the
+    // comparison is the ROOT's: the receiver's type does not enter it
+    // (§8.4: "compares object identity"). The ONE identity compare below
+    // therefore serves both spellings — there is no second compare to keep in
+    // step.
+    const bool viaClassTypeName =
+        pt == sema::PrimitiveType::None && !isMath &&
+        isClassTypeNameRefEqualsRef(ma);
+    if (viaClassTypeName) pt = sema::PrimitiveType::Object;
     if (pt == sema::PrimitiveType::None && !isMath) return nullptr;
 
     // fix #6295 item 1 (§14.2, §27.6, stdlib §2.2, v0.355): a `Math.Max<T>`
@@ -9469,7 +9482,11 @@ llvm::Value* Emitter::makePrimIntrinsicThunk(const ast::MemberAccessExpr& ma,
     auto synthCall = std::make_unique<ast::CallExpr>();
     {
         auto synthTargetId = std::make_unique<ast::IdentifierExpr>();
-        synthTargetId->name = id->name;
+        // fix #9028: the class-type-name spelling lowers through the ROOT's
+        // identity compare, so the synthetic call spells the ROOT (`Object`) —
+        // the ONE lowering, not a second identity compare to keep in step.
+        synthTargetId->name = viaClassTypeName ? std::string_view("Object")
+                                                : id->name;
         auto synthCallee = std::make_unique<ast::MemberAccessExpr>();
         synthCallee->target = std::move(synthTargetId);
         synthCallee->member = ma.member;
@@ -9549,7 +9566,46 @@ bool Emitter::isPrimIntrinsicMethodRef(const ast::Expr* e) const {
     if (id->name == "Math")
         return ma->member == "Min" || ma->member == "Max" ||
                ma->member == "Clamp" || ma->member == "Abs";
-    return sema::primitiveFromName(id->name) != sema::PrimitiveType::None;
+    if (sema::primitiveFromName(id->name) != sema::PrimitiveType::None)
+        return true;
+    // fix #9028 (§8.1 / §8.4 / §11.7 / §22.12 / §27.6, v0.359): the INHERITED
+    // static `Object.ReferenceEquals` named through a CLASS type name —
+    // `var f := K.ReferenceEquals;` — is the ROOT's static, so it lowers
+    // through the SAME thunk as the root `Object.ReferenceEquals` reference
+    // (makePrimIntrinsicThunk → the one identity compare). Sema already
+    // types this shape as a `(Object, Object) -> bool` function value and
+    // binds NO MethodSymbol to it (the #8795 arm), so without this arm the
+    // CG60 gate fell through to `ret nullptr`: the local's slot degraded to
+    // zero behind #2434's warning and the call of it was a null-function
+    // SEGV.
+    return isClassTypeNameRefEqualsRef(*ma);
+}
+
+// fix #9028 (§8.1 / §8.4 / §11.7 / §22.12, v0.359): the SHARED discriminator
+// for the class-type-name spelling of the inherited static
+// `Object.ReferenceEquals` — `K.ReferenceEquals` as a method-group VALUE.
+//
+// §11.7: "`Object`'s static `ReferenceEquals` (§8.1) is inherited by a static
+// class as by every class"; §22.12: "A static member declared on a base class
+// is a member of every class derived from it ... and may be named through a
+// derived type". The target must be a CLASS type name — §12: "If no base
+// class is specified, the implicit base is `Object`" — and the member must be
+// `ReferenceEquals`, the ONE static §8.1 declares.
+//
+// A record, an enum, a choice and an interface are NOT admitted (#9021 owns
+// those holes): they reach `Object` by BOXING (§8.6) or not at all (§11.2),
+// so §26.5 rule 2's "no member" answer is theirs — this predicate does not
+// widen the admission.
+bool Emitter::isClassTypeNameRefEqualsRef(
+        const ast::MemberAccessExpr& ma) const {
+    if (ma.member != "ReferenceEquals") return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get());
+    if (!id) return false;
+    // The TARGET's symbol is the type it names — the same binding the #8795
+    // CALL-form arm reads (LlvmBackend_Calls2.cpp's tryLowerPrimitiveStaticCall
+    // #8795 arm), so the two spellings agree on WHAT is admitted.
+    auto* ts = dynamic_cast<sema::TypeSymbol*>(ctx_.exprSymbol(*id));
+    return ts && ts->kind == ast::TypeDeclKind::Class;
 }
 
 // fix #2781 (§8.1 / §14.2 / §27.6): mirror of isPrimIntrinsicMethodRef for
