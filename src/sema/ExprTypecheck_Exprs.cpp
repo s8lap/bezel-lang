@@ -17811,14 +17811,49 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // concrete class/interface slot, so an untyped-context lambda
         // (`var f := lambda() => new Res();` with no annotation) is
         // unaffected — the no-target inference still picks `Res` and the
-        // §21.9 / §28.6 paths handle the rest. The check also does NOT
-        // fire on an ASCRIBED lambda: an ascription is the programmer-
-        // declared return slot, and its `return` statements go through
-        // the ordinary `checkAssignable(currentReturnType_, …)` path
-        // (line 8090+) which already constrains the body's types.
-        // The two paths are distinct (typed-context vs. ascription) per
-        // #2107's threading distinction.
-        if (lamTargetRet && !hasAscription) {
+        // §21.9 / §28.6 paths handle the rest.
+        //
+        // fix #9040 (§28.3.5 *The announcement table* row 4, v0.359): the
+        // check now fires on an ASCRIBED lambda too — the `!hasAscription`
+        // gate this site carried is REMOVED. The gate's own rationale
+        // ("an ascription is the programmer-declared return slot, and its
+        // `return` statements go through the ordinary `checkAssignable`
+        // path, which already constrains the body's types") constrains
+        // TYPES, not OWNERSHIP — and the callee-side half of row 4 is an
+        // ownership rule: a fresh owned value minted into a plain
+        // concrete class/interface slot is rejected, because the row's
+        // function-value-invocation column classifies every such
+        // invocation's result as a BORROW ("The result is never owned"),
+        // so no caller would ever dispose the minted frame.
+        //
+        // The ASCRIPTION does not change the slot's kind: the CALLER
+        // reads the TARGET's function type (the target is what the
+        // caller holds and what its invocation is keyed on — §28.3.5's
+        // Keying rule reads the callee's DECLARED return kind), and the
+        // ascription only constrains the body's types against it. So a
+        // target slot that is a plain class/interface is row 4's slot
+        // whether or not the lambda spelled its return type out.
+        //
+        // MEASURED (the gap this closes), on r30-c1 @ 5697baf74:
+        //   `var f: () -> W := lambda(): W => new W();`   ACCEPTED (leaks)
+        //   `Make(): () -> W { return lambda(): W => new W(); }`  ACCEPTED
+        // the two un-ascribed twins
+        //   `var f: () -> W := lambda() => new W();`       REJECTED
+        //   `Make(): () -> W { return lambda() => new W(); }`  REJECTED
+        // were already rejected by this same check — the ascription was
+        // the only way past it. The accepted forms are exactly the
+        // programs issue #9040's family needs rejected: their lambda
+        // mints a fresh frame into a slot the caller reads as a borrow.
+        // (The legal spelling is `() -> owned W` on the TARGET — a
+        // lambda ascription cannot carry an `owned` marker at all: the
+        // grammar's `owned` appears only in a function type's return
+        // slot, a parameter modifier, and an inline-array element.)
+        //
+        // An `owned`-marked TARGET is unaffected: `lamTargetRetOwned`
+        // suppresses the check there (§28.8's transferring slot), so the
+        // stdlib §4.14 spelling `init: (int) -> owned T` and its
+        // `lambda(i: int): T => new T()` argument keep working.
+        if (lamTargetRet) {
             checkConcreteSlotLambdaBody(*lam, lamTargetRet,
                                         lamTargetRetOwned,
                                         /*savedCurrentReturnType=*/nullptr);

@@ -13504,12 +13504,81 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         if (calleeTy && calleeTy->kind == sema::TypeRef::Kind::Function) {
             llvm::Value* closurePtr = lowerExpr(*call.callee);
             llvm::Value* ccRes = emitClosureCall(closurePtr, calleeTy, &call);
+            // fix #9040 (§28.3.5 *The announcement table* row 4, v0.359): the
+            // scope-end disposal is registered ONLY when the announcement
+            // table says the caller OWNS the chain-call result. The
+            // function-value-invocation column of row 4 (a plain concrete
+            // class or interface return slot) reads "Borrow, sources = the
+            // function value's source set … **The result is never owned**",
+            // and the ownership pass classifies the chain-call result the
+            // same way (Ownership.cpp's `producerState` function-value arm:
+            // a plain class slot is not one of the Owned families, so the
+            // local the result is bound to is a BORROW and carries no
+            // disposal obligation).
+            //
+            // THE DEFECT (issue #9040). The registration below fired for
+            // EVERY class/record-typed return slot, owned or not, so a
+            // BORROWED result was DISPOSED at the end of the full expression
+            // — freeing an object the caller does not own. Measured on
+            // r30-c1 @ 5697baf74 with `bezelc --sanitize=address`:
+            //
+            //   public static method Use(p: K): () -> K
+            //     var f := lambda() => p; var g := lambda() => f();
+            //     return lambda() => g();
+            //   end Use;
+            //   ...
+            //   var r2 := Program.Use(s2)();     // the chain-call form
+            //   Console.WriteLine(r2.N);
+            //
+            // — `Use`'s closure captures the plain (borrowing) parameter `p`,
+            // so the invocation's result is a BORROW of the caller's `s2`
+            // (row 4's sources: the function value's source set). The
+            // disposal freed `s2`'s object at the end of the statement, and
+            // `s2`'s own scope-end disposal then read the freed object:
+            //
+            //   ERROR: AddressSanitizer: heap-use-after-free
+            //   READ of size 8 … in main          (s2's scope-end disposal)
+            //   freed by thread T0 here: free … in main  (the chain-call
+            //                                    result's disposal)
+            //
+            // The BOUND twin (`var h := Program.Use(s); h()`) is clean and
+            // stays clean: its callee is an identifier, so the result is
+            // bound straight into the local's slot and no chain-call
+            // disposal was ever registered for it.
+            //
+            // THE OWNED FAMILIES still dispose, and are the ones the
+            // announcement table makes Owned: row 1 (`owned T` over a
+            // non-mint-announcing type — the function type's own `owned`
+            // return marker), rows 2/3 (a mint-announcing declared slot: the
+            // `Task`-family and the eight iterable-family heads — calls
+            // mint), and the owning-wrapper/owning-collection heads, which
+            // §28.3's producers classify Owned. Every other slot is row 4's
+            // borrow — including a bare type parameter (row 5) and a value
+            // type (row 7) — and the result is never owned, so no disposal
+            // is registered for it.
+            //
+            // A chain call whose result is a BORROW and is not bound to a
+            // local is an unbound temporary, and §28.3.11 disposes an
+            // unbound temporary at the end of the full expression — but
+            // only an OWNED one ("Such a temporary" = an owned value). A
+            // borrowed one is not disposed at all: the caller does not own
+            // the referent. So the whole registration is skipped for a
+            // borrow, and the value is simply left alone.
+            bool chainResultOwned = calleeTy->funcReturnOwned;
+            if (!chainResultOwned && calleeTy->funcReturn &&
+                calleeTy->funcReturn->kind == sema::TypeRef::Kind::Named) {
+                const std::string_view head = calleeTy->funcReturn->headName();
+                chainResultOwned = common::isTaskFamilyHead(head) ||
+                                   common::isIterableInterfaceHead(head) ||
+                                   common::isOwningTypeHead(head);
+            }
             // fix #4239 (§27.5 / §28.9, v0.300): when the chain-call result is
             // a class/record type, store through the local's OWN slot and register
             // scope-end disposal.  lowerLocalDecl wires the slot to us via
             // pendingChainCallLocalSlot_ so we use the same slot the disposal
             // will fire on.
-            if (calleeTy->funcReturn &&
+            if (chainResultOwned &&
+                calleeTy->funcReturn &&
                 calleeTy->funcReturn->kind == sema::TypeRef::Kind::Named &&
                 calleeTy->funcReturn->declaration &&
                 !calleeTy->funcReturn->nullable) {
