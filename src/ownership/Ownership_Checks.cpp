@@ -19457,6 +19457,28 @@ void MethodOwnership::noteLoopScanOffset(std::uint32_t off) {
     }
 }
 
+// issue #8988: a binding DECLARED inside a loop body is re-created on every
+// iteration of that loop. Record its declaration node on every loop currently
+// being scanned (a nested loop's declarations are re-created by the enclosing
+// loop's back edge as well), so the freeze query can tell a per-iteration
+// binding from a loop-invariant one. // per §28.3.9
+void MethodOwnership::noteLoopDecl(const ast::Node* decl) {
+    if (!decl) return;
+    for (auto& lr : loopScanStack_) lr.decls.push_back(decl);
+}
+
+// issue #8988: is `sym`'s binding declared inside the loop body `lr`? The
+// declaration node identity is the test (a local's symbol records its
+// declaration node), so a symbol with no declaration node — a parameter, a
+// field — is never per-iteration. // per §28.3.9
+bool MethodOwnership::declaredInLoopBody(const sema::Symbol* sym,
+                                         const LoopBodyScan& lr) const {
+    if (!sym || !sym->decl) return false;
+    for (const ast::Node* d : lr.decls)
+        if (d == sym->decl) return true;
+    return false;
+}
+
 void MethodOwnership::recordBorrowUseExpr(const ast::Expr& e,
                                           std::uint32_t attributeOffset) {
     // A self-contained recursive read-collector for the freeze liveness pre-scan.
@@ -19667,6 +19689,11 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        // issue #8988: this binding is declared inside the loop body (if any)
+        // currently being scanned — a per-iteration binding. The freeze query
+        // uses it to tell a back edge's fresh binding from the one the
+        // question is about. // per §28.3.9
+        noteLoopDecl(ld);
         if (ld->initializer) recordBorrowUseExpr(*ld->initializer);
         // §28.3 (v0.186, #1726): record the carried source of a borrow-bearing-
         // record / span local so the consume-site freeze can see it as a live
@@ -19706,6 +19733,10 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
     // #1966 and §28.3 #1801 respectively) — see the two functions' own comments
     // for the measured repros. Run them here exactly as the `var` arm does.
     if (auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        // issue #8988: the `const` sibling of the `var` arm above — a `const`
+        // binding declared inside a loop body is a per-iteration binding too.
+        // // per §28.3.9
+        noteLoopDecl(lcd);
         if (lcd->value) recordBorrowUseExpr(*lcd->value);
         collectRecordBorrowSource(*lcd);
         collectBareTypeParamCallBorrowSource(*lcd);
@@ -19750,10 +19781,10 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
         ++borrowUseCondDepth_;  // per §28.3 (#1741): loop body is conditional
-        loopScanStack_.push_back({UINT32_MAX, 0});
+        loopScanStack_.push_back(LoopBodyScan{});
         if (ws->condition) recordBorrowUseExpr(*ws->condition);
         collectBorrowUses(ws->body);
-        auto lr = loopScanStack_.back();
+        LoopBodyScan lr = loopScanStack_.back();
         loopScanStack_.pop_back();
         if (lr.first <= lr.second) {
             noteLoopScanOffset(lr.first);
@@ -19765,11 +19796,11 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
         ++borrowUseCondDepth_;  // per §28.3 (#1741): loop body is conditional
-        loopScanStack_.push_back({UINT32_MAX, 0});
+        loopScanStack_.push_back(LoopBodyScan{});
         if (fs->iterable) recordBorrowUseExpr(*fs->iterable);
         if (fs->withExpr) recordBorrowUseExpr(*fs->withExpr);
         collectBorrowUses(fs->body);
-        auto lr = loopScanStack_.back();
+        LoopBodyScan lr = loopScanStack_.back();
         loopScanStack_.pop_back();
         if (lr.first <= lr.second) {
             noteLoopScanOffset(lr.first);
@@ -20610,13 +20641,16 @@ MethodOwnership::recordBorrowConsumedWindow(const sema::Symbol* recLocal,
 }
 
 bool MethodOwnership::borrowHolderUsedAfter(const sema::Symbol* holder,
-                                            std::uint32_t consumeOffset) const {
-    return borrowHolderUsedAfterInWindow(holder, consumeOffset, 0, UINT32_MAX);
+                                            std::uint32_t consumeOffset,
+                                            const sema::Symbol* consumed) const {
+    return borrowHolderUsedAfterInWindow(holder, consumeOffset, 0, UINT32_MAX,
+                                         consumed);
 }
 
 bool MethodOwnership::borrowHolderUsedAfterInWindow(
     const sema::Symbol* holder, std::uint32_t consumeOffset,
-    std::uint32_t winFrom, std::uint32_t winUntil) const {
+    std::uint32_t winFrom, std::uint32_t winUntil,
+    const sema::Symbol* consumed) const {
     auto it = borrowUseOffsets_.find(holder);
     if (it == borrowUseOffsets_.end()) return false;
     auto inWindow = [&](std::uint32_t off) {
@@ -20627,8 +20661,26 @@ bool MethodOwnership::borrowHolderUsedAfterInWindow(
     // Loop back edge: a use textually BEFORE the consume but inside the same
     // enclosing loop body re-executes AFTER the consume on the next iteration,
     // so it keeps the borrow live. Sound closure of the textual query over loops.
+    //
+    // issue #8988: the back edge re-executes the loop body, and a binding
+    // DECLARED in that body is re-CREATED by it — so the use the back edge
+    // reaches is a use of a DIFFERENT borrow, not of this one. That is the
+    // case when BOTH the borrow holder (the closure) and the consumed binding
+    // are declared inside the body: the next iteration's closure captures the
+    // next iteration's owner, and this iteration's borrow of this iteration's
+    // owner has no later use. The freeze is a question about a LATER USE OF
+    // THIS BORROW (§28.3.9: "some path from the site reaches a later use of
+    // it"), and the back edge reaches no such use here — the closure's live
+    // range is the ITERATION it was declared in.
+    //
+    // The other cases keep the sound closure: a holder or a consumed binding
+    // that is declared OUTSIDE the body survives the back edge, so the use the
+    // back edge reaches IS a later use of this borrow (the same closure, or
+    // the same owner, held across iterations).
     for (const auto& lr : loopBodySpans_) {
         if (consumeOffset < lr.first || consumeOffset > lr.second) continue;
+        if (declaredInLoopBody(holder, lr) && declaredInLoopBody(consumed, lr))
+            continue;  // the back edge reaches a fresh binding (and a fresh borrow)
         for (std::uint32_t off : it->second)
             if (off >= lr.first && off <= lr.second && inWindow(off)) return true;
     }
@@ -20675,9 +20727,11 @@ void MethodOwnership::checkConsumeFreeze(std::string_view consumedName,
         if (!live) {
             if (auto win = aliasBorrowConsumedWindow(holder, consumed))
                 live = borrowHolderUsedAfterInWindow(holder, consumeLoc.offset,
-                                                     win->first, win->second);
+                                                     win->first, win->second,
+                                                     consumed);
             else
-                live = borrowHolderUsedAfter(holder, consumeLoc.offset);
+                live = borrowHolderUsedAfter(holder, consumeLoc.offset,
+                                              consumed);
         }
         if (!live) continue;
         report(Severity::Error, consumeLoc,
@@ -20848,7 +20902,7 @@ void MethodOwnership::checkConsumeFreeze(std::string_view consumedName,
         auto win = recordBorrowConsumedWindow(recLocal, consumed);
         if (!win) continue;
         if (!borrowHolderUsedAfterInWindow(recLocal, consumeLoc.offset,
-                                           win->first, win->second))
+                                           win->first, win->second, consumed))
             continue;
         report(Severity::Error, consumeLoc,
                std::string("cannot consume `") + std::string(consumedName) +

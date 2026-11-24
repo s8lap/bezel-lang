@@ -1635,17 +1635,32 @@ private:
     // SourceLocation::offset (0-based buffer index) is a total source order.
     std::unordered_map<const sema::Symbol*, std::vector<std::uint32_t>>
         borrowUseOffsets_;
-    // §28.3 (v0.180) consume-site freeze: the [lo, hi] source-offset extent of
-    // every `while` / `for` loop body (bounded by the identifier offsets it
-    // contains — loop-statement spans are not populated by the parser). A holder
-    // use textually *before* a consume but inside the SAME enclosing loop
-    // re-executes after the consume via the back edge, so it keeps the borrow
-    // live — the sound closure of the textual "used-after" query over loops.
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> loopBodySpans_;
+    // §28.3 (v0.180) consume-site freeze: one `while` / `for` loop body.
+    //
+    // `first`/`second` are the [lo, hi] source-offset extent of the body
+    // (bounded by the identifier offsets it contains — loop-statement spans are
+    // not populated by the parser). A holder use textually *before* a consume
+    // but inside the SAME enclosing loop re-executes after the consume via the
+    // back edge, so it keeps the borrow live — the sound closure of the textual
+    // "used-after" query over loops.
+    //
+    // `decls` are the DECLARATION NODES of the locals declared inside the body
+    // (issue #8988): a binding declared inside the loop body is re-created on
+    // every iteration, so the back edge reaches a FRESH binding — not a later
+    // use of the previous iteration's one. The list is the per-iteration
+    // binding set the freeze query consults before it lets a back edge keep a
+    // borrow live.
+    struct LoopBodyScan {
+        std::uint32_t first = UINT32_MAX;
+        std::uint32_t second = 0;
+        std::vector<const ast::Node*> decls;
+    };
+    std::vector<LoopBodyScan> loopBodySpans_;
     // Transient stack of the loop bodies currently being scanned by
     // collectBorrowUses (innermost last); accumulates each loop's identifier
-    // extent. Populated and drained during the pre-pass only.
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> loopScanStack_;
+    // extent and its per-iteration declaration set. Populated and drained
+    // during the pre-pass only.
+    std::vector<LoopBodyScan> loopScanStack_;
     // §28.3 (v0.186, #1726) consume-site freeze: for each local of borrow-
     // bearing-record type (a span, canonically — isBorrowBearingRecordOrSpan),
     // the source binding(s) whose borrow the record carries, computed at the
@@ -4897,10 +4912,17 @@ private:
     // fall inside the source-view window [winFrom, winUntil) — a use of a
     // reassigned span after its old source's window has closed no longer keeps
     // that (now-retired) source live. // per §28.3
+    //
+    // issue #8988: `consumed` is the binding the freeze is about (null when the
+    // caller does not know it). It is what the loop-back-edge leg consults: a
+    // back edge reaches a FRESH binding when the holder AND the consumed
+    // binding are both declared inside the loop body, so it reaches a
+    // different borrow and must not keep this one live. // per §28.3.9
     bool borrowHolderUsedAfterInWindow(const sema::Symbol* holder,
                                        std::uint32_t consumeOffset,
                                        std::uint32_t winFrom,
-                                       std::uint32_t winUntil) const;
+                                       std::uint32_t winUntil,
+                                       const sema::Symbol* consumed) const;
     // Record each identifier read inside `e` into borrowUseOffsets_ (and into any
     // enclosing loop's identifier extent). `attributeOffset` != 0 forces every
     // recorded use to that source offset instead of the identifier's own — used
@@ -4910,11 +4932,23 @@ private:
                              std::uint32_t attributeOffset = 0);
     // Extend every loop currently on loopScanStack_ to include `off`. // per §28.3
     void noteLoopScanOffset(std::uint32_t off);
+    // issue #8988: record `decl` — the declaration node of a local declared
+    // inside the loop body currently being scanned — as a PER-ITERATION
+    // binding of every loop on loopScanStack_ (a nested loop's declarations
+    // are re-created by the enclosing loop's back edge too). // per §28.3.9
+    void noteLoopDecl(const ast::Node* decl);
+    // issue #8988: true when `sym`'s binding is DECLARED inside the loop body
+    // `lr` — i.e. it is re-created on every iteration, so a back edge of that
+    // loop reaches a fresh binding of it rather than the one the question is
+    // about. // per §28.3.9
+    bool declaredInLoopBody(const sema::Symbol* sym,
+                            const LoopBodyScan& lr) const;
     // True when the borrow-holder `holder` has a reachable use after the consume
     // at `consumeOffset` — a use textually after it, or (loop back edge) a use
     // inside a loop body that also contains the consume. // per §28.3
     bool borrowHolderUsedAfter(const sema::Symbol* holder,
-                               std::uint32_t consumeOffset) const;
+                               std::uint32_t consumeOffset,
+                               const sema::Symbol* consumed) const;
     // §28.3 (v0.180) consume-site freeze: reject consuming the owned binding
     // named `consumedName` at `consumeLoc` while a LIVE local borrow of its
     // current value exists (a plain alias, a `using var` pin, or a closure that
