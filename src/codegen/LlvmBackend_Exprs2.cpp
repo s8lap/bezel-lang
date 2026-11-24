@@ -2410,7 +2410,57 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                      ((ce.semaTy->kind == sema::TypeRef::Kind::Primitive &&
                        ce.semaTy->primitive == sema::PrimitiveType::String) ||
                       ce.semaTy->kind == sema::TypeRef::Kind::Function));
-                pArmed = !pContentsAlsoManaged && !ce.freeCellInEnvdtor &&
+                // fix #8929 (§27.5 / §28.9, v0.359): the TYPE-driven half of
+                // `pContentsAlsoManaged` is not a blocker when the cell is
+                // SHARED — held by TWO OR MORE envs.
+                //
+                // A shared cell has NO single envdtor that could own its
+                // free, so the counted-cell protocol (#4509: the frame and
+                // every env hold a counted reference and the LAST one out
+                // frees the cell) is the only route that can reclaim it.
+                // #694's route needs a SOLE holder (`singleCaptureLocals_`),
+                // #3426's needs a sole ESCAPING holder plus a non-escaping
+                // co-capturer (`sharedCellEnvdtorFreeOwner_`), and the
+                // scope-end route declines any key an escaping lambda
+                // captures (`cellFreeEligible_`) — so all three decline a
+                // shared cell and the cell was reclaimed by NOBODY.
+                //
+                // The shape that reaches it is the §27.5/#1135 nested
+                // widening: a method returning `lambda() => lambda() => p`
+                // captures `p` in TWO envs — the outer holds the cell, and
+                // the inner reaches the SAME cell through the widening (one
+                // allocation, two holders). `p` is therefore counted by two
+                // envs, is in neither `singleCaptureLocals_` nor
+                // `sharedCellEnvdtorFreeOwner_`, and its 8 B cell leaked on
+                // every call: MEASURED 1600 B / 200 allocations over 200
+                // calls (`bz$P.Program$Ident`), the block-bodied twin
+                // identically (#8929). The `int` twin of the same shape is
+                // CLEAN on the base, because a value-typed parameter's
+                // contents are NOT managed and the counted-cell route arms
+                // for it — the difference is exactly this conjunct.
+                //
+                // WHY THE CONTENTS DO NOT STAND IN THE WAY for a PARAMETER.
+                // #4509's first cut declined a contents-managed capture
+                // because "the cell's lifetime is entangled with the
+                // CONTENTS refcount" (§27.5's #2718 half: "rc(contents) must
+                // equal the LIVE ENV COUNT"). For a PARAMETER that
+                // entanglement does not arise: the contents are a BORROW the
+                // CALLER owns (§28.1 makes `owned` a compile error on a
+                // `string`), #2689's per-capture retain takes ONE reference
+                // per ENV (so one per holder of the cell) and that env's
+                // envdtor drops it — the contents' accounting is per ENV and
+                // does not depend on WHEN the cell's own memory is freed.
+                // The envdtor drops the contents BEFORE it drops its cell
+                // reference, and the cell is freed by the LAST holder, so a
+                // holder never reads through a freed cell and the contents
+                // are never released twice. (The #2706 mutated-shared-cell
+                // case keeps its own suppression and stays declined: its
+                // content release is suppressed on BOTH sides, so the
+                // contents' accounting there is the frame's, not the envs'.)
+                const bool pSharedCell = multiCaptureLocals_.count(pkey) != 0;
+                pArmed = (!pContentsAlsoManaged ||
+                          (pSharedCell && !ce.suppressContentRcInEnvdtor)) &&
+                         !ce.freeCellInEnvdtor &&
                          currentFn_ == cellFreeEligibleFn_ &&
                          declsCapturedByEscaping_.count(pkey) &&
                          !cellFreeEligible_.count(pkey) &&
