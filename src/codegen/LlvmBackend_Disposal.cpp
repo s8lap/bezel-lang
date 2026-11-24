@@ -5404,6 +5404,86 @@ bool Emitter::choiceHasStringFields(const sema::TypeSymbol* ts) {
 }
 
 
+// fix #8964 (§9.7 / §28.9 / §28.3, v0.359): release every FUNCTION-TYPED
+// component of record `tr` at the struct ADDRESS `recAddr` — the closure
+// twin of emitRecordStringFieldReleases_impl (LlvmBackend_impl.hpp).
+//
+// WHY IT EXISTS. §9.7: "Reference-typed fields whose declared types are
+// runtime-managed (`string`, `Type`, function types) do not make the record
+// borrow-bearing because runtime-managed values have unbounded lifetime by
+// construction" — but the record's component still holds a REFERENCE, and
+// the +1 the closure producer minted must be discharged EXACTLY ONCE
+// (§28.9). The construction-site store (buildRecordValue's positional-field
+// store, LlvmBackend_Exprs2.cpp) is a BARE store, so the component ALIASES
+// the producer's cell and the +1 is the RECORD's to release.
+//
+// BEFORE THIS FIX nothing released it. The `recordStringFields` walker
+// releases only `string` components, and a record whose type has a
+// function-typed component and NO string component never even got a
+// `recordStringFields` Disposal registered — so every construction leaked
+// the whole 64-byte cell. MEASURED (issue #8964): 200 constructions leaked
+// 12800 B / 200 objects under ASan/LSan.
+//
+// THE SHAPE. For each function-typed component: GEP the slot, load the
+// closure cell, bz_closure_release (null-safe — a never-assigned component
+// slot is null), then NULL the slot so a re-entrant / double dispose finds
+// null and is a no-op (the #396 slot-null precedent, exactly what the CLASS
+// field's closure release does — the #429 walk in emitOwnedFieldDisposals,
+// LlvmBackend_Disposal.cpp). A nested non-nullable record component is
+// recursed into by a further GEP off the SAME base address (a record is a
+// value type embedded INLINE, §9 — no load/indirection needed), exactly as
+// emitRecordStringFieldReleases_impl recurses.
+//
+// THE OWNERSHIP PROOF IS NOT HERE. This walker releases what the slot holds;
+// it does not prove the slot may release it. That is the `recordClosureFields`
+// Disposal's admission (LlvmBackend_Setup.cpp): the record local must be
+// bound from a provably-fresh construction whose function-typed argument is a
+// +1 closure PRODUCER (isPlusOneClosureProducer), and the local must be
+// proven non-escaping by the conservative escape walk. A borrowed component
+// (a closure local / parameter / field read) is therefore never released
+// here — that cell belongs to its own owner.
+//
+// bz_closure_release frees ONLY the cell + its env block; the captured
+// values are borrows (§28.9), so nothing else is disposed.
+void Emitter::emitRecordClosureFieldReleases(llvm::Value* recAddr,
+                                              const sema::TypeRef* tr) {
+    if (!recAddr || !tr || tr->kind != sema::TypeRef::Kind::Named ||
+        !tr->declaration ||
+        tr->declaration->kind != ast::TypeDeclKind::Record)
+        return;
+    const sema::TypeSymbol* ts = tr->declaration;
+    RecordSubstGuard guard(this, tr);  // fix #3945's twin: the substitution.
+    llvm::StructType* st = recordStruct(ts);
+    if (!st) return;
+    std::vector<const sema::Symbol*> storage;
+    collectRecordStorage(ts, storage);
+    for (const sema::Symbol* m : storage) {
+        auto idxIt = fieldIndex_.find(m);
+        if (idxIt == fieldIndex_.end()) continue;
+        if (isClosureStorageMemberResolved(m)) {
+            llvm::Value* addr =
+                builder_.CreateStructGEP(st, recAddr, idxIt->second,
+                                         "recclf.addr");
+            llvm::Value* val =
+                builder_.CreateLoad(ptrTy(), addr, "recclf.val");
+            emitClosureRelease(val);
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
+            continue;
+        }
+        const sema::TypeRef* mty = recordMemberTypeResolved(m);
+        if (mty && !mty->nullable &&
+            mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
+            mty->declaration->kind == ast::TypeDeclKind::Record &&
+            recordHasClosureFields(mty)) {
+            llvm::Value* nestedAddr = builder_.CreateStructGEP(
+                st, recAddr, idxIt->second, "recclf.nested.addr");
+            emitRecordClosureFieldReleases(nestedAddr, mty);
+        }
+    }
+}
+
+
 // fix #2425 / §9.8 / §28.3 / §28.9 / §35.4 v0.235: release the ACTIVE case's
 // `string`-owning payload(s) of value-like choice `choiceTy` at struct
 // ADDRESS `choiceAddr`, recursing into a non-nullable nested-record or
@@ -11044,6 +11124,31 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // `clsRef` at registration (LlvmBackend_Setup.cpp /
             // _Serialization.cpp).
             emitRecordStringFieldReleases(it->slot, it->clsRef);
+            continue;
+        }
+        // fix #8964 (§9.7 / §28.9 / §28.3, v0.359): the CLOSURE counterpart
+        // just above — a plain `var` RECORD local whose type owns at least one
+        // FUNCTION-TYPED component, bound from a provably-fresh construction
+        // whose function-typed argument is a +1 closure PRODUCER, and proven
+        // non-escaping by the conservative escape walk.
+        //
+        // The component's cell was TRANSFERRED to the record by the
+        // construction-site store (a bare store), so the +1 is this record's
+        // to discharge: bz_closure_release frees the cell + its env block
+        // exactly once (no double-free) and, since the local never escaped, no
+        // live binding is left holding a freed cell (no UAF). The captured
+        // values are borrows (§28.9), so nothing else is disposed.
+        // bz_closure_release is null-safe (a never-assigned component slot is
+        // null), and the walker NULLS the slot after the release, so a
+        // re-entrant / double dispose finds null and is a no-op (the #396
+        // slot-null precedent, exactly what the CLASS field's closure release
+        // does).
+        //
+        // Runs on BOTH the normal and the unwind exit, for the same reason
+        // `recordStringFields` does: the reference dies either way, and a
+        // given exit goes one way only, so it is released exactly once.
+        if (it->recordClosureFields) {
+            emitRecordClosureFieldReleases(it->slot, it->clsRef);
             continue;
         }
         // fix #2425 / §9.8 / §28.3/§28.9 / §35.4: the choice-side counterpart

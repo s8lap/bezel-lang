@@ -2934,6 +2934,47 @@ private:
         // double-free). `slot` is the record's struct alloca; `cls` is the
         // record TypeSymbol (used to GEP each string storage member).
         bool recordStringFields = false;
+        // fix #8964 (§9.7 / §28.9 / §28.3, v0.359): the CLOSURE twin of
+        // `recordStringFields` — a plain `var` RECORD local whose type owns at
+        // least one FUNCTION-TYPED component (a closure cell), bound from a
+        // PROVABLY-FRESH construction whose function-typed argument is a +1
+        // closure producer (isPlusOneClosureProducer — a lambda, a method
+        // reference, or a conditional of producers).
+        //
+        // WHY IT IS NEEDED. §9.7: "Reference-typed fields whose declared types
+        // are runtime-managed (`string`, `Type`, function types) do not make
+        // the record borrow-bearing because runtime-managed values have
+        // unbounded lifetime by construction" — but the record's component
+        // still holds a REFERENCE, and the reference the closure producer
+        // minted (+1) must be discharged EXACTLY ONCE (§28.9). The
+        // construction-site store is a bare store (buildRecordValue's
+        // positional-field store), so the record's component ALIASES the
+        // producer's cell: the +1 is the RECORD's to release. Before this
+        // fix NOTHING released it — the `recordStringFields` walker releases
+        // only `string` components, and a record with a function-typed
+        // component and no string component never even got a
+        // `recordStringFields` Disposal registered — so every construction
+        // leaked the whole cell (64 B, MEASURED: 200 constructions =
+        // 12800 B / 200 objects under ASan/LSan; issue #8964).
+        //
+        // WHY IT IS SAFE. The +1 is the record's ONLY claim on the cell
+        // because the freshness proof (isFreshRecordConstructionOfExactType
+        // with requireClosureProducers) admits ONLY a construction whose
+        // function-typed argument is a +1 PRODUCER — never a borrow (a local
+        // / parameter / field read), which another live binding still owns.
+        // The local was proven NON-ESCAPING by the same conservative escape
+        // walk the string path uses (StringEscapeWalker in
+        // recordFieldReleaseMode), so no alias survives the scope: the release
+        // frees the cell exactly once (no double-free) and no live binding
+        // is left dangling (no UAF). bz_closure_release is null-safe (a
+        // never-assigned component slot is null) and frees ONLY the cell + env
+        // block, never a captured value (§28.9 — captures are borrows).
+        //
+        // `slot` is the record's struct alloca; `clsRef` is the record's
+        // per-instantiation TypeRef (e.g. `Box<() -> int>`), the closure twin
+        // of `recordStringFields`'s `clsRef` — it carries the substitution a
+        // bare-type-parameter component needs resolved at release time.
+        bool recordClosureFields = false;
         // fix #2425 / §9.8 / §28.3 / §28.9 / §35.4 v0.235: an ALREADY-
         // POPULATED deserialize component/payload slot (#2398 disposal
         // scope, LlvmBackend_Serialization.cpp) whose declared type is a
@@ -17170,6 +17211,30 @@ private:
         return isTypeParamBoundToFunction(recordMemberType(m));
     }
 
+    // fix #8964 (§9.7 / §28.9, v0.359): the CLOSURE twin of
+    // isStringStorageMemberResolved — a record component whose RESOLVED type
+    // is a FUNCTION type (sema::TypeRef::Kind::Function). `recordMemberTypeResolved`
+    // resolves a bare type-parameter component through the ACTIVE substitution,
+    // so `record Box<T>(x: T)` instantiated at `() -> int` is recognised (the
+    // closure twin of the #3945 fix the string side already carries).
+    //
+    // A NULLABLE function type (`(() -> int)?`) is included, exactly as
+    // isStringStorageMemberResolved includes a nullable `string?`: the slot
+    // holds a plain pointer, and bz_closure_release is null-safe, so a
+    // never-assigned / null component is a no-op.
+    //
+    // ⚠ THIS IS THE RECORD-SIDE PREDICATE, and it is NOT `isClosureStorageMember`
+    // (the CLASS-field one, above): a class field holds an INDEPENDENT +1
+    // (retained at store by lowerClosureFieldStore), while a record's
+    // component holds the +1 the closure producer minted — TRANSFERRED by the
+    // construction-site store. The record side therefore admits a component
+    // only when the freshness proof says the argument was a +1 PRODUCER; this
+    // predicate alone says nothing about ownership.
+    bool isClosureStorageMemberResolved(const sema::Symbol* m) {
+        const sema::TypeRef* rt = recordMemberTypeResolved(m);
+        return rt && rt->kind == sema::TypeRef::Kind::Function;
+    }
+
     // fix #3945 / #3964 review (§9.7 / §28.9 / §14.1, v0.294): the
     // substitution-aware twin of isStringStorageMember just above, used ONLY
     // by the RECORD string-field walk — recordHasStringFields and
@@ -17379,6 +17444,54 @@ private:
         return found;
     }
 
+    // fix #8964 (§9.7 / §28.9, v0.359): the CLOSURE twin of
+    // recordHasStringFields — does record `tr` own, directly (a component
+    // whose resolved type is a function type) or transitively (through a
+    // non-nullable nested record), at least one FUNCTION-TYPED component?
+    //
+    // It mirrors recordHasStringFields's shape — the same PATH guard on the
+    // concrete TypeRef instantiation, the same RecordSubstGuard, the same
+    // un-mark-on-exit — so a generic record's bare-type-parameter component
+    // instantiated at a function type is recognised, and the walk terminates
+    // on the same finite-DAG argument (§9 rejects a self-containing record by
+    // value).
+    //
+    // It is NOT a choice-walking predicate: a choice's payload is tag-switched
+    // and a function-typed CHOICE payload would need the choice-side walker
+    // (emitChoiceStringFieldReleases_impl's shape) — out of scope here, so a
+    // record with a choice component is not descended into (a safe-direction
+    // leak, never a wrong release).
+    bool recordHasClosureFields(const sema::TypeRef* tr) {
+        std::unordered_set<const sema::TypeRef*> seen;
+        return recordHasClosureFieldsOnPath(tr, seen);
+    }
+    bool recordHasClosureFieldsOnPath(
+            const sema::TypeRef* tr,
+            std::unordered_set<const sema::TypeRef*>& seen) {
+        if (!tr || tr->kind != sema::TypeRef::Kind::Named || !tr->declaration)
+            return false;
+        const sema::TypeSymbol* ts = tr->declaration;
+        if (ts->kind != ast::TypeDeclKind::Record) return false;
+        if (!seen.insert(tr).second) return false;
+        RecordSubstGuard guard(this, tr);
+        std::vector<const sema::Symbol*> storage;
+        collectRecordStorage(ts, storage);
+        bool found = false;
+        for (const sema::Symbol* m : storage) {
+            if (isClosureStorageMemberResolved(m)) { found = true; break; }
+            const sema::TypeRef* mty = recordMemberTypeResolved(m);
+            if (mty && !mty->nullable &&
+                mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
+                mty->declaration->kind == ast::TypeDeclKind::Record &&
+                recordHasClosureFieldsOnPath(mty, seen)) {
+                found = true;
+                break;
+            }
+        }
+        seen.erase(tr);
+        return found;
+    }
+
     // fix #2326 / §9.8 v0.228: does the element type of a non-nullable inline
     // array carry a string — directly (a `string` element), or transitively
     // through a non-nullable nested record / choice / inline array?
@@ -17540,6 +17653,48 @@ private:
         emitRecordStringFieldReleases_impl(recAddr, tr);
     }
 
+    // fix #8964 (§9.7 / §28.9 / §28.3, v0.359): the CLOSURE twin of
+    // isRecordWithStringFieldsTypeRef — is `tr` a (non-nullable) record
+    // TypeRef whose record owns at least one FUNCTION-TYPED component? The
+    // classifier the `recordClosureFields` scope-end Disposal registration
+    // keys off of, exactly as isRecordWithStringFieldsTypeRef keys off the
+    // `recordStringFields` one.
+    //
+    // It is a SEPARATE predicate (not a widening of
+    // isRecordWithStringFieldsTypeRef) because the two release walks are
+    // gated by DIFFERENT ownership proofs: the string walk is admitted by
+    // isFreshRecordConstructionOfExactType's string arm (each string
+    // argument a literal or a +1 producer), the closure walk by its
+    // function-typed arm (each function-typed argument a +1 closure
+    // producer). Widening the shared predicate would have widened the STRING
+    // release's admission surface — and the string release is also reachable
+    // from the class-field walk (emitOwnedFieldDisposals' record-typed field
+    // arm), where the record's component is a BORROW, not a transfer.
+    bool isRecordWithClosureFieldsTypeRef(const sema::TypeRef* tr) {
+        if (!tr || tr->nullable ||
+            tr->kind != sema::TypeRef::Kind::Named || !tr->declaration)
+            return false;
+        return recordHasClosureFields(tr);
+    }
+
+    // fix #8964 (§9.7 / §28.9 / §28.3, v0.359): release each FUNCTION-TYPED
+    // component of record `tr` at the struct ADDRESS `recAddr`: GEP the slot,
+    // load the closure cell, bz_closure_release (null-safe), null the slot.
+    // The closure twin of emitRecordStringFieldReleases (above), and the
+    // walker's counterpart to the CLASS field's closure release (the #429
+    // walk in emitOwnedFieldDisposals, LlvmBackend_Disposal.cpp): same
+    // release-then-null shape, same "the captured values are borrows, so only
+    // the cell + env block are freed" rule (§28.9).
+    //
+    // It is a SEPARATE walker (not an extra arm of
+    // emitRecordStringFieldReleases_impl) for the same reason
+    // isRecordWithClosureFieldsTypeRef is a separate classifier: the string
+    // walk is reached from sites that do NOT hold the closure ownership proof
+    // (the class-field walk above), and releasing a borrowed component's cell
+    // there would be an over-release.
+    void emitRecordClosureFieldReleases(llvm::Value* recAddr,
+                                         const sema::TypeRef* tr);
+
     // fix #1747 / §28.9 / §9.7 / §28.3: the set of plain `var` RECORD
     // LocalDecl nodes whose declared type owns at least one `string` field,
     // whose initializer is a CALL returning that record (`var p := Mk()`),
@@ -17564,6 +17719,24 @@ private:
     // walker over-approximates and the eligibility is intentionally narrow.
     std::unordered_set<const void*> recordCallResultReleaseEligible_;
     llvm::Function* recordCallResultReleaseEligibleFn_ = nullptr;
+
+    // fix #8964 (§9.7 / §28.9 / §28.3, v0.359): the CLOSURE twin of
+    // `recordCallResultReleaseEligible_` / `recordCallResultReleaseEligibleFn_`
+    // — the set of plain `var` RECORD LocalDecl nodes whose declared type owns
+    // at least one FUNCTION-TYPED component, whose initializer is a provably
+    // fresh construction whose function-typed argument is a +1 CLOSURE
+    // PRODUCER, and which the conservative escape walk proved never to
+    // escape.
+    //
+    // It is a SEPARATE set (not a widening of `recordCallResultReleaseEligible_`)
+    // because the two release walks are gated by DIFFERENT ownership proofs:
+    // the string walk admits a local whose STRING arguments are literals or +1
+    // producers; the closure walk admits a local whose FUNCTION-TYPED arguments
+    // are +1 closure producers. A local may satisfy one and not the other, and
+    // merging them would let the string release fire on a local that never
+    // passed the string proof (an over-release of a borrowed string).
+    std::unordered_set<const void*> recordClosureReleaseEligible_;
+    llvm::Function* recordClosureReleaseEligibleFn_ = nullptr;
 
     // fix #8162 (stdlib §3.3, v0.355): the MAP from a `new
     // ReadOnlyStringSpan(source, start, length)` NewExpr node to the
@@ -17732,7 +17905,8 @@ private:
     bool isFreshRecordConstructionOfExactType(
         const ast::Expr* expr, const sema::TypeSymbol* recTs,
         const sema::MethodSymbol* enclosingFactory = nullptr,
-        bool admitThisPassthrough = false) const;
+        bool admitThisPassthrough = false,
+        bool requireClosureProducers = false) const;
 
     // fix #2448 / §9.7 / §28.9 (v0.235): is MethodSymbol `ms` provably a
     // "fresh record factory" for record `recTs`? Consulted by

@@ -11746,6 +11746,16 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // return type and a conservative non-escape verdict).
     recordCallResultReleaseEligible_.clear();
     recordCallResultReleaseEligibleFn_ = fn;
+    // fix #8964 (§9.7 / §28.9 / §28.3): the CLOSURE twin of the two lines
+    // just above — which plain `var` RECORD locals bound from a construction
+    // whose FUNCTION-TYPED argument is a +1 closure producer may have their
+    // closure components released at scope end (mirrors
+    // recordCallResultReleaseEligible_; consulted in lowerLocalDecl). It is a
+    // SEPARATE set because the two releases are gated by different ownership
+    // proofs (the string arm of the freshness proof vs its function-typed
+    // arm) — see the set's declaration comment.
+    recordClosureReleaseEligible_.clear();
+    recordClosureReleaseEligibleFn_ = fn;
     inlineArrayStringCallResultReleaseEligible_.clear();
     inlineArrayStringCallResultReleaseEligibleFn_ = fn;
     inlineArrayStringDeclareThenAssignSite_.clear();
@@ -21066,6 +21076,54 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             // alone loses the substitution a bare-type-parameter field
             // needs resolved at release time. See the Disposal::clsRef
             // comment (LlvmBackend_impl.hpp).
+            d.clsRef = tr;
+            disposeStack_.back().push_back(d);
+        }
+    }
+    // fix #8964 (§9.7 / §28.9 / §28.3, v0.359): the CLOSURE twin of the
+    // `recordStringFields` registration just above — if this plain `var`
+    // RECORD local was bound from a provably-fresh construction whose
+    // FUNCTION-TYPED argument is a +1 closure PRODUCER, and the conservative
+    // escape walk proved it non-escaping (recordClosureReleaseEligible_),
+    // register a scope-end release of every function-typed component (the
+    // recordClosureFields Disposal).
+    //
+    // WHY. The construction-site store (buildRecordValue's positional-field
+    // store) is a BARE store, so the component ALIASES the closure producer's
+    // cell: the +1 the producer minted is the RECORD's to discharge (§28.9 —
+    // every heap object is disposed exactly once). Before this fix nothing
+    // discharged it — a record with a function-typed component and no string
+    // component never even got a `recordStringFields` Disposal — so every
+    // construction leaked the whole 64-byte cell (issue #8964: 200
+    // constructions leaked 12800 B / 200 objects under ASan/LSan).
+    //
+    // WHY IT IS SAFE. The admission proves (a) the argument was a +1 PRODUCER
+    // (never a borrow another binding owns), and (b) the local never escapes
+    // — so the release frees the cell exactly once (no double-free) and no
+    // live binding is left dangling (no UAF).
+    //
+    // It is a SEPARATE registration (not a widening of the one above) because
+    // the two are gated by DIFFERENT ownership proofs: the string walk is
+    // admitted by the string arm of the freshness proof, the closure walk by
+    // its function-typed arm. A local may satisfy one and not the other, and
+    // merging them would let a release fire on a local that never passed the
+    // matching proof (an over-release).
+    if ((v || recordDeclareThenAssignSite_.count(
+                   static_cast<const void*>(declNode))) &&
+        currentFn_ == recordClosureReleaseEligibleFn_ &&
+        recordClosureReleaseEligible_.count(
+            static_cast<const void*>(declNode)) &&
+        !disposeStack_.empty()) {
+        const sema::TypeRef* tr = nullptr;
+        if (declType) tr = ctx_.resolvedType(*declType);
+        if (!tr && init) tr = ctx_.exprType(*init);
+        if (tr && isRecordWithClosureFieldsTypeRef(tr)) {
+            Disposal d{slot, tr->declaration};
+            d.recordClosureFields = true;
+            // the per-instantiation TypeRef (e.g. `Box<() -> int>`), the
+            // closure twin of the string path's `clsRef` — it carries the
+            // substitution a bare-type-parameter component needs resolved at
+            // release time.
             d.clsRef = tr;
             disposeStack_.back().push_back(d);
         }
@@ -47440,6 +47498,31 @@ void Emitter::collectRecordCallResultReleaseEligible(
     // releases, at the same point, under the same StringEscapeWalker.
     std::vector<const ast::Node*> candidates;
 
+    // fix #8964 (§9.7 / §28.9 / §28.3, v0.359): the PER-CANDIDATE KIND map.
+    // One candidate can qualify for the STRING release, for the CLOSURE
+    // release, or for both — each under its OWN ownership proof (the string
+    // arm of isFreshRecordConstructionOfExactType vs its function-typed arm).
+    // The escape walk below runs ONCE per candidate and its verdict is
+    // recorded into the set(s) the candidate's kind admits, so a local that
+    // passed only one proof is released only by that one walk.
+    //
+    //   bit 1 — the STRING release (`recordStringFields`)
+    //   bit 2 — the CLOSURE release (`recordClosureFields`)
+    std::unordered_map<const ast::Node*, unsigned> candidateKind;
+    // Add `s` as a candidate of the given kind, without listing it twice (the
+    // escape walk is per candidate; running it twice on one decl would be
+    // wasteful, and the two runs would agree anyway — but the map is the
+    // authority, so a single entry is what keeps the bookkeeping honest).
+    auto addCandidate = [&](const ast::Node* s, unsigned kindBit) {
+        auto it = candidateKind.find(s);
+        if (it == candidateKind.end()) {
+            candidateKind[s] = kindBit;
+            candidates.push_back(s);
+        } else {
+            it->second |= kindBit;
+        }
+    };
+
     // fix #4266 (§9.7 / §28.9): "declare, then assign" — `var outer: P;`
     // with NO initializer, whose value comes from a LATER plain `outer :=
     // <call>;` / `outer := new P(...);` rather than the LocalDecl's own
@@ -47707,7 +47790,7 @@ void Emitter::collectRecordCallResultReleaseEligible(
                               isProvablyFreshImportedRecordFactoryMethod_(
                                   ms, tr->declaration, ctx_))) ||
                             isSynthesizedRecordDeserializeCall(call, tr->declaration))
-                            candidates.push_back(s);
+                            addCandidate(s, 1);
                     }
                 }
                 // fix #2866 / §9.7 / §28.3 / §28.9 (v0.240): a `new P(...)`
@@ -47731,7 +47814,34 @@ void Emitter::collectRecordCallResultReleaseEligible(
                     if (!tr) tr = ctx_.exprType(*v.init);
                     if (tr && isRecordWithStringFieldsTypeRef(tr) && ne->type &&
                         isFreshRecordConstructionOfExactType(ne, tr->declaration)) {
-                        candidates.push_back(s);
+                        addCandidate(s, 1);
+                    }
+                    // fix #8964 (§9.7 / §28.9 / §28.3, v0.359): the CLOSURE
+                    // twin of the arm just above — a `new P(...)` initializer
+                    // whose record has a FUNCTION-TYPED component is a
+                    // fresh-construction candidate for the CLOSURE release
+                    // when that component's argument is a +1 CLOSURE
+                    // PRODUCER (isPlusOneClosureProducer), never a borrow.
+                    //
+                    // The construction-site store (buildRecordValue's
+                    // positional-field store) is a bare store, so the
+                    // component ALIASES the producer's cell: the +1 the
+                    // producer minted is the RECORD's to discharge, and the
+                    // scope-end `recordClosureFields` release is what
+                    // discharges it. Before this fix nothing did — the cell
+                    // leaked in full (issue #8964: 200 constructions leaked
+                    // 12800 B / 200 objects under ASan/LSan).
+                    //
+                    // The proof is the freshness predicate with
+                    // `requireClosureProducers` — the SAME predicate, asked
+                    // for its function-typed arm instead of its string arm.
+                    // It is a SEPARATE admission (its own kind bit) because
+                    // the two releases are gated by different proofs.
+                    if (tr && isRecordWithClosureFieldsTypeRef(tr) && ne->type &&
+                        isFreshRecordConstructionOfExactType(
+                            ne, tr->declaration, nullptr, false,
+                            /*requireClosureProducers=*/true)) {
+                        addCandidate(s, 2);
                     }
                 }
             } else if (!v.init) {
@@ -48240,7 +48350,7 @@ void Emitter::collectRecordCallResultReleaseEligible(
             (st.perPathMaxCount >= 0) ? st.perPathMaxCount : st.assignCount;
         if (effectiveCount == 1 && st.soleAssignFresh && st.soleAssign &&
             !st.anyAssignInLoop) {
-            candidates.push_back(kv.first);
+            addCandidate(kv.first, 1);
             // fix #4307: populate the SET of valid assignment sites. For a
             // plain (no-branch) #4266 candidate this is a single-member
             // set; for a mutually-exclusive-branches candidate it has one
@@ -48263,7 +48373,7 @@ void Emitter::collectRecordCallResultReleaseEligible(
             (st2.perPathMaxCount >= 0) ? st2.perPathMaxCount : st2.assignCount;
         if (effectiveCount2 == 1 && st2.soleAssignFresh && st2.soleAssign &&
             !st2.anyAssignInLoop) {
-            candidates.push_back(kv.first);
+            addCandidate(kv.first, 1);
             classCallResultWithRecordFieldEligible_
                 [static_cast<const void*>(kv.first)] = st2.soleAssign;
         }
@@ -48380,9 +48490,26 @@ void Emitter::collectRecordCallResultReleaseEligible(
         // candidate gate untouched.
         w.scrutineeBorrowMode = true;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
-        if (!w.escaped)
-            recordCallResultReleaseEligible_.insert(
-                static_cast<const void*>(ld));
+        // fix #8964 (§9.7 / §28.9 / §28.3): the candidate's KIND decides which
+        // release set(s) the non-escape verdict feeds. A candidate that
+        // qualified for the STRING release only is recorded in
+        // `recordCallResultReleaseEligible_`; one that qualified for the
+        // CLOSURE release only is recorded in `recordClosureReleaseEligible_`;
+        // one that qualified for both is recorded in both. The two releases
+        // are gated by DIFFERENT ownership proofs (the string arm of the
+        // freshness predicate vs its function-typed arm), so a local that
+        // passed only one must be released only by that one walk.
+        if (!w.escaped) {
+            const unsigned kind = candidateKind.count(ld)
+                                      ? candidateKind[ld]
+                                      : 0u;
+            if (kind & 1u)
+                recordCallResultReleaseEligible_.insert(
+                    static_cast<const void*>(ld));
+            if (kind & 2u)
+                recordClosureReleaseEligible_.insert(
+                    static_cast<const void*>(ld));
+        }
         // fix #4300: also insert into the Class-with-Record-field map.
         // (the candidate set is shared — `candidates` holds both record-typed
         // and Class-with-Record-field locals; the StringEscapeWalker walk above
@@ -48486,7 +48613,8 @@ void Emitter::collectRecordCallResultReleaseEligible(
 bool Emitter::isFreshRecordConstructionOfExactType(
         const ast::Expr* expr, const sema::TypeSymbol* recTs,
         const sema::MethodSymbol* enclosingFactory,
-        bool admitThisPassthrough) const {
+        bool admitThisPassthrough,
+        bool requireClosureProducers) const {
     if (!expr || !recTs || recTs->kind != ast::TypeDeclKind::Record)
         return false;
     auto* ne = dynamic_cast<const ast::NewExpr*>(expr);
@@ -48613,9 +48741,53 @@ bool Emitter::isFreshRecordConstructionOfExactType(
             // fix #4237 (§9.7 / §28.9): recurse — see the function-header
             // comment above for the termination argument (AST-tree descent,
             // not a record type-graph walk, so no visited-set is needed).
-            if (!isFreshRecordConstructionOfExactType(arg.value.get(),
-                                                       fty->declaration))
+            // fix #8964 (§9.7 / §28.9, v0.359): the closure requirement is
+            // THREADED into the nested call — the closure release walker
+            // recurses into a nested record component (emitRecordClosure-
+            // FieldReleases), so the nested record's own function-typed
+            // arguments must be proven producers at every depth. Without the
+            // threading, a nested record built from a BORROWED closure would
+            // pass this proof and its borrowed cell would be released at the
+            // outer record's scope end (an over-release).
+            if (!isFreshRecordConstructionOfExactType(
+                    arg.value.get(), fty->declaration, nullptr,
+                    /*admitThisPassthrough=*/false,
+                    /*requireClosureProducers=*/requireClosureProducers))
                 return false;  // nested arg not itself a provably-fresh ctor
+        }
+        // fix #8964 (§9.7 / §28.9 / §28.3, v0.359): the FUNCTION-TYPED
+        // component's ownership proof — the closure twin of the string arm
+        // below.
+        //
+        // A function-typed component holds a CLOSURE CELL. The construction-
+        // site store (buildRecordValue's positional-field store) is a bare
+        // `CreateStore`, so the component ALIASES the argument's cell: the
+        // argument's +1 becomes the RECORD's to discharge. It may only be
+        // discharged if the argument was a +1 PRODUCER (a lambda, a method
+        // reference, a conditional of producers — isPlusOneClosureProducer),
+        // never a BORROW (a closure local / parameter / field read), which
+        // another live binding still owns: releasing that at the record's
+        // scope end would free a cell the borrow's owner still uses (a
+        // use-after-free) — the same argument the string arm below makes, and
+        // for the same reason (the string arm's own comment records the
+        // measured #3964 use-after-free when the requirement was missing).
+        //
+        // A BORROW-shaped argument is therefore a SAFE-DIRECTION decline: the
+        // construction is not "provably fresh" for the closure release, the
+        // `recordClosureFields` Disposal is not registered, and the cell is
+        // left to its own owner (a leak, never a wrong release).
+        //
+        // The requirement is OPT-IN (`requireClosureProducers`), because this
+        // predicate also gates the STRING release — whose proof is about the
+        // string components only. Requiring a function-typed argument to be a
+        // producer there would narrow the string release's admission surface
+        // for a record that has BOTH kinds of component (a behaviour flip in
+        // the leak direction), and the class-field walk
+        // (emitOwnedFieldDisposals' record-typed field arm) consults this
+        // predicate too, where the record's component is a BORROW.
+        if (requireClosureProducers &&
+            fty->kind == sema::TypeRef::Kind::Function) {
+            if (!isPlusOneClosureProducer(arg.value.get())) return false;
         }
         if (!fty->nullable && fty->kind == sema::TypeRef::Kind::Primitive &&
             fty->primitive == sema::PrimitiveType::String) {
