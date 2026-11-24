@@ -4991,6 +4991,35 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
         // setter, the last consumer of the index on this path.
         releaseIndexArgStringProducers(*ix, ps, recvDecl, idxArgVals,
                                        /*accessorResultEscapes=*/false);
+        // fix #9110 (§28.14 / §27.5 / §28.9 / §23.4, v0.359): the CLOSURE
+        // twin of the string release above, and the compound twin of the
+        // plain setter's `releaseIndexArgClosureProducers` call (#4078's
+        // setter twin, in `lowerIndexerSet`'s imported arm).
+        //
+        // §23.5 forbids `ref`/`out`/`owned` on an indexer parameter list, so
+        // the accessor receives a plain by-value borrow of the callback and
+        // never consumes it: the producer's +1 is the CALLER's to drop once
+        // the accessor has returned — here, on the normal-return edge, after
+        // the setter (the last consumer of the index on this path). §28.9:
+        // the closure object is runtime-managed, so its own reference must be
+        // dropped exactly once.
+        //
+        // WITHOUT this, a lambda written AT the index position of a
+        // compound assignment (`fl[lambda() => 7] += 3;`) minted its +1 and
+        // never dropped it: the compound path lowers the index ONCE and
+        // shares it between the getter and the setter, and NEITHER call site
+        // discharged it (the plain getter's release is #9083's, in
+        // `lowerIndexerGet`, which the compound path does not go through).
+        // MEASURED on r30-c1 @ 116823e00: 12800 byte(s) in 200 allocation(s)
+        // over the issue's own 200-iteration repro, for the imported setter
+        // and for the single-module twin alike — 64 bytes per call, the
+        // closure object alone.
+        //
+        // Gated on `!diverged_` (the same discipline as the plain setter's
+        // call and #9068's vtable sibling) so the release is not emitted into
+        // unreachable IR after a setter that threw; the unwind edge's
+        // caller owns the throw path (a leak there is the safe direction).
+        if (!diverged_) releaseIndexArgClosureProducers(*ix, ps, idxArgVals);
         return true;
     }
 
@@ -5400,6 +5429,16 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
                 // the setter, its last consumer.
                 releaseIndexArgStringProducers(*ix, ps, recvDecl, idxArgVals,
                                                /*accessorResultEscapes=*/false);
+                // fix #9110 (§28.14 / §27.5 / §28.9 / §23.4, v0.359): the
+                // CLOSURE twin of the string release above — the compound
+                // twin of the plain setter's `releaseIndexArgClosureProducers`
+                // call. See the imported arm's twin of this line for the
+                // argument; the accessor receives the callback as a plain
+                // by-value borrow (§23.5 forbids `ref`/`out`/`owned` on an
+                // indexer parameter list), so the producer's +1 is the
+                // caller's to drop after the setter returns.
+                if (!diverged_)
+                    releaseIndexArgClosureProducers(*ix, ps, idxArgVals);
                 return true;
             }
         }
@@ -5882,6 +5921,15 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
     // producer +1 is discharged once, after the setter — the last consumer.
     releaseIndexArgStringProducers(*ix, ps, recvDecl, idxArgVals,
                                    /*accessorResultEscapes=*/false);
+    // fix #9110 (§28.14 / §27.5 / §28.9 / §23.4, v0.359): the CLOSURE twin
+    // of the string release above — the compound twin of the plain setter's
+    // `releaseIndexArgClosureProducers` call (#4078's setter twin, in
+    // `lowerIndexerSet`'s inline-setter arm). See the imported arm's twin of
+    // this line for the argument: §23.5 forbids `ref`/`out`/`owned` on an
+    // indexer parameter list, so the accessor receives the callback as a
+    // plain by-value borrow and never consumes it — the producer's +1 is the
+    // caller's to drop once the accessor has returned.
+    if (!diverged_) releaseIndexArgClosureProducers(*ix, ps, idxArgVals);
     thisRecvScope.close();  // fix-forward #8127
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
