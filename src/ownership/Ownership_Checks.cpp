@@ -32301,7 +32301,21 @@ MethodOwnership::SetErasingSourceSet MethodOwnership::setErasingSourceSet(
         if (!flowInsensitive && d.positioned &&
             !setErasingFlowReaches(d, rp->second, defs))
             continue;
-        if (aliased && d.traced && d.value && callBoundedSourceOf(*d.value))
+        // fix #9072 (§28.3 *Provenance* clause 6, v0.359): a definition whose
+        // value is itself an ALIAS local is judged by THAT local's definitions
+        // reaching this read (the recursive trace below), not by the
+        // flow-insensitive alias map. Only a direct source decides here.
+        bool chained = false;
+        if (aliased && d.traced && d.value && seFlowComplete_) {
+            if (auto* vid = dynamic_cast<const ast::IdentifierExpr*>(d.value)) {
+                sema::Symbol* vs = ctx_.exprSymbol(*vid);
+                chained = vs && !callBoundedParams_.count(vs) &&
+                          dynamic_cast<sema::LocalSymbol*>(vs) &&
+                          callBoundedAlias_.count(vs) && seFlowReads_.count(vid);
+            }
+        }
+        if (aliased && !chained && d.traced && d.value &&
+            callBoundedSourceOf(*d.value))
             r = Set::NonEmpty;
         else if (!d.traced)
             r = join(r, Set::Untraced);
