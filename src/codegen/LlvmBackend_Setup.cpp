@@ -33333,6 +33333,13 @@ static bool isBuiltinReaderCollectionArg(const ast::Expr* callee, size_t i,
         else if (id->name == "Console" &&
                  sema::receiverMayReachBuiltinStaticArm(ctx.exprSymbol(*id)))
             owner = "Console";  // fix #8126: a VALUE `Console` is not the built-in
+        // fix #8666 (§28.3, §28.9, stdlib §4.4, v0.359): the static sugar
+        // `Array.Sort(a)` / `Array.Reverse(a)` (#3345) lowers as the instance
+        // call on `a` (isStaticArrayCall in tryLowerCollectionInstanceCall):
+        // an in-place pass that never stores the array.
+        else if (id->name == "Array" &&
+                 sema::receiverMayReachBuiltinStaticArm(ctx.exprSymbol(*id)))
+            owner = "Array";
         else return false;
     } else {
         // The instance spelling (`"abc".Trim(cs)`): the receiver is a VALUE.
@@ -33355,6 +33362,9 @@ static bool isBuiltinReaderCollectionArg(const ast::Expr* callee, size_t i,
                       ma->member == "TrimEnd") && i == 0);
     } else if (owner == "Console") {
         readerPos = (ma->member == "Write" || ma->member == "WriteLine") &&
+                    i == 0;
+    } else if (owner == "Array") {
+        readerPos = (ma->member == "Sort" || ma->member == "Reverse") &&
                     i == 0;
     }
     if (!readerPos) return false;
