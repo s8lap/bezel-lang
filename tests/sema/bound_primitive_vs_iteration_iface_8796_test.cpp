@@ -64,3 +64,39 @@ end P;
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(
         r, "type argument `int` does not satisfy the constraint `where S: IEnumerable` (\xC2\xA7" "14.2)"));
 }
+
+// narrow #8796 (CALL-SITE direct arm, §14.2, stdlib §9.6, v0.359): an explicit
+// method type argument `string` against `where S: IEnumerable<int>`.
+BEZEL_TEST(sema_bound_conformance_8796, string_is_no_ienumerable_of_int_at_a_call_site) {
+    JitResult r = runAot(R"(
+module M;
+class P
+  public static method F<S>(a: S): int where S: IEnumerable<int> => 1;
+  public static method Main(): int
+    return P.F<string>("x");
+  end Main;
+end P;
+)");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "does not satisfy the constraint `where S: IEnumerable`"));
+}
+
+// narrow #8796 (CALL-SITE class-parameter arm): `where S: Y` with the
+// receiver's `Y := IEnumerable<int>`.
+BEZEL_TEST(sema_bound_conformance_8796, string_is_no_ienumerable_of_int_through_a_class_parameter_bound) {
+    JitResult r = runAot(R"(
+module M;
+class D<Y>
+  public method ZY<S>(a: S): int where S: Y => 1;
+end D;
+class P
+  public static method Main(): int
+    return new D<IEnumerable<int>>().ZY<string>("x");
+  end Main;
+end P;
+)");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "does not satisfy the constraint"));
+}

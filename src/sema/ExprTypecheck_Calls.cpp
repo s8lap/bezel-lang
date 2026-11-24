@@ -529,6 +529,10 @@ static bool primitiveRejectedByBuiltinInterfaceSubstitution(
     if (arg->primitive == PrimitiveType::None ||
         arg->primitive == PrimitiveType::Object)
         return false;
+    // narrow #8796 (§14.2, stdlib §9.6, v0.359): U := a declaration-less
+    // built-in iteration interface (`IEnumerable<int>`), decided by the ONE
+    // predicate the type-instantiation site reads too (TypeRef.hpp).
+    if (primitiveRejectedByDeclLessIterationIface(arg, u)) return true;
     if (u->kind != TypeRef::Kind::Named || !u->declaration ||
         !u->declaration->isSynthesizedBuiltinInterface)
         return false;
@@ -10808,6 +10812,21 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 report(std::string(bound->headName()));
                                 continue;
                             }
+                            // narrow #8796 (§14.2, stdlib §9.6, v0.359): a
+                            // primitive against a declaration-less built-in
+                            // iteration interface it provably does not
+                            // conform to (`string` vs `IEnumerable<int>`);
+                            // the predicate is shared with the
+                            // type-instantiation site (TypeRef.hpp). A bound
+                            // that is itself a type parameter takes the
+                            // arm below.
+                            if (bound && !bound->declaration &&
+                                !bound->isResolvedTypeParam() &&
+                                primitiveRejectedByDeclLessIterationIface(
+                                    argRef, boundSubst ? boundSubst : bound)) {
+                                report(std::string(bound->headName()));
+                                continue;
+                            }
                             // §14.2 type-parameter bound (`where T: U`):
                             // the bound is another type parameter — of this
                             // method (a sibling parameter) or, since #8663,
@@ -10844,7 +10863,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                              boundSubst->kind ==
                                                  TypeRef::Kind::Named &&
                                              primitiveNeverConformsToBuiltinIface(
-                                                 boundSubst->headName())))) {
+                                                 boundSubst->headName())) ||
+                                            // narrow #8796: a declaration-less
+                                            // iteration-interface substitution.
+                                            (boundSubst != bound &&
+                                             primitiveRejectedByDeclLessIterationIface(
+                                                 argRef, boundSubst)))) {
                                     // the ENCLOSING CLASS's own parameter,
                                     // substituted with the receiver's class
                                     // argument (#8663: §14.2's
