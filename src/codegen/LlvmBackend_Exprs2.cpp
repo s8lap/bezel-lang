@@ -4786,7 +4786,57 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // singleCaptureLocals_, never add one, so it can only make the
     // sole-holder gates MORE conservative (a bounded leak on the newly
     // excluded key, never an over-free) — never less.
+    //
+    // fix #8948 (§27.5 / §28.9, v0.359): EXCEPT for a local THIS body itself
+    // declares. The ancestor's tally counts THIS lambda as a capturer of
+    // every symbol its nested lambdas mention (collectCapturedSyms descends
+    // into nested bodies and excludes only the lambda's own PARAMETERS), so a
+    // local declared in this body and captured by ONE nested lambda reads 2
+    // there: this lambda's env "holds" a cell that is allocated in this very
+    // frame, per activation, and never reaches this lambda's env at all. The
+    // merge turned that overcount into "shared", which declined #694's
+    // sole-holder envdtor free: MEASURED `return lambda() => do var h :=
+    // lambda() => 3; var g := lambda() => h(); return g; end` leaked h's 8 B
+    // cell per activation (1600 B / 200), while the same body in a METHOD
+    // frame, whose scan has no ancestor, is clean. Only a lambda lexically
+    // inside this body can capture a local this body declares, and this
+    // body's own re-scan counted every one of them, so for such a key the
+    // re-scan is the authority and the ancestor's verdict is not merged. A
+    // local of an ANCESTOR frame (and every parameter) keeps the merge
+    // exactly as before. The walk below under-collects at worst (a statement
+    // kind it does not descend into), which keeps the ancestor's verdict for
+    // that local: a bounded leak, never an over-free.
+    std::unordered_set<const void*> ownBodyDecls8948;
+    if (!ancestorMultiCaptureLocals4240.empty()) {
+        std::function<void(const ast::Stmt*)> own = [&](const ast::Stmt* st) {
+            if (!st) return;
+            if (dynamic_cast<const ast::LocalDecl*>(st) ||
+                dynamic_cast<const ast::LocalConstDecl*>(st))
+                ownBodyDecls8948.insert(static_cast<const void*>(st));
+            if (auto* is = dynamic_cast<const ast::IfStmt*>(st)) {
+                for (auto& b : is->ifBranch.body) own(b.get());
+                for (auto& br : is->elifBranches)
+                    for (auto& b : br.body) own(b.get());
+                for (auto& b : is->elseBody) own(b.get());
+            } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(st)) {
+                for (auto& b : ws->body) own(b.get());
+            } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(st)) {
+                for (auto& b : fs->body) own(b.get());
+            } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(st)) {
+                for (auto& b : d->body) own(b.get());
+            } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(st)) {
+                for (auto& b : ts->body) own(b.get());
+                for (auto& c : ts->catches) own(c.body.get());
+                for (auto& b : ts->finallyBody) own(b.get());
+            } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(st)) {
+                for (auto& arm : cs->arms)
+                    for (auto& a : arm.stmts) own(a.get());
+            }
+        };
+        for (auto& st : lam.stmts) own(st.get());
+    }
     for (const void* k : ancestorMultiCaptureLocals4240) {
+        if (ownBodyDecls8948.count(k)) continue;  // fix #8948: re-scan decides
         multiCaptureLocals_.insert(k);
         singleCaptureLocals_.erase(k);
     }
