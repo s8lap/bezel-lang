@@ -320,7 +320,7 @@ BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
 // ============================================================================
 
 BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
-           throw_expr_in_null_coalesce_discharges_no_warning_31_1) {
+           throw_expr_in_null_coalesce_discharges_only_on_the_throwing_path_31_1) {
     OwnershipResult r = parseAndCheckOwnership(
         "module M; "
         "class Prog "
@@ -332,10 +332,15 @@ BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
         "    return r; "
         "  end Main; "
         "end Prog;");
-    // The whole point: no diagnostic AT ALL — `exc` is a real discharge, not
-    // an implicitly-disposed plain local.
+    // No error: the `throw` operand is a real discharge on the path that
+    // throws. #8993 (§28.3 K7.4 / K7.5, §7.7, v0.359): `n ?? throw exc`
+    // throws only when `n` is null, so on the other path `exc` reaches its
+    // scope end undischarged and IS implicitly disposed there — the must-use
+    // warning (§28.3.10) is now correct, exactly as for the statement twin
+    // `if n = null then throw exc; end;`. Before #8993 `exc` was marked
+    // consumed on both paths and leaked when `n` was non-null.
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(hasAutoDropWarning(r, "exc"));
+    BEZEL_EXPECT_TRUE(hasAutoDropWarning(r, "exc"));
 }
 
 BEZEL_TEST(record_moves_arm_and_throw_3989_3990,

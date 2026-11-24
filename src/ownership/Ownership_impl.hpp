@@ -2250,6 +2250,37 @@ private:
     void joinMarkerFreeArmEnds(std::vector<BlockState>&& ends,
                                 BlockState&& baseline, SourceLocation joinLoc);
 
+    // fix #8986 / #8993 (§28.3 K7.4 / K7.5, §7.5, §7.7, §17.2, v0.359): run
+    // `walk` — the move-recording walk of ONE operand that may not be
+    // evaluated at run time (the right operand of `??` / `and` / `or`, the
+    // argument list of a `?(` call or of a `?.` member call) — from the
+    // current state, then meet the walked exit with the state in which the
+    // operand never ran, exactly as `joinMarkerFreeArmEnds` meets the two arms
+    // of a marker-free `if` expression. A binding the operand moves is
+    // therefore maybe-consumed afterwards (unreadable), not moved-from, and
+    // a plain `var` local that becomes so is flagged for the per-path
+    // scope-end disposal K7.4 demands. `absorbing` is K7.5's `throw` /
+    // `null` operand: control never continues past the construct on the path
+    // that evaluates it, so its exit is walked for its diagnostics and
+    // dropped from the meet.
+    template <class Walk>
+    void recordMovesInMaybeEvaluated(Walk&& walk, bool absorbing,
+                                     SourceLocation joinLoc);
+    // The `?.` call `handleDischarge` is currently re-walking inside
+    // recordMovesInMaybeEvaluated (fix #8502), so the re-entry walks it
+    // plainly instead of forking again.
+    const ast::Expr* nullCondDischargeFork_ = nullptr;
+
+    // The move-recording walk of a binary expression's operands, short-
+    // circuit aware (see recordMovesInMaybeEvaluated). `skipBareMoves`: the
+    // `handleDischarge` position, where a bare `move x` operand is not
+    // recorded (axiom A7's deferred bound, v0.359).
+    // K7.4 per-path disposal flag for the locals a meet newly made
+    // maybe-consumed (Ownership_Checks.cpp). // per §28.3 K7.4, v0.359
+    void flagPerPathDisposal(const BlockState& before);
+    void recordMovesInBinaryOperands(const ast::BinaryExpr& be,
+                                     bool skipBareMoves);
+
     void recordMovesInArgs(const std::vector<ast::CallArgument>& args,
                            const ast::Expr* callee = nullptr,
                            const sema::TypeRef* choiceInstTy = nullptr);

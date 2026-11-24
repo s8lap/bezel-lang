@@ -335,7 +335,31 @@ BEZEL_TEST(move_only_field_read_arg_cond_7693,
     expectRunCount("var bx := new Bx(); var g := lambda(o: VC) => 1; var n := 0; if g(bx.C) > 0 then n := n + 1; end if; G(n);", "300", kMore);
 }
 
+// fix #8982 (BEHAVIOUR FLIP, named in the commit body): this row was
+// `spec_15_3_moved_local_to_owned_param_in_condition_accepted` — it pinned
+// the POSITION GAP this issue reports.
+//
+// THE VERDICT THE ROW NOW ASSERTS. `Make()` is a factory method whose result
+// is a BORROW (§28.3 *Factory methods and sourceless returns*), so `o` is a
+// borrow and `move o` does not make it owned (§28.8.1: "`move`-wrapping a
+// borrow does NOT make it owned"). Handing a borrow to an `owned` parameter
+// is §28.8's rejected shape — "an `owned` sink takes responsibility for
+// disposing the value, but a borrow is owned elsewhere" — and the byte-
+// identical BINDING spelling of this call (`var q := CountO(move o);`) was
+// ALREADY rejected with exactly that diagnostic before #8982. Only the
+// CONDITION spelling slipped through, because the condition position reached
+// no §22.3 / §28.8 classifier at all.
+//
+// This file's own governing sentence is the position-independence principle:
+// "Nothing in §15.3 makes the verdict depend on where the call sits, so a
+// call inside an `if` / `elif` / `while` condition ... is rejected exactly
+// like the same call as a statement." The row now asserts that — and the
+// soundness half of the same gap is the file's own measured defect ("the
+// field was lent to a parameter that disposes it while `Bx` disposes it
+// again: an AddressSanitizer failure at runtime").
+//
+// per §28.8, §28.8.1, §15.3, v0.359
 BEZEL_TEST(move_only_field_read_arg_cond_7693,
-           spec_15_3_moved_local_to_owned_param_in_condition_accepted) {
-    expectRunCount("var o := Make(); var n := 0; if CountO(move o) > 0 then n := n + 1; end if; G(n);", "100", kMore);
+           spec_15_3_moved_local_to_owned_param_in_condition_rejected) {
+    expectOwnedSinkBorrowRejected("var o := Make(); var n := 0; if CountO(move o) > 0 then n := n + 1; end if; G(n);");
 }

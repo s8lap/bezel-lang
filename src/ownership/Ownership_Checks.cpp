@@ -1157,6 +1157,108 @@ void MethodOwnership::collectCallArgDirectLambdaTargetsExpr(
     // Literals / identifiers / typeof / nameof / default / unit: no children.
 }
 
+// §7.7 / §17.2 (v0.359): the binary operators whose RIGHT operand is not
+// always evaluated — `??` evaluates it only when the left is `null`, `and` /
+// `or` only when the left does not already decide the result.
+static bool isShortCircuitBinaryOp(std::string_view op) {
+    return op == "??" || op == "and" || op == "or";
+}
+
+// §28.3 K7.5 (v0.359): an operand that ABSORBS — control never continues
+// past the construct on the path that evaluates it.
+static bool isAbsorbingOperand(const ast::Expr& e) {
+    return dynamic_cast<const ast::ThrowExpr*>(&e) != nullptr;
+}
+
+// A bare `move x` operand — a `move` that is not a call's argument. Whether
+// the transfer marker is admitted in a `??`-operand / operator-operand
+// position is axiom A7's recorded, DEFERRED bound (v0.359;
+// docs/proposals/DECLINED.md, *Marked transfer in `??`-operand and
+// operator-operand position*). `handleDischarge`'s binary arm does not decide
+// it, so a bare `move` operand keeps the treatment it had before that arm
+// existed (`handleReturn` / the statement position own it).
+static bool isBareMoveOperand(const ast::Expr& e) {
+    const auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e);
+    return ue && ue->op == "move";
+}
+
+// fix #8986 / #8993 (§28.3 K7.4 / K7.5, §7.5, §7.7, §17.2, v0.359): the
+// move-recording walk of an operand that is NOT ALWAYS EVALUATED. §7.7: `??`
+// evaluates its right operand only when the left is `null`; §17.2: `and` /
+// `or` evaluate their right operand only when the left does not already
+// decide the result; §7.5: a `?.` / `?(` over a `null` receiver or callee
+// evaluates none of its argument expressions. Before this helper every such
+// operand was walked as if it always ran, so a binding it moves was left
+// MOVED-FROM on the path that never moved it: no scope-end disposal was
+// emitted and the value leaked (#8986: `Take(move x ?? move y)` leaks `y`;
+// #8993: `k ?? Take(move y)`, `c and Take(move x) > 0`, `this.cb?(move x)`,
+// `k ?? throw e`).
+//
+// §28.3 K7.4 is the rule: "owned ⊓ moved-from ... = maybe-consumed —
+// unreadable after the join, no flow around a back edge into a use;
+// scope-end disposal per-path". The operand's two paths are met exactly as
+// a marker-free `if` expression's two arms are (`joinMarkerFreeArmEnds`,
+// the SAME `joinInto` the CFG `if` join uses): the not-evaluated path is the
+// state before the walk, the evaluated path is the state after it. K7.5's
+// absorbing operand (`throw`, `null`) is walked for its own diagnostics, but
+// control never continues past the construct on the path that runs it, so
+// its exit is not met.
+//
+// THE PER-PATH DISPOSAL. A plain `var` local that this meet makes
+// maybe-consumed is flagged `dischargedByArmTransfer` — the flag whose
+// meaning is exactly K7.4's per-path scope-end disposal (#2080): the
+// ownership pass then neither rejects its scope end ("would be dropped
+// here without disposal") nor arms the plain auto-drop, and codegen nulls
+// the slot at the `move` (LlvmBackend_Exprs2.cpp, case (d)) and registers a
+// NULL-GUARDED scope-end dynamicDispose (LlvmBackend_Stmts.cpp), so the
+// moved path skips and the not-evaluated path disposes exactly once. The
+// flag is set only on a local that was NOT already maybe-consumed before the
+// walk (a move of one is rejected anyway). // per §28.3 K7.4, v0.359
+template <class Walk>
+void MethodOwnership::recordMovesInMaybeEvaluated(Walk&& walk, bool absorbing,
+                                                  SourceLocation joinLoc) {
+    BlockState skipped = states_;  // the path on which the operand never ran
+    walk();
+    std::vector<BlockState> ends;
+    ends.push_back(skipped);
+    if (!absorbing) ends.push_back(std::move(states_));
+    BlockState baseline = skipped;
+    joinMarkerFreeArmEnds(std::move(ends), std::move(baseline), joinLoc);
+    flagPerPathDisposal(skipped);
+}
+
+// K7.4's per-path scope-end disposal for the plain `var` locals a meet has
+// just made maybe-consumed (`before` is the state ahead of the met
+// construct); see `recordMovesInMaybeEvaluated` above.
+//
+// NOT applied to the marker-free if-expression / expression-`case` arm joins
+// below: there a binding consumed in one arm may be CAPTURED by a closure in
+// another, and the scope-end "would be dropped" rejection those joins keep
+// is the guard against that shape's double free (#3999,
+// own_captured_moved_from_3755's if/case rows). A conditionally-evaluated
+// operand has no sibling arm. // per §28.3 K7.4, v0.359
+void MethodOwnership::flagPerPathDisposal(const BlockState& before) {
+    for (auto& [sym, st] : states_) {
+        if (st.state != OwnershipState::Owned || !st.maybeConsumed) continue;
+        auto pre = before.find(sym);
+        if (pre == before.end() || pre->second.maybeConsumed) continue;
+        auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+        auto* ld = ls ? dynamic_cast<const ast::LocalDecl*>(ls->decl) : nullptr;
+        if (!ld || st.implicitDischarge) continue;
+        // A move-only value local (an owning inline array or choice) already
+        // takes its per-path drop from the end-of-method pass
+        // (`moveOnlyValuePerPathAutoDrop`, Ownership.cpp); the flag's codegen
+        // arm is a class-vtable / collection disposal and must not reach it.
+        const sema::TypeRef* dt =
+            ld->type ? ctx_.resolvedType(*ld->type)
+                     : (ld->initializer ? ctx_.exprType(*ld->initializer)
+                                        : nullptr);
+        const char* moveOnlyKind = nullptr;
+        if (common::isMoveOnlyValueType(dt, ctx_, moveOnlyKind)) continue;
+        const_cast<ast::LocalDecl*>(ld)->dischargedByArmTransfer = true;
+    }
+}
+
 void MethodOwnership::recordMovesIn(const ast::Expr& e) {
     if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
         if (un->op == "move") {
@@ -1470,8 +1572,7 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
         return;
     }
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
-        if (be->left) recordMovesIn(*be->left);
-        if (be->right) recordMovesIn(*be->right);
+        recordMovesInBinaryOperands(*be, /*skipBareMoves=*/false);
         return;
     }
     // fix #4003 (§28.3, v0.294): a bare structural wrapper — `expr.member`,
@@ -1580,11 +1681,29 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
         return;
     }
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+        // fix #8993 (§7.5, §28.3 K7.4, v0.359): a `recv?.M(args)` call over
+        // a `null` receiver evaluates none of its argument expressions.
+        if (dynamic_cast<const ast::NullCondMemberExpr*>(call->callee.get())) {
+            recordMovesInMaybeEvaluated(
+                [&] {
+                    recordMovesInArgs(call->args, call->callee.get(),
+                                      ctx_.exprType(e));
+                },
+                /*absorbing=*/false, e.span.begin);
+            return;
+        }
         recordMovesInArgs(call->args, call->callee.get(), ctx_.exprType(e));
         return;
     }
     if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
-        recordMovesInArgs(nc->args, nc->callee.get(), ctx_.exprType(e));
+        // fix #8993 (§7.5, §28.3 K7.4, v0.359): `f?(args)` over a `null`
+        // callee evaluates none of its argument expressions.
+        recordMovesInMaybeEvaluated(
+            [&] {
+                recordMovesInArgs(nc->args, nc->callee.get(),
+                                  ctx_.exprType(e));
+            },
+            /*absorbing=*/false, e.span.begin);
         return;
     }
     // A constructor call `new T(owned x)` / `new T(move x)` consumes its
@@ -1952,6 +2071,24 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
         handleDischarge(*te);
         return;
     }
+}
+
+void MethodOwnership::recordMovesInBinaryOperands(const ast::BinaryExpr& be,
+                                                  bool skipBareMoves) {
+    // The LEFT operand always runs; the right one of `??` / `and` / `or`
+    // runs on one path only, so its moves are met with the path that skipped
+    // it (fix #8986 / #8993, §28.3 K7.4, §7.7, §17.2, v0.359). Any other
+    // operator evaluates both operands.
+    if (be.left && !(skipBareMoves && isBareMoveOperand(*be.left)))
+        recordMovesIn(*be.left);
+    if (!be.right || (skipBareMoves && isBareMoveOperand(*be.right))) return;
+    if (!isShortCircuitBinaryOp(be.op)) {
+        recordMovesIn(*be.right);
+        return;
+    }
+    recordMovesInMaybeEvaluated([&] { recordMovesIn(*be.right); },
+                                isAbsorbingOperand(*be.right),
+                                be.right->span.begin);
 }
 
 void MethodOwnership::joinMarkerFreeArmEnds(std::vector<BlockState>&& ends,
@@ -2635,6 +2772,52 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             }
         }
         states_ = std::move(saved);
+        return;
+    }
+    // fix #8982 / #8938 (§22.3, §28.3, §28.8, v0.359): a BINARY expression
+    // at a discharge position — a `return` operand, an expression statement,
+    // an `if` / `while` condition. Before this arm it fell into the
+    // read-only fallback below, so a call nested in either operand was seen
+    // by NEITHER move classifier: §22.3's marker demand on a named owned
+    // argument at an `owned` slot was not made (`return 1 + f(a);`,
+    // `if f(a) > 0 then`, `return this.cb?(a) ?? 0;` were accepted and
+    // double-freed — #8982), and a transfer was not recorded, so two
+    // `move x` in one `return` operand were accepted and double-freed
+    // (`return Sink.Take(move x) + Sink.Take(move x);` — #8938).
+    //
+    // `checkRead(e, …)` is exactly the fallback's own call, so the READ side
+    // (the `??` meet checks, the operand reads) is unchanged. The operands'
+    // moves are then recorded by the SAME classifier the LocalDecl-
+    // initializer / assignment-RHS positions use, short-circuit aware
+    // (recordMovesInBinaryOperands): a move in the right operand of `??` /
+    // `and` / `or` happens on one path only, so it leaves the binding
+    // maybe-consumed with per-path scope-end disposal (§28.3 K7.4), never
+    // moved-from on the path that did not run it (the leak that refuted the
+    // first #8982 / #8938 fixes — #8986, #8993). A bare `move x` operand is
+    // not recorded here (isBareMoveOperand: axiom A7's deferred bound).
+    // // per §22.3, §28.3 K7.4, §28.8, §7.7, §17.2, v0.359
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        checkRead(e, /*selfTarget=*/false);
+        recordMovesInBinaryOperands(*be, /*skipBareMoves=*/true);
+        return;
+    }
+    // fix #8502 (§7.5, §28.3 K7.4, v0.359): a `recv?.M(args)` call at a
+    // discharge position (an expression statement, a `return` operand) over a
+    // `null` receiver evaluates none of its argument expressions, so a
+    // `move x` argument transfers on one path only. The whole discharge walk
+    // of the call runs once from the current state and its exit is met with
+    // the state in which the call never ran (recordMovesInMaybeEvaluated);
+    // the re-entry (`nullCondDischargeFork_`) walks it plainly. A call with
+    // no arguments is not forked: there is nothing it could move, and its
+    // receiver-side effects (`x?.Dispose()`) keep their existing handling.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(&e);
+        call && !call->args.empty() && nullCondDischargeFork_ != &e &&
+        dynamic_cast<const ast::NullCondMemberExpr*>(call->callee.get())) {
+        const ast::Expr* outerFork = nullCondDischargeFork_;
+        nullCondDischargeFork_ = &e;
+        recordMovesInMaybeEvaluated([&] { handleDischarge(e); },
+                                    /*absorbing=*/false, e.span.begin);
+        nullCondDischargeFork_ = outerFork;
         return;
     }
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
