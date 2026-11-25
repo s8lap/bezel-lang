@@ -5,13 +5,12 @@
 //! rule: store into an `owned` field or owning-collection slot, including through a `set(owned)` accessor
 //! cites: 28.3.1
 //! expect: run
-//! output: 2
+//! output: 1
 //!  close 1
-//!  close 2
 //! notes: Pins #9053 (fix 5488b0e1c): a store into an owning-collection slot whose element type is a type
-//!   parameter consumes the `owned` parameter. Admitting twin of 9201-9203 and 9205. Two adds, Count = 2;
-//!   the holder disposes each User exactly once at scope end: `close 1`, `close 2`. Output-only (the
-//!   corpus has no leak leg).
+//!   parameter consumes the `owned` parameter. Admitting twin of 9201-9203 and 9205. One add, Count = 1;
+//!   the holder disposes the User exactly once at scope end: `close 1`. A single entry keeps the output
+//!   independent of the collection's disposal order. Output-only (the corpus has no leak leg).
 module Conf;
 public class User
   public Id: int;
@@ -33,7 +32,6 @@ public class Program
   public static method Main()
     using var r := new Repo<int, User>();
     r.Add(1, new User(1));
-    r.Add(2, new User(2));
     Console.WriteLine($"{r.Count}");
   end Main;
 end Program;
