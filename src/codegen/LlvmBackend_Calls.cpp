@@ -120,17 +120,26 @@ llvm::Value* Emitter::emitConsoleWrite(llvm::Value* strPtr, bool newline,
 }
 
 
-// stdlib §2.1 / §7.4 (v0.359; fix #9303): the ONE reader of a line of
+// stdlib §2.1 / §7.4 (v0.359; fix #9303, #9302): the ONE reader of a line of
 // standard input — §2.1's `Console.ReadLine()` and §7.4's
 // `TextReader.ReadLine()` both lower here, so the two agree. The runtime reads
 // up to the '\n' terminator whatever the line's length (an implementation
-// buffer is not a line delimiter) and returns it as the producer's +1
-// reference (#422 / #8592 — `bz_string_init_rc`), or NULL at EOF (§7.4 "null
-// at EOF").
+// buffer is not a line delimiter), decodes the UTF-8 into a string of the
+// narrowest width (§4.6) and returns it as the producer's +1 reference
+// (#422 / #8592 — `bz_string_init_rc`), or NULL at EOF (§7.4 "null at EOF").
 llvm::Value* Emitter::emitConsoleReadLine() {
     llvm::Function* fn = declareC("bz_console_read_line", ptrTy(), {});
     return builder_.CreateCall(fn, {}, "rl.result");
 }
+
+// stdlib §2.1 / §7.4 (v0.359; fix #9302): the next CODE POINT of standard
+// input as an i32 (-1 at EOF) — §7.4's `TextReader.Read(): int` and §2.1's
+// `Console.ReadKey()` ("one key (code point)") share this reader.
+llvm::Value* Emitter::emitConsoleReadChar(const char* name) {
+    llvm::Function* fn = declareC("bz_console_read_char", i32(), {});
+    return builder_.CreateCall(fn, {}, name);
+}
+
 
 // fix #7792 (stdlib §7.4, v0.355): is `ty` the built-in `TextWriter` (no user
 // declaration), nullable or not? A value of that type is the i32 descriptor of

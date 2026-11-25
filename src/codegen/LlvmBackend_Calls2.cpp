@@ -11528,22 +11528,14 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     rteMa && lowerExpr(*rteMa->target) != nullptr;
             }
             if (receiverOk) {
-                // THE READ. `getchar()` — the next code point of standard
-                // input as an `int`, or EOF (-1) at the end of it (§7.4's
-                // `Read(): int`, "next char as int, or -1 at EOF"). The same
-                // libc call §2.1's `Console.ReadKey()` lowering uses, with the
-                // same `EOF == -1` reading (glibc and musl, the two supported
-                // C libraries, both define `EOF` as -1).
-                auto* gcFn = module_->getFunction("getchar");
-                if (!gcFn) {
-                    auto* ft =
-                        llvm::FunctionType::get(i32(), {}, false);
-                    gcFn = llvm::Function::Create(
-                        ft, llvm::Function::ExternalLinkage, "getchar",
-                        module_.get());
-                }
+                // THE READ. The next CODE POINT of standard input as an
+                // `int`, or EOF (-1) at the end of it (§7.4's `Read(): int`,
+                // "next char as int, or -1 at EOF"; a `char` is a Unicode
+                // scalar value, spec §3 / §1.1, so a multi-byte UTF-8
+                // sequence is ONE read — fix #9302). The same reader serves
+                // §2.1's `Console.ReadKey()` (`emitConsoleReadChar`).
                 llvm::Value* codePoint =
-                    builder_.CreateCall(gcFn, {}, "read.codepoint");
+                    emitConsoleReadChar("read.codepoint");
                 // fix #9260 (§7.4): the RESULT is an `int` — stamp it so the
                 // call's type is the member's declared return type.
                 ctx_.setExprType(
@@ -11578,13 +11570,9 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     if (id->name == "Console" &&
                         receiverMayReachBuiltinStaticArm(*id)) {
                         if (ma->member == "ReadKey") {
-                            // getchar() → char (i32)
-                            auto* gcFn = module_->getFunction("getchar");
-                            if (!gcFn) {
-                                auto* ft = llvm::FunctionType::get(i32(), {}, false);
-                                gcFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "getchar", module_.get());
-                            }
-                            return builder_.CreateCall(gcFn, {}, "readkey");
+                            // fix #9302 (§2.1): one key is one code point —
+                            // the same reader as §7.4's `Read()`.
+                            return emitConsoleReadChar("readkey");
                         }
                     }
                 }

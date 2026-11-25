@@ -1998,10 +1998,13 @@ int64_t bz_wstrlen(const void* wstr);
 void* bz_string_from_utf8z(const void* p);
 void* bz_string_from_utf16z(const void* p);
 
-// stdlib §2.1 / §7.4 (v0.359) / fix #9303: the standard-input line reader behind
-// `Console.ReadLine` / `TextReader.ReadLine`: the next line (no '\n', any
-// length) as a +1 string, or NULL at EOF.
+// stdlib §2.1 / §7.4 (v0.359) / fix #9302 #9303: the standard-input readers
+// behind `Console.ReadLine` / `Console.ReadKey` / `TextReader.ReadLine` /
+// `TextReader.Read`. `bz_console_read_line` returns the next line (UTF-8
+// decoded, no '\n', any length) as a +1 string, or NULL at EOF;
+// `bz_console_read_char` returns the next code point, or -1 at EOF.
 void* bz_console_read_line();
+int32_t bz_console_read_char();
 
 // stdlib §10.3 / fix #977 / #985: RawBytes.From(buffer: Array<byte>) — copies
 // the byte array into a fresh malloc'd buffer and wraps it with its length in a

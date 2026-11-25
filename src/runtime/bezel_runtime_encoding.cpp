@@ -518,13 +518,23 @@ extern "C" void* bz_string_from_utf8z(const void* p) {
 }
 
 // ---------------------------------------------------------------------------
-// The standard-input line reader (stdlib §2.1 / §7.4, v0.359; fix #9303).
+// Standard-input readers (stdlib §2.1 / §7.4, v0.359; fix #9302, #9303).
 //
 // §2.1 `Console.ReadLine(): string?` and §7.4 `TextReader.ReadLine(): string?`
-// are ONE reader of standard input. A line is delimited by its '\n' terminator,
-// not by an implementation buffer (#9303): the line comes back whole whatever
-// its length. Only '\n' is the terminator here: CR handling is the spec
-// question #9305 and is NOT decided in this reader.
+// / `TextReader.Read(): int` ("next char as int, or -1 at EOF") are ONE reader
+// of standard input, and a `char` is a Unicode scalar value (spec §3, §1.1:
+// sources and strings are UTF-8 text). So a line is decoded from UTF-8 into a
+// string of the §4.6 narrowest width, and `Read` returns the next code point,
+// not the next byte. A line is delimited by its '\n' terminator, not by an
+// implementation buffer (#9303). Only '\n' is the terminator here: CR handling
+// is the spec question #9305 and is NOT decided in this reader.
+//
+// MALFORMED INPUT. Neither section says what a reader does with a byte
+// sequence that is not well-formed UTF-8 (a spec-question, #9302). The simplest
+// interpretation, which is also what the readers did before they decoded: the
+// offending bytes stand as themselves, one code point per byte (U+0000..U+00FF).
+// `bz_console_read_line` falls back to that for the line that holds them;
+// `bz_console_read_char` returns the lead byte and leaves the rest unread.
 
 // A width-1 string of the `n` bytes at `p`, one code point per byte. +1.
 static void* bz_console_raw_byte_string(const uint8_t* p, int64_t n) {
@@ -553,9 +563,43 @@ extern "C" void* bz_console_read_line() {
         buf[n++] = (uint8_t)c;
     }
     if (!any) { free(buf); return nullptr; }
-    void* s = bz_console_raw_byte_string(buf, (int64_t)n);
+    void* s = bz_decode_utf8_range(buf, (int64_t)n);
+    if (!s) s = bz_console_raw_byte_string(buf, (int64_t)n);
     free(buf);
     return s;
+}
+
+// The next code point of standard input, or -1 at the end of it.
+extern "C" int32_t bz_console_read_char() {
+    int b0 = getc(stdin);
+    if (b0 == EOF) return -1;
+    int need;
+    uint32_t cp;
+    if (b0 < 0x80) return b0;
+    else if ((b0 & 0xE0) == 0xC0) { need = 1; cp = (uint32_t)(b0 & 0x1F); }
+    else if ((b0 & 0xF0) == 0xE0) { need = 2; cp = (uint32_t)(b0 & 0x0F); }
+    else if ((b0 & 0xF8) == 0xF0) { need = 3; cp = (uint32_t)(b0 & 0x07); }
+    else return b0;  // a continuation byte or 0xF8..0xFF: not a lead byte
+    int got[3];
+    int have = 0;
+    bool ok = true;
+    while (have < need) {
+        int c = getc(stdin);
+        if (c == EOF) { ok = false; break; }
+        if ((c & 0xC0) != 0x80) { ungetc(c, stdin); ok = false; break; }
+        got[have++] = c;
+        cp = (cp << 6) | (uint32_t)(c & 0x3F);
+    }
+    if (ok) {
+        static const uint32_t minCp[4] = {0, 0x80, 0x800, 0x10000};
+        if (cp < minCp[need] || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+            ok = false;  // overlong / out of range / surrogate
+    }
+    if (ok) return (int32_t)cp;
+    // Malformed: the lead byte stands as itself; what was read after it is
+    // handed back, in reverse, to be read in its turn.
+    for (int k = have - 1; k >= 0; --k) ungetc(got[k], stdin);
+    return b0;
 }
 
 // string.From(w: WString) / string.FromWStringPointer(p): copy the UTF-16LE

@@ -28012,6 +28012,7 @@ private:
     // CG-console: Console.ReadLine() → string? (null at EOF).
     // Uses fgets(buf, 4096, stdin), strips trailing newline, copies to heap.
     llvm::Value* emitConsoleReadLine();
+    llvm::Value* emitConsoleReadChar(const char* name);
 
     // Detect `Console.Write(...)` / `Console.WriteLine(...)` /
     // `Console.WriteLine()` (no-arg) as intrinsic call patterns.
