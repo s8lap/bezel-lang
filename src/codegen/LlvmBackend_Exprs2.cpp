@@ -5488,6 +5488,63 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                             v = wrapNullableValue(retSemaTy, v);
                     }
                 }
+                // fix #9120 (§14.1 / §7.1 / §22.2, v0.359): the SAME promotion
+                // for a NULLABLE TYPE PARAMETER (`T?`) — a lambda whose declared
+                // result type is a type parameter's nullable form. The
+                // closure's LLVM return type is then the TAGGED nullable
+                // CARRIER (`{i8 hasValue; T value}`) while the body yields the
+                // BARE payload (`T`): the erased i32 placeholder in the
+                // unspecialized template, the instantiation's own type in a
+                // specialization (§14.1: a generic declaration is instantiated
+                // at a concrete type argument, and the body's types are the
+                // instantiation's).
+                //
+                // The #541 arm above cannot do it: `isNullableValueTy` is FALSE
+                // for a bare type parameter (it names no known value type — it
+                // is lowerTypeRef's nullable bare-type-parameter arm that
+                // answers it), so the value stayed the bare payload and the
+                // `ret` carried it into the carrier-returning closure —
+                // "Function return type does not match operand type of return
+                // inst!  ret i32 %4 / { i8, i32 }" (issue #9120). The
+                // METHOD-return twin of this promotion is `emitReturn`'s
+                // CG-nullable arm (LlvmBackend_Setup.cpp), which is why the
+                // non-generic twin (`M(p: string?): () -> string?`) and the
+                // BLOCK-bodied lambda (`lambda(): T? => do return p; end`,
+                // whose `return` goes through `emitReturn`) already lower
+                // correctly: only the EXPRESSION body lacked it.
+                //
+                // The CARRIER is read from `retTy` — the closure's OWN declared
+                // LLVM return type (the `llvm::FunctionType::get(retTy, …)`
+                // below) — so the payload width is the instantiation's (i32 at
+                // `T := int`, i64 at `T := long`, the i32 placeholder in the
+                // template) and is never re-derived here. `slotPayloadTy` is the
+                // ONE reader of the tagged-carrier shape (LlvmBackend_Layout.cpp),
+                // so this is the same shape test every other nullable-value slot
+                // uses.
+                //
+                // ⚠ THE ARM CANNOT CHANGE A PROGRAM THAT COMPILES TODAY: it
+                // fires only when the value IS the carrier's payload, and then
+                // the `ret` would carry the bare payload into the
+                // carrier-returning closure — which the LLVM verifier rejects.
+                // A `null` body (the `ret ptr null` twin of the same defect) is
+                // the all-zero carrier, exactly as `emitReturn`'s CG-nullable
+                // arm spells it.
+                {
+                    llvm::Type* payloadTy = slotPayloadTy(retTy);
+                    if (payloadTy != retTy && v->getType() != retTy) {
+                        if (v->getType()->isPointerTy() &&
+                            llvm::isa<llvm::ConstantPointerNull>(v)) {
+                            v = llvm::ConstantAggregateZero::get(retTy);
+                        } else if (v->getType() == payloadTy) {
+                            llvm::Value* res = builder_.CreateInsertValue(
+                                llvm::UndefValue::get(retTy),
+                                llvm::ConstantInt::get(
+                                    nullablePrimHasValTy(), 1),
+                                {0u});
+                            v = builder_.CreateInsertValue(res, v, {1u});
+                        }
+                    }
+                }
                 // fix #1697 / §22.6 (v0.184) "Lambda-literal arguments": a
                 // NON-nullable numeric widening at a closed function-typed
                 // slot — e.g. `M(f: (int) -> long)` called as
