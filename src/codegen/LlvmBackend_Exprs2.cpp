@@ -2737,8 +2737,26 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 (ty && !ty->nullable && isTypeParamBoundToString(ty))
                     ? resolveTypeParamRef(ty)
                     : nullptr;
+            // fix #9119 (§14.1 / §22.3 / §27.5 / §28.9, v0.359): the
+            // substitution may bind the bare `T` to a NULLABLE `string`
+            // (`T = string?`) — the nullable twin of #9077, which the
+            // `!r->nullable` conjunct above excluded. The shape is the SAME:
+            // the alias names the CALLER's location (§22.3), whose value the
+            // callee does NOT own, so the write must take a reference of its
+            // own on the value it stores or the caller's later read of its own
+            // `ref` local reads a freed string (#9119). The retain is
+            // NULL-SAFE — `bz_string_retain` returns early on null — so a null
+            // written through the alias is stored without a reference-count
+            // change and without a crash.
+            //
+            // The DISPLACED value is still not released: the recorded
+            // #4965/#4980 policy (#9077's commit body) — the alias names the
+            // CALLER's location, whose value the callee does not own, so the
+            // callee may not drop a reference it never had.
             ce.typeParamRefStringAlias =
-                r && !r->nullable && elemTy && elemTy->isPointerTy();
+                r && r->kind == sema::TypeRef::Kind::Primitive &&
+                r->primitive == sema::PrimitiveType::String &&
+                elemTy && elemTy->isPointerTy();
         }
         // semaTy / releaseBoxInEnvdtor / freeCellInEnvdtor all stay at their
         // zero-initialised defaults: the closure holds no ownership over the
