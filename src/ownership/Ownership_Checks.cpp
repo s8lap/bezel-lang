@@ -7770,6 +7770,40 @@ void MethodOwnership::scanCapturedOwnedConsumeStmt(const ast::Stmt& s,
                 dynamic_cast<const ast::IdentifierExpr*>(as->target.get());
             reportCapturedOwnedConsume(tid->name, tid->span.begin, "assign to");
         }
+        // fix #9196 (§28.3 K3.1 + *Captured owned bindings*, §28.11, v0.359):
+        // a store of a captured owned binding into an OWNING-COLLECTION slot
+        // (`_items[key] := item;`) is the consume table's K3.1 row ("store
+        // into an `owned` field or owning-collection slot"; §28.11: the
+        // owning family's indexer-set "takes `owned`"), so it is an
+        // "owned-consuming use" of the binding, and §28.3's *Captured owned
+        // bindings* says every such use inside a closure is a compile error
+        // ("a closure cannot consume, reassign, or dispose a captured owned
+        // binding"). The METHOD-body spelling of the same store consumes the
+        // binding and is checked by `handleAssignment`; a LAMBDA body never
+        // reaches that arm, so the store was admitted and the enclosing
+        // scope kept a binding the closure had moved out (a kill no
+        // body-local liveness can see): a read after the store segfaulted.
+        // The diagnostic is the marked transfer's own, so every consuming
+        // spelling reads alike. Both a captured owned LOCAL and a captured
+        // `owned` PARAMETER are `isCapturedOwnedBinding`; an owned binding of
+        // an ENCLOSING LAMBDA (a nested closure) is
+        // `reportEnclosingLambdaOwnedTransfer`'s, and a lambda's OWN `owned`
+        // parameter / local is neither, so it stays admitted.
+        // per §28.3 K3.1, §28.3 *Captured owned bindings*, §28.11
+        if (insideLambda && as->op == ":=" && as->target && as->value &&
+            (indexerSetterTakesOwned(*as->target) ||
+             propertySetterTakesOwned(*as->target) ||
+             targetIsOwningInlineArraySlot(*as->target))) {
+            if (const auto* vid =
+                    dynamic_cast<const ast::IdentifierExpr*>(as->value.get())) {
+                if (isCapturedOwnedBinding(*vid))
+                    reportCapturedOwnedConsume(vid->name, vid->span.begin,
+                                               "transfer");
+                else
+                    reportEnclosingLambdaOwnedTransfer(
+                        ctx_.exprSymbol(*vid), vid->name, vid->span.begin);
+            }
+        }
         // fix #7891 (§15.3): `y := o;` / `h.F := o;` moves a captured
         // owning-choice `o` out of the enclosing scope.
         if (insideLambda && as->value)
