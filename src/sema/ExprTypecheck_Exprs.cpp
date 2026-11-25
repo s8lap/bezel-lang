@@ -8825,6 +8825,11 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     // regardless of context.  The expression is still TYPED as `Type` so that
     // no secondary "untyped expression" cascades are emitted and the
     // future-implementation path (System.Reflection §11) is preserved.
+    // fix #9058 (§17.10, v0.359): the tracker citation is the OPEN successors
+    // #3819 (the `Type` lattice of stdlib §2.13) and #4630 (typeof/`Type`
+    // reflection still unimplemented); the CLOSED #487 is the issue that
+    // shipped this refusal. The tracker numbers are the ONLY change — the
+    // verdict is not.
     if (auto* to = dynamic_cast<const ast::TypeOfExpr*>(&e)) {
         (void)to; // the queriedType is already resolved by TypeResolution
         auto* typeTy = ctx_.makeTypeRef();
@@ -8834,7 +8839,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         ctx_.diagnostics().report(
             Severity::Error, e.span.begin,
             "reflection is not yet implemented: 'typeof' "
-            "(§17.10, #487); deferred pending System.Reflection §11");
+            "(§17.10, #3819, #4630); deferred pending System.Reflection §11");
     }
     // §17.9: nameof(QualifiedName) → string. The result is the rightmost
     // identifier of the operand, as a compile-time string constant. No

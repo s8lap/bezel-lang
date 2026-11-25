@@ -14815,6 +14815,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // of context.  The expression is still TYPED as `Type` so that
                 // no secondary "untyped expression" cascades are emitted and the
                 // future-implementation path (System.Reflection §11) is preserved.
+                // fix #9058 (§8.2, v0.359): the tracker citation is the OPEN
+                // successors #3819 (the `Type` lattice of stdlib §2.13) and
+                // #4630 (typeof/`Type` reflection still unimplemented); the
+                // CLOSED #487 is the issue that shipped this refusal. The
+                // tracker numbers are the ONLY change — the verdict is not.
                 if (m == "GetType" && ce.args.empty()) {
                     auto* typeTy = ctx_.makeTypeRef();
                     typeTy->kind = TypeRef::Kind::Named;
@@ -14823,7 +14828,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     ctx_.diagnostics().report(
                         Severity::Error, ce.span.begin,
                         "reflection is not yet implemented: 'GetType()' "
-                        "(§8.2, #487); deferred pending System.Reflection §11");
+                        "(§8.2, #3819, #4630); deferred pending "
+                        "System.Reflection §11");
                     return;
                 }
                 // stdlib §5: build a lazy IEnumerable<T> result type for a

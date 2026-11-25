@@ -10374,13 +10374,19 @@ Emitter::CallArgPins::~CallArgPins() {
 // note (issue #6859's `t?.GetType()` row,
 // `tests/conformance/rules/cases/s8_1_0004.bzl`, which then printed `False`
 // where §8.2 requires `True`). ONE helper, so the two spellings cannot drift.
+//
+// fix #9058 (§8.2, v0.359): the refusal's tracker citation is the OPEN
+// successors #3819 (the `Type` lattice of stdlib §2.13) and #4630 (typeof/
+// `Type` reflection still unimplemented); the CLOSED #487 is the issue that
+// shipped the refusal. The tracker numbers are the ONLY change — the verdict
+// (the call is refused) is not.
 static void reportUniversalGetTypeRefusal(sema::SemaContext& ctx,
                                            SourceLocation loc) {
     ctx.diagnostics().report(
         Severity::Error, loc,
         "`GetType()` is not yet implemented in codegen: the runtime "
         "`Type` class (stdlib \xC2\xA7""2.13) requires a type-descriptor "
-        "table that is not yet emitted (\xC2\xA7""8.2, #487). This call "
+        "table that is not yet emitted (\xC2\xA7""8.2, #3819, #4630). This call "
         "will be supported in a future milestone.");
 }
 

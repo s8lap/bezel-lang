@@ -2409,13 +2409,19 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     // stdlib §11).  Until that milestone, typeof(T) in a codegen-bound context
     // emits a clean compile-time error rather than reaching LLVM with an untyped
     // expression and producing silent garbage or a crash (#487).
+    //
+    // fix #9058 (§17.10, v0.359): the refusal's tracker citation is the OPEN
+    // successors #3819 (the `Type` lattice of stdlib §2.13) and #4630 (typeof/
+    // `Type` reflection still unimplemented); the CLOSED #487 is the issue that
+    // shipped the refusal. The tracker numbers are the ONLY change — the
+    // verdict (the expression is refused) is not.
     if (auto* to = dynamic_cast<const ast::TypeOfExpr*>(&e)) {
         (void)to;
         ctx_.diagnostics().report(
             Severity::Error, e.span.begin,
             "`typeof` is not yet implemented in codegen: the runtime `Type` "
             "class (stdlib \xC2\xA7""2.13) requires a type-descriptor table that is "
-            "not yet emitted (\xC2\xA7""17.10, #487). This expression will be "
+            "not yet emitted (\xC2\xA7""17.10, #3819, #4630). This expression will be "
             "supported in a future milestone.");
         return llvm::PoisonValue::get(ptrTy());
     }

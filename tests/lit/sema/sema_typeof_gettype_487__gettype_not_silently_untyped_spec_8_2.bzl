@@ -8,4 +8,4 @@
 module M; class Animal public _name: string; end Animal; class C public method M(a: Animal) var t := a.GetType(); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: reflection is not yet implemented: 'GetType()'
-// CHECK-SAME: (§8.2, #487)
+// CHECK-SAME: (§8.2, #3819, #4630)

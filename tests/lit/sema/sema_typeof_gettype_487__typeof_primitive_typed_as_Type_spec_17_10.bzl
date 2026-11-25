@@ -8,4 +8,4 @@
 module M; class C public method M() var t := typeof(int); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: reflection is not yet implemented: 'typeof'
-// CHECK-SAME: (§17.10, #487)
+// CHECK-SAME: (§17.10, #3819, #4630)

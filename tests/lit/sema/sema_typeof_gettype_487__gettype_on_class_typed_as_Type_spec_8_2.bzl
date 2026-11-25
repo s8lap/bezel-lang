@@ -8,4 +8,4 @@
 module M; class Widget public _id: int; end Widget; class C public method M(w: Widget) var t := w.GetType(); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: reflection is not yet implemented: 'GetType()'
-// CHECK-SAME: (§8.2, #487)
+// CHECK-SAME: (§8.2, #3819, #4630)

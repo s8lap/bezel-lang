@@ -360,7 +360,7 @@ public class Program
 end Program;
 )bz");
     BEZEL_EXPECT_TRUE(hasErrorMessage(
-        r, "reflection is not yet implemented: 'typeof' (§17.10, #487)"));
+        r, "reflection is not yet implemented: 'typeof' (§17.10, #3819, #4630)"));
     BEZEL_EXPECT_EQ(nominalCount(r), 0u);
 }
 
@@ -375,7 +375,7 @@ public class Program
 end Program;
 )bz");
     BEZEL_EXPECT_TRUE(hasErrorMessage(
-        r, "reflection is not yet implemented: 'GetType()' (§8.2, #487)"));
+        r, "reflection is not yet implemented: 'GetType()' (§8.2, #3819, #4630)"));
     BEZEL_EXPECT_EQ(nominalCount(r), 0u);
 }
 

@@ -258,7 +258,7 @@ end Program;
 )BZL");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasErrorContaining(
-        r, "reflection is not yet implemented: 'GetType()' (§8.2, #487)"));
+        r, "reflection is not yet implemented: 'GetType()' (§8.2, #3819, #4630)"));
     BEZEL_EXPECT_FALSE(r.ran);
 }
 
@@ -280,6 +280,6 @@ end Program;
 )BZL");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasErrorContaining(
-        r, "reflection is not yet implemented: 'GetType()' (§8.2, #487)"));
+        r, "reflection is not yet implemented: 'GetType()' (§8.2, #3819, #4630)"));
     BEZEL_EXPECT_FALSE(r.ran);
 }

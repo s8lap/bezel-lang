@@ -28009,6 +28009,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // `.ToArray()/.Count()/.Any()`), never bound to a variable. This converts
         // a clean-compile-then-crash into a clean diagnostic (decline-with-reasons
         // until the value model lands).
+        // fix #9058 (stdlib §5, v0.359): the diagnostic's tracker citation is
+        // the OPEN successor #4694 (the follow-up to the CLOSED #755) — a reader
+        // following the number must land on open work. The TEXT is the only
+        // change: the verdict (the stored shape is refused) is unchanged.
         if (ld->initializer) {
             if (const TypeRef* it = ctx_.exprType(*ld->initializer))
                 if (isBareLazyGroupingType(it))
@@ -28016,7 +28020,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         Severity::Error, ld->initializer->span.begin,
                         "a GroupBy(...) result cannot be stored in a variable yet: "
                         "the IGrouping<TKey, T> value model is not implemented "
-                        "(#755). Consume it inline — iterate "
+                        "(#4694). Consume it inline — iterate "
                         "`for var g in <seq>.GroupBy(...)`, or use a terminal "
                         "operator such as `.ToArray()`, `.Count()`, or `.Any()`");
         }
