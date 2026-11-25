@@ -3577,12 +3577,30 @@ llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
     // substitution recordStruct returns the i32 placeholder layout, so the
     // wrapper's payload offsets disagree with the access side and `b!.value`
     // reads the wrong slot (garbage for `Box<int>?`; a corrupted 8-byte pointer
-    // for `Box<string>?`). RecordSubstGuard installs `rt`'s concrete type args
-    // for the recordStruct call, then restores the outer subst.
+    // for `Box<string>?`). The substitution is installed by `lowerTypeRef`
+    // itself now (see the #9049 note below), which reads `rt`'s concrete type
+    // args for the recordStruct call and restores the outer subst.
+    //
+    // fix #9049 (§14.1 / §9.4 / §4.8, v0.359): the payload is the SAME LLVM
+    // type the VALUE of this type lowers to, and it is read from the ONE
+    // authority for that — `lowerTypeRef` on the non-nullable form — instead
+    // of re-deriving the struct here. The two derivations disagreed in an
+    // UNSPECIALIZED template body: `lowerTypeRef` keeps the ERASED struct when
+    // every type argument is still an unbound template parameter (§14.1's
+    // erasure rule — the template body must share its base struct with every
+    // other use of that type), while the substitution installed here ALWAYS
+    // specialised — so the carrier's payload was the SPECIALIZED struct and
+    // the value the UNSPECIALIZED one, and the `insertvalue` that builds the
+    // carrier was rejected by LLVM's verifier ("Invalid InsertValueInst
+    // operands!": `insertvalue { i8, %"record.Entry$spec0" } %18, %record.Entry
+    // %gon.val, 1`). The `DictionaryEntry` branch below already reads its
+    // payload this way; this branch now matches it.
     if (isNullableRecordTy(rt)) {
-        RecordSubstGuard guard(this, rt);
-        return llvm::StructType::get(
-            llvm_, {nullablePrimHasValTy(), recordStruct(rt->declaration)});
+        sema::TypeRef nn = *rt;
+        nn.nullable = false;
+        llvm::Type* payload = lowerTypeRef(&nn);
+        if (!payload) payload = i32();
+        return llvm::StructType::get(llvm_, {nullablePrimHasValTy(), payload});
     }
     // fix #8232 (stdlib §4.8 / §5, v0.355): the NULLABLE
     // `DictionaryEntry<K, V>` -- §5's `ElementAtOrNull(index: int): T?` forms
@@ -3603,13 +3621,22 @@ llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
     // fix #2447 / §35.9 / §7.2: a nullable choice's payload is the bare
     // choice struct ({i32 tag, case0_payload, ...} — choiceStruct), so the
     // leading hasValue tag distinguishes null from any choice value
-    // (mirroring isNullableRecordTy just above; RecordSubstGuard is reused
-    // here exactly as it is for a nullable GENERIC record — a generic
-    // choice's payload struct is likewise per-instantiation, #2047).
+    // (mirroring isNullableRecordTy just above; the payload is read the same
+    // way — a generic choice's payload struct is likewise per-instantiation,
+    // #2047).
+    //
+    // fix #9049 (§35.4 / §14.1, v0.359): the choice twin of the record branch
+    // above — the payload is read from `lowerTypeRef` (the ONE authority for
+    // the type's LLVM form), so it agrees with the VALUE of the same type in
+    // an unspecialized template body too (the erased struct, not the
+    // placeholder-specialized one). Same defect, same fix: the carrier's
+    // payload and the value must be the same type.
     if (isNullableChoiceTy(rt)) {
-        RecordSubstGuard guard(this, rt);
-        return llvm::StructType::get(
-            llvm_, {nullablePrimHasValTy(), choiceStruct(rt->declaration)});
+        sema::TypeRef nn = *rt;
+        nn.nullable = false;
+        llvm::Type* payload = lowerTypeRef(&nn);
+        if (!payload) payload = i32();
+        return llvm::StructType::get(llvm_, {nullablePrimHasValTy(), payload});
     }
     // per §2.5–§2.6 / issue #1954: a nullable value-builtin's payload is the
     // NON-nullable builtin's lowering (DateTime/TimeSpan → i64, DateOnly/TimeOnly →
