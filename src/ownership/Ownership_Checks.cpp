@@ -32869,31 +32869,12 @@ MethodOwnership::SetErasingSourceSet MethodOwnership::setErasingSourceSet(
                                 SetErasingFlowPos{}};
         entry.nonEmpty = callBounded;
         defs.push_back(entry);
+        auto ad = seFlowDefs_.find(sym);
+        if (ad != seFlowDefs_.end())
+            defs.insert(defs.end(), ad->second.begin(), ad->second.end());
     } else {
-        const ast::Expr* init = nullptr;
-        bool known = false;
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
-            init = ld->initializer.get();
-            known = true;
-        } else if (auto* lc =
-                       dynamic_cast<const ast::LocalConstDecl*>(ls->decl)) {
-            init = lc->value.get();
-            known = true;
-        }
-        auto dp = seFlowDeclPos_.find(ls->decl);
-        if (known && dp != seFlowDeclPos_.end()) {
-            defs.push_back({init, /*traced=*/true, /*kills=*/true,
-                            /*positioned=*/true, dp->second});
-        } else {
-            // A for-variable, a pattern or catch binding, or a declaration
-            // the walk did not place: untraced, and it reaches every read.
-            defs.push_back({nullptr, /*traced=*/false, /*kills=*/false,
-                            /*positioned=*/false, SetErasingFlowPos{}});
-        }
+        setErasingFlowLocalDefs(*ls, defs);
     }
-    auto ad = seFlowDefs_.find(sym);
-    if (ad != seFlowDefs_.end())
-        defs.insert(defs.end(), ad->second.begin(), ad->second.end());
     auto rp = seFlowReads_.find(id);
     if (rp == seFlowReads_.end()) flowInsensitive = true;
 
@@ -32943,6 +32924,39 @@ MethodOwnership::SetErasingSourceSet MethodOwnership::setErasingSourceSet(
             r = Set::NonEmpty;
     }
     return r;
+}
+
+// The definitions of local `ls` the flow facts record, in walk order: its
+// declaration (a placed `var`/`const` declaration is a traced, killing
+// definition; any other binding form is untraced and reaches every read),
+// then every assignment to it. Shared by `setErasingSourceSet` and the #9310
+// carrier trace, so the two read one set of definitions. // per §28.3
+void MethodOwnership::setErasingFlowLocalDefs(
+    const sema::LocalSymbol& ls, std::vector<SetErasingFlowDef>& defs) const {
+    const ast::Expr* init = nullptr;
+    bool known = false;
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls.decl)) {
+        init = ld->initializer.get();
+        known = true;
+    } else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(ls.decl)) {
+        init = lc->value.get();
+        known = true;
+    }
+    auto dp = seFlowDeclPos_.find(ls.decl);
+    if (known && dp != seFlowDeclPos_.end()) {
+        SetErasingFlowDef decl{init, /*traced=*/true, /*kills=*/true,
+                               /*positioned=*/true, dp->second};
+        decl.stores = true;
+        defs.push_back(decl);
+    } else {
+        // A for-variable, a pattern or catch binding, or a declaration
+        // the walk did not place: untraced, and it reaches every read.
+        defs.push_back({nullptr, /*traced=*/false, /*kills=*/false,
+                        /*positioned=*/false, SetErasingFlowPos{}});
+    }
+    auto ad = seFlowDefs_.find(&ls);
+    if (ad != seFlowDefs_.end())
+        defs.insert(defs.end(), ad->second.begin(), ad->second.end());
 }
 
 // fix #8871 (§28.3 *Provenance* clause 6, v0.359): build the flow facts of
@@ -33158,11 +33172,14 @@ void MethodOwnership::setErasingFlowStmt(const ast::Stmt& s) {
         setErasingFlowExpr(as->target.get());
         if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                 as->target.get()))
-            if (const sema::Symbol* tsym = ctx_.exprSymbol(*tid))
-                seFlowDefs_[tsym].push_back(
-                    {as->value.get(), /*traced=*/true,
-                     /*kills=*/as->op == ":=", /*positioned=*/true,
-                     {seFlowCur_, ++seFlowSeq_}});
+            if (const sema::Symbol* tsym = ctx_.exprSymbol(*tid)) {
+                SetErasingFlowDef def{as->value.get(), /*traced=*/true,
+                                      /*kills=*/as->op == ":=",
+                                      /*positioned=*/true,
+                                      {seFlowCur_, ++seFlowSeq_}};
+                def.stores = as->op == ":=" || as->op == "??=";
+                seFlowDefs_[tsym].push_back(std::move(def));
+            }
         return;
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s))
@@ -34066,6 +34083,13 @@ bool MethodOwnership::scopedRestrictedUse(const ast::Expr& e,
 // and ran into a use-after-free when the stored closure later fired.
 bool MethodOwnership::scopedCarrierSource(const ast::Expr& e,
                                           std::string_view& nameOut) {
+    std::unordered_set<const ast::Expr*> visited;
+    return scopedCarrierSourceIn(e, nameOut, visited);
+}
+
+bool MethodOwnership::scopedCarrierSourceIn(
+    const ast::Expr& e, std::string_view& nameOut,
+    std::unordered_set<const ast::Expr*>& visited) {
     if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
         std::vector<const ast::IdentifierExpr*> ids;
         scopedCollectCaptures(*lam, ids);
@@ -34076,27 +34100,135 @@ bool MethodOwnership::scopedCarrierSource(const ast::Expr& e,
                 return true;
             }
         }
+        // fix-forward #9310 (§28.3 *Provenance* clause 1, v0.359): "a
+        // captured function value its own set, transitively" — a lambda that
+        // captures a CARRIER local (`lambda(t) => f(t)` over `var f :=
+        // lambda(t) => handler(t)`) carries the formal too. A captured
+        // binding reads as the union (clause 1), which the identifier arm
+        // below gives it.
+        for (const ast::IdentifierExpr* id : ids)
+            if (scopedCarrierSourceIn(*id, nameOut, visited)) return true;
         return false;
     }
     if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e))
-        return (cd->thenValue && scopedCarrierSource(*cd->thenValue, nameOut)) ||
-               (cd->elseValue && scopedCarrierSource(*cd->elseValue, nameOut));
+        return (cd->thenValue &&
+                scopedCarrierSourceIn(*cd->thenValue, nameOut, visited)) ||
+               (cd->elseValue &&
+                scopedCarrierSourceIn(*cd->elseValue, nameOut, visited));
     if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e))
-        return pb->operand && scopedCarrierSource(*pb->operand, nameOut);
+        return pb->operand &&
+               scopedCarrierSourceIn(*pb->operand, nameOut, visited);
     if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
         for (const auto& el : cl->elements)
-            if (el && scopedCarrierSource(*el, nameOut)) return true;
+            if (el && scopedCarrierSourceIn(*el, nameOut, visited)) return true;
         return false;
     }
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
         sema::Symbol* sym = ctx_.exprSymbol(*id);
         auto it = sym ? scopedCarrierLocals_.find(sym)
                       : scopedCarrierLocals_.end();
+        // The union map is a superset of every exact answer below: a local
+        // never assigned a carrier carries none.
         if (it == scopedCarrierLocals_.end()) return false;
-        nameOut = it->second;
-        return true;
+        // fix-forward #9310 (§28.3 *Provenance* clause 1, v0.359): "a binding
+        // no lambda captures contributes the assignments that reach the
+        // read". With exact flow facts, an UNCAPTURED local's read carries
+        // the formal iff a storing definition that REACHES it — forward, or
+        // around a loop's back edge, cut by a dominating `:=` — stores a
+        // carrier (`setErasingFlowReaches`, the reaching-assignment test the
+        // set-erasing verdict reads clause 6 through). A captured binding
+        // holds "every value it is ever assigned" (clause 1): the union.
+        auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+        auto rp = seFlowReads_.find(id);
+        if (!scopedCarrierFlowExact_ || !ls || seFlowCaptured_.count(sym) ||
+            rp == seFlowReads_.end()) {
+            nameOut = it->second;
+            return true;
+        }
+        // A definition chain that cycles back to this read adds nothing (the
+        // least set, §28.3 clause 1's fixpoint sentence).
+        if (!visited.insert(id).second) return false;
+        std::vector<SetErasingFlowDef> defs;
+        setErasingFlowLocalDefs(*ls, defs);
+        for (const SetErasingFlowDef& d : defs) {
+            if (!d.stores || !d.value) continue;
+            if (d.positioned && !setErasingFlowReaches(d, rp->second, defs))
+                continue;
+            if (scopedCarrierSourceIn(*d.value, nameOut, visited)) return true;
+        }
+        return false;
     }
     return false;
+}
+
+// fix-forward #9310 (§28.14, §28.3 *Provenance* clause 1, v0.359): prepare
+// the carrier trace for the callee sink walk over `body` (or an expression
+// body). Builds the body's flow facts (`setErasingFlowBuild`, the one
+// complete walk of every statement and expression kind, lambda bodies
+// included) and, from every storing definition those facts record, the
+// UNION carrier map as a least fixed point: a local is a carrier when ANY of
+// its definitions stores one, whatever its position. Computing the map
+// before the sink walk is what puts a carrier that reaches a sink only around
+// a loop's back edge (`_keep.f := f; f := <carrier>;` in a loop body) in
+// front of that sink. TERMINATION: each round only adds locals of this body
+// (a finite set) to the map, and the loop stops on a round that adds none.
+void MethodOwnership::scopedCarrierPrepare(
+    const std::vector<std::unique_ptr<ast::Stmt>>* body,
+    const ast::Expr* exprBody) {
+    scopedCarrierLocals_.clear();
+    scopedCarrierFlowExact_ = false;
+    // Only a `scoped` formal of this member can be carried (`scopedUseKind`
+    // reads `methodParamSet_`); without one the walk meets no carrier.
+    bool anyScoped = false;
+    for (const sema::Symbol* sym : methodParamSet_)
+        if (auto* ps = dynamic_cast<const sema::ParameterSymbol*>(sym))
+            if (ps->modifier == "scoped") anyScoped = true;
+    if (!anyScoped) return;
+    if (body)
+        setErasingFlowBuild(*body);
+    else if (exprBody)
+        setErasingFlowBuildExpr(*exprBody);
+    else
+        return;
+    // The locals the body reads, in walk order (a local no read names
+    // reaches no sink, and is no other local's source).
+    std::vector<std::pair<unsigned, sema::LocalSymbol*>> reads;
+    for (const auto& [rexpr, pos] : seFlowReads_)
+        if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(rexpr))
+            if (auto* ls = dynamic_cast<sema::LocalSymbol*>(
+                    ctx_.exprSymbol(*rid)))
+                reads.push_back({pos.seq, ls});
+    std::sort(reads.begin(), reads.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::vector<sema::LocalSymbol*> locals;
+    std::unordered_set<const sema::LocalSymbol*> seen;
+    for (const auto& r : reads)
+        if (seen.insert(r.second).second) locals.push_back(r.second);
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (sema::LocalSymbol* ls : locals) {
+            if (scopedCarrierLocals_.count(ls)) continue;
+            std::vector<SetErasingFlowDef> defs;
+            setErasingFlowLocalDefs(*ls, defs);
+            for (const SetErasingFlowDef& d : defs) {
+                std::string_view carried;
+                if (d.stores && d.value &&
+                    scopedCarrierSource(*d.value, carried)) {
+                    scopedCarrierLocals_[ls] = carried;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    }
+    scopedCarrierFlowExact_ = seFlowComplete_;
+}
+
+void MethodOwnership::scopedCarrierFinish() {
+    scopedCarrierFlowExact_ = false;
+    // As `checkSetErasingPositionsInExpr` leaves them: the facts belong to
+    // this walk only.
+    seFlowComplete_ = false;
 }
 
 bool MethodOwnership::scopedCarrierEscape(const ast::Expr& e,
@@ -34162,8 +34294,10 @@ void MethodOwnership::scopedCarrierAtCallArg(
 
 void MethodOwnership::scopedCalleeScan(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    scopedCarrierPrepare(&body, nullptr);  // fix-forward #9310
     for (const auto& s : body)
         if (s) scopedCalleeWalkStmt(*s);
+    scopedCarrierFinish();
 }
 
 void MethodOwnership::scopedCalleeWalkStmt(const ast::Stmt& s) {

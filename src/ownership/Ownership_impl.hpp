@@ -8200,6 +8200,11 @@ private:
         // and, for a swap, its sibling's). Those reads' sets are joined into
         // the definition's.
         std::vector<const ast::Expr*> refSources;
+        // fix #9310 (§28.3 *Provenance* clause 1, v0.359): the definition
+        // STORES its `value` into the binding — a declaration's initializer,
+        // a `:=` or a `??=` (not a compound assignment, whose value is an
+        // operand, nor an `out`/`ref` argument).
+        bool stores = false;
     };
     std::vector<SetErasingFlowNode> seFlowNodes_;
     int seFlowCur_ = 0;
@@ -8255,6 +8260,8 @@ private:
     bool setErasingFlowAncestorOrEqual(int anc, int node) const;
     bool setErasingFlowDisjointArms(int a, int b) const;
     int setErasingFlowCommonLoop(int a, int b) const;
+    void setErasingFlowLocalDefs(const sema::LocalSymbol& ls,
+                                 std::vector<SetErasingFlowDef>& defs) const;
     bool setErasingFlowReaches(const SetErasingFlowDef& d,
                                const SetErasingFlowPos& read,
                                const std::vector<SetErasingFlowDef>& defs) const;
@@ -8331,10 +8338,28 @@ private:
                                 const std::vector<ast::CallArgument>* args,
                                 std::size_t argPos, const ast::Expr& arg,
                                 std::string_view formalName);
-    // Locals bound from a carrier (flow-insensitive, never un-recorded —
-    // conservative, like `callBoundedAlias_`), mapped to the carried
-    // parameter's name.
+    // Locals bound from a carrier anywhere in the body, mapped to the
+    // carried parameter's name: the UNION over every definition, computed by
+    // `scopedCarrierPrepare` as a fixed point BEFORE the sink walk, so a
+    // carrier that reaches a sink only around a loop's back edge is in it
+    // (fix-forward #9310). It is the whole answer for a binding a lambda
+    // captures (§28.3 clause 1: "every value it is ever assigned … whatever
+    // the assignment's position") and wherever the flow facts are not exact.
     std::unordered_map<sema::Symbol*, std::string_view> scopedCarrierLocals_;
+    // fix-forward #9310 (§28.3 *Provenance* clause 1, v0.359): "a binding no
+    // lambda captures contributes the assignments that reach the read". True
+    // while the sink walk runs over a body whose flow facts
+    // (`setErasingFlowBuild`) `scopedCarrierPrepare` built: a read of an
+    // UNCAPTURED local is then a carrier iff a definition that REACHES it
+    // (`setErasingFlowReaches`, the §28.3 reaching-assignment test) stores a
+    // carrier.
+    bool scopedCarrierFlowExact_ = false;
+    void scopedCarrierPrepare(
+        const std::vector<std::unique_ptr<ast::Stmt>>* body,
+        const ast::Expr* exprBody);
+    void scopedCarrierFinish();
+    bool scopedCarrierSourceIn(const ast::Expr& e, std::string_view& nameOut,
+                               std::unordered_set<const ast::Expr*>& visited);
     // > 0 while the callee walk is inside a lambda BODY: a `return` there
     // returns from the lambda, not from the method.
     int scopedLambdaDepth_ = 0;
