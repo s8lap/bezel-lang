@@ -3376,7 +3376,8 @@ void bz_channel_sender_send(void* txp, void* item, void* cce_vtable,
 // completes when `item` has been accepted into the channel:
 //   - closed/disposed        → dispose the item, fault the task with
 //                              ChannelClosedException (immediate).
-//   - a receiver is parked    → deliver directly; task already-done (void).
+//   - a ReceiveAll drain waiter is parked (fix #9054) or a receiver is
+//     parked              → deliver directly; task already-done (void).
 //   - unbounded or space free  → buffer the item; task already-done (void).
 //   - full bounded             → park {item, task} in the send-waiter FIFO; the
 //                                task completes when a later Receive/TryReceive
@@ -3398,12 +3399,27 @@ static void* channel_send_async_core(bz_channel_t* ch, void* item,
     bz_pending_receiver_t recv{nullptr, nullptr};
     bool complete_now  = false;  // accepted immediately (void completion)
     bool closed_fault  = false;  // channel closed → fault the task
+    // fix #9054 (stdlib §6.9, v0.359): a ReceiveAll drain waiter parked in
+    // MoveNextAsync on an empty open channel. As in channel_send_core, a new
+    // item goes straight to it, ahead of `pending` and the buffer. Without
+    // this arm the item was buffered and the waiter never woke: the drain
+    // then saw only the close (status 0), ending the enumeration with items
+    // still buffered (lost), or, on a full bounded buffer, never woke at all
+    // while every sender stayed parked (a hang).
+    bz_task_t* drain_waiter = nullptr;
+    void**     drain_slot   = nullptr;
 
     {   std::lock_guard<std::mutex> lk(ch->mtx);
         if (ch->closed || ch->disposed) {
             if (item && ch->dispose_elem)
                 ch->dispose_elem(item);
             closed_fault = true;
+        } else if (ch->recv_all_waiter_task) {
+            drain_waiter = ch->recv_all_waiter_task;
+            drain_slot   = ch->recv_all_waiter_item_slot;
+            ch->recv_all_waiter_task      = nullptr;
+            ch->recv_all_waiter_item_slot = nullptr;
+            complete_now = true;
         } else if (!ch->pending.empty()) {
             // A receiver is already waiting: hand the item straight across.
             recv = ch->pending.front();
@@ -3430,6 +3446,13 @@ static void* channel_send_async_core(bz_channel_t* ch, void* item,
     if (recv.task) {
         // Deliver the item to the waiting receiver (ptr-sized result).
         bz_task_complete(recv.task, &item, sizeof(void*));
+    }
+    // fix #9054: hand the item to the drain waiter (1-byte status 1, "got an
+    // item"), exactly as channel_send_core does.
+    if (drain_waiter) {
+        if (drain_slot) *drain_slot = item;
+        uint8_t one = 1;
+        bz_task_complete(drain_waiter, &one, sizeof(one));
     }
     if (closed_fault) {
         void* excObj = nullptr;
