@@ -10191,6 +10191,37 @@ void ExprTC::checkAssignable(
                 "`owned` to transfer");
             return;
         }
+        // fix #9127 (§27.1.1 fourth bullet, §28.3.5 rows 1 and 4, v0.359): the
+        // REVERSE of the #9105 check above. "Modifier slots (`owned`/…) must
+        // match exactly": a value whose return slot is the plain concrete
+        // class/interface `K` (a variable typed `() -> K`, or a method-group
+        // reference to a borrow-returning method — row 4, "Borrow … The
+        // result is never owned") retyped to a target whose return slot is
+        // `owned` (row 1: "Function-value invocation: Owned", so the caller
+        // disposes each result) would hand the caller's disposal obligation a
+        // borrow of storage someone else owns — a heap-use-after-free. A fresh
+        // lambda literal is the callee-side-checked spelling (#9040/#1820:
+        // its body must supply a fresh or owned value) and is skipped. Keyed
+        // on the SOURCE slot via the same predicate as above; the
+        // mint-announcing slots (`Task`-family, iterable heads) and a bare
+        // type parameter are not touched.
+        if (!freshLambda && !selFrom->funcReturnOwned &&
+            to->funcReturnOwned && isConcreteSlotReturnType(selFrom->funcReturn)) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("the ") + what + " has a function type whose "
+                "return slot is the plain `" +
+                std::string(selFrom->funcReturn->headName()) +
+                "` but the target's is `owned` \xe2\x80\x94 a call through a "
+                "plain concrete class/interface slot yields a borrow, while "
+                "a call through an `owned` slot hands the caller a value it "
+                "must dispose, so the caller would dispose a borrow of "
+                "storage someone else owns; modifier slots are part of a "
+                "function signature's identity and there is no conversion "
+                "between them (\xc2\xa7""27.1.1, \xc2\xa7""28.3.5 rows 1 and 4 "
+                "v0.359)");
+            return;
+        }
         // §27.3 (v0.217, #2101): a fresh lambda's param/return SHAPES stay
         // target-typed (the skipShapeCheck carve above) — EXCEPT that a
         // return-type ASCRIPTION, when written, must agree with the target's
