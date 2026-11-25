@@ -31220,8 +31220,20 @@ void MethodOwnership::queueAccessorSetErasingPositions(
 // scope-end free, and does not report through `MethodOwnership::report`
 // anything but the set-erasing verdict. // per §28.3, v0.359
 void MethodOwnership::checkSetErasingPositionsInAccessorBody(
-    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    const std::vector<std::unique_ptr<ast::Stmt>>& body,
+    const std::vector<sema::Symbol*>* paramSyms) {
     if (body.empty()) return;
+    // fix #9067 (§28.3 *Provenance* clause 3, v0.359): "A plain
+    // function-typed parameter of the enclosing body contributes itself: its
+    // signature announces no set (K2.4), so the value is bounded by the call,
+    // §28.14's call-bounded tier." An indexer's index parameters are the
+    // accessor body's own formals; seed them as `run` seeds a method's, so
+    // `get => do return Reg.Keep(q); end;` reads `q` as NON-EMPTY at the
+    // `Object` parameter exactly as the method twin does. // per §28.3
+    if (paramSyms) {
+        seedCallBoundedFormals(*paramSyms);
+        for (sema::Symbol* sym : *paramSyms) methodParamSet_.insert(sym);
+    }
     const bool saved = setErasingAccessorWalk_;
     setErasingAccessorWalk_ = true;
     // The flow facts (Provenance clause 6) are built by the same walk that

@@ -22172,8 +22172,11 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
                 if (acc.bodyKind == ast::PropertyAccessorBodyKind::Block &&
                     !acc.isSet) {
                     MethodOwnership setErasingMo(ctx);
+                    // fix #9067 (§28.3 *Provenance* clause 3, v0.359): with
+                    // the indexer's own formals, as the `=>` accessor bodies
+                    // get them (#9063).
                     setErasingMo.checkSetErasingPositionsInAccessorBody(
-                        acc.stmts);
+                        acc.stmts, paramSymsOf(m, ctx));
                 }
                 // fix #9084 (§28.14 *The call-bounded default*, v0.359): the
                 // §28.14 callee-side verification of the indexer's own plain

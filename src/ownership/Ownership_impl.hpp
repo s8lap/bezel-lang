@@ -1031,8 +1031,15 @@ public:
     // LAMBDA's own call-bounded parameters, and queue the set-erasing
     // positions the body meets.  It adds NO other diagnostic. // per §28.3,
     // v0.359
+    //
+    // fix #9067 (§28.3 *Provenance* clause 3, v0.359): `paramSyms` are the
+    // accessor's own formals (an indexer's index parameters); their plain
+    // function-typed ones are seeded call-bounded for the walk, exactly as
+    // `run` seeds a method's and the `=>` driver (#9045, #9063) seeds an
+    // expression body's.
     void checkSetErasingPositionsInAccessorBody(
-        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        const std::vector<sema::Symbol*>* paramSyms = nullptr);
 
     // fix #9084 (§28.14 *The call-bounded default*, v0.359): the §28.14
     // callee-side verification at an INDEXER ACCESSOR body that no full
