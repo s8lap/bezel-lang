@@ -2542,7 +2542,8 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // admitted where the block twin is rejected).  This change does not
     // touch it: #8825's repro still compiles here, MEASURED. // per §28.14,
     // v0.359
-    if (!scopedRestrictedUse(exprBody, "be returned"))
+    if (!scopedRestrictedUse(exprBody, "be returned") &&
+        !scopedCarrierEscape(exprBody, "be returned"))  // fix #9310
         scopedCalleeWalkExpr(exprBody);
     // §28.3 SB01-B (v0.190, #1919): the `=>` expression-body sibling of the
     // block-body driver above — a lambda embedded in an expression body carries

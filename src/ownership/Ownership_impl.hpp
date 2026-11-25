@@ -8311,6 +8311,34 @@ private:
     // this-qualified). Returns 0 otherwise.
     int scopedUseKind(const ast::Expr& e, std::string_view* nameOut = nullptr);
 
+    // fix #9310 (§28.14 *The `scoped` modifier*, §28.3 closure bullet, v0.359):
+    // a CLOSURE that captures the method's own `scoped` function-typed
+    // parameter carries it in its source set, so the callee obligations that
+    // bind the parameter ("may not return it, move it into non-`scoped`
+    // storage, or store it in any other object") bind the closure too.
+    // `scopedCarrierSource` answers "does `e` carry a scoped formal?" (a
+    // lambda literal capturing one, a conditional / `!` / collection literal
+    // over such a value, or a local bound from one); `scopedCarrierEscape`
+    // reports a carrier at a sink (return); `scopedCarrierAtCallArg` judges a
+    // carrier handed to a call argument position. Syntactic, like the rest of
+    // the callee walk.
+    bool scopedCallLiterallyOnThis(const ast::CallExpr& ce);
+    bool scopedCarrierSource(const ast::Expr& e, std::string_view& nameOut);
+    bool scopedCarrierEscape(const ast::Expr& e, std::string_view context);
+    void scopedCarrierAtCallArg(const ast::Expr& callNode,
+                                const ast::Expr* callee,
+                                const ast::NewExpr* ne,
+                                const std::vector<ast::CallArgument>* args,
+                                std::size_t argPos, const ast::Expr& arg,
+                                std::string_view formalName);
+    // Locals bound from a carrier (flow-insensitive, never un-recorded —
+    // conservative, like `callBoundedAlias_`), mapped to the carried
+    // parameter's name.
+    std::unordered_map<sema::Symbol*, std::string_view> scopedCarrierLocals_;
+    // > 0 while the callee walk is inside a lambda BODY: a `return` there
+    // returns from the lambda, not from the method.
+    int scopedLambdaDepth_ = 0;
+
     // -- §28.14 v0.177 (#1419): the call-bounded default ----------------------
     //
     // A PLAIN (no-modifier) function-typed parameter is CALL-BOUNDED in this

@@ -34054,6 +34054,112 @@ bool MethodOwnership::scopedRestrictedUse(const ast::Expr& e,
     return true;
 }
 
+// fix #9310 (§28.14 *The `scoped` modifier*, §28.3 closure bullet, v0.359):
+// "The callee may store the callback, but only in `scoped` fields of the
+// bounding object itself, or forward it to another `scoped` parameter whose
+// bounding object is the same object; it may invoke it. It may not return it,
+// move it into non-`scoped` storage, or store it in any other object." A
+// closure that CAPTURES the formal carries it in its source set (§28.3), so
+// handing the closure to one of those sinks hands the callback to it. The
+// walk below read only a BARE use of the formal, so `_keep.bus.Add(lambda(t)
+// => handler(t))` was admitted where `_keep.bus.Add(handler)` is rejected —
+// and ran into a use-after-free when the stored closure later fired.
+bool MethodOwnership::scopedCarrierSource(const ast::Expr& e,
+                                          std::string_view& nameOut) {
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        std::vector<const ast::IdentifierExpr*> ids;
+        scopedCollectCaptures(*lam, ids);
+        for (const ast::IdentifierExpr* id : ids) {
+            std::string_view n;
+            if (scopedUseKind(*id, &n) == 1) {
+                nameOut = n;
+                return true;
+            }
+        }
+        return false;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e))
+        return (cd->thenValue && scopedCarrierSource(*cd->thenValue, nameOut)) ||
+               (cd->elseValue && scopedCarrierSource(*cd->elseValue, nameOut));
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e))
+        return pb->operand && scopedCarrierSource(*pb->operand, nameOut);
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& el : cl->elements)
+            if (el && scopedCarrierSource(*el, nameOut)) return true;
+        return false;
+    }
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        auto it = sym ? scopedCarrierLocals_.find(sym)
+                      : scopedCarrierLocals_.end();
+        if (it == scopedCarrierLocals_.end()) return false;
+        nameOut = it->second;
+        return true;
+    }
+    return false;
+}
+
+bool MethodOwnership::scopedCarrierEscape(const ast::Expr& e,
+                                          std::string_view context) {
+    std::string_view name;
+    if (!scopedCarrierSource(e, name)) return false;
+    report(Severity::Error, e.span.begin,
+           std::string("this closure captures `") + std::string(name) +
+               "`, a `scoped` parameter — a closure that captures it carries "
+               "it (§28.3), so it may not " + std::string(context) +
+               ": the callback may only be invoked, stored into a `scoped` "
+               "field of the bounding object itself, or forwarded to a "
+               "`scoped` parameter of a call on the same bounding object "
+               "(`this`) (§28.14, v0.359)");
+    return true;
+}
+
+void MethodOwnership::scopedCarrierAtCallArg(
+    const ast::Expr& callNode, const ast::Expr* callee, const ast::NewExpr* ne,
+    const std::vector<ast::CallArgument>* args, std::size_t argPos,
+    const ast::Expr& arg, std::string_view formalName) {
+    // A `scoped` position: the closure is the stored callback, bounded by the
+    // call's bounding object (forms 1-5). Resolved to `this` it is the
+    // admitted forward (the direct `_changed.Add(handler)` twin); resolved to
+    // a `using var` local it is bounded by that local, which a callee
+    // parameter outlives. A call whose bounding object resolves to NOTHING
+    // (a static chain, a getter, a borrow-field hop, a parameter receiver)
+    // "admits no capture-bearing arguments" (§28.14, forms 4/5).
+    if (scopedFormalAt(callee, ne, args, argPos)) {
+        // Form 5 on `this` (`this.M(…)`, a bare `M(…)`, a constructor chain
+        // call) is the callee's own `this` — the same bounding object — and is
+        // the admitted forward the direct `this.M(handler)` spelling is.
+        const auto* callExpr = dynamic_cast<const ast::CallExpr*>(&callNode);
+        if (callExpr && scopedCallLiterallyOnThis(*callExpr)) return;
+        if (scopedBoundingLocal(callNode, callee, ne).kind ==
+            ScopedBound::Kind::None)
+            report(Severity::Error, arg.span.begin,
+                   std::string("this closure captures `") +
+                       std::string(formalName) +
+                       "`, a `scoped` parameter, and is passed to a `scoped` "
+                       "position whose bounding object resolves to neither "
+                       "`this` nor a `using var` local — the stored closure "
+                       "would outlive the callback it carries (§28.14, forms "
+                       "4/5 — a static chain, a getter, a borrow-field hop or "
+                       "a parameter receiver admits no capture-bearing "
+                       "argument; §28.3; v0.359)");
+        return;
+    }
+    // A built-in collection mutator on a receiver reachable beyond the call
+    // stores the closure beyond the call.
+    if (!ne && builtinCollectionStoreCallee(callee)) {
+        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+        if (ma && ma->target && exprReachableBeyondCall(*ma->target))
+            report(Severity::Error, arg.span.begin,
+                   std::string("this closure captures `") +
+                       std::string(formalName) +
+                       "`, a `scoped` parameter — a closure that captures it "
+                       "carries it (§28.3), so it may not be stored into a "
+                       "collection reachable beyond the call (§28.14, "
+                       "v0.359)");
+    }
+}
+
 void MethodOwnership::scopedCalleeScan(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     for (const auto& s : body)
@@ -34154,6 +34260,56 @@ void MethodOwnership::scopedCalleeWalkStmt(const ast::Stmt& s) {
             scopedCalleeWalkExpr(*as->target);
             return;
         }
+        // fix #9310 (§28.14, §28.3, v0.359): a closure that captures a
+        // `scoped` parameter, assigned anywhere but a local, is stored in
+        // "any other object" — a field, a static field, an indexer slot, an
+        // `out`/`ref` parameter. A local target binds the carrier locally.
+        // `lhs += closure` is `lhs.Add(closure)` (§17.2): a `scoped` position
+        // whose bounding object is the receiver chain's head.
+        if (as->target && as->value) {
+            std::string_view carried;
+            if (scopedCarrierSource(*as->value, carried)) {
+                if (as->op == "+=") {
+                    if ((dynamic_cast<sema::EventSymbol*>(
+                             ctx_.exprSymbol(*as->target)) ||
+                         typeRefIsEventSourceLike(
+                             ctx_.exprType(*as->target))) &&
+                        resolveChainHead(as->target.get()).kind ==
+                            ScopedBound::Kind::None)
+                        report(Severity::Error, as->value->span.begin,
+                               std::string("this closure captures `") +
+                                   std::string(carried) +
+                                   "`, a `scoped` parameter, and is "
+                                   "subscribed with `+=` (`.Add`, a `scoped` "
+                                   "position) on a receiver whose bounding "
+                                   "object resolves to neither `this` nor a "
+                                   "`using var` local — the stored closure "
+                                   "would outlive the callback it carries "
+                                   "(§28.14, forms 4/5; §17.2; §28.3; "
+                                   "v0.359)");
+                } else if (as->op == ":=" || as->op == "??=") {
+                    sema::LocalSymbol* tl = nullptr;
+                    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                            as->target.get()))
+                        tl = dynamic_cast<sema::LocalSymbol*>(
+                            ctx_.exprSymbol(*tid));
+                    if (tl) {
+                        scopedCarrierLocals_[tl] = carried;
+                    } else {
+                        report(Severity::Error, as->value->span.begin,
+                               std::string("this closure captures `") +
+                                   std::string(carried) +
+                                   "`, a `scoped` parameter — a closure that "
+                                   "captures it carries it (§28.3), so it may "
+                                   "not be stored into a field, a static "
+                                   "field, an indexer slot or an `out`/`ref` "
+                                   "parameter: the callback may be stored "
+                                   "only in a `scoped` field of the bounding "
+                                   "object itself (§28.14, v0.359)");
+                    }
+                }
+            }
+        }
         if (as->target) scopedCalleeWalkExpr(*as->target);
         if (as->value) scopedCalleeWalkExpr(*as->value);
         return;
@@ -34161,6 +34317,12 @@ void MethodOwnership::scopedCalleeWalkStmt(const ast::Stmt& s) {
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
         if (rs->value) {
             if (scopedRestrictedUse(*rs->value, "be returned")) return;
+            // fix #9310: a closure carrying the formal, returned from the
+            // method (a `return` inside a lambda body returns from the
+            // lambda; its closure is judged where the lambda escapes).
+            if (scopedLambdaDepth_ == 0 &&
+                scopedCarrierEscape(*rs->value, "be returned"))
+                return;
             scopedCalleeWalkExpr(*rs->value);
         }
         return;
@@ -34170,6 +34332,14 @@ void MethodOwnership::scopedCalleeWalkStmt(const ast::Stmt& s) {
             if (scopedRestrictedUse(*ld->initializer,
                                     "be bound to a local"))
                 return;
+            // fix #9310: binding a carrier to a local is a local binding; the
+            // local carries the formal from here on (judged at its sinks).
+            {
+                std::string_view carried;
+                if (scopedCarrierSource(*ld->initializer, carried))
+                    if (sema::LocalSymbol* ls = findLocalSymbol(*ld))
+                        scopedCarrierLocals_[ls] = carried;
+            }
             scopedCalleeWalkExpr(*ld->initializer);
         }
         return;
@@ -34259,6 +34429,39 @@ void MethodOwnership::scopedCalleeWalkStmt(const ast::Stmt& s) {
     }
 }
 
+// The §28.14 form-5 receiver `this`: the call's receiver is literally `this`
+// (`this.M(…)`), a bare instance-method name (the implicit `this`), or a
+// `this(...)` / `base(...)` constructor chain call. The bounding object is the
+// object the callee itself runs on, so it is "the same object" a callee's own
+// `scoped` formal is bounded by.
+bool MethodOwnership::scopedCallLiterallyOnThis(const ast::CallExpr& ce) {
+    bool onThis = false;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+        auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        onThis = tid && tid->name == "this";
+    } else if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
+                   ce.callee.get())) {
+        // Bare method name: an instance method of this class — receiver is
+        // the implicit `this`.
+        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*cid))) {
+            onThis = true;
+            for (std::string_view mod : ms->modifiers)
+                if (mod == "static") onThis = false;
+        } else if (resolveChainCtorParams(ce.callee.get(), ce.args).valid()) {
+            // fix #8803 (§28.14, v0.359): a `this(...)` / `base(...)`
+            // constructor CHAIN call constructs the object under construction
+            // — its bounding object is `this`, the same object, so forwarding
+            // a `scoped` parameter into the chain target's `scoped` formal is
+            // the admitted forward. Without this, the remedy #8778's
+            // call-bounded diagnostic names ("declare `f` itself `scoped`")
+            // was itself rejected here. Same chain resolver as
+            // `scopedFormalAt`.
+            onThis = true;
+        }
+    }
+    return onThis;
+}
+
 void MethodOwnership::scopedCalleeWalkExpr(const ast::Expr& e) {
     // Admitted context 1: INVOCATION — the scoped param / field is the callee.
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
@@ -34279,38 +34482,7 @@ void MethodOwnership::scopedCalleeWalkExpr(const ast::Expr& e) {
                 // parameter with the same bounding object") forwards.
                 bool formalScoped =
                     scopedFormalAt(ce->callee.get(), nullptr, &ce->args, i);
-                bool onThis = false;
-                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                        ce->callee.get())) {
-                    auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
-                        ma->target.get());
-                    onThis = tid && tid->name == "this";
-                } else if (auto* cid =
-                               dynamic_cast<const ast::IdentifierExpr*>(
-                                   ce->callee.get())) {
-                    // Bare method name: an instance method of this class —
-                    // receiver is the implicit `this`.
-                    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
-                            ctx_.exprSymbol(*cid))) {
-                        onThis = true;
-                        for (std::string_view mod : ms->modifiers)
-                            if (mod == "static") onThis = false;
-                    } else if (resolveChainCtorParams(ce->callee.get(),
-                                                      ce->args)
-                                   .valid()) {
-                        // fix #8803 (§28.14, v0.359): a `this(...)` /
-                        // `base(...)` constructor CHAIN call constructs the
-                        // object under construction — its bounding object
-                        // is `this`, the same object, so forwarding a
-                        // `scoped` parameter into the chain target's
-                        // `scoped` formal is the admitted forward. Without
-                        // this, the remedy #8778's call-bounded diagnostic
-                        // names ("declare `f` itself `scoped`") was itself
-                        // rejected here. Same chain resolver as
-                        // `scopedFormalAt`.
-                        onThis = true;
-                    }
-                }
+                bool onThis = scopedCallLiterallyOnThis(*ce);
                 // fix #9274 (§28.14 forms 3/4, v0.359): the forward's
                 // "same object" is the bounding object the INNER call
                 // resolves by §28.14's own forms at its own site — the
@@ -34359,6 +34531,14 @@ void MethodOwnership::scopedCalleeWalkExpr(const ast::Expr& e) {
                            "argument (§28.14, v0.175)");
                 continue;
             }
+            // fix #9310: a closure carrying a `scoped` formal handed to a
+            // call argument position.
+            {
+                std::string_view carried;
+                if (scopedCarrierSource(*a.value, carried))
+                    scopedCarrierAtCallArg(*ce, ce->callee.get(), nullptr,
+                                           &ce->args, i, *a.value, carried);
+            }
             scopedCalleeWalkExpr(*a.value);
         }
         return;
@@ -34395,13 +34575,21 @@ void MethodOwnership::scopedCalleeWalkExpr(const ast::Expr& e) {
         return;
     }
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
-        for (const auto& a : ne->args) {
+        for (std::size_t ai = 0; ai < ne->args.size(); ++ai) {
+            const auto& a = ne->args[ai];
             if (!a.value) continue;
             // Forwarding into a CONSTRUCTOR is never same-object (the new
             // object is a different bounding object). // per §28.14
             if (scopedRestrictedUse(*a.value,
                                     "be passed to a constructor"))
                 continue;
+            // fix #9310: a closure carrying a `scoped` formal.
+            {
+                std::string_view carried;
+                if (scopedCarrierSource(*a.value, carried))
+                    scopedCarrierAtCallArg(*ne, nullptr, ne, &ne->args, ai,
+                                           *a.value, carried);
+            }
             scopedCalleeWalkExpr(*a.value);
         }
         return;
@@ -34481,9 +34669,11 @@ void MethodOwnership::scopedCalleeWalkExpr(const ast::Expr& e) {
     if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
         // A lambda CAPTURING a scoped param/field would let it escape through
         // the closure — every use inside the body is checked as a bare use.
+        ++scopedLambdaDepth_;
         if (lam->exprBody) scopedCalleeWalkExpr(*lam->exprBody);
         for (const auto& bs : lam->stmts)
             if (bs) scopedCalleeWalkStmt(*bs);
+        --scopedLambdaDepth_;
         return;
     }
     if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
