@@ -31,7 +31,7 @@ public class Program
     for var i in 0..<200 do
       using var c := new Counter2();
       using var hub := new Hub();
-      var f := lambda(t: double) => c.Hit(t);
+      var f := lambda(x: double) => c.Hit(x);
       hub.On(f);
       hub.Src.Remove(f);
       f(1.0);

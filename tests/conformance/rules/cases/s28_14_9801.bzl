@@ -33,7 +33,7 @@ public class Program
     for var i in 0..<200 do
       using var c := new Counter2();
       using var b := new Bag();
-      var f := lambda(t: double) => c.Hit(t);
+      var f := lambda(x: double) => c.Hit(x);
       b.Remove(f);
       b.Fire(1.0);
       t := t + c.N;

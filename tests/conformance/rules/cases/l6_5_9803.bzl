@@ -32,7 +32,7 @@ public class Program
     for var i in 0..<200 do
       using var c := new Counter2();
       using var hub := new Hub();
-      var f: (double) -> Task := async lambda(t: double) => do c.Hit(t); end;
+      var f: (double) -> Task := async lambda(x: double) => do c.Hit(x); end;
       hub.On(f);
       await hub.Fire(1.0);
       hub.Off(f);
