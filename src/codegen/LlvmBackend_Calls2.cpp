@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "codegen/LlvmBackend_Console.hpp"  // fix #9213: the ONE built-in `Console.ReadLine()` classifier (lowering + consumer-side classification)
 #include "codegen/LlvmBackend_TextReader.hpp"  // fix #9199: the ONE built-in `TextReader.ReadToEnd()` classifier (lowering + consumer-side classification)
 #include "llvm/ADT/STLFunctionalExtras.h"  // llvm::function_ref (fix #4901 shared-event gate)
 #include "sema/BuiltinInterfaceAncestors.hpp"  // fix #6828: the §26.5 built-in interface table — the ONE copy, shared with sema's §14.5 phase-1 unification
@@ -11388,6 +11389,16 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // duplicate never had (#2265).
     // Console.ReadLine() → string? / Console.ReadKey() → char
     if (call.args.empty() && call.callee) {
+        // fix #9213 (stdlib §2.1 / §4.6 / §28.3 / §28.9, v0.359): the
+        // built-in `Console.ReadLine()` is recognised by the ONE shared
+        // classifier (`src/codegen/LlvmBackend_Console.hpp`) that the
+        // consumer-side classification (`Emitter::isPlusOneStringProducer`,
+        // src/codegen/LlvmBackend_Setup.cpp) ALSO reads — the two answer
+        // "is this call the built-in member?" and "does this call mint a fresh
+        // string the caller owns?" and must not drift (the same discipline
+        // `LlvmBackend_TextReader.hpp` states for the §7.4 reader's member).
+        if (isBuiltinConsoleReadLine(call, ctx_))
+            return emitConsoleReadLine();
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
             if (ma->target) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
@@ -11395,7 +11406,6 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     // is member access, not the built-in reader.
                     if (id->name == "Console" &&
                         receiverMayReachBuiltinStaticArm(*id)) {
-                        if (ma->member == "ReadLine") return emitConsoleReadLine();
                         if (ma->member == "ReadKey") {
                             // getchar() → char (i32)
                             auto* gcFn = module_->getFunction("getchar");

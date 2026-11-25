@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "codegen/LlvmBackend_Console.hpp"  // fix #9213: the ONE built-in `Console.ReadLine()` classifier (lowering + consumer-side classification)
 #include "codegen/LlvmBackend_EnumMembers.hpp"  // fix #3862 (§10.4, v0.357): the ONE enum-member gate (lowering + ownership walk)
 #include "codegen/LlvmBackend_IndexerParams.hpp"  // fix #9102: the ONE indexer index-parameter shape (lowering + escape walk)
 #include "codegen/LlvmBackend_TextReader.hpp"  // fix #9199: the ONE built-in `TextReader.ReadToEnd()` classifier (lowering + consumer-side classification)
@@ -31303,6 +31304,56 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                 }
             }
         }
+    }
+    // fix #9213 (stdlib §2.1 / §4.6 / §28.3 / §28.9, v0.359): the built-in
+    // `Console.ReadLine(): string?` is a +1 string PRODUCER — the §2.1 sibling
+    // of the `Environment.Get` arm above.
+    //
+    // WHY IT IS A PRODUCER. stdlib §2.1 declares, on the built-in `Console`,
+    //
+    //   public static method ReadLine(): string?;     // null at EOF
+    //
+    // and the `ReadLine` lowering (`emitConsoleReadLine`, LlvmBackend_Calls.cpp)
+    // reads one line from standard input into a heap buffer and mints the
+    // result the way every fresh string production is minted: a `malloc`'d
+    // `bz.string` header whose rc is set to 1 (`initStringRc`) — the producer's
+    // reference, §28.3's "Fresh productions are owned" and §28.9's "the
+    // implementation reclaims the production" (§4.6: "`string` is
+    // runtime-managed: its memory is reclaimed automatically"). So the CALLER
+    // owns exactly ONE reference to it.
+    //
+    // WITHOUT THIS ARM every consumer treated the result as a BORROW and never
+    // discharged the producer's +1: the bound local was not a release candidate
+    // at all, so nothing released it and the read line leaked once per read.
+    // MEASURED (issue #9213; generated-code LeakSanitizer): the issue's own
+    // program — `var s := Console.ReadLine();` over the input "hello\n" —
+    // printed `5` and then reported `SUMMARY: AddressSanitizer: 38 byte(s)
+    // leaked in 2 allocation(s)` (the 32-byte `bz.string` header + the 6-byte
+    // data buffer), exit status 99.
+    //
+    // A bound local TRANSFERS the single reference (no extra retain) and the
+    // scope-end release drops rc 1->0 exactly once; a call argument and the
+    // `Console.Write` #1031 arm discharge it at the end of the full expression.
+    // No double free: an ESCAPING local is excluded from the scope-end release
+    // by the escape walk (its +1 then leaks — the safe direction).
+    //
+    // THE NULL AT EOF. The result is `string?`: at end of input the call
+    // returns NULL and mints NOTHING. The arm says only WHETHER the call can
+    // mint a fresh production, never whether THIS run produced a value, and
+    // the runtime's string release is null-safe — so the EOF case discharges
+    // nothing and crashes nothing.
+    //
+    // THE DISCRIMINATOR IS THE LOWERING'S OWN (`isBuiltinConsoleReadLine`,
+    // `src/codegen/LlvmBackend_Console.hpp`), so the two halves agree on
+    // WHICH call is the built-in member: the SYNTACTIC receiver `Console`
+    // (the built-in CLASS, read the same way `Console.In` / `Console.Out` /
+    // `Console.Error` are read). A VALUE named `Console` is member access, not
+    // the built-in class (fix #8126, §2.7 rule 1, v0.355), and a USER class
+    // named `Console` has its own member surface and its own dispatch — both
+    // are excluded, exactly as the lowering excludes them.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (isBuiltinConsoleReadLine(*call, ctx_))
+            return true;  // emitConsoleReadLine → initStringRc → rc=1
     }
     // #2199 / stdlib §9.6 / §4.6 / §28.9 (v0.220): the stdlib `string` INSTANCE
     // methods that transform self into a fresh heap `bz.string` at rc := 1. Each

@@ -384,18 +384,21 @@ BEZEL_TEST(textreader_readtoend_8383, no_internal_degrade_note_21_1) {
 // still reads a line and still strips its terminator ('hello', not
 // 'hello\n').
 //
-// THE LEAK ORACLE IS OFF FOR THIS ROW ONLY. `Console.ReadLine()` (stdlib
-// §2.1) is NOT the §7.4 `TextReader.ReadToEnd()`: it is its OWN member, and
-// its OWN result is still never discharged (`Emitter::isPlusOneStringProducer`
-// has no `Console.ReadLine` arm), so this row's program leaks the line it
-// read — 38 bytes in 2 allocations, MEASURED with the generated code's
-// LeakSanitizer on the tip of fix #9199. That is a SEPARATE defect from the
-// one this file covers, and it is filed as its own issue; this lane does not
-// fix it (scope discipline) and must not import its failure into this file.
-// Every OTHER row of this file runs with `detect_leaks=1`: since fix #9199
-// the §7.4 `ReadToEnd()` result IS discharged, so the read text is no longer
-// leaked, and the leak oracle now watches these rows (which is the net that
-// would have caught #9199).
+// THE LEAK ORACLE IS ON FOR THIS ROW SINCE fix #9213. `Console.ReadLine()`
+// (stdlib §2.1) is NOT the §7.4 `TextReader.ReadToEnd()`: it is its OWN
+// member. It leaked the line it read — 38 bytes in 2 allocations, MEASURED
+// with the generated code's LeakSanitizer — because
+// `Emitter::isPlusOneStringProducer` had no `Console.ReadLine` arm, so every
+// consumer treated the result as a BORROW and nothing discharged the
+// producer's +1. That was a SEPARATE defect (filed as its own issue), and
+// fix #9213 closed it: the row's program now runs under `detect_leaks=1`
+// like every OTHER row of this file, and its program leaks NOTHING. The
+// EXPECTATIONS are unchanged (the same stdout, the same exit code 0) — the
+// new expectation is the LEAK: none.
+//
+// (The row was opted out of the leak oracle by fix #9199, which noted that
+// this member's own result was still undischarged; #9213 discharges it, so
+// the opt-out is lifted here.)
 BEZEL_TEST(textreader_readtoend_8383, console_read_line_still_strips_the_newline_2_1) {
     const char* src =
         "module P;\n"
@@ -405,7 +408,7 @@ BEZEL_TEST(textreader_readtoend_8383, console_read_line_still_strips_the_newline
         "    if l <> null then Console.WriteLine($\"[{l}]\"); end if;\n"
         "  end Main;\n"
         "end Program;\n";
-    auto o = runWithStdin(src, "hello\nworld\n", /*detectLeaks=*/false);
+    auto o = runWithStdin(src, "hello\nworld\n", /*detectLeaks=*/true);
     BEZEL_EXPECT_TRUE(o.compiled);
     BEZEL_EXPECT_EQ(o.exitCode, 0);
     BEZEL_EXPECT_EQ(o.stdoutText, std::string("[hello]\n"));
