@@ -1154,6 +1154,18 @@ bool closureRefArgKeepsNothingPastCall(const sema::SemaContext& ctx,
                                         const ast::CallExpr& call,
                                         std::size_t ai);
 
+// fix-forward #9056 (stdlib §6.5 / spec §17.2, §28.9, v0.359): a BUILT-IN
+// event source receiver (a keyword `event` access, or a declaration-less
+// `EventSource<T>` / `AsyncEventSource<T>` / `SharedEventSource<T>` value),
+// and the HANDLER argument of its `Remove(handler)` — a call-bounded borrow
+// (the runtime only compares it). Shared by the caller's closure-local escape
+// walk and the callee-body forwarding walk. Defined in LlvmBackend_Setup.cpp.
+bool isBuiltinEventSourceReceiver(const ast::Expr* receiver,
+                                  const sema::SemaContext& ctx);
+bool isBuiltinEventRemoveHandlerArg(const ast::Expr* callee, std::size_t i,
+                                    std::size_t argc,
+                                    const sema::SemaContext& ctx);
+
 // fix #6075 (§12.1 / §14.1 / §27.8, v0.338): the type arguments of a generic
 // BASE, bound to the base's type-parameter names. `class G<T>` with a virtual
 // member over `T` (or over a type CONTAINING `T`: `Array<T>`, `Stack<T?>`),
@@ -15904,12 +15916,16 @@ private:
 
     // fix #9056 (§28.14 / §28.9 / stdlib §6.5, v0.359): retain `closure` when
     // `handlerExpr` — the handler argument of a STORING stdlib sink
-    // (Subscribe / Add / Register) — is a bare read of a
-    // `scoped` formal of the method being emitted whose callers release their
+    // (Subscribe / Add / Register) — is a bare read (or an all-formal
+    // conditional) of a `scoped` formal of the method being emitted whose callers release their
     // own reference (`scopedFormalCallerReleasesProducer`). The sink then owns
     // the +1 it drops. Returns `closure`. Defined in LlvmBackend_Calls2.cpp.
     llvm::Value* retainForwardedScopedHandler(const ast::Expr* handlerExpr,
                                               llvm::Value* closure);
+    // fix-forward #9056: the handler-shape test retainForwardedScopedHandler
+    // applies — a bare read of such a `scoped` formal, or a conditional all
+    // of whose arms are. Defined in LlvmBackend_Calls2.cpp.
+    bool forwardedScopedFormalRead(const ast::Expr* e);
 
     // fix #8950 (§28.14 / §27.5 / §28.9, v0.359): is the argument at
     // PARAMETER index `idx` a lambda LITERAL at a PLAIN ASYNC callee's

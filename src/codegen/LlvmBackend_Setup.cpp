@@ -43557,6 +43557,14 @@ struct ClosureEscapeWalker {
                     argIsTarget(c->args[ai].value.get()) &&
                     isBuiltinArrayComparerArg(c->callee.get(), ai, ctx))
                     safeArg = true;
+                // fix-forward #9056: a built-in event source's
+                // `Remove(handler)` only compares (isBuiltinEventRemoveHandlerArg).
+                if (!safeArg && c->args[ai].modifier.empty() &&
+                    c->args[ai].name.empty() &&
+                    argIsTarget(c->args[ai].value.get()) &&
+                    isBuiltinEventRemoveHandlerArg(c->callee.get(), ai,
+                                                   c->args.size(), ctx))
+                    safeArg = true;
                 // fix #8723 / #8747: see closureLocalAssignTakesReference.
                 const bool savedSite = inReferenceTakingSite_;
                 if (!safeArg && callBoundedArg &&
@@ -44004,6 +44012,17 @@ struct ClosureEscapeWalker {
             // different function) is what clears it there.
             if (targetSym && !inLambda && as->op == ":=" &&
                 isTargetIdent(as->target.get())) {
+                expr(as->value.get(), /*safeRead=*/true);
+                return;
+            }
+            // fix-forward #9056 (spec §17.2, stdlib §6.5, v0.359): `src -= h`
+            // is the fixed desugaring of `src.Remove(h)` (tryLowerEventCompound
+            // lowers it to the same `bz_event_remove_closure`), so its handler
+            // is the same call-bounded borrow as the call form
+            // (isBuiltinEventRemoveHandlerArg).
+            if (as->op == "-=" && argIsTarget(as->value.get()) &&
+                isBuiltinEventSourceReceiver(as->target.get(), ctx)) {
+                expr(as->target.get(), /*safeRead=*/false);
                 expr(as->value.get(), /*safeRead=*/true);
                 return;
             }

@@ -21159,7 +21159,8 @@ bool Emitter::scopedCallResultAdmitsRelease(const sema::SemaContext& ctx,
 // heap-use-after-free at the first `Raise` under ASan). Retain it here, so the
 // sink owns the reference it will drop.
 //
-// ONLY a bare read of a `scoped` formal of the method being emitted, and only
+// ONLY a bare read of a `scoped` formal of the method being emitted (or a
+// conditional all of whose arms are one — fix-forward #9056), and only
 // when that method's callers release (the same predicate): a constructor's
 // `scoped` formal (no MethodSymbol) and a lambda's are left as they were,
 // because their callers do not release a producer there (#8771 item 2,
@@ -21168,10 +21169,30 @@ llvm::Value* Emitter::retainForwardedScopedHandler(const ast::Expr* handlerExpr,
                                                    llvm::Value* closure) {
     if (!handlerExpr || !closure || !closure->getType()->isPointerTy())
         return closure;
-    auto* id = dynamic_cast<const ast::IdentifierExpr*>(handlerExpr);
-    if (!id) return closure;
+    // fix-forward #9056: a conditional whose EVERY arm is such a forwarded
+    // formal (`Add((if pick then a else b))`) yields one of the caller's
+    // borrowed references either way, so the sink takes its own +1 on the
+    // selected value just as for a bare formal. A conditional with any other
+    // arm (a fresh producer) is left as it was: one retain for the selected
+    // value would over-count that arm's transferred +1.
+    if (!forwardedScopedFormalRead(handlerExpr)) return closure;
+    emitClosureRetain(closure);  // null-safe; atomic rc inc
+    return closure;
+}
+
+// fix #9056 / fix-forward #9056 (§28.14 / §28.9, v0.359): is `e` a read of a
+// `scoped` formal of the method being emitted whose callers release their own
+// reference — a bare identifier, or a conditional all of whose arms are? See
+// retainForwardedScopedHandler.
+bool Emitter::forwardedScopedFormalRead(const ast::Expr* e) {
+    if (!e) return false;
+    if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(e))
+        return forwardedScopedFormalRead(ce->thenValue.get()) &&
+               forwardedScopedFormalRead(ce->elseValue.get());
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+    if (!id) return false;
     auto* ps = dynamic_cast<sema::ParameterSymbol*>(ctx_.exprSymbol(*id));
-    if (!ps || ps->modifier != "scoped") return closure;
+    if (!ps || ps->modifier != "scoped") return false;
     // The formal's owner is the method being emitted (`currentMethod_`) or,
     // for an expression-bodied GENERIC method inlined at its call site
     // (`emitInlineGenericMethod`, which keeps the CALLER's `currentMethod_`),
@@ -21195,10 +21216,7 @@ llvm::Value* Emitter::retainForwardedScopedHandler(const ast::Expr* handlerExpr,
     sema::MethodSymbol* owner = ownsFormal(currentMethod_) ? currentMethod_
         : ownsFormal(currentSpecMethodSymbol_)              ? currentSpecMethodSymbol_
                                                             : nullptr;
-    if (!owner || !scopedFormalCallerReleasesProducer(ctx_, owner))
-        return closure;
-    emitClosureRetain(closure);  // null-safe; atomic rc inc
-    return closure;
+    return owner && scopedFormalCallerReleasesProducer(ctx_, owner);
 }
 
 // fix #8950 (§28.14 *Call-bounded × deferred activation*, shape (1) "Frame
@@ -22552,6 +22570,15 @@ struct FormalInvocationOnlyWalk {
                     return;
                 }
             }
+            // fix-forward #9056 (spec §17.2, stdlib §6.5, v0.359): `src -= h`
+            // desugars to `src.Remove(h)`, a call-bounded position (see
+            // forwardedArgPositionIsCallBounded).
+            if (allowForwarding && ctx && lambdaDepth == 0 && as->op == "-=" &&
+                isName(as->value.get()) &&
+                isBuiltinEventSourceReceiver(as->target.get(), *ctx)) {
+                expr(as->target.get());
+                return;
+            }
             expr(as->target.get());
             expr(as->value.get());
             return;
@@ -23040,6 +23067,10 @@ static bool forwardedArgPositionIsCallBounded(
     const ast::CallArgument& a = c.args[i];
     if (!a.modifier.empty() || !a.name.empty() || a.isDiscard) return false;
     if (!c.callee) return false;
+    // fix-forward #9056 (stdlib §6.5, v0.359): a built-in event source's
+    // `Remove(handler)` only compares its handler — a call-bounded position.
+    if (isBuiltinEventRemoveHandlerArg(c.callee.get(), i, c.args.size(), ctx))
+        return true;
     // The METHOD branch.
     if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
             ctx.exprSymbol(*c.callee))) {
@@ -23245,6 +23276,49 @@ static bool refFormalBodyKeepsNothing(const sema::SemaContext& ctx,
     return w.ok;
 }
 
+
+// fix-forward #9056 (stdlib §6.5 / spec §17.2, §28.9, §28.14, v0.359): is
+// `receiver` a BUILT-IN event source — a keyword-form `event` access, or a
+// value of static type `EventSource<T>` / `AsyncEventSource<T>` /
+// `SharedEventSource<T>` (a declaration-less Named ref; a user class that
+// merely carries the name has a `declaration` and answers false)?
+bool isBuiltinEventSourceReceiver(const ast::Expr* receiver,
+                                  const sema::SemaContext& ctx) {
+    if (!receiver) return false;
+    if (dynamic_cast<const sema::EventSymbol*>(ctx.exprSymbol(*receiver)))
+        return true;
+    const sema::TypeRef* rt = ctx.exprType(*receiver);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    const std::string_view h = rt->headName();
+    return h == "EventSource" || h == "AsyncEventSource" ||
+           h == "SharedEventSource";
+}
+
+// fix-forward #9056 (stdlib §6.5, spec §28.9 / §28.14, v0.359): is argument
+// `i` of a call whose callee is `callee` the HANDLER of a built-in event
+// source's `Remove(handler)`? stdlib §6.5 declares it with a PLAIN
+// (call-bounded) parameter — `Remove(handler: (T) -> ()); // call-bounded:
+// Remove only compares` — and the lowering (dispatchEventMethods' `isRemove`
+// arm, LlvmBackend_Calls2.cpp) hands the closure to
+// `bz_event_remove_closure`, which only COMPARES it against the registered
+// handlers (`bz_closure_same`) and deactivates the first match: nothing is
+// stored, so the closure cannot outlive the call. A closure LOCAL read here is
+// therefore a call-bounded BORROW, not an escape; its own scope-end release
+// stays armed. Before this relief the position was an escape, so the local
+// leaked whenever nothing else had taken its +1 (`Src.Remove(f)` alone), and —
+// once fix #9056 let a local passed to a forwarding `scoped` formal keep its
+// +1 — the subscribe-then-unsubscribe idiom (`hub.On(f); Src.Remove(f);`)
+// leaked one closure and its capture cells per call. The `-=` desugaring
+// (spec §17.2) is the AssignmentStmt twin (ClosureEscapeWalker).
+bool isBuiltinEventRemoveHandlerArg(const ast::Expr* callee, std::size_t i,
+                                    std::size_t argc,
+                                    const sema::SemaContext& ctx) {
+    if (i != 0 || argc != 1) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target || ma->member != "Remove") return false;
+    return isBuiltinEventSourceReceiver(ma->target.get(), ctx);
+}
 
 // fix #9222 (§22.3 / §28.3.8 / §28.9 / §28.14, v0.359): the caller's verdict
 // on a `ref`/`out` FUNCTION-TYPED argument position. See the declaration in
