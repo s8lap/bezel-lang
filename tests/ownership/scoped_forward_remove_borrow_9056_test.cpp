@@ -18,8 +18,9 @@
 // `bz_event_remove_closure` only compares and deactivates — it stores
 // nothing — so the handler position is a call-bounded BORROW.
 //
-// Row F: a conditional whose arms are both `scoped` formals of the emitting
-// method, handed to `Add`. The caller releases both lambda literals, so the
+// Row F (FLIPPED to a rejection by fix #9201, see the row): a conditional
+// whose arms are both `scoped` formals of the emitting method, handed to
+// `Add`. The caller releases both lambda literals, so the
 // sink must take its own reference on whichever arm is selected (a
 // heap-use-after-free before).
 //
@@ -34,6 +35,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -163,11 +165,16 @@ BEZEL_TEST(ownership_9056_ff_remove_borrow,
     expectClean(r, repeatLine("0", 200));
 }
 
-// F — a conditional of two `scoped` formals handed to `Add`: the sink takes
-// its own reference on the selected one (both lambdas bump the counter).
+// F — FLIPPED by fix #9201 (accepted -> REJECTED), under the conservative v1
+// reading (ruling r43-rule-9201-9056 §4 item 3). §28.14 lets the callee
+// "forward it to another `scoped` parameter": the forward names the
+// PARAMETER, and a conditional `(if pick then a else b)` reads each formal as
+// a value. The block twin was already rejected (probe S4); the arrow body now
+// gets the same diagnostics. #9056-ff's conditional retain in codegen stays
+// (harmless; unreachable from user code until the bound is lifted).
 BEZEL_TEST(ownership_9056_ff_remove_borrow,
            conditional_of_two_scoped_formals_forwarded_to_add_spec_28_14) {
-    auto r = runAotChecked(program(
+    auto r = runAot(program(
         "public class Hub "
         "  private owned readonly _changed: EventSource<double> := "
         "    new EventSource<double>(); "
@@ -178,5 +185,15 @@ BEZEL_TEST(ownership_9056_ff_remove_borrow,
         "      using var hub := new Hub(); "
         "      hub.On(lambda(t) => c.Hit(t), lambda(t) => c.Ping(), i mod 2 = 0); "
         "      hub.Fire(1.0); "));
-    expectClean(r, repeatLine("1", 200));
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    for (const char* name : {"a", "b"}) {
+        const std::string msg =
+            std::string("`") + name +
+            "` is a `scoped` parameter — it may only be invoked, stored into "
+            "a `scoped` field of `this`, or forwarded to a `scoped` parameter "
+            "of a call on `this`; it may not be read as a value (§28.14, "
+            "v0.175)";
+        BEZEL_EXPECT_TRUE(
+            bezel::test::diagnosticMessageContains(r, msg.c_str()));
+    }
 }

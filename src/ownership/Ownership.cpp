@@ -2511,6 +2511,39 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
             callBoundedReportsScopedForward_ = false;
         }
     }
+    // fix #9201 (§28.14 *The `scoped` modifier*, v0.359): the `=> E` body is
+    // a USER-AUTHORED CALLEE body, so §28.14's callee-side obligations bind
+    // it exactly as they bind a block body — but the §28.14 CALLEE-OBLIGATION
+    // walk never ran on it. A block body runs that walk (`scopedCalleeScan` →
+    // `scopedCalleeWalkStmt`, from `run`); an EXPRESSION body ran NEITHER it
+    // nor the call-site admission, so the method's OWN `scoped` parameter
+    // could be forwarded off `this`, stored anywhere else, or RETURNED with
+    // no diagnostic at all — the SILENT ACCEPTANCE #9201 reports.
+    //
+    // MEASURED on r30-c1 (#9201): the issue's own program
+    //   `public method F(scoped q: () -> int): int => (new Sink()).Take(q);`
+    // compiled with ZERO diagnostics, while its block-bodied twin
+    //   `public method F(scoped q: () -> int): int return (new Sink()).Take(q); end F;`
+    // was rejected with §28.14's forward diagnostic.
+    //
+    // The walk is the block body's OWN twin: `scopedCalleeWalkStmt`'s
+    // ReturnStmt case reports the RETURN sink and STOPS when the returned
+    // expression IS a restricted use, and otherwise descends into it. Mirror
+    // that shape exactly — the `=> E` body IS the returned value (§28.3 /
+    // §5.11) — so the diagnostics are the SAME diagnostics, at the same
+    // positions.
+    //
+    // SCOPE.  This closes the CALLEE-side obligations over the method's own
+    // `scoped` parameter — the sinks #9201 reports.  The CALL-SITE admission
+    // (`scopedPreScan` → `checkScopedAdmission`: a `scoped` ARGUMENT at a
+    // call inside the body) is a DIFFERENT pass and a DIFFERENT defect: it
+    // too never ran on an expression body, but its own shapes are already
+    // filed (#8825 — `=> new B(scoped s)` over a plain borrow parameter is
+    // admitted where the block twin is rejected).  This change does not
+    // touch it: #8825's repro still compiles here, MEASURED. // per §28.14,
+    // v0.359
+    if (!scopedRestrictedUse(exprBody, "be returned"))
+        scopedCalleeWalkExpr(exprBody);
     // §28.3 SB01-B (v0.190, #1919): the `=>` expression-body sibling of the
     // block-body driver above — a lambda embedded in an expression body carries
     // the same lambda-return obligation. // per §28.3 SB01-B (v0.190)

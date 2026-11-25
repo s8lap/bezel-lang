@@ -33,6 +33,9 @@
 // same discipline is applied to an IMPORTED callee (see
 // tests/module/xmod_scoped_forward_event_subscribe_9056_test.cpp).
 //
+// (Rows F and K were FLIPPED to rejections by fix #9201: their arrow-bodied
+// forwards resolve no `this` bound under §28.14's forms; see each row.)
+//
 // ROWS A–K are RED on r30-c1 (MEASURED with --no-results-cache: A–G, I and K
 // abort or report a use-after-free; H and J leak the closure each iteration)
 // and GREEN with the fix. Two BOUNDARY CONTROLS (base-green, named in the
@@ -51,6 +54,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -99,6 +103,21 @@ void expectClean(const JitResult& r, const std::string& out) {
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, out);
+}
+
+// §28.14's forward diagnostic for the formal `name`, verbatim (fix #9201: the
+// arrow body now runs the callee-side walk its block twin runs).
+std::string scopedForward(const std::string& name) {
+    return "`" + name +
+           "` is a `scoped` parameter — it may be forwarded only to another "
+           "`scoped` parameter of a call on the same bounding object (`this`) "
+           "(§28.14, v0.175)";
+}
+
+void expectForwardRejected(const JitResult& r, const std::string& name) {
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        bezel::test::diagnosticMessageContains(r, scopedForward(name).c_str()));
 }
 
 }  // namespace
@@ -166,11 +185,22 @@ BEZEL_TEST(ownership_9056_scoped_forward_sink,
     expectClean(r, repeatLine("1", 200));
 }
 
-// F — the forward to `CancellationToken.Register(scoped callback)` (stdlib
-// §6.1), the callback fired once by `Cancel()`.
+// F — FLIPPED by fix #9201 (accepted -> REJECTED). The forward
+// `=> tok.Register(cb)` has a PARAMETER receiver: §28.14 form 4 needs a chain
+// "rooted at `this` or a local binding", so form 5 resolves the receiver
+// `tok` — "a parameter … admits no capture-bearing arguments" — which is not
+// the callee's own bounding object, and the forward is not "to another
+// `scoped` parameter whose bounding object is the same object" (§28.14,
+// v0.359; ruling r43-rule-9201-9056 R4). The same callee is a measured ASan
+// SEGV once the caller resolves the receiver instead of the handle (the
+// #9201 row S2). Its block twin was already rejected; the arrow body now
+// gets the same diagnostic. #9056's Register retain keeps its runtime oracle
+// on the spec-legal form-3 spelling `_reg := tok.Register(cb)`
+// (ownership_9274_scoped_forward_owned_chain.
+// block_register_into_owned_field_admitted_spec_28_14_form_3).
 BEZEL_TEST(ownership_9056_scoped_forward_sink,
            forwarded_lambda_to_token_register_spec_28_14) {
-    auto r = runAotChecked(
+    auto r = runAot(
         "module P; "
         "import System.Threading; "
         "public class Box "
@@ -195,7 +225,7 @@ BEZEL_TEST(ownership_9056_scoped_forward_sink,
         "    end; "
         "  end Main; "
         "end Program;");
-    expectClean(r, repeatLine("1", 200));
+    expectForwardRejected(r, "cb");
 }
 
 // G — a lambda literal forwarded TWICE through `this` (§28.14's "forward it
@@ -273,11 +303,16 @@ BEZEL_TEST(ownership_9056_scoped_forward_sink,
     expectClean(r, repeatLine("1", 200));
 }
 
-// K — the forward reaches the sink through an `IEvent<T>` view
-// (`this.Changed.Subscribe(handler)`, stdlib §6.5's read-only face).
+// K — FLIPPED by fix #9201 (accepted -> REJECTED). The forward reaches the
+// sink through the GETTER face `this.Changed` (stdlib §6.5's read-only
+// `IEvent<T>` property): §28.14 form 4, "A chain containing … a getter …
+// resolves no bounding object", and the transparent-getter lift is
+// "recorded, not shipped" (v0.359; ruling r43-rule-9201-9056 R4). The block
+// twin was already rejected. FLIPPED rather than respelled: the respelling
+// `=> _changed.Subscribe(handler)` is row A's program verbatim.
 BEZEL_TEST(ownership_9056_scoped_forward_sink,
            forwarded_lambda_to_ievent_subscribe_spec_28_14) {
-    auto r = runAotChecked(program(
+    auto r = runAot(program(
         "public class Hub "
         "  private owned readonly _changed: EventSource<double> := "
         "    new EventSource<double>(); "
@@ -289,7 +324,7 @@ BEZEL_TEST(ownership_9056_scoped_forward_sink,
         "      using var hub := new Hub(); "
         "      using var sub := hub.OnChanged(lambda(t) => c.Hit(t)); "
         "      hub.Fire(1.0); "));
-    expectClean(r, repeatLine("1", 200));
+    expectForwardRejected(r, "handler");
 }
 
 // CTRL1 — BOUNDARY CONTROL (base-green): a closure LOCAL forwarded to the
