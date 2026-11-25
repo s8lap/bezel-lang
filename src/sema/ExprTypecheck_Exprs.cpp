@@ -18123,11 +18123,69 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 ctx_.diagnostics().errorCount() == lamBodyErrsBefore) {
                 // (b): a call whose CALLEE carries no type — a unit-returning
                 // built-in member call.
+                //
+                // fix #8784 follow-up (§27.3 *Expression body*, §22.6
+                // *Lambda-literal arguments*, v0.359): "the callee has no
+                // type" is evidence of a unit-returning built-in call ONLY
+                // when the callee's receiver RESOLVED to a built-in class
+                // (`Console`, `Array<T>`, ...): a built-in member is left
+                // untyped on purpose. A receiver that did not resolve — a
+                // lambda parameter whose type is still a method TYPE
+                // PARAMETER (`lambda(x) => x.ToString()` at `(T) -> string`,
+                // `y.Get()` at `(T) -> U`), whose members sema cannot look up
+                // yet — leaves the callee untyped for a different reason and
+                // says NOTHING about the body's type: it may return a value.
+                // Reading it as `()` wrote a guess into the lambda's inferred
+                // return type and into the §22.6 grid (the `A` overload lost
+                // to the `()` one; `Map<T,U>`'s `U` inferred as `()`).
                 if (const auto* ce = dynamic_cast<const ast::CallExpr*>(
                         lam->exprBody.get())) {
                     if (ce->callee) {
                         const TypeRef* calleeTy = ctx_.exprType(*ce->callee);
-                        lamExprBodyIsUnit = !calleeTy;
+                        // The receiver chain (`Console`, `Console.Out`,
+                        // `xs`) must bottom out at a RESOLVED receiver: a
+                        // type name, or a typed value, that is not a type
+                        // parameter. An unresolved lambda parameter has no
+                        // symbol-level type at all.
+                        bool resolvedBuiltinReceiver = false;
+                        const ast::Expr* recv = ce->callee.get();
+                        while (const auto* ma =
+                                   dynamic_cast<const ast::MemberAccessExpr*>(
+                                       recv)) {
+                            recv = ma->target.get();
+                            if (!recv) break;
+                            const TypeRef* recvTy = ctx_.exprType(*recv);
+                            if (!recvTy) {
+                                auto* sym = ctx_.exprSymbol(*recv);
+                                if (auto* loc =
+                                        dynamic_cast<LocalSymbol*>(sym))
+                                    recvTy = loc->declType;
+                                else if (auto* par =
+                                             dynamic_cast<ParameterSymbol*>(
+                                                 sym))
+                                    recvTy = par->declType
+                                                 ? ctx_.resolvedType(
+                                                       *par->declType)
+                                                 : par->resolvedDeclType;
+                            }
+                            if (recvTy) {
+                                // A typed value: resolved unless it is a
+                                // type parameter (or itself an error).
+                                resolvedBuiltinReceiver =
+                                    recvTy->kind != TypeRef::Kind::Error &&
+                                    !recvTy->isResolvedTypeParam() &&
+                                    !isInScopeTypeParamRef(recvTy);
+                                break;
+                            }
+                            // No type: resolved only as a TYPE NAME
+                            // (`Console`), never an unresolved value.
+                            if (memberTargetType(recv) != nullptr) {
+                                resolvedBuiltinReceiver = true;
+                                break;
+                            }
+                        }
+                        lamExprBodyIsUnit =
+                            !calleeTy && resolvedBuiltinReceiver;
                     }
                 }
             }

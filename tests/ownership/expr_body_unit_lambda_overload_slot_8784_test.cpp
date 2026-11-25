@@ -347,3 +347,131 @@ BEZEL_TEST(expr_body_unit_lambda_overload_slot_8784,
         "end;\n");
     expectClean(r, 0, "A\n");
 }
+
+// ---------------------------------------------------------------------------
+// FIX-FORWARD rows (review r43-rev-m69-8784, REJECT of 1572c2794).
+//
+// §27.3: "the body expression's type is the return type, and a body of type
+// `()` makes a procedure lambda." The first cut read "the body's recorded type
+// is MISSING and the call's callee has no recorded type" as "the body is of
+// type `()`". That holds for a built-in unit call (`Console.WriteLine`) whose
+// receiver RESOLVED, but ALSO for ANY call on a lambda parameter whose type is
+// still a method TYPE PARAMETER `T` (sema cannot look the member up yet), and
+// those bodies return values. The guess went into the lambda's inferred return
+// type and into the §22.6 grid, so a `(T) -> string` overload lost to the
+// `(T) -> ()` one (a wrong pick the base got right), and `Map<T, U>`'s `U` was
+// inferred as `()` (a silent miscompile on a program the base rejects).
+// ---------------------------------------------------------------------------
+
+// §22.6 *Lambda-literal arguments*: `x.ToString()` is a VALUE body of type
+// `string`, so it is exact at the `(T) -> string` slot; it must never be
+// classified as a body of type `()`.
+//
+// RED on 1572c2794: prints "B" (the string result discarded). GREEN: "A:5".
+BEZEL_TEST(expr_body_unit_lambda_overload_slot_8784,
+           type_parameter_receiver_string_body_selects_the_value_overload_spec_22_6) {
+    auto r = runAotChecked(
+        "module T;\n"
+        "public static class K\n"
+        "  public static method M<T>(x: T, f: (T) -> string) Console.WriteLine(\"A:\" + f(x)); end;\n"
+        "  public static method M<T>(x: T, f: (T) -> ()) Console.WriteLine(\"B\"); end;\n"
+        "end;\n"
+        "public static class Program\n"
+        "  public static method Main(args: Array<string>): int\n"
+        "    K.M(5, lambda(x) => x.ToString());\n"
+        "    return 0;\n"
+        "  end;\n"
+        "end;\n");
+    expectClean(r, 0, "A:5\n");
+}
+
+// The same shape where the lambda parameter is a USER class and the body calls
+// a user method returning `string`.
+//
+// RED on 1572c2794: prints "B". GREEN: "A".
+BEZEL_TEST(expr_body_unit_lambda_overload_slot_8784,
+           type_parameter_receiver_user_class_body_selects_the_value_overload_spec_22_6) {
+    auto r = runAotChecked(
+        "module T;\n"
+        "public class Item\n"
+        "  public method Name(): string => \"n\";\n"
+        "end;\n"
+        "public static class K\n"
+        "  public static method M<T>(x: T, f: (T) -> string) Console.WriteLine(\"A\"); end;\n"
+        "  public static method M<T>(x: T, f: (T) -> ()) Console.WriteLine(\"B\"); end;\n"
+        "end;\n"
+        "public static class Program\n"
+        "  public static method Main(args: Array<string>): int\n"
+        "    K.M(new Item(), lambda(x) => x.Name());\n"
+        "    return 0;\n"
+        "  end;\n"
+        "end;\n");
+    expectClean(r, 0, "A\n");
+}
+
+// The same shape under a constraint (`where T: IFoo`) with an `int` body.
+//
+// RED on 1572c2794: prints "B". GREEN: "A".
+BEZEL_TEST(expr_body_unit_lambda_overload_slot_8784,
+           constrained_type_parameter_receiver_int_body_selects_the_value_overload_spec_22_6) {
+    auto r = runAotChecked(
+        "module T;\n"
+        "public interface IFoo\n"
+        "  method Get(): int;\n"
+        "end;\n"
+        "public static class K\n"
+        "  public static method M<T>(x: T, f: (T) -> int) where T: IFoo Console.WriteLine(\"A\"); end;\n"
+        "  public static method M<T>(x: T, f: (T) -> ()) where T: IFoo Console.WriteLine(\"B\"); end;\n"
+        "end;\n"
+        "public class Foo : IFoo\n"
+        "  public method Get(): int => 1;\n"
+        "end;\n"
+        "public static class Program\n"
+        "  public static method Main(args: Array<string>): int\n"
+        "    K.M(new Foo(), lambda(x) => x.Get());\n"
+        "    return 0;\n"
+        "  end;\n"
+        "end;\n");
+    expectClean(r, 0, "A\n");
+}
+
+// §14.5 / §27.3: a generic `Map<T, U>(x: T, f: (T) -> U): U` over a lambda
+// whose body is a VALUE call on a `T`-typed parameter. The body is not of type
+// `()`, so `U` must never be inferred as `()`: the program either compiles and
+// prints the body's value `7`, or is rejected with the "cannot infer" error —
+// it must NEVER compile and print `()`.
+//
+// RED on 1572c2794: compiled, exit 0, printed "()" (a silent miscompile; the
+// base rejects with "cannot infer the type argument `U`"). GREEN: the base's
+// rejection (whether a `T`-typed lambda parameter should infer `U` here is a
+// separate, pre-existing question; this row pins only that `()` is not it).
+BEZEL_TEST(expr_body_unit_lambda_overload_slot_8784,
+           type_parameter_receiver_value_body_never_infers_unit_return_spec_27_3) {
+    auto r = runAotChecked(
+        "module T;\n"
+        "public interface IFoo\n"
+        "  method Get(): int;\n"
+        "end;\n"
+        "public class Foo : IFoo\n"
+        "  public method Get(): int => 7;\n"
+        "end;\n"
+        "public static class K\n"
+        "  public static method Map<T, U>(x: T, f: (T) -> U): U => f(x);\n"
+        "  public static method Run<T>(x: T) where T: IFoo\n"
+        "    var r := K.Map(x, lambda(y) => y.Get());\n"
+        "    Console.WriteLine(r);\n"
+        "  end;\n"
+        "end;\n"
+        "public static class Program\n"
+        "  public static method Main(args: Array<string>): int\n"
+        "    K.Run(new Foo());\n"
+        "    return 0;\n"
+        "  end;\n"
+        "end;\n");
+    if (r.ran) {
+        expectClean(r, 0, "7\n");
+    } else {
+        BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+        BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "cannot infer"));
+    }
+}
