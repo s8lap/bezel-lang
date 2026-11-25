@@ -41806,10 +41806,45 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
     if (!call.args[ai].modifier.empty()) return false;
     auto* ms = dynamic_cast<sema::MethodSymbol*>(
         call.callee ? ctx.exprSymbol(*call.callee) : nullptr);
-    if (!ms || ms->isOperator || ctx.isImported(ms)) return false;
+    if (!ms || ms->isOperator) return false;
+    if (ctx.isImported(ms) && !dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        // fix #9056 (§28.14 / §28.9 / §2.5, v0.359): arm (d) below, for an
+        // IMPORTED non-generic callee — the bound-LOCAL spelling of
+        // `prepareCallClosureArgRelease`'s imported `scoped` twin. Only arm
+        // (d): the other arms walk the callee body, which an import does not
+        // carry, so they stay refused (fail closed: ESCAPE → leak).
+        const auto& a = call.args[ai];
+        const std::size_t np = sema::formalParamCount(*ms);
+        std::size_t pidx = np;
+        if (a.name.empty()) {
+            for (std::size_t j = 0; j < ai; ++j)
+                if (!call.args[j].name.empty()) return false;
+            pidx = ai;
+        } else {
+            for (std::size_t j = 0; j < np; ++j)
+                if (sema::formalParamName(*ms, j) == a.name) { pidx = j; break; }
+        }
+        if (pidx >= np || sema::formalParamModifier(*ms, pidx) != "scoped")
+            return false;
+        const sema::TypeRef* pt = sema::formalParamResolvedType(*ms, pidx);
+        if (!pt || pt->kind != sema::TypeRef::Kind::Function) return false;
+        const sema::TypeRef* at0 = ctx.exprType(*a.value);
+        if (!at0 || at0->kind != sema::TypeRef::Kind::Function) return false;
+        if (!Emitter::scopedFormalCallerReleasesProducer(ctx, ms)) return false;
+        const sema::TypeRef* drt = sema::methodReturnResolvedType(*ms, ctx);
+        if (drt && drt->kind != sema::TypeRef::Kind::Unit &&
+            !Emitter::scopedCallResultAdmitsRelease(ctx, call))
+            return false;
+        if (viaFnvalFieldStore) *viaFnvalFieldStore = true;
+        return true;
+    }
+    // An imported GENERIC callee carries its re-parsed `MethodDecl`; only
+    // arm (d), which reads the formal list and not the body, admits it.
+    const bool importedWithDecl = ctx.isImported(ms);
     // SEAM-DEBT: #5129 — class-3 read on ms->decl; the callee-body walk
-    // needs the AST. An imported callee is refused just above, so it
-    // fails closed (ESCAPE → leak, never an early release).
+    // needs the AST. An imported callee reaches only arm (d) (the block
+    // above, or `importedWithDecl` below), so the body-walking arms fail
+    // closed for it (ESCAPE → leak, never an early release).
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md) return false;
     for (auto mod : md->modifiers)
@@ -41827,6 +41862,35 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
     }
     if (pidx >= md->params.size()) return false;
     const ast::Param& p = md->params[pidx];
+    // fix #9056 (§28.14 / §28.9, v0.359): arm (d) — a `scoped` function-typed
+    // formal. §28.14 lets the callee keep the callback only by storing it in a
+    // `scoped` field of the bounding object or by forwarding it to another
+    // `scoped` parameter (sema enforces the list), and every such keep takes
+    // a reference of ITS OWN: the `scoped` field store retains
+    // (`lowerClosureFieldStore`, #8817), a forward to a user method recurses
+    // into the same two cases, and a forward to a storing stdlib sink retains
+    // (`Emitter::retainForwardedScopedHandler`). So the caller's reference
+    // stays the caller's to drop — the very argument #8817 used to release a
+    // lambda LITERAL passed there (`prepareCallClosureArgRelease`'s `scoped`
+    // arm). This is the bound-LOCAL spelling of that release: the local keeps
+    // its +1 and releases it at its own scope end. Gated on the SAME
+    // callee-shape predicate as the literal arm and the sink retain
+    // (`Emitter::scopedFormalCallerReleasesProducer`), plus the literal arm's
+    // call-site half (the call's substituted result type), so the three sites
+    // agree on every callee. The value may outlive this scope in the callee's
+    // storage, so its capture cells are not freed with the scope
+    // (`viaFnvalFieldStore`, the #9061 discipline).
+    if (p.modifier == "scoped") {
+        if (!p.type || !resolvedFormalIsFunction(*p.type, ctx)) return false;
+        const sema::TypeRef* at0 = ctx.exprType(*a.value);
+        if (!at0 || at0->kind != sema::TypeRef::Kind::Function) return false;
+        if (!Emitter::scopedFormalCallerReleasesProducer(ctx, ms)) return false;
+        if (md->returnType && !Emitter::scopedCallResultAdmitsRelease(ctx, call))
+            return false;
+        if (viaFnvalFieldStore) *viaFnvalFieldStore = true;
+        return true;
+    }
+    if (importedWithDecl) return false;
     if (!p.modifier.empty() || !p.type) return false;
     // fix #5611 (§28.14 / §27.5 / §28.9, v0.334): arm (b) — a formal whose
     // DECLARED type RESOLVES to a function type. This is the shape #5129's

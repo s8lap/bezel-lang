@@ -1585,6 +1585,19 @@ public:
         return std::move(module_);
     }
 
+    // fix #9056 (§28.14 / §28.9, v0.359): does the CALLER of method `ms`
+    // release a `+1` closure producer it passes at a `scoped` formal once the
+    // call returns? The callee-shape half of `prepareCallClosureArgRelease`'s
+    // `scoped` arm, shared with the storing stdlib sink in the callee
+    // (`retainForwardedScopedHandler`) and the caller's closure-local relief
+    // (LlvmBackend_Setup.cpp) so the three cannot drift. Public so the free
+    // escape-walk helpers can read it. Defined in LlvmBackend_Calls2.cpp.
+    static bool scopedFormalCallerReleasesProducer(const sema::SemaContext& ctx,
+                                                   sema::MethodSymbol* ms);
+    // fix #9056: the call-site half of the same gate (see its definition).
+    static bool scopedCallResultAdmitsRelease(const sema::SemaContext& ctx,
+                                              const ast::CallExpr& call);
+
 private:
     sema::SemaContext& ctx_;
     llvm::LLVMContext& llvm_;
@@ -15888,6 +15901,15 @@ private:
     // ITERATOR is excluded: its frame hold is #2609's and its call-site
     // release is the `rel.syncIter` arm, so arming both would double-release.
     bool isPlainAsyncCalleeMethod(sema::MethodSymbol* ms) const;
+
+    // fix #9056 (§28.14 / §28.9 / stdlib §6.5, v0.359): retain `closure` when
+    // `handlerExpr` — the handler argument of a STORING stdlib sink
+    // (Subscribe / Add / Register) — is a bare read of a
+    // `scoped` formal of the method being emitted whose callers release their
+    // own reference (`scopedFormalCallerReleasesProducer`). The sink then owns
+    // the +1 it drops. Returns `closure`. Defined in LlvmBackend_Calls2.cpp.
+    llvm::Value* retainForwardedScopedHandler(const ast::Expr* handlerExpr,
+                                              llvm::Value* closure);
 
     // fix #8950 (§28.14 / §27.5 / §28.9, v0.359): is the argument at
     // PARAMETER index `idx` a lambda LITERAL at a PLAIN ASYNC callee's

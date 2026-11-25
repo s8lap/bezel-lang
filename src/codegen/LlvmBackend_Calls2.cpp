@@ -7769,6 +7769,11 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
             // one whose receiver isn't a using-var local).
             if (dynamic_cast<const ast::LambdaExpr*>(call.args[0].value.get()))
                 consumeLastLambdaCapturedCells();
+            // fix #9056 (§28.14 / §28.9 / stdlib §6.5, v0.359): a forwarded
+            // `scoped` formal is a borrow; the storing sink takes its own +1
+            // (see retainForwardedScopedHandler). Remove stores nothing.
+            if (isSubscribe || isAdd)
+                retainForwardedScopedHandler(call.args[0].value.get(), closure);
             if (isSubscribe) {
                 auto* subFn =
                     declareC("bz_event_subscribe", ptrTy(), {ptrTy(), ptrTy()});
@@ -7877,6 +7882,9 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
         // using-var local).
         if (dynamic_cast<const ast::LambdaExpr*>(call.args[0].value.get()))
             consumeLastLambdaCapturedCells();
+        // fix #9056: the storing sink takes its own +1 on a forwarded
+        // `scoped` formal (see retainForwardedScopedHandler).
+        retainForwardedScopedHandler(call.args[0].value.get(), closure);
         auto* subFn =
             declareC("bz_event_subscribe", ptrTy(), {ptrTy(), ptrTy()});
         return std::optional<llvm::Value*>(
@@ -20794,51 +20802,20 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
         // arms now read the registry predicates rather than each carrying its
         // own copy of the ten names — "re-derive identically so the two arms
         // never disagree" is precisely the instruction that cannot be checked.
-        auto headIsDeferredFrameSc = [](std::string_view h) {
-            return common::isIterableInterfaceHead(h) ||
-                   common::isTaskFamilyHead(h);
-        };
-        const bool isSyncIterCalleeSc =
-            mdSc->bodyKind == ast::MethodBodyKind::Block &&
-            containsYield(mdSc->stmts);
-        bool declaredReturnOkSc = false;
-        if (!mdSc->returnType) {
-            declaredReturnOkSc = true;
-        } else if (mdSc->returnType->kind == ast::TypeKind::Named &&
-                   mdSc->returnType->name &&
-                   mdSc->returnType->name->parts.size() == 1) {
-            std::string_view synHead = mdSc->returnType->name->parts.front();
-            bool isTypeParam = false;
-            for (const auto& gp : mdSc->genericParams)
-                if (gp.name == synHead) { isTypeParam = true; break; }
-            if (!isTypeParam && ms->parent)
-                for (const sema::Symbol* gp : ms->parent->genericParams)
-                    if (gp && gp->name == synHead) { isTypeParam = true; break; }
-            std::string_view head = synHead;
-            if (const sema::TypeRef* drt =
-                    ctx_.resolvedType(*mdSc->returnType)) {
-                if (drt->kind == sema::TypeRef::Kind::Function)
-                    isTypeParam = true;  // closure-returning — bail
-                else if (drt->kind == sema::TypeRef::Kind::Named &&
-                         !drt->headName().empty())
-                    head = drt->headName();
-            }
-            declaredReturnOkSc = !isTypeParam && !headIsDeferredFrameSc(head);
-        }
-        bool callResultOkSc = true;
-        if (mdSc->returnType) {
-            const sema::TypeRef* rt = ctx_.exprType(call);
-            if (!rt || rt->kind == sema::TypeRef::Kind::Function) {
-                callResultOkSc = false;
-            } else if (rt->kind == sema::TypeRef::Kind::Named) {
-                if (!rt->declaration && !rt->astNode && !rt->genericArgs.empty() &&
-                    rt->importedName.empty())
-                    callResultOkSc = false;
-                else if (headIsDeferredFrameSc(rt->headName()))
-                    callResultOkSc = false;
-            }
-        }
-        if (!isAsyncMethod(ms) && !isSyncIterCalleeSc && declaredReturnOkSc &&
+        // fix #9056 (§28.14 / §28.9, v0.359): the CALLEE-SHAPE half of this
+        // gate (not async, not an iterator, declared return neither a frame
+        // nor a function value) is EXTRACTED into
+        // `scopedFormalCallerReleasesProducer`, because two other sites must
+        // read the very same fact: the storing stdlib sink inside the callee
+        // (`retainForwardedScopedHandler`), which takes its own reference on
+        // a forwarded `scoped` formal exactly when this arm releases the
+        // caller's, and the caller's closure-LOCAL relief
+        // (`closureArgBindsMethodOwnTypeParamBorrow`, LlvmBackend_Setup.cpp).
+        const bool calleeShapeOkSc =
+            scopedFormalCallerReleasesProducer(ctx_, ms);
+        const bool callResultOkSc =
+            !mdSc->returnType || scopedCallResultAdmitsRelease(ctx_, call);
+        if (calleeShapeOkSc &&
             callResultOkSc && argExprs.size() == args.size() &&
             args.size() >= mdSc->params.size() &&
             args.size() - mdSc->params.size() <= 1) {
@@ -20916,6 +20893,36 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
                 // "rebind a local initialized from the formal" hazard — the
                 // one shape in which a callee could drop a reference it never
                 // owned — is not expressible for a `scoped` formal.
+                const std::size_t ai = off + pi;
+                if (argExprs[ai] && isPlusOneClosureProducer(argExprs[ai]))
+                    rel.scoped.push_back(args[ai]);
+            }
+        }
+    } else if (ctx_.isImported(ms) &&
+               scopedFormalCallerReleasesProducer(ctx_, ms)) {
+        // fix #9056 (§28.14 / §28.9 / §2.5, v0.359): the IMPORTED twin of the
+        // arm above. A non-generic imported method has no `ast::MethodDecl`
+        // (the loader re-parses bodies only for generic types), so the arm
+        // above never armed for it — and the exporter, which compiled the
+        // callee under the same discipline, takes its own reference at every
+        // keep (the `scoped` field store, the storing-sink retain of
+        // `retainForwardedScopedHandler`). Without this arm the producer's
+        // +1 was dropped by nobody across a module boundary. The formals are
+        // read through the both-sources accessors (`formalParamModifier`,
+        // `formalParamResolvedType`), the callee shape through the shared
+        // predicate's imported arm, so the importer and the exporter answer
+        // the same question from the same facts.
+        const sema::TypeRef* drt = sema::methodReturnResolvedType(*ms, ctx_);
+        const bool hasReturn = drt && drt->kind != sema::TypeRef::Kind::Unit;
+        const std::size_t np = sema::formalParamCount(*ms);
+        if ((!hasReturn || scopedCallResultAdmitsRelease(ctx_, call)) &&
+            argExprs.size() == args.size() && args.size() >= np &&
+            args.size() - np <= 1) {
+            const std::size_t off = args.size() - np;
+            for (std::size_t pi = 0; pi < np; ++pi) {
+                if (sema::formalParamModifier(*ms, pi) != "scoped") continue;
+                const sema::TypeRef* pt = sema::formalParamResolvedType(*ms, pi);
+                if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
                 const std::size_t ai = off + pi;
                 if (argExprs[ai] && isPlusOneClosureProducer(argExprs[ai]))
                     rel.scoped.push_back(args[ai]);
@@ -21028,6 +21035,170 @@ bool Emitter::calleeFrameHoldsClosureParam(sema::MethodSymbol* ms,
     if (!ps->modifier.empty()) return false;
     const sema::TypeRef* pt = paramTypeOf(ps);
     return pt && pt->kind == sema::TypeRef::Kind::Function;
+}
+
+// fix #9056 (§28.14 / §28.9, v0.359): the CALLEE-SHAPE half of
+// `prepareCallClosureArgRelease`'s `scoped` arm (#3195 / #8817), extracted so
+// the three sites that must agree on it read ONE definition:
+//
+//   * the caller's release of a `+1` producer (a lambda literal or a method
+//     reference) passed at a `scoped` formal of `ms` (`rel.scoped`);
+//   * the storing stdlib sink inside `ms`'s own body
+//     (`retainForwardedScopedHandler`): `_changed.Subscribe(handler)` with
+//     `handler` a `scoped` formal of `ms` takes its OWN reference exactly when
+//     `ms`'s callers release theirs;
+//   * the caller's closure-LOCAL relief (`closureArgBindsMethodOwnTypeParamBorrow`,
+//     LlvmBackend_Setup.cpp): a closure local passed at such a formal keeps
+//     its +1 and releases it at its own scope end.
+//
+// TRUE for a locally compiled METHOD (not a constructor, which has no
+// MethodSymbol) that is not async, not a sync iterator, and whose declared
+// return is neither a deferred-activation frame (a Task-family or iterable
+// head — §28.14 *Call-bounded × deferred activation*: the frame may hold the
+// callback) nor a function value nor a bare type parameter. The call-site
+// half (the substituted result type, the argument count) stays at the call.
+bool Emitter::scopedFormalCallerReleasesProducer(const sema::SemaContext& ctx,
+                                                 sema::MethodSymbol* ms) {
+    if (!ms || ms->isOperator) return false;
+    if (isAsyncMethod(ms)) return false;
+    auto isOwnTypeParamName = [ms](std::string_view n) {
+        for (const sema::Symbol* gp : ms->genericParams)
+            if (gp && gp->name == n) return true;
+        if (ms->parent)
+            for (const sema::Symbol* gp : ms->parent->genericParams)
+                if (gp && gp->name == n) return true;
+        return false;
+    };
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md) {
+        // An IMPORTED non-generic method (§2.5: the loader re-parses a body
+        // only for a GENERIC type, so `decl` is null here). Its exporter
+        // compiled the body under THIS predicate's AST arm, so the importer
+        // must answer from the wire facts the same way, or the two sides of
+        // the module boundary disagree on who owns the reference (the
+        // exporter's sink retains; an importer that did not release leaked
+        // it). The declared return is the loader's record; an iterator
+        // method's return is an iterable head, so the AST arm's
+        // `containsYield` test is subsumed by the head test.
+        if (!ctx.isImported(ms)) return false;
+        const sema::TypeRef* rt = sema::methodReturnResolvedType(*ms, ctx);
+        if (!rt || rt->kind == sema::TypeRef::Kind::Unit ||
+            rt->kind == sema::TypeRef::Kind::Primitive)
+            return true;
+        if (rt->kind != sema::TypeRef::Kind::Named) return false;
+        std::string_view head = rt->headName();
+        if (head.empty() || isOwnTypeParamName(head)) return false;
+        return !common::isIterableInterfaceHead(head) &&
+               !common::isTaskFamilyHead(head);
+    }
+    if (md->bodyKind == ast::MethodBodyKind::Block && containsYield(md->stmts))
+        return false;
+    if (!md->returnType) return true;
+    if (md->returnType->kind != ast::TypeKind::Named || !md->returnType->name ||
+        md->returnType->name->parts.size() != 1)
+        return false;
+    std::string_view synHead = md->returnType->name->parts.front();
+    for (const auto& gp : md->genericParams)
+        if (gp.name == synHead) return false;
+    if (isOwnTypeParamName(synHead)) return false;
+    std::string_view head = synHead;
+    if (const sema::TypeRef* drt = ctx.resolvedType(*md->returnType)) {
+        if (drt->kind == sema::TypeRef::Kind::Function)
+            return false;  // closure-returning — bail
+        if (drt->kind == sema::TypeRef::Kind::Named && !drt->headName().empty())
+            head = drt->headName();
+    }
+    return !common::isIterableInterfaceHead(head) &&
+           !common::isTaskFamilyHead(head);
+}
+
+// fix #9056 (§28.14 / §28.9, v0.359): the CALL-SITE half of the same gate,
+// shared by the caller's literal release (`prepareCallClosureArgRelease`'s
+// `scoped` arm and its imported twin) and the caller's closure-LOCAL relief
+// (`closureArgBindsMethodOwnTypeParamBorrow`). Asked only of a callee that
+// declares a return: the call's SUBSTITUTED result type must be neither a
+// function value, an unsubstituted generic sentinel, nor a deferred-
+// activation frame (an iterable or Task-family head), each of which may hold
+// the callback past the call.
+bool Emitter::scopedCallResultAdmitsRelease(const sema::SemaContext& ctx,
+                                            const ast::CallExpr& call) {
+    const sema::TypeRef* rt = ctx.exprType(call);
+    if (!rt || rt->kind == sema::TypeRef::Kind::Function) return false;
+    if (rt->kind == sema::TypeRef::Kind::Named) {
+        if (!rt->declaration && !rt->astNode && !rt->genericArgs.empty() &&
+            rt->importedName.empty())
+            return false;
+        if (common::isIterableInterfaceHead(rt->headName()) ||
+            common::isTaskFamilyHead(rt->headName()))
+            return false;
+    }
+    return true;
+}
+
+// fix #9056 (§28.14 / §28.9 / stdlib §6.5, v0.359): a storing stdlib sink —
+// `EventSource<T>.Subscribe` / `.Add`, `IEvent<T>.Subscribe`,
+// `CancellationToken.Register` — keeps the handler past the call and releases
+// it exactly once when the registration ends (`bz_subscription_dispose`, the
+// source's free). The event `+=` and `TaskScope.Spawn` need no retain: sema
+// rejects a `scoped` formal there (§28.14), and `scopedFormalCallerReleases-
+// Producer` excludes async methods, the only home of a `TaskScope`. The
+// runtime calls that reference a TRANSFERRED +1 (#841: "codegen hands the
+// event source the SOLE reference with no separate retain"), which is what a
+// lambda literal or a method reference produces at the sink's own call.
+//
+// A `scoped` formal FORWARDED to the sink is not that: §28.14 admits the
+// forward ("or forward it to another `scoped` parameter"), and the formal is
+// a BORROW of the caller's value (§28.3's producers table). Since #8817 the
+// caller of a method whose shape `scopedFormalCallerReleasesProducer`
+// accepts RELEASES its `+1` producer once the call returns, on the argument
+// that every store the callee makes takes a reference of its own (the
+// `scoped` field store's retain). The sink was the one store that did not, so
+// the forwarded handler was released twice — once by the caller, once by the
+// subscription — and invoked after the first (issue #9056: a fatal
+// `refcount over-release (closure)` at teardown under checked disposal, a
+// heap-use-after-free at the first `Raise` under ASan). Retain it here, so the
+// sink owns the reference it will drop.
+//
+// ONLY a bare read of a `scoped` formal of the method being emitted, and only
+// when that method's callers release (the same predicate): a constructor's
+// `scoped` formal (no MethodSymbol) and a lambda's are left as they were,
+// because their callers do not release a producer there (#8771 item 2,
+// #8907 item 1), so the transfer is still the only reference.
+llvm::Value* Emitter::retainForwardedScopedHandler(const ast::Expr* handlerExpr,
+                                                   llvm::Value* closure) {
+    if (!handlerExpr || !closure || !closure->getType()->isPointerTy())
+        return closure;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(handlerExpr);
+    if (!id) return closure;
+    auto* ps = dynamic_cast<sema::ParameterSymbol*>(ctx_.exprSymbol(*id));
+    if (!ps || ps->modifier != "scoped") return closure;
+    // The formal's owner is the method being emitted (`currentMethod_`) or,
+    // for an expression-bodied GENERIC method inlined at its call site
+    // (`emitInlineGenericMethod`, which keeps the CALLER's `currentMethod_`),
+    // the inlined method (`currentSpecMethodSymbol_`). Membership in the
+    // owner's own `params` decides which, so a stale candidate never matches.
+    // An IMPORTED generic method's formals are the loader's symbols while its
+    // re-parsed body (§2.5) may bind its own, so for an import the formal is
+    // matched by name and `scoped` modifier through the both-sources accessors.
+    auto ownsFormal = [this, ps](sema::MethodSymbol* m) {
+        if (!m) return false;
+        for (const sema::Symbol* q : m->params)
+            if (q == ps) return true;
+        if (!ctx_.isImported(m)) return false;
+        const std::size_t np = sema::formalParamCount(*m);
+        for (std::size_t i = 0; i < np; ++i)
+            if (sema::formalParamName(*m, i) == ps->name &&
+                sema::formalParamModifier(*m, i) == "scoped")
+                return true;
+        return false;
+    };
+    sema::MethodSymbol* owner = ownsFormal(currentMethod_) ? currentMethod_
+        : ownsFormal(currentSpecMethodSymbol_)              ? currentSpecMethodSymbol_
+                                                            : nullptr;
+    if (!owner || !scopedFormalCallerReleasesProducer(ctx_, owner))
+        return closure;
+    emitClosureRetain(closure);  // null-safe; atomic rc inc
+    return closure;
 }
 
 // fix #8950 (§28.14 *Call-bounded × deferred activation*, shape (1) "Frame

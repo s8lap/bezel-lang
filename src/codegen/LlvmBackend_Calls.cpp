@@ -16455,6 +16455,11 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         if (dynamic_cast<const ast::LambdaExpr*>(
                                 call.args[0].value.get()))
                             consumeLastLambdaCapturedCells();
+                        // fix #9056 (§28.14 / §28.9 / stdlib §6.1, v0.359):
+                        // the storing sink takes its own +1 on a forwarded
+                        // `scoped` formal (see retainForwardedScopedHandler).
+                        retainForwardedScopedHandler(call.args[0].value.get(),
+                                                     closure);
                         llvm::Value* tokArg =
                             tok ? tok : llvm::ConstantPointerNull::get(ptrTy());
                         auto* fn = declareC("bz_ctoken_register",
