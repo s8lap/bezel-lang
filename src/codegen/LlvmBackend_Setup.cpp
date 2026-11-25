@@ -38781,8 +38781,9 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
         return isPlusOneClosureProducer(cond->thenValue.get()) &&
                isPlusOneClosureProducer(cond->elseValue.get());
     }
-    // A method reference used as a VALUE: a bare IdentifierExpr (a static method
-    // of the current type) or a MemberAccessExpr `T.M` / `obj.M` whose resolved
+    // A method reference used as a VALUE: a bare IdentifierExpr (a method of
+    // the current type — static, or an instance one bound to the implicit
+    // `this`) or a MemberAccessExpr `T.M` / `obj.M` whose resolved
     // symbol is a MethodSymbol — the exact shape codegen lowers to a fresh +1
     // closure cell via makeMethodThunk (LlvmBackend_Exprs.cpp's
     // `Emitter::lowerExprInner`, LlvmBackend_Layout.cpp makeMethodThunk). A method *call* is a distinct
@@ -38794,15 +38795,58 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     // Property/Field symbol, not a MethodSymbol, so it is not treated as a
     // closure-cell producer here (it lowers differently) and stays leaked —
     // safe.
-    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*init))) {
-        // A bare IdentifierExpr method reference is lowered to a cell ONLY for a
-        // static method (`Emitter::lowerExprInner` gates on isStaticMethod);
-        // an instance `obj.M` member access is lowered to a cell for either.
-        // Match those gates exactly so eligibility never arms a release for an
-        // init that did not actually produce a +1 cell.
+    if (dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*init))) {
+        // A MemberAccessExpr method reference (`T.M` / `obj.M`) is lowered to a
+        // cell for either callee kind.
         if (dynamic_cast<const ast::MemberAccessExpr*>(init)) return true;
-        if (dynamic_cast<const ast::IdentifierExpr*>(init) && isStaticMethod(ms))
-            return true;
+        // fix #9216 (§27.6 / §28.9, v0.359): a BARE method-group identifier is
+        // lowered to a cell for BOTH callee kinds, and this arm used to admit
+        // only the STATIC one. The gate it mirrored was STALE: the emitter's
+        // bare-identifier arm (`Emitter::lowerExprInner`,
+        // src/codegen/LlvmBackend_Exprs.cpp) forms a cell for a STATIC group
+        // (`makeMethodThunk(emitMs, nullptr, nullptr, &e)`) AND for an
+        // INSTANCE group of the enclosing class — the IMPLICIT-`this` BOUND
+        // reference, `makeMethodThunk(emitMs, currentThis_, nullptr, &e)`, the
+        // #880/#881 path. §27.6 (v0.359) is what the emitter implements: "the
+        // instance is captured at formation" — and the BARE spelling of an
+        // enclosing-class instance method is the same reference the QUALIFIED
+        // spelling `this.M` forms (§2.7's bare-name lookup finds the
+        // enclosing type's own member).
+        //
+        // WHY THE MISSING ADMISSION LEAKED. The cell is a fresh +1 (a 64 B
+        // cell plus an 8 B receiver-capture env block — `buildMethodClosureCell`),
+        // and §28.9 (v0.359) puts it under the runtime's lifetime: "Runtime
+        // management governs the *function value itself* — the heap-allocated
+        // closure object that backs it" — so it must be released exactly once.
+        // This predicate is the ONE gate every discharge site asks, so a
+        // "not a producer" answer left the cell unowned:
+        //   * the scope-end release of a function-typed LOCAL
+        //     (`collectClosureReleaseEligible`'s candidate walk) was never
+        //     armed;
+        //   * `lowerClosureFieldStore`'s retain-vs-transfer decision RETAINED
+        //     the field's own reference and left the producer's +1 un-dropped;
+        //   * the call-site release of a producer ARGUMENT
+        //     (`releaseCallClosureArgs`) never fired.
+        // MEASURED on the base (r30-c1 @ d3f56e723, `bezelc --sanitize=address`):
+        // every formation leaked 72 B (a 64 B cell + an 8 B env) — the local
+        // spelling, the field-store spelling, the call-argument spelling, the
+        // inherited-base spelling, the interface-implementing spelling, the
+        // spelling inside a lambda, the async spelling and the record spelling
+        // all leaked; the QUALIFIED twins of the first two were clean.
+        //
+        // WHY NO "IS THERE A `this`?" GATE IS NEEDED. A bare name that
+        // resolves to an INSTANCE member is resolvable only in a body that
+        // binds `this`: sema refuses the other two contexts outright — a
+        // static body ("`Get` is an instance member of the enclosing type; a
+        // static body has no `this` to reach it through", §2.7) and a field
+        // initializer ("a field initializer may not reference instance member
+        // `Get`", §22.8) — so an ACCEPTED program that reaches this arm always
+        // has the receiver the emitter binds. And even a hypothetical frame
+        // without one is harmless: the emitter's bare arm then forms NO cell,
+        // the initializer lowers to null, and every discharge of a null cell is
+        // null-safe (`bz_closure_release`) — over-arming leaks nothing and
+        // frees nothing, while under-arming (the pre-fix state) leaks.
+        if (dynamic_cast<const ast::IdentifierExpr*>(init)) return true;
     }
     // fix #4151 (§27.6 / §27.7.1, v0.298+): a PROPERTY reference used in
     // function-value position (`var f: () -> int := o.P;`, §27.6) is a +1
