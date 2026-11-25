@@ -3988,6 +3988,11 @@ private:
     // #429 / §4.6 / §28.9: the cached per-element string-release thunk (built
     // lazily) for a borrowing Array<string>'s co-owned string elements.
     llvm::Function* stringElementReleaseThunk_ = nullptr;
+    // fix #9104 / #9112 / §28.9 / §28.11 (v0.359): the cached per-element
+    // closure-release thunk (built lazily) for a borrowing Array<() -> R>'s
+    // co-owned closure cells — the function-typed twin of
+    // `stringElementReleaseThunk` (§28.11's *runtime-managed reference* row).
+    llvm::Function* functionElementReleaseThunk_ = nullptr;
     // #401 / stdlib §4.8: the cached value-box-free thunk (built lazily) for a
     // borrowing Dictionary<K, record>'s heap-boxed record values.
     llvm::Function* valueBoxFreeThunk_ = nullptr;
@@ -16246,6 +16251,140 @@ private:
                      : llvm::ConstantPointerNull::get(ptrTy());
     }
 
+    // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the FUNCTION-typed half of
+    // §28.11's element-slot policy's *runtime-managed reference* row, and the
+    // ONE derivation of it (the file header of LlvmBackend_ElementPolicy.cpp
+    // names that file the single source of truth for collection-element slot
+    // behaviour — this row is no exception).
+    //
+    // THE ROW. §28.11 (v0.359, "Collection element ownership")'s element-slot
+    // policy table classifies a FUNCTION type (with `string` and `Type`) as a
+    // *runtime-managed reference*, and the borrowing family's column for that
+    // row reads "shared references". The operations table then fixes the
+    // slot's reference discipline:
+    //   * store (`Add`, `Insert`, the indexer-set): "stores the reference" —
+    //     the collection holds a reference of its OWN on the element;
+    //   * `Remove` / `RemoveAt`: "removes the reference"; `Clear()`: "removes
+    //     all" — the collection gives the reference back;
+    //   * `Dispose()` of the collection: "no user-visible work" — the
+    //     references it holds are given back invisibly (the backing storage is
+    //     released with the instance, §28.9), and the element's own holder
+    //     keeps its obligation;
+    //   * indexer-get: "reference out" — the caller receives a reference, not
+    //     the collection's own.
+    //
+    // §28.9 (v0.359) puts a function-typed value in the runtime-managed tier
+    // ("the type's lifetime is managed by the runtime without user
+    // involvement"), and §27.5 (v0.359) keeps a closure's captures alive as
+    // long as the closure.
+    //
+    // WHY THIS IS A DERIVATION AND NOT A PER-SITE TEST. The TAKE half (the
+    // store) and the GIVE-BACK half (the removal / the collection's free) are
+    // ONE reference: an unpaired take strands a reference (a leak) and an
+    // unpaired give-back drops a reference the collection never took (an
+    // over-release, which the runtime turns into a fatal abort, §28.9). Every
+    // site therefore reads the element type through the helpers below, so the
+    // two halves cannot disagree about (a) whether the slot holds a reference
+    // of its own and (b) WHICH element type decides it.
+    //
+    // WHICH ELEMENT TYPE DECIDES IT. The element category is a derived type
+    // property (§3.6) evaluated PER INSTANTIATION (§3.6 rule 2), so inside a
+    // MONOMORPHIZED generic body the collection's `genericArgs[0]` is still
+    // the placeholder type parameter `T` (§14.1's monomorphization keeps the
+    // DECLARATION's spelling) and the decision must read the SUBSTITUTED
+    // type. `resolveTypeParamRef` does that (it returns its argument
+    // unchanged for any non-parameter ref and outside an active
+    // substitution), so the take and the give-back agree in a generic body
+    // too. (The same reading fix #9100 applied to the `string` row.)
+
+    // Is `el` a FUNCTION-typed element slot — i.e. does §28.11's
+    // *runtime-managed reference* row apply to it? The RESOLVED form (see
+    // above): the substituted type inside a monomorphized generic body.
+    // A NULLABLE function type is the same row with the nullability
+    // stripped (§3.6's *Nullable forms* rule reads the element category of
+    // `V?` as `V`), exactly as the `string?` element is (§3.6, §28.11).
+    bool isFunctionElementSlotType(const sema::TypeRef* el) const {
+        return isFunctionElementTypeRef(el);
+    }
+
+    // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the FUNCTION-typed twin of
+    // `isStringElementTypeRef` — is this element a FUNCTION type (a closure /
+    // first-class function, §27.5)? §28.11's element-slot policy puts a
+    // function type in the SAME *runtime-managed reference* row as `string`
+    // (whose borrowing-family column reads "shared references"), so the two
+    // are co-owned identically: the collection takes a reference of its OWN at
+    // the store and gives it back when the slot goes away.
+    //
+    // The type is read RESOLVED (`resolveTypeParamRef`, §14.1): inside a
+    // MONOMORPHIZED generic body the collection's `genericArgs[0]` is still
+    // the placeholder `T`, and the element category is fixed at the
+    // INSTANTIATION (§3.6 rule 2 / §14.4) — so the TAKE half and the
+    // GIVE-BACK half must read the same SUBSTITUTED type or one of them
+    // would pair with the wrong element kind.
+    //
+    // A NULLABLE function type is the same row with the nullability stripped
+    // (§3.6's *Nullable forms* rule reads the element category of `V?` as
+    // `V`), exactly as the `string?` element is (§3.6, §28.11) — the
+    // null-safe retain/release is a no-op on `null`.
+    bool isFunctionElementTypeRef(const sema::TypeRef* rt) const {
+        const sema::TypeRef* r = resolveTypeParamRef(rt);
+        return r && r->kind == sema::TypeRef::Kind::Function;
+    }
+
+    // fix #9104 / #9112 (§28.11, v0.359): the collection kinds whose
+    // function-element slot reference the collection gives back ITSELF — the
+    // slot's reference is released by the collection's free / Remove /
+    // RemoveAt / Clear, so a TAKE at the store is PAIRED with it (§28.11's
+    // element-slot policy is a PAIR: the store takes a reference of its own,
+    // and the slot's release gives it back).
+    //
+    // The kinds NOT here are not an oversight:
+    //   * the STACK and the QUEUE give their slot's reference back at
+    //     Pop() / Dequeue() — which does NOT release it (issue #8453, OPEN) —
+    //     so a reference taken at Push would be STRANDED when the element is
+    //     popped. The `string` row has the same gap (its Popped element
+    //     leaks, #8453); the function row does not open a second one.
+    //   * the LINKED LIST and the DICTIONARY have their own store and free
+    //     derivation sites (their element slot is a list node / a table
+    //     value, not an array slot); the function row's array half is not
+    //     theirs to enable, and issue #9076 is the opposite half of the same
+    //     slot policy for them.
+    static bool isFunctionSlotPairedCollectionName(std::string_view collName) {
+        return collName == "Array";
+    }
+
+    // The paired-kind test for a collection SLOT: is this slot a
+    // function-typed shared-reference slot whose reference the collection
+    // gives back itself? `collName` is the collection type's head name, `el`
+    // the element type (resolved inside a monomorphized generic body).
+    bool isFunctionElementSlotPaired(std::string_view collName,
+                                     const sema::TypeRef* el) const {
+        if (!isFunctionSlotPairedCollectionName(collName)) return false;
+        return isFunctionElementSlotType(el);
+    }
+
+    // fix #9104 / #9112 (§28.11, §28.9, v0.359): the GIVE-BACK half of the
+    // function row — the per-element RELEASE thunk (the `void(void*)` callback
+    // the runtime's collection free / disposing setters call per element).
+    // `bz_closure_release` is null-safe and runs the cell's envdtor at the
+    // last drop (the runtime's closure contract, §28.9). Null for every
+    // element kind that is not a function type — a `string` element has its
+    // own thunk (`stringElementReleaseThunk`), a class element's obligation
+    // is the owning family's disposer, a value element has none.
+    llvm::Function* functionElementReleaseThunk();
+
+    // fix #9104 / #9112 (§28.11, §28.9, v0.359): the TAKE half of the
+    // function row — the store into a shared-reference slot takes a reference
+    // of the collection's OWN, and the collection's free gives it back.
+    //
+    // A FRESH +1 PRODUCER's reference is TRANSFERRED (its single reference
+    // becomes the slot's — no retain, exactly as the `string` row's
+    // `isPlusOneStringProducer` gate does), because otherwise the producer's
+    // reference would be orphaned (the producer has no other holder). Any
+    // other value is RETAINED: the slot takes a reference of its own and the
+    // source keeps its own (the source may die while the collection lives).
+    void emitFunctionElementSlotRetain(llvm::Value* v, const ast::Expr* arg);
+
     // #2608 / #2635 / §28.11 / stdlib §4.3: record an OWNING array-backed
     // collection's element disposer in its `bz_array_t` header at CONSTRUCTION,
     // so an erased free site can recover it (bz_array_free_dynamic).
@@ -16440,6 +16579,34 @@ private:
         // path does not release (the STACK / QUEUE, issue #8453).
         if (!isStringElementSlotPaired(cn, el)) return;
         auto* fn = declareC("bz_array_retain_strings",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(fn, {arr});
+    }
+
+    // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the FUNCTION-typed twin of
+    // `emitArrayRetainStringsIfStringArray` — a function type is the same
+    // §28.11 *runtime-managed reference* row as `string` (a shared-reference
+    // slot), so a copied / materialized `Array<() -> R>` co-owns a +1 per
+    // element exactly as `Array<string>` does — matching the per-element
+    // release its later free/dispose issues (`functionElementReleaseThunk`).
+    //
+    // The kind gate is the PAIRED one (`Array` — see
+    // `isFunctionSlotPairedCollectionName`): a take is only sound where the
+    // collection gives the slot's reference back ITSELF. The element type is
+    // read RESOLVED (§3.6 rule 2 / §14.1) so that the take and the give-back
+    // halves agree inside a monomorphized generic body too.
+    //
+    // It is a SEPARATE helper rather than a branch inside the string one so
+    // that each helper keeps ONE derivation of its own row's rule.
+    void emitArrayRetainClosuresIfFunctionArray(const sema::TypeRef* collTy,
+                                                llvm::Value* arr) {
+        if (!arr || !collTy) return;
+        std::string_view cn = collTy->headName();
+        if (cn != "Array") return;
+        if (collTy->genericArgs.empty() || !collTy->genericArgs[0]) return;
+        const sema::TypeRef* el = collTy->genericArgs[0];
+        if (!isFunctionElementSlotType(el)) return;
+        auto* fn = declareC("bz_array_retain_closures",
                             llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(fn, {arr});
     }
@@ -23906,6 +24073,15 @@ private:
     // *call*, which is not a value-producing reference). Used to gate release
     // eligibility.
     bool isPlusOneClosureProducer(const ast::Expr* init) const;
+    // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): does this value expression
+    // own a +1 closure reference of its OWN — a producer whose single
+    // reference the collection's element slot can TAKE OVER (a TRANSFER)
+    // rather than a borrow the slot must RETAIN on top of? The `string`
+    // row's answer is `isPlusOneStringProducer`, which includes the
+    // user-method return arm; the FUNCTION row's answer is the same shape,
+    // but `isPlusOneClosureProducer` DELIBERATELY declines every CallExpr,
+    // so the call arms are spelled out here.
+    bool isClosureSlotProducer(const ast::Expr* e) const;
     // fix #8763 (follow-up, §27.5 / §28.9, v0.359): true when a READ of this
     // property hands the reader a +1 closure reference — the FUNCTION-TYPED
     // block getter's own protocol (#8763): the getter's `return` either

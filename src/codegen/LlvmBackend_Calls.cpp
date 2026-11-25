@@ -9768,6 +9768,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // releasing un-retained elements would prematurely free strings the
             // source still owns (a double-free). retain is null/sentinel-safe.
             emitArrayRetainStringsIfStringArray(recvTy, copy);
+            emitArrayRetainClosuresIfFunctionArray(recvTy, copy);
             // In-place reverse on the copy (same logic as Reverse()).
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {copy});
@@ -9812,6 +9813,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                                     "srtd.copy");
             // #429: a copied Array<string> co-owns a +1 per element (see Reversed).
             emitArrayRetainStringsIfStringArray(recvTy, copy);
+            emitArrayRetainClosuresIfFunctionArray(recvTy, copy);
             // #1195: detect class IComparable<T> first — class elements are
             // ptrTy()-typed just like strings; without this guard they fall into
             // the strcmp path and are sorted by pointer value.  per §14.2.
@@ -10023,6 +10025,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                                     "srtdc.copy");
             // #429: a copied Array<string> co-owns a +1 per element (see Reversed).
             emitArrayRetainStringsIfStringArray(recvTy, copy);
+            emitArrayRetainClosuresIfFunctionArray(recvTy, copy);
             // fix #533 / §4.4: same two-param funcRef fix as Sort(comparer) above.
             // The comparer is (T,T)->int; build a two-param type hint so that
             // unannotated lambda params (e.g. `(p,q)=>p.X-q.X` on Array<Point>)
@@ -10814,6 +10817,24 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (arrIsStringElem &&
                 !isPlusOneStringProducer(call.args[0].value.get()))
                 emitStringRetain(v);
+            // fix #9104 / #9112 / §28.11 (v0.359): the FUNCTION-typed twin of
+            // that rule. §28.11's element-slot policy puts a function type in
+            // the same *runtime-managed reference* row as `string`, whose
+            // borrowing-family column reads "shared references": the
+            // collection owns a reference of its OWN on the element it stores
+            // ("store: stores the reference"). Before this the store took NO
+            // reference at all, so the collection ALIASED the closure cell —
+            // and the cell's owner (a class field's release at the instance's
+            // Dispose, or the producer's own release) freed it while the
+            // collection still held the pointer (issue #9112: a
+            // heap-use-after-free), while a FRESH producer's reference was
+            // orphaned (issue #9104: the closure env leaked per `Add`).
+            // The TAKE half's partner — the GIVE-BACK half — is the
+            // collection's free / Remove / Clear, which releases the slot's
+            // reference through `functionElementReleaseThunk`.
+            if (recvTy &&
+                isFunctionElementSlotPaired(recvTy->headName(), arrElemRef))
+                emitFunctionElementSlotRetain(v, call.args[0].value.get());
             // Store elem to stack alloca, pass pointer to runtime
             llvm::AllocaInst* slot = entryAlloca(v->getType());
             builder_.CreateStore(v, slot);
@@ -11345,6 +11366,18 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (arrIsStringElem &&
                 !isPlusOneStringProducer(call.args[1].value.get()))
                 emitStringRetain(v);
+            // fix #9104 / #9112 / §28.11 (v0.359): the FUNCTION-typed twin of
+            // that rule — a function element is the same §28.11 *runtime-managed
+            // reference* row (a shared-reference slot), so Insert takes a
+            // reference of the collection's OWN on the element it stores
+            // ("stores the reference"): a fresh +1 producer's reference is
+            // TRANSFERRED, any other value is RETAINED. The GIVE-BACK half is
+            // the collection's free / Remove / RemoveAt / Clear (the
+            // `functionElementReleaseThunk`); the kind gate is the PAIRED one
+            // (`Array`) — see `isFunctionSlotPairedCollectionName`.
+            if (recvTy &&
+                isFunctionElementSlotPaired(recvTy->headName(), arrElemRef))
+                emitFunctionElementSlotRetain(v, call.args[1].value.get());
             llvm::AllocaInst* slot = entryAlloca(v->getType());
             builder_.CreateStore(v, slot);
             auto* fn = declareC("bz_array_insert_at", llvm::Type::getVoidTy(llvm_),
@@ -11447,6 +11480,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 arrIsStringElem ? stringElementReleaseThunk()
                                 : (arrIsOwning ? arrElemPol.disposerThunk
                                                : nullptr);
+            // fix #9104 / #9112 / §28.11 (v0.359): the FUNCTION-typed twin —
+            // a function element is a shared-reference slot (§28.11's
+            // *runtime-managed reference* row), so the overwritten slot's
+            // reference is given back (the indexer-set "removes the
+            // reference" of the displaced element) and the new value's
+            // reference is taken.
+            if (!setDisp && recvTy &&
+                isFunctionElementSlotPaired(recvTy->headName(), arrElemRef))
+                setDisp = functionElementReleaseThunk();
             if (setDisp) {
                 // A borrowing string array co-owns a +1 per element: retain the
                 // new string unless it is already a +1 producer. A class element
@@ -11454,6 +11496,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 if (arrIsStringElem &&
                     !isPlusOneStringProducer(call.args[1].value.get()))
                     emitStringRetain(v);
+                // fix #9104 / #9112 / §28.11 (v0.359): the function twin —
+                // the slot takes a reference of its own on the new value (the
+                // store "stores the reference"), and the disposer installed
+                // above gives the DISPLACED cell's reference back.
+                if (recvTy &&
+                    isFunctionElementSlotPaired(recvTy->headName(), arrElemRef))
+                    emitFunctionElementSlotRetain(v, call.args[1].value.get());
                 llvm::Value* oor2 = builder_.CreateICmpUGE(
                     idx, builder_.CreateCall(
                         declareC("bz_array_len", i64(), {ptrTy()}), {recv}),
@@ -11499,6 +11548,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // mutually exclusive; arrElemPol.disposerThunk is non-null for ClassOwned.
             llvm::Function* elemDisp = arrElemPol.disposerThunk;
             if (!elemDisp && arrIsStringElem) elemDisp = stringElementReleaseThunk();
+            // fix #9104 / #9112 / §28.11 (v0.359): the FUNCTION-typed twin —
+            // a shared-reference slot's removal "removes the reference", so
+            // the removed cell's reference the collection co-owned is given
+            // back here.
+            if (!elemDisp && recvTy &&
+                isFunctionElementSlotPaired(recvTy->headName(), arrElemRef))
+                elemDisp = functionElementReleaseThunk();
             if (elemDisp) {
                 auto* fn = declareC("bz_array_remove_at_disposing",
                     llvm::Type::getVoidTy(llvm_),
@@ -11569,6 +11625,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // the string-release path.  Both derived from arrElemPol (hoisted above).
             llvm::Function* rmDisp = arrElemPol.disposerThunk;
             if (!rmDisp && arrIsStringElem) rmDisp = stringElementReleaseThunk();
+            // fix #9104 / #9112 / §28.11 (v0.359): the FUNCTION-typed twin —
+            // the removal "removes the reference", so the removed cell's
+            // co-owned reference is given back.
+            if (!rmDisp && recvTy &&
+                isFunctionElementSlotPaired(recvTy->headName(), arrElemRef))
+                rmDisp = functionElementReleaseThunk();
             if (rmDisp) {
                 auto* fn = declareC("bz_array_remove_at_disposing",
                     llvm::Type::getVoidTy(llvm_),
@@ -11871,6 +11933,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // and interface element types in the owning family.
             llvm::Function* elemDisp = arrElemPol.disposerThunk;
             if (!elemDisp && arrIsStringElem) elemDisp = stringElementReleaseThunk();
+            // fix #9104 / #9112 / §28.11 (v0.359): the FUNCTION-typed twin —
+            // `Clear()` "removes all", so every co-owned reference the
+            // collection holds is given back.
+            if (!elemDisp && recvTy &&
+                isFunctionElementSlotPaired(recvTy->headName(), arrElemRef))
+                elemDisp = functionElementReleaseThunk();
             if (elemDisp) {
                 auto* fn = declareC("bz_array_clear_disposing",
                     llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
@@ -12095,6 +12163,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (arrIsStringElem) {
                 llvm::Value* elemVal = builder_.CreateLoad(ptrTy(), ep, "ar.elem");
                 emitStringRetain(elemVal);
+            }
+            // fix #9104 / #9112 / §28.11 (v0.359): the FUNCTION-typed twin — a
+            // function element is the same §28.11 *runtime-managed reference*
+            // row, so the appended slot takes a reference of the collection's
+            // OWN ("stores the reference"). The appended element is always a
+            // BORROWED COPY out of `other` (the source keeps its own +1), so
+            // it is always RETAINED here — there is no fresh producer to
+            // transfer. The GIVE-BACK half is the collection's free / Remove /
+            // RemoveAt / Clear; the kind gate is the PAIRED one (`Array`).
+            if (recvTy &&
+                isFunctionElementSlotPaired(recvTy->headName(), arrElemRef)) {
+                llvm::Value* elemVal = builder_.CreateLoad(ptrTy(), ep, "ar.elem");
+                emitClosureRetain(elemVal);
             }
             auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
                                    {ptrTy(), ptrTy(), i64()});

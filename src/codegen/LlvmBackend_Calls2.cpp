@@ -8933,6 +8933,18 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
                 isStringElementTypeRef(arrElem);
             if (!elemDisp && arrIsStringElem)
                 elemDisp = stringElementReleaseThunk();
+            // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the FUNCTION-typed
+            // twin — a function element is the same §28.11 *runtime-managed
+            // reference* row as `string` (a shared-reference slot), so the
+            // collection co-owns a +1 per element and the collection's free
+            // gives one back per slot. The kind gate is the PAIRED one
+            // (`Array`); the element type is read RESOLVED (§3.6 rule 2 /
+            // §14.1) so the take and the give-back halves agree.
+            if (!elemDisp &&
+                arrElemPol.cat == ElementPolicy::Category::RuntimeManaged &&
+                recvTy->headName() == "Array" &&
+                isFunctionElementTypeRef(arrElem))
+                elemDisp = functionElementReleaseThunk();
             llvm::Value* disp = elemDisp
                 ? llvm::cast<llvm::Value>(elemDisp)
                 : llvm::ConstantPointerNull::get(ptrTy());
@@ -9078,6 +9090,18 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
                 isStringElementSlotPaired(recvTy, arrElem);
             if (!elemDisp && arrIsStringElem)
                 elemDisp = stringElementReleaseThunk();
+            // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the FUNCTION-typed
+            // twin — a function element is the same §28.11 *runtime-managed
+            // reference* row as `string` (a shared-reference slot), so the
+            // collection co-owns a +1 per element and the collection's free
+            // gives one back per slot. The kind gate is the PAIRED one
+            // (`Array`); the element type is read RESOLVED (§3.6 rule 2 /
+            // §14.1) so the take and the give-back halves agree.
+            if (!elemDisp &&
+                arrElemPol.cat == ElementPolicy::Category::RuntimeManaged &&
+                recvTy->headName() == "Array" &&
+                isFunctionElementTypeRef(arrElem))
+                elemDisp = functionElementReleaseThunk();
             llvm::Value* disp = elemDisp
                 ? llvm::cast<llvm::Value>(elemDisp)
                 : llvm::ConstantPointerNull::get(ptrTy());

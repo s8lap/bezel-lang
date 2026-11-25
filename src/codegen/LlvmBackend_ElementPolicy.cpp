@@ -552,4 +552,95 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
     };
 }
 
+// fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the FUNCTION-typed half of the
+// *runtime-managed reference* row's GIVE-BACK half — the per-element RELEASE
+// thunk, the function-typed twin of `stringElementReleaseThunk`.
+//
+// §28.11 (v0.359, "Collection element ownership")'s element-slot policy table
+// puts a FUNCTION type in the *runtime-managed reference* row (with `string`
+// and `Type`), whose borrowing-family column reads "shared references": the
+// collection owns a reference of its OWN on the element it stores, and the
+// operations table gives that reference back when the slot goes away ("Remove
+// / RemoveAt: removes the reference"; "Clear(): removes all"; the collection's
+// `Dispose()`: "no user-visible work" — the references it holds go back
+// invisibly). §28.9 puts a function-typed value in the runtime-managed tier.
+//
+// `bz_closure_release` is null-safe and runs the cell's envdtor at the last
+// drop (the runtime's closure contract, §28.9). Built once with its own
+// IRBuilder so the active `builder_` insert point is untouched (mirrors
+// `stringElementReleaseThunk` / `elementDisposerThunk`).
+llvm::Function* Emitter::functionElementReleaseThunk() {
+    if (functionElementReleaseThunk_) return functionElementReleaseThunk_;
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      "bz$fnElemRelease", module_.get());
+    llvm::Argument* c = &*fn->args().begin();
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    llvm::IRBuilder<> b(entry);
+    auto* relFn = declareC("bz_closure_release",
+                           llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    b.CreateCall(relFn, {c});   // null-safe in the runtime
+    b.CreateRetVoid();
+    functionElementReleaseThunk_ = fn;
+    return fn;
+}
+
+// fix #9104 / #9112 / §28.11 / §28.9 (v0.359): does the value expression own
+// a +1 closure reference of its OWN — a producer whose single reference the
+// collection's element slot can TAKE OVER (a TRANSFER), rather than a borrow
+// the slot must RETAIN on top of?
+//
+// The `string` row's answer is `isPlusOneStringProducer`, which INCLUDES the
+// user-method return arm (`isUserMethodStringReturnCall`): a call to a user
+// method whose declared return type is a `string` mints +1 for the CALLER
+// (§28.9 / #712), so the collection's slot takes that single reference over
+// and gives it back at the collection's free — one reference, one release.
+//
+// The FUNCTION row's answer is the same shape, but the closure producer
+// predicate DELIBERATELY declines every CallExpr (its own comment: "the callee
+// may hand back a function value WITHOUT a fresh +1"), so the call arms are
+// spelled out here. The set is the one the closure row's other "does this
+// expression own a +1" questions already ask (fix #2714 / #8925): a lambda
+// literal / method reference (`isPlusOneClosureProducer`), a user method's
+// closure return (`isUserMethodClosureReturnCall`), a lambda-typed local's
+// call (`isLambdaClosureReturnCall`) and an awaited closure return
+// (`isAwaitedClosureReturnCall`).
+//
+// WHY IT MATTERS (MEASURED): a slot that RETAINS a producer's value takes a
+// SECOND reference on a value whose producer never releases its own — the
+// producer's +1 is stranded, the closure's count never reaches 0 and its env
+// leaks (issue #9104's family: LSan 15 200 B / 600 allocations over 200
+// iterations of `fs[0] := MakeF(3)` and `new Array<() -> int>(3, MakeF(3))`).
+// The mirror image is the DANGEROUS direction: a value that does NOT own a +1
+// classified as a producer would be under-counted, so the transfer is
+// restricted to the four producer shapes above.
+bool Emitter::isClosureSlotProducer(const ast::Expr* e) const {
+    if (!e) return false;
+    return isPlusOneClosureProducer(e) ||
+           isUserMethodClosureReturnCall(e) ||
+           isLambdaClosureReturnCall(e) ||
+           isAwaitedClosureReturnCall(e);
+}
+
+// fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the TAKE half of the function
+// row — the store into a shared-reference slot takes a reference of the
+// collection's OWN (the GIVE-BACK half is `functionElementReleaseThunk`,
+// installed wherever the collection gives the slot's reference back).
+//
+// A +1 PRODUCER's reference is TRANSFERRED into the slot (no retain), exactly
+// as the `string` row's `isPlusOneStringProducer` gate does: the producer has
+// no other holder, so a retain here would orphan its reference (a leak — the
+// shape issue #9104 measured, 64 B per stored closure). Any other value is
+// RETAINED: the slot takes a reference of its own and the source keeps its
+// own, so the source may die while the collection lives (the
+// heap-use-after-free issue #9112 measured).
+void Emitter::emitFunctionElementSlotRetain(llvm::Value* v,
+                                             const ast::Expr* arg) {
+    if (!v || !v->getType()->isPointerTy()) return;
+    // A +1 producer's reference is transferred into the slot (no retain).
+    if (isClosureSlotProducer(arg)) return;
+    emitClosureRetain(v);
+}
+
 } // namespace bezel::codegen

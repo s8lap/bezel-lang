@@ -728,6 +728,7 @@ llvm::Value* Emitter::lowerArrayRangeSlice(llvm::Value* recv,
     // sibling. This retain pairs with the slice's OWN disposal, which already
     // installs stringElementReleaseThunk and releases exactly this +1.
     emitArrayRetainStringsIfStringArray(recvTy, sliced);
+    emitArrayRetainClosuresIfFunctionArray(recvTy, sliced);
     return sliced;
 }
 
@@ -2317,6 +2318,55 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                     {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
                 builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz),
                                          strDisp});
+                return true;
+            }
+            // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the FUNCTION-typed
+            // twin of the string arm above. A function type is the same §28.11
+            // *runtime-managed reference* row as `string` (a shared-reference
+            // slot), so the indexer-set "stores the reference": the slot takes
+            // a reference of the collection's OWN (a fresh +1 producer's
+            // reference is TRANSFERRED, any other value is RETAINED), and the
+            // DISPLACED element's co-owned reference is given back (the
+            // "removes the reference" row) through the per-element release
+            // thunk.
+            //
+            // Before this the store took NO reference at all, so the collection
+            // ALIASED the closure cell: the cell's owner (a class field's
+            // release at the instance's Dispose, or the producer's own release)
+            // freed it while the collection still held the pointer (issue
+            // #9112: a heap-use-after-free), while a FRESH producer's reference
+            // was orphaned (issue #9104: the closure env leaked per `Add`).
+            //
+            // The kind gate is the PAIRED one (`Array`) — a take is only sound
+            // where the collection gives the slot's reference back itself (see
+            // `isFunctionSlotPairedCollectionName`).
+            bool isFnElemArr =
+                !arrIsOwning &&
+                arrPol.cat == ElementPolicy::Category::RuntimeManaged &&
+                isFunctionElementTypeRef(arrEl) &&
+                recvTy->headName() == "Array";
+            if (isFnElemArr) {
+                // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the slot
+                // takes a reference of its OWN on the new value — a +1
+                // PRODUCER's single reference is TRANSFERRED into the slot
+                // (the `string` row's rule), any other value is RETAINED so
+                // the source may die while the collection lives. The
+                // producer set is `isClosureSlotProducer` (the closure row's
+                // four producer shapes), NOT the narrower
+                // `isPlusOneClosureProducer`: a closure-returning CALL
+                // (`fs[0] := MakeF(3)`) mints +1 for the caller, and
+                // RETAINING on top of it stranded the producer's reference —
+                // the closure's env leaked (MEASURED: LSan 15 200 B / 600
+                // allocations over 200 iterations).
+                emitFunctionElementSlotRetain(val, valueExpr);
+                llvm::AllocaInst* slot = entryAlloca(val->getType());
+                builder_.CreateStore(val, slot);
+                llvm::Function* fnDisp = functionElementReleaseThunk();
+                auto* fn = declareC("bz_array_set_disposing",
+                    llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+                builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz),
+                                         fnDisp});
                 return true;
             }
         }
@@ -13041,6 +13091,16 @@ void Emitter::freeCollectionSourceNow(llvm::Value* v,
             isStringElementSlotPaired(srcTy, elTy);
         if (!elemDisp && arrIsStringElem)
             elemDisp = stringElementReleaseThunk();
+        // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the FUNCTION-typed
+        // twin — a function element is the same §28.11 *runtime-managed
+        // reference* row (a shared-reference slot), so the source array
+        // co-owns a +1 per element and gives it back here, exactly as the
+        // string row does. The kind gate is the PAIRED one (`Array`) — the
+        // collection must be the one whose slot the store sites took a
+        // reference on (see `isFunctionSlotPairedCollectionName`).
+        if (!elemDisp && srcTy->headName() == "Array" &&
+            isFunctionElementTypeRef(elTy))
+            elemDisp = functionElementReleaseThunk();
     }
     llvm::Value* disp = elemDisp
         ? llvm::cast<llvm::Value>(elemDisp)

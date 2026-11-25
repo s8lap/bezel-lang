@@ -18736,6 +18736,21 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                             // QUEUE, issue #8453).
                             if (isStringElementSlotPaired(collTy, elt))
                                 d.collectionElemDisposer = stringElementReleaseThunk();
+                            // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the
+                            // FUNCTION-typed twin — a function element is the
+                            // same §28.11 *runtime-managed reference* row (a
+                            // shared-reference slot), so a literal-built
+                            // `Array<() -> R>` co-owns a +1 per cell (the
+                            // literal insert path's take) and the scope-end
+                            // free gives one back per slot.
+                            //
+                            // The kind gate is the PAIRED one (`Array`) and the
+                            // element type is read RESOLVED (§3.6 rule 2 /
+                            // §14.1), so the take and the give-back agree.
+                            else if (collTy->headName() == "Array" &&
+                                     isFunctionElementTypeRef(elt))
+                                d.collectionElemDisposer =
+                                    functionElementReleaseThunk();
                         }
                         // fix #5173 / §28.11: for a borrowing Array<T> with
                         // class/interface/Shared<T>/Weak<T> elements (whose owning-
@@ -20983,6 +20998,18 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 // declaration-site reading (the STACK / QUEUE, issue #8453).
                 isStringElementSlotPaired(rt, el)) {
             d.collectionElemDisposer = stringElementReleaseThunk();
+        }
+        // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the FUNCTION-typed
+        // twin — a function element is the same §28.11 *runtime-managed
+        // reference* row (a shared-reference slot), so the materialized array
+        // co-owns a +1 per cell and gives it back at the scope-end free. The
+        // kind gate is the PAIRED one (`Array`); the element type is read
+        // RESOLVED (§3.6 rule 2 / §14.1) so the take and the give-back agree.
+        if (!d.collectionElemDisposer &&
+            ep.cat == ElementPolicy::Category::RuntimeManaged &&
+            rt && rt->headName() == "Array" &&
+            isFunctionElementTypeRef(el)) {
+            d.collectionElemDisposer = functionElementReleaseThunk();
         }
         disposeStack_.back().push_back(d);
     }
@@ -25098,6 +25125,28 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                         // STACK / QUEUE, issue #8453).
                         isStringElementSlotPaired(collTy, collEl)) {
                     d.collectionElemDisposer = stringElementReleaseThunk();
+                }
+                // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the
+                // FUNCTION-typed twin — a function element is the same
+                // §28.11 *runtime-managed reference* row (a shared-reference
+                // slot), so the collection co-owns a reference of its own on
+                // the cell (the TAKE half is the store, below) and gives it
+                // back here, at the collection's free ("Dispose() of the
+                // collection: no user-visible work" — the references it holds
+                // go back invisibly; the element's own holder keeps its
+                // obligation). Before this the collection's reference was
+                // never given back: issue #9104 measured the closure env
+                // leaking per `Add` (12 800 B / 200 allocations over 200
+                // iterations of `Array<Fn>`).
+                //
+                // The kind gate is the PAIRED one (`Array`): a take is only
+                // sound where the collection gives the slot's reference back
+                // itself. The element type is read RESOLVED (§3.6 rule 2 /
+                // §14.1) so that a monomorphized generic body's take and
+                // give-back halves agree.
+                if (!d.collectionElemDisposer && collTy &&
+                    isFunctionElementSlotPaired(collTy->headName(), collEl)) {
+                    d.collectionElemDisposer = functionElementReleaseThunk();
                 }
             }
             // fix #2660 / §15.4: a `using var xs: Array<Array<int>> := [[…],[…]]`
@@ -34094,6 +34143,61 @@ static bool isBuiltinArrayComparerArg(const ast::Expr* callee, size_t i,
     return rt->headName() == "Array";
 }
 
+// fix #9104 / #9112 / §28.11 / §28.9 (v0.359): is argument `i` of a call
+// whose callee is `callee` a store into the element slot of a BUILT-IN
+// `Array` whose ELEMENT TYPE is a FUNCTION type?
+//
+// §28.11's element-slot policy puts a FUNCTION type in the *runtime-managed
+// reference* row (with `string` and `Type`), whose borrowing-family column
+// reads "shared references": the collection owns a reference of its OWN on
+// the element it stores ("the store: stores the reference"), and the
+// operations table gives that reference back when the slot goes away ("Remove
+// / RemoveAt: removes the reference"; "Clear(): removes all"; the collection's
+// `Dispose()`: "no user-visible work" — the references it holds go back
+// invisibly). §28.9 puts a function-typed value in the runtime-managed tier.
+//
+// So the store TAKES a reference and the collection's free GIVES IT BACK — the
+// two halves are a PAIR, and this predicate names the store half so that the
+// closure escape walk knows the value does not need to be kept alive by the
+// local alone (the local's own reference is released at its scope end; the
+// collection's reference keeps the closure alive past that).
+//
+// Keyed on the RECEIVER'S TYPE, not on the member name alone: a user class
+// with an `Add` method is not the built-in `Array` and does not take a
+// reference; a `Stack`/`Queue`/`LinkedList`/`Dictionary` is not this row
+// (the Stack's `Pop` gives the slot's reference back at the POP, which does
+// not release it — issue #8453, OPEN — so a take there would strand it);
+// and an interface-headed alias (`IList<T>`) has its own free path.
+//
+// The element type is read as WRITTEN: inside a monomorphized generic body
+// the collection's `genericArgs[0]` is still the placeholder `T`, and the
+// element category is fixed at the INSTANTIATION (§3.6 rule 2 / §14.4) — a
+// body whose instantiation is not visible here keeps the conservative escape
+// (a leak, never a use-after-free).
+static bool isBuiltinArrayFunctionElementStore(const ast::Expr* callee, size_t i,
+                                               const sema::SemaContext& ctx) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target) return false;
+    // The VALUE argument's position: `Add(v)` takes one argument, `Insert(i,
+    // v)` and `Set(i, v)` take the index first.
+    size_t valueArg = 0;
+    if (ma->member == "Add") {
+        valueArg = 0;
+    } else if (ma->member == "Insert" || ma->member == "Set") {
+        valueArg = 1;
+    } else {
+        return false;
+    }
+    if (i != valueArg) return false;
+    const sema::TypeRef* rt = ctx.exprType(*ma->target);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (rt->headName() != "Array") return false;
+    if (rt->genericArgs.empty() || !rt->genericArgs[0]) return false;
+    const sema::TypeRef* el = rt->genericArgs[0];
+    return el->kind == sema::TypeRef::Kind::Function;
+}
+
 // fix #3874 (§4.14/§4.15/§4.16/§8.6/§28.9, v0.294): is argument `i` of a call
 // whose callee is `callee` the `other` argument of `SequenceEqual` on a
 // T-element span receiver — ArraySpan<T>/ReadOnlyArraySpan<T> (§4.15,
@@ -42661,6 +42765,18 @@ struct ClosureEscapeWalker {
     // collectClosureReleaseEligible reads this for an owned alias: binding a
     // source into such an alias is an escape of the SOURCE.
     bool keptWithoutReference_ = false;
+    // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): set when the target was
+    // read at a collection store that TAKES a reference of its own — the
+    // §28.11 *runtime-managed reference* row's "store: stores the reference"
+    // (a FUNCTION-typed element of a built-in `Array`; see the CallExpr arm's
+    // `isBuiltinArrayFunctionElementStore` relief). The value still ESCAPES
+    // the frame (the collection holds it), but the LOCAL's own reference is
+    // still the local's: it is released at the local's scope end, while the
+    // collection's own reference keeps the closure alive past that. The
+    // capture cells are NOT freed with the scope (the closure may outlive it),
+    // so the post-walk override arms the local through
+    // `closureEscapingScopeEndRelease_` rather than `closureReleaseEligible_`.
+    bool storedIntoSharedRefSlot_ = false;
     // True while the walk is inside one of the two reference-taking escape
     // sites named above.
     bool inReferenceTakingSite_ = false;
@@ -43802,6 +43918,37 @@ struct ClosureEscapeWalker {
                     safeArg = true;
                 // fix #8723 / #8747: see closureLocalAssignTakesReference.
                 const bool savedSite = inReferenceTakingSite_;
+                // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): a FUNCTION-
+                // typed element stored into a BUILT-IN `Array`. §28.11's
+                // *runtime-managed reference* row puts a function type in the
+                // same shared-reference row as `string`, whose borrowing-
+                // family column reads "shared references": the collection
+                // owns a reference of its OWN on the element it stores ("the
+                // store: stores the reference"), and gives that reference back
+                // when the slot goes away (the collection's free / Remove /
+                // RemoveAt / Clear).
+                //
+                // So the store is a REFERENCE-TAKING site, not a "keep": the
+                // local keeps its own reference and releases it at its scope
+                // end, and the collection's own reference keeps the closure
+                // alive after that. Without this the store read as a plain
+                // ESCAPE, so the local's scope-end release was never armed and
+                // the holder's reference leaked (issue #9104's own Probe B:
+                // 12800 B / 200 allocations over 200 iterations of
+                // `Array<Fn>`; the `string` twin leaks identically).
+                //
+                // The verdict is per-callee AND per-element-type: only a
+                // built-in `Array` whose ELEMENT type is a function type
+                // takes a reference — the one row the compiler implements
+                // (see `isBuiltinArrayFunctionElementStore`). Every other
+                // receiver (a user class, a Stack, a Dictionary, a generic
+                // `Array<T>` whose instantiation is unknown here) keeps the
+                // conservative escape.
+                if (!safeArg && argIsTarget(c->args[ai].value.get()) &&
+                    isBuiltinArrayFunctionElementStore(c->callee.get(), ai, ctx)) {
+                    inReferenceTakingSite_ = true;
+                    storedIntoSharedRefSlot_ = true;
+                }
                 if (!safeArg && callBoundedArg &&
                     argIsTarget(c->args[ai].value.get()) &&
                     callBoundedArg(*c, ai))
@@ -46472,6 +46619,24 @@ void Emitter::collectClosureReleaseEligible(
             else
                 closureReleaseEligible_.insert(ldKey);
         }
+        // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the local was STORED
+        // into a collection slot that TAKES a reference of its own (§28.11's
+        // *runtime-managed reference* row: the store "stores the reference").
+        // The value therefore still escapes the frame — but the LOCAL's own
+        // reference is still the local's: the collection co-owns a reference
+        // of its own, and the local's reference is released at the local's
+        // scope end. Before this the store read as a plain escape, so the
+        // local's scope-end release was never armed and the holder's
+        // reference leaked (issue #9104's Probe B: 12800 B / 200 allocations
+        // over 200 iterations of `Array<Fn>`).
+        //
+        // The local goes through `closureEscapingScopeEndRelease_` and NOT
+        // `closureReleaseEligible_`: the closure may outlive this scope (the
+        // collection holds it), so its capture cells stay with its env
+        // destructor rather than being freed with the scope (the same
+        // discipline the #8479 / #8480 arms use).
+        if (w.storedIntoSharedRefSlot_ && !w.isCapturedCellSlot_)
+            closureEscapingScopeEndRelease_.insert(ldKey);
         if (w.isReturned_) returnedByName.insert(ldKey);
     }
     // fix #8479 (§27.5 / §28.9, v0.357): a local that an owned alias was
@@ -52587,7 +52752,8 @@ bool Emitter::isBorrowingArrayLiteralLocal(const LocalDeclInitView& view) {
     // element and the reclaim block releases each one. The `!nullable` gate
     // was issue #9064 / #8485.
     if (ep.cat == ElementPolicy::Category::RuntimeManaged &&
-        !isStringElementTypeRef(el)) return false;
+        !isStringElementTypeRef(el) && !isFunctionElementTypeRef(el))
+        return false;
     return true;
 }
 
@@ -61527,6 +61693,16 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
                 (name == "Array" || name == "Stack" || name == "Queue");
             if (litIsStrArr && !isPlusOneStringProducer(elemPtr.get()))
                 emitStringRetain(ev);
+            // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the FUNCTION-typed
+            // twin — a function element is a shared-reference slot (§28.11's
+            // *runtime-managed reference* row), so a literal-built
+            // `Array<() -> R>` co-owns a +1 per cell (the store "stores the
+            // reference"; a fresh producer's reference is transferred, any
+            // other value is retained), matching the per-element release its
+            // scope-end free issues. The kind gate is the PAIRED one
+            // (`Array`) — see `isFunctionSlotPairedCollectionName`.
+            if (name == "Array" && isFunctionElementSlotType(elemRef))
+                emitFunctionElementSlotRetain(ev, elemPtr.get());
         }
         // fix #2771 (§8.6, §15.4, v0.240): BOX the element against the declared
         // ELEMENT type before storing it. Without this the loop stored the raw

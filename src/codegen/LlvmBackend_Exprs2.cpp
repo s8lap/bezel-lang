@@ -9708,6 +9708,22 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             fillVal = boxForTarget(
                                 fillVal, rt->genericArgs[0],
                                 ne.args[fillArgIdx].value.get());
+                        // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the
+                        // FUNCTION-typed twin of the string row below — a
+                        // function type is the same §28.11 *runtime-managed
+                        // reference* row as `string` (a shared-reference
+                        // slot), so an `Array<() -> R>` holds ONE reference
+                        // per slot exactly as `Array<string>` does — and its
+                        // free gives one back per slot. The element type is
+                        // read RESOLVED (§3.6 rule 2 / §14.1) so the take
+                        // and the give-back halves agree inside a
+                        // monomorphized generic body; the kind gate is the
+                        // PAIRED one (`Array`).
+                        const bool fillIsFunction =
+                            fillVal->getType()->isPointerTy() &&
+                            !rt->genericArgs.empty() &&
+                            isFunctionElementSlotPaired(rt->headName(),
+                                                        rt->genericArgs[0]);
                         // Spill fill value into an alloca so bz_array_set
                         // can read it via a pointer (matching OwningBuffer init
                         // loop pattern at §4.14 / #778).
@@ -9780,6 +9796,23 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         // into every slot and took none. Each slot now takes
                         // its own (a no-op on a literal).
                         if (fillIsString) emitStringRetain(fillVal);
+                        // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the
+                        // FUNCTION-typed twin — a function type is the same
+                        // §28.11 *runtime-managed reference* row as `string`
+                        // (a shared-reference slot), so an `Array<() -> R>`
+                        // holds ONE reference per slot exactly as
+                        // `Array<string>` does — and its free gives one back
+                        // per slot. The per-slot retain below is the matching
+                        // half (the string arm above).
+                        //
+                        // The element type is read RESOLVED (§3.6 rule 2 /
+                        // §14.1): inside a monomorphized generic body the
+                        // collection's `genericArgs[0]` is still the
+                        // placeholder `T`, and the element category is fixed
+                        // at the INSTANTIATION — so the take and the
+                        // give-back halves must read the same substituted
+                        // type. The kind gate is the PAIRED one (`Array`).
+                        if (fillIsFunction) emitClosureRetain(fillVal);
                         builder_.CreateStore(
                             builder_.CreateAdd(iv, builder_.getInt64(1)), iSlot);
                         builder_.CreateBr(hdrBB);
@@ -9791,6 +9824,22 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             isPlusOneStringProducer(
                                 ne.args[fillArgIdx].value.get()))
                             emitStringRelease(fillVal);
+                        // fix #9104 / #9112 (§28.11, v0.359): the function
+                        // twin of that surplus release. The producer set is
+                        // `isClosureSlotProducer` (the closure row's four
+                        // producer shapes), NOT the narrower
+                        // `isPlusOneClosureProducer`: a closure-returning CALL
+                        // as the fill value (`new Array<() -> int>(3, MakeF(3))`)
+                        // mints +1 for the caller, and the slots' own retains
+                        // sit ON TOP of it — so the producer's reference is
+                        // surplus and must be given back here. Without this
+                        // the producer's +1 was stranded and the closure's env
+                        // leaked (MEASURED: LSan 15 200 B / 600 allocations
+                        // over 200 iterations).
+                        if (fillIsFunction &&
+                            isClosureSlotProducer(
+                                ne.args[fillArgIdx].value.get()))
+                            emitClosureRelease(fillVal);
                     }
                     // fix #6557: stamped AFTER the fill, so the stamp's walk
                     // takes one Key reference per pre-populated slot.

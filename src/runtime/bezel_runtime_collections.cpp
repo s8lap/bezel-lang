@@ -1349,6 +1349,29 @@ void bz_array_retain_strings(void* arrp) {
     }
 }
 
+// fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the FUNCTION-typed twin of
+// `bz_array_retain_strings` — a function type is the same §28.11
+// *runtime-managed reference* row as `string` (a shared-reference slot), so a
+// freshly copied / materialized `Array<() -> R>` independently co-owns a +1 per
+// element exactly as `Array<string>` does.
+//
+// This pairs with the per-element `bz_closure_release` the array's later
+// free / dispose issues (the compiler's per-element release thunk for a
+// function-typed slot): an insert-built array retains at the store (codegen),
+// a copy/materialize-built array retains here, so both are symmetric and
+// release exactly their +1 at free. `bz_closure_retain` is null-safe (a
+// `null` slot of a nullable function element is a no-op), so a
+// partial/empty array is safe.
+void bz_array_retain_closures(void* arrp) {
+    if (!arrp) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (!arr->data) return;
+    for (int64_t i = 0; i < arr->count; ++i) {
+        void* elem = ((void**)arr->data)[i];
+        if (elem) bz_closure_retain(elem);
+    }
+}
+
 void* bz_array_ptr_at(void* arrp, int64_t idx, int64_t elem_size) {
     auto* arr = (bz_array_t*)arrp;
     return (char*)arr->data + idx * elem_size;

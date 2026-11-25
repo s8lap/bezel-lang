@@ -191,6 +191,16 @@ void* bz_array_slice(void* arr, int64_t start, int64_t end, int64_t elem_size);
 // sentinel/literal or null, so partial/empty arrays are safe.
 void bz_array_retain_strings(void* arr);
 
+// fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the FUNCTION-typed twin of
+// `bz_array_retain_strings` — a function type is the same §28.11
+// *runtime-managed reference* row as `string` (a shared-reference slot), so a
+// freshly copied or materialized `Array<() -> R>` independently co-owns a +1
+// per element — matching the per-element bz_closure_release the array's
+// free/dispose later issues.  Only valid for an array whose elements are
+// pointer-sized closures.  retain is a no-op on null, so partial/empty arrays
+// are safe.
+void bz_array_retain_closures(void* arr);
+
 // fix #6550 / §28.11 / §28.9 / §9.7 (v0.338): the `{K, V}`-struct analogue of
 // `bz_array_retain_strings`, for an array whose elements are `{bz_string*, V}`
 // structs — a snapshot of a `Dictionary<string, V>`'s entries — rather than

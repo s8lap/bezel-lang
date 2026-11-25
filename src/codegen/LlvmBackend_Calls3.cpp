@@ -4119,6 +4119,19 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(rf, {arr});
             }
+            // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the FUNCTION-typed
+            // twin of that row — a function type is the same §28.11
+            // *runtime-managed reference* row as `string` (a shared-reference
+            // slot), so the materialized `Array<() -> R>` co-owns a +1 per
+            // element exactly as `Array<string>`'s does — and its free gives
+            // one back per slot (the `functionElementReleaseThunk`). The kind
+            // gate is the PAIRED one (`Array`).
+            if (toArrPol.cat == ElementPolicy::Category::RuntimeManaged &&
+                isFunctionElementSlotPaired("Array", elemRef)) {
+                auto* rf = declareC("bz_array_retain_closures",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(rf, {arr});
+            }
         }
         return arr;
     }
