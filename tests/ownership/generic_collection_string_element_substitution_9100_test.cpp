@@ -423,6 +423,120 @@ const char* kGenericFrozenArrayLocalString =
     "  end Main;\n"
     "end C;\n";
 
+// A `FrozenArray<string?>` held in an OWNED FIELD (non-generic), built from a
+// borrowed `Array<string?>` holding a value AND a null. The owned-field
+// disposal releases each `string?` slot (§3.6 *Nullable forms*: `V?` has
+// `V`'s element category, so §28.11's shared-reference row applies), so the
+// copying `From` must take the +1 for a `string?` element too; it skipped
+// them, and the field's free over-released (exit 134).
+const char* kFrozenNullableStringConcreteField =
+    "module M; import System;\n"
+    "public class CBox\n"
+    "  public owned items: FrozenArray<string?>;\n"
+    "  public constructor(src: Array<string?>) items := FrozenArray<string?>.From(src); end;\n"
+    "end CBox;\n"
+    "public class C\n"
+    "  public static method Main(): int\n"
+    "    var tot := 0;\n"
+    "    for var i in 0..<200 do\n"
+    "      var s := new Array<string?>(); s.Add(\"w\" + i.ToString()); s.Add(null);\n"
+    "      using var b := new CBox(s);\n"
+    "      for var x in b.items do tot := tot + (x ?? \"\").Length; end;\n"
+    "    end;\n"
+    "    Console.WriteLine(tot);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end C;\n";
+
+// The same field reassigned with a second `From`: §28.7's drop-on-overwrite
+// releases the displaced FrozenArray's `string?` slots, which `From` must have
+// taken.
+const char* kFrozenNullableStringConcreteFieldOverwrite =
+    "module M; import System;\n"
+    "public class CBox\n"
+    "  public owned items: FrozenArray<string?>;\n"
+    "  public constructor(src: Array<string?>) items := FrozenArray<string?>.From(src); end;\n"
+    "  public method Reset(src: Array<string?>) items := FrozenArray<string?>.From(src); end Reset;\n"
+    "end CBox;\n"
+    "public class C\n"
+    "  public static method Main(): int\n"
+    "    var tot := 0;\n"
+    "    for var i in 0..<200 do\n"
+    "      var s := new Array<string?>(); s.Add(\"w\" + i.ToString()); s.Add(null);\n"
+    "      using var b := new CBox(s);\n"
+    "      var s2 := new Array<string?>(); s2.Add(null); s2.Add(\"v\" + i.ToString());\n"
+    "      b.Reset(s2);\n"
+    "      for var x in b.items do tot := tot + (x ?? \"\").Length; end;\n"
+    "    end;\n"
+    "    Console.WriteLine(tot);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end C;\n";
+
+// A generic `Box<T>`'s `owned items: FrozenArray<T>` at T = `string?`: the
+// field disposal reads the SUBSTITUTED element (§3.6 rule 2), so the generic
+// `From` must take at `string?` too.
+const char* kFrozenNullableStringGenericField =
+    "module M; import System;\n"
+    "public class Box<T>\n"
+    "  public owned items: FrozenArray<T>;\n"
+    "  public constructor(src: Array<T>) items := FrozenArray<T>.From(src); end;\n"
+    "end Box;\n"
+    "public class C\n"
+    "  public static method Main(): int\n"
+    "    var tot := 0;\n"
+    "    for var i in 0..<200 do\n"
+    "      var s := new Array<string?>(); s.Add(\"w\" + i.ToString()); s.Add(null);\n"
+    "      using var b := new Box<string?>(s);\n"
+    "      for var x in b.items do tot := tot + (x ?? \"\").Length; end;\n"
+    "    end;\n"
+    "    Console.WriteLine(tot);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end C;\n";
+
+// A generic body's `using var r := FrozenArray<T>.From(s)` at T = `string?`:
+// the scope-end free releases at the substituted `string?`, so `From` must
+// take at it.
+const char* kFrozenNullableStringGenericLocal =
+    "module M; import System;\n"
+    "public class G\n"
+    "  public static method Loc<T>(a: T, b: T): int\n"
+    "    var s := new Array<T>(); s.Add(a); s.Add(b);\n"
+    "    using var r := FrozenArray<T>.From(s);\n"
+    "    return r.Length;\n"
+    "  end Loc;\n"
+    "end G;\n"
+    "public class C\n"
+    "  public static method Main(): int\n"
+    "    var tot := 0;\n"
+    "    for var i in 0..<200 do\n"
+    "      tot := tot + G.Loc<string?>(\"w\" + i.ToString(), null);\n"
+    "    end;\n"
+    "    Console.WriteLine(tot);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end C;\n";
+
+// Issue #9121's repro: a non-generic `using var f :=
+// FrozenArray<string?>.From(src)` local; its scope-end free released the
+// `string?` slots that `From` never took (refcount over-release, exit 134).
+const char* kFrozenNullableStringConcreteLocal9121 =
+    "module M; import System;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var tot := 0;\n"
+    "    for var i in 0..<200 do\n"
+    "      var src := new Array<string?>();\n"
+    "      src.Add(\"w\" + i.ToString());\n"
+    "      using var f := FrozenArray<string?>.From(src);\n"
+    "      tot := tot + f.Length;\n"
+    "    end;\n"
+    "    Console.WriteLine(tot);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
 void expectClean(const char* src, const char* out) {
     JitResult r = runAotChecked(src);
     BEZEL_EXPECT_TRUE(r.ran);          // no leak (the bug) and no double-free
@@ -512,4 +626,29 @@ BEZEL_TEST(ownership_generic_collection_string_element_substitution_9100,
 BEZEL_TEST(ownership_generic_collection_string_element_substitution_9100,
            generic_frozenarray_local_string_released_as_taken_spec_28_11) {
     expectClean(kGenericFrozenArrayLocalString, "1780\n");
+}
+
+BEZEL_TEST(ownership_generic_collection_string_element_substitution_9100,
+           frozenarray_nullable_string_owned_field_takes_per_element_spec_28_11) {
+    expectClean(kFrozenNullableStringConcreteField, "690\n");
+}
+
+BEZEL_TEST(ownership_generic_collection_string_element_substitution_9100,
+           frozenarray_nullable_string_owned_field_overwrite_releases_displaced_spec_28_7) {
+    expectClean(kFrozenNullableStringConcreteFieldOverwrite, "690\n");
+}
+
+BEZEL_TEST(ownership_generic_collection_string_element_substitution_9100,
+           generic_frozenarray_nullable_string_owned_field_takes_per_element_spec_28_11) {
+    expectClean(kFrozenNullableStringGenericField, "690\n");
+}
+
+BEZEL_TEST(ownership_generic_collection_string_element_substitution_9100,
+           generic_frozenarray_nullable_string_local_takes_per_element_spec_28_11) {
+    expectClean(kFrozenNullableStringGenericLocal, "400\n");
+}
+
+BEZEL_TEST(ownership_generic_collection_string_element_substitution_9100,
+           frozenarray_nullable_string_local_from_takes_per_element_9121_spec_28_11) {
+    expectClean(kFrozenNullableStringConcreteLocal9121, "200\n");
 }

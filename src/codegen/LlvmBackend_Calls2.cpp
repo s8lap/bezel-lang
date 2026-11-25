@@ -1153,8 +1153,14 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
     // Retain only for a borrowed source. An owned source (literal, call
     // result, `move`) is freed below with a NULL element disposer, which hands
     // its +1 per string to the copy; retaining there too would leak one per
-    // element. Nullable `string?` elements are not co-owned (the same
-    // exclusion the shared helper and the array disposal make).
+    // element. A `string?` element is co-owned exactly like a `string` one
+    // (§3.6 *Nullable forms*: `V?` has `V`'s element category, so §28.11's
+    // shared-reference slot policy applies to it): every FrozenArray release
+    // half — the owned-field disposal, the drop-on-overwrite, the `using var`
+    // scope-end free and a reclaimed temporary — releases a `string?` slot,
+    // so this, the kind's only string take, must take it (fix-forward #9100;
+    // the `!nullable` conjunct here was issue #9121's over-release). A null
+    // slot is skipped by both bz_array_retain_strings and the release thunk.
     //
     // The copy's header also records the string release as its element
     // disposer, for EVERY source: a FrozenArray<string> co-owns its elements
@@ -1173,7 +1179,7 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
             ? resolveTypeParamRef(resTy->genericArgs[0])
             : nullptr;
     const bool frozenStringElems =
-        frozenEl && !frozenEl->nullable &&
+        frozenEl &&
         frozenEl->kind == sema::TypeRef::Kind::Primitive &&
         frozenEl->primitive == sema::PrimitiveType::String;
     if (frozenStringElems && !sourceOwnedHere) {

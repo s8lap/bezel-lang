@@ -18294,9 +18294,9 @@ private:
     // its free releases every slot; so its release halves must resolve too.
     // Leaving it on the declaration-site reading made a generic `Holder<T>`'s
     // `owned items: FrozenArray<T>` field leak one reference per element at
-    // T = `string`. (Its `string?` take is still `!nullable`-gated — issue
-    // #9121 — so `isUnboundTempStringElement` does not extend the nullable
-    // allowance to it.)
+    // T = `string`. Its take co-owns a `string?` element too (§3.6 *Nullable
+    // forms*; the `!nullable` gate there was issue #9121), so every release
+    // half reads `string?` as `string` for it, as for Array and LinkedList.
     //
     // The other array-backed kinds are deliberately NOT here: the STACK and
     // the QUEUE give their slot's reference back at Pop()/Dequeue(), which
@@ -18348,7 +18348,7 @@ private:
     // LINQ `ToDictionary`'s `valIsString`) read, so the decline and the release
     // it declines cannot drift. A `string?` element counts for a PAIRED kind:
     // its every insert takes the +1 for a `string?` as for a `string` (#9064's
-    // array family, #9107's linked list — §3.6's *Nullable forms* read the
+    // array family, #9107's linked list, FrozenArray's `From` — §3.6's *Nullable forms* read the
     // element category of `V?` as `V`), so its reclaim must give it back.
     // The other kinds keep the `!nullable` reading their inserts have.
     bool isUnboundTempStringElement(const sema::TypeRef* collTy,
@@ -18358,9 +18358,7 @@ private:
             el->primitive != sema::PrimitiveType::String)
             return false;
         const std::string_view head = slotCollectionHead(collTy);
-        return !el->nullable ||
-               (head != "FrozenArray" &&
-                isSlotReferencePairedCollectionName(head));
+        return !el->nullable || isSlotReferencePairedCollectionName(head);
     }
 
     // fix #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the string-element
