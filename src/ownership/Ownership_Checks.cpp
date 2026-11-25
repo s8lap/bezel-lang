@@ -34402,6 +34402,47 @@ bool MethodOwnership::choicePayloadHolderIsFunctionTyped(
     return ft && ft->kind == sema::TypeRef::Kind::Function;
 }
 
+// fix #9353 (§28.3 *Function-typed holders*, §28.14, v0.359): is the argument
+// at source position `argPos` a store into a COLLECTION SLOT — the `fill`
+// argument of a built-in collection constructor over a function-typed
+// element? Both the `scoped` walk and the §28.14 call-bounded walk ask the
+// same question of the same site.
+//
+// §28.3's *Function-typed holders* bullet lists "any collection slot" among
+// the function-typed holders, and a function value read from a collection
+// carries the empty source set (§28.3 *Provenance* clause 5), so a closure
+// stored in a slot hands the callback past its bound. §28.14's call-bounded
+// twin states it outright: "stored into any collection, a local one included".
+//
+// The standard library declares ONE such constructor: `Array<T>(size: int,
+// fill: T)` (stdlib §4.4) — "Count = size, every slot = fill". Its `fill`
+// argument is therefore a store into every slot of the new array.
+//
+// The constructed type is the built-in `Array` — a Named TypeRef with a NULL
+// declaration carrying the class name on the AST node, the shape
+// `builtinCollectionStoreCallee` reads for a receiver. A user type with its
+// own `Array` name never matches, and a user collection's own constructor
+// keeps its own §28.14 obligations.
+// per §28.3, §28.14, stdlib §4.4, v0.359
+bool MethodOwnership::collectionFillHolderIsFunctionTyped(
+    const ast::NewExpr& ne, const std::vector<ast::CallArgument>* args,
+    std::size_t argPos) const {
+    if (!args || argPos >= args->size()) return false;
+    const sema::TypeRef* rt = ctx_.exprType(ne);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration ||
+        rt->headName() != "Array" || rt->genericArgs.empty() ||
+        !rt->genericArgs[0] ||
+        rt->genericArgs[0]->kind != sema::TypeRef::Kind::Function)
+        return false;
+    // The `fill` parameter of the two-argument form (§22.5's binder: a named
+    // argument binds the parameter of that name, a positional one the next
+    // parameter in declaration order).
+    const ast::CallArgument& a = args->at(argPos);
+    if (!a.name.empty()) return a.name == "fill";
+    if (args->size() != 2) return false;
+    return argPos == 1;
+}
+
 // fix-forward #9310: §28.3 *Function-typed holders* names "a `with`
 // assignment to it" (§9.5) beside the construction argument as a record
 // component's store, so a `with` override with a carrier at a function-typed
@@ -34480,6 +34521,13 @@ void MethodOwnership::scopedCarrierAtCallArg(
             scopedCarrierReportRecordStore(arg, formalName);
             return;
         }
+        // fix #9353 (§28.3 *Function-typed holders*, §28.14, v0.359): the
+        // `fill` argument of a built-in collection constructor over a
+        // function-typed element is a store into every slot of the new
+        // collection (§28.3 lists "any collection slot" among the holders;
+        // stdlib §4.4's `Array<T>(size: int, fill: T)`).
+        if (collectionFillHolderIsFunctionTyped(*ne, args, argPos))
+            scopedCarrierReportCollectionStore(arg, formalName);
         return;
     }
     // fix #9352 (§28.3 *Function-typed holders*, §28.14, v0.359): an argument
@@ -35259,19 +35307,20 @@ void MethodOwnership::reportCallBounded(SourceLocation loc,
                std::string(sink));
 }
 
-// fix #9352 (§28.3 *Function-typed holders*, §28.14, v0.359): a
+// fix #9352 / #9353 (§28.3 *Function-typed holders*, §28.14, v0.359): a
 // CALL-BOUNDED callback stored into a FUNCTION-TYPED HOLDER — a choice case's
-// payload field.
+// payload field (#9352) or a collection slot (#9353).
 //
 // §28.14's call-bounded tier: a plain function-typed parameter "may not be
 // stored in a field of any object (a property or indexer assignment is such a
 // store, and so is a store into a function-typed record component, **choice
 // payload** or inline-array slot, a local array's included, §28.3's
-// *function-typed holders*)". §28.3's *Function-typed holders*: "At every
-// function-typed holder the closure bullet's sink rule holds: a store of a
-// function value admits a capture-free value and rejects one whose source set
-// is non-empty (a capture-bearing closure, **a plain function-typed
-// parameter**, a local carrying either), judged at the site".
+// *function-typed holders*), **stored into any collection, a local one
+// included**". §28.3's *Function-typed holders*: "At every function-typed
+// holder the closure bullet's sink rule holds: a store of a function value
+// admits a capture-free value and rejects one whose source set is non-empty
+// (a capture-bearing closure, **a plain function-typed parameter**, a local
+// carrying either), judged at the site".
 //
 // The remedy is NOT to declare the parameter `scoped` — a `scoped` parameter
 // is storage-bounded and may not be stored in a holder either (§28.14): the
@@ -35682,6 +35731,19 @@ void MethodOwnership::callBoundedWalkExpr(const ast::Expr& e) {
                     reportCallBoundedHolderStore(
                         *a.value, src->name,
                         "stored into a function-typed choice payload");
+                    continue;
+                } else if (ne &&
+                           collectionFillHolderIsFunctionTyped(*ne, args, i)) {
+                    // fix #9353 (§28.3 *Function-typed holders*, §28.14,
+                    // v0.359): the `fill` argument of a built-in collection
+                    // constructor over a function-typed element is a store
+                    // into every slot of the new collection (§28.3 lists "any
+                    // collection slot" among the holders; stdlib §4.4's
+                    // `Array<T>(size: int, fill: T)`) — §28.14's call-bounded
+                    // tier: "stored into any collection, a local one
+                    // included".
+                    reportCallBoundedHolderStore(*a.value, src->name,
+                                                 "stored into a collection slot");
                     continue;
                 } else if (collStore) {
                     // Sink: builtin-collection mutator on a receiver

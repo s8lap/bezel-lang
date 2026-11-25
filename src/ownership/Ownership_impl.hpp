@@ -8379,15 +8379,19 @@ private:
     // form included)" among their stores.
     void scopedCarrierReportChoicePayloadStore(const ast::Expr& value,
                                                 std::string_view formalName);
-    // fix #9352 (§28.3 *Function-typed holders*, §28.14, v0.359): the
-    // HOLDER the §28.3 rule names that the `scoped` walk and the
+    // fix #9352 / #9353 (§28.3 *Function-typed holders*, §28.14, v0.359): the
+    // two HOLDERS the §28.3 rule names that the `scoped` walk and the
     // call-bounded walk both judge — a choice case's function-typed payload
-    // field. The predicate answers "is the argument at source position
-    // `argPos` a store into such a holder?", so both walks read the site the
-    // same way (§22.5's binder: a named argument binds the member of that
-    // name, a positional one the next member in declaration order).
+    // field and a collection slot. Each predicate answers "is the argument at
+    // source position `argPos` a store into such a holder?", so both walks
+    // read the site the same way (§22.5's binder: a named argument binds the
+    // member of that name, a positional one the next member in declaration
+    // order).
     bool choicePayloadHolderIsFunctionTyped(
         const ast::Expr* callee, const std::vector<ast::CallArgument>* args,
+        std::size_t argPos) const;
+    bool collectionFillHolderIsFunctionTyped(
+        const ast::NewExpr& ne, const std::vector<ast::CallArgument>* args,
         std::size_t argPos) const;
     // > 0 while the callee walk is inside a lambda BODY: a `return` there
     // returns from the lambda, not from the method.
@@ -8480,11 +8484,12 @@ private:
     // spec-stated fix.
     void reportCallBounded(SourceLocation loc, std::string_view paramName,
                            std::string_view sink);
-    // fix #9352 (§28.3 *Function-typed holders*, §28.14, v0.359): the
+    // fix #9352 / #9353 (§28.3 *Function-typed holders*, §28.14, v0.359): the
     // §28.14 CALL-BOUNDED tier's holder store — a choice case's function-typed
-    // payload field. §28.14's call-bounded tier names the store; a `scoped`
-    // parameter is storage-bounded and may not be stored in a holder either,
-    // so the remedy is a capture-free closure, not a `scoped` declaration.
+    // payload field (#9352) or a collection slot (#9353). §28.14's call-bounded
+    // tier names both stores; a `scoped` parameter is storage-bounded and may
+    // not be stored in a holder either, so the remedy is a capture-free
+    // closure, not a `scoped` declaration.
     void reportCallBoundedHolderStore(const ast::Expr& value,
                                       std::string_view paramName,
                                       std::string_view sink);
