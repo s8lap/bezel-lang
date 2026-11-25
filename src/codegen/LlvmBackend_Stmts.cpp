@@ -2403,6 +2403,93 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         }
                     }
                 }
+                // fix #9249 (§22.3 / §28.9, v0.359): the store through a
+                // `ref`/`out` FUNCTION-typed PARAMETER takes the aliased
+                // slot's OWN reference to the value it stores.
+                //
+                // THE DEFECT. §22.3 (v0.359) makes a `ref` argument naming a
+                // writable field (or a mutable local) a TRUE ALIAS: "callee
+                // writes are visible through the caller's location
+                // immediately". So the callee's `x := src.F` IS a store into
+                // the CALLER's slot — and §28.3.8 (v0.359), *A `ref` or plain
+                // `out` location outlives the call*, says that location "is
+                // caller storage". The slot is therefore a HOLDER of the
+                // function value it holds: the caller's holder (a class field
+                // released on the owner's disposal; a local released at its
+                // scope end) drops a reference of its OWN on the value it
+                // holds. The store was a PLAIN store: it took NO reference of
+                // its own to the value it stored, so the caller's holder and
+                // the value's REAL owner (the source's own holder) released
+                // the SAME cell — the caller's release drove the count to
+                // zero and the real owner's release drove it NEGATIVE.
+                // MEASURED on r30-c1 (d66898662), the issue's own program
+                // verbatim (`scripts/agent_check.sh --probe --asan`):
+                // "bezel: fatal: refcount over-release (closure) — two
+                // releases for one reference; terminating per §28.9", exit
+                // 134, no stdout.
+                //
+                // THE DISCIPLINE. A +1 PRODUCER (a lambda, a method
+                // reference, a closure-returning call) is TRANSFERRED — its
+                // single reference becomes the slot's; anything else (a
+                // BORROW: a field read, a local read, a parameter read) is
+                // RETAINED, so the slot owns a reference of its own and the
+                // source's holder keeps its own. This is exactly
+                // lowerClosureFieldStore's / lowerClosureLocalReassign's
+                // retain-or-transfer decision, and the STRING twin of this
+                // very shape is lowerStringRefParamStore (#2321) — the
+                // closure twin of which was MISSING, so every `ref`/`out`
+                // function-typed parameter store fell through to the plain
+                // store.
+                //
+                // NO RELEASE-OLD. The value the slot DISPLACES is released by
+                // the CALLER, which is the only party that can prove the slot
+                // owns its value (issue #9173's caller-side discharge: a
+                // callee-side release-old frees a cell the real owner still
+                // reaches — measured there as a heap-use-after-free). So this
+                // arm takes the slot's reference to the NEW value and leaves
+                // the displaced one to the caller's discharge.
+                //
+                // A SELF-ASSIGNMENT (`x := x`) keeps the one reference the
+                // slot already holds, so the retain is emitted only when the
+                // slot's value CHANGES — the same discipline (and the same
+                // reason) as lowerClosureFieldStore's bare-`T` arm.
+                if (!handled) {
+                    const sema::TypeRef* refTy = ctx_.exprType(*as->target);
+                    if (refTy && refTy->kind == sema::TypeRef::Kind::Function &&
+                        rhs && rhs->getType()->isPointerTy() && elemTy &&
+                        elemTy->isPointerTy()) {
+                        if (auto* refId =
+                                dynamic_cast<const ast::IdentifierExpr*>(
+                                    as->target.get())) {
+                            sema::Symbol* refSym = ctx_.exprSymbol(*refId);
+                            if (refSym &&
+                                refParams_.find(refSym) != refParams_.end()) {
+                                const bool isProducer =
+                                    isPlusOneClosureProducer(as->value.get()) ||
+                                    isUserMethodClosureReturnCall(
+                                        as->value.get()) ||
+                                    isLambdaClosureReturnCall(as->value.get()) ||
+                                    isAwaitedClosureReturnCall(as->value.get());
+                                if (!isProducer) {
+                                    llvm::Value* oldVal =
+                                        builder_.CreateLoad(ptrTy(), addr,
+                                                            "clrp.old");
+                                    llvm::Value* changed =
+                                        builder_.CreateICmpNE(oldVal, rhs,
+                                                             "clrp.changed");
+                                    emitClosureRetain(
+                                        builder_.CreateSelect(
+                                            changed, rhs,
+                                            llvm::ConstantPointerNull::get(
+                                                ptrTy()),
+                                            "clrp.retain"));
+                                }
+                                builder_.CreateStore(rhs, addr);
+                                handled = true;
+                            }
+                        }
+                    }
+                }
                 // #429 (box FIELD-STORE category) / §8.6 / §28.9: a store into
                 // a CLASS Object/interface field whose every store (per the
                 // collectBoxStorageFields pre-pass) uses a boxable value source
