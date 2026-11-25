@@ -13399,11 +13399,12 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // The predicate is `calleeReadsClosureField` — the SAME one
                 // the field arm and the null-conditional arm ask — so the
                 // question "is the callee a HOLDER's function value?" has one
-                // answer everywhere. A COMPUTED property is not this shape:
-                // its read MINTS the reader's reference (#8763's
-                // `propertyReadMintsClosureRef`), which the release above
-                // already gives back, so `calleeIsField` is false there and
-                // the two releases cannot both fire.
+                // answer everywhere. A COMPUTED property is not this shape
+                // UNLESS its getter LENDS a field (fix #9163, the flag below):
+                // the BLOCK-bodied computed property's read MINTS the reader's
+                // reference (#8763's `propertyReadMintsClosureRef`), which the
+                // release above already gives back, so `calleeIsField` is false
+                // there and the two releases cannot both fire.
                 const bool calleeIsField = calleeReadsClosureField(call.callee.get());
                 // fix #9147 (§28.9 / §27.5 / §28.3 / §28.3.11, v0.359): an
                 // INTERFACE-dispatched property read is a LEND as well — §28.9's
@@ -13441,7 +13442,51 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // the two releases below cannot both fire.
                 const bool calleeIsIfaceProp =
                     ifacePropertyGetIndex_.count(ps) != 0;
-                const bool calleeTakesOwnRef = calleeIsField || calleeIsIfaceProp;
+                // fix #9163 (§28.9 / §27.5 / §28.3 / §28.3.11, v0.359): a
+                // COMPUTED property whose getter reads a FIELD is the third
+                // spelling of the same question the two flags above ask.
+                //
+                // The getter here is the EXPRESSION-bodied one (`property P:
+                // (Hx) -> int => _q;`), whose body is INLINED in the reader's
+                // frame (§23.2). That body reads the class field `_q`, so the
+                // read is a BORROW of the FIELD's own reference — §28.9's
+                // *Accessor faces are uniform across type kinds* ("A property
+                // or indexer **read** is a lend for every declared type … a
+                // getter never transfers a reclamation obligation to its
+                // reader") and §28.3's *Function-typed holders* ("A function
+                // value **read** from any holder — a field, a property or
+                // indexer … — carries the empty set"). The reader owns
+                // nothing, and the field's reference is the only one.
+                //
+                // The callee may DISPLACE the field while it runs (`x.Drop()`
+                // sets `_q := lambda(x: Hx) => 0;`), which releases that
+                // reference and, if it was the last one, frees the closure
+                // object (with the captured variables §27.5 heap-allocates in
+                // it) while the body still reads them. MEASURED (issue
+                // #9163): a heap-use-after-free in `lam$1`, freed by
+                // `bz$lam$1$envdtor`.
+                //
+                // So the call takes a reference of its OWN for the duration of
+                // the call and gives it back after it (§28.3.11's discharge
+                // at the end of the full expression — here the end of the call
+                // expression) — the same discipline #9096's field arm and
+                // #9124's auto-property arm take.
+                //
+                // THE PREDICATE is `propertyGetterLendsClosureField` — the
+                // computed-property spelling of `calleeReadsClosureField`'s
+                // question (there the callee's symbol IS the holder; here the
+                // holder is the field the GETTER reads, one level down). It
+                // admits only the EXPRESSION-bodied getter: the BLOCK-bodied
+                // one is emitted out of line and MINTS the reader a reference
+                // of its own (#8763's `propertyReadMintsClosureRef`), which
+                // the release above already gives back — so `calleeMintsRef`
+                // is true there and the two releases cannot both fire. The
+                // `!calleeMintsRef` guard below states that exclusion
+                // EXPLICITLY, so the two answers cannot drift apart.
+                const bool calleeIsLentGetterProp =
+                    !calleeMintsRef && propertyGetterLendsClosureField(ps);
+                const bool calleeTakesOwnRef =
+                    calleeIsField || calleeIsIfaceProp || calleeIsLentGetterProp;
                 if (calleeTakesOwnRef) emitClosureRetain(closurePtr);
                 llvm::Value* r = emitClosureCall(closurePtr, rt, &call);
                 if (calleeMintsRef && !diverged_ && closurePtr &&

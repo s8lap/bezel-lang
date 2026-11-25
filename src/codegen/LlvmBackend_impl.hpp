@@ -23609,6 +23609,37 @@ private:
     // reference, and a static field's store has its own path — both are
     // excluded, so neither is touched.
     bool calleeReadsClosureField(const ast::Expr* callee);
+    // fix #9163 (§28.9 / §27.5 / §28.3 / §28.3.11, v0.359): does this
+    // property's getter LEND a HOLDER's function value — is the getter's
+    // EXPRESSION body a READ of a function-typed CLASS FIELD, so that the
+    // value the read yields is the field's own value and the field keeps the
+    // only reference on it?
+    //
+    // The COMPUTED-property spelling of `calleeReadsClosureField`'s question:
+    // there the callee's symbol IS the holder (a field / auto-property); here
+    // the callee's symbol is a PropertySymbol and the holder is the field
+    // the GETTER reads, one level down. §28.9's *Accessor faces are uniform
+    // across type kinds* ("A property or indexer **read** is a lend for every
+    // declared type … a getter never transfers a reclamation obligation to its
+    // reader") — so the reader owns nothing and the field's reference is the
+    // only one; the callee may displace the field while it runs, and the
+    // closure object (with the capture cells §27.5 heap-allocates in it) is
+    // then freed while its body still reads them. MEASURED (issue #9163): a
+    // heap-use-after-free in `lam$1`, freed by `bz$lam$1$envdtor`.
+    //
+    // The call through such a property must take a reference of its OWN for
+    // the duration of the call and give it back after it (§28.3.11's
+    // discharge at the end of the full expression) — the discipline #9096's
+    // field arm and #9124's auto-property arm already take.
+    //
+    // The gates: not an indexer; not slot-dispatched (`propGetSlot_` /
+    // `ifacePropertyGetIndex_` — the interface spelling is #9147's own arm);
+    // the getter is the EXPRESSION-bodied one (`computedGetterOf` — the BLOCK
+    // form MINTS the reader a reference of its own, #8763, and needs none);
+    // the body reads a function-typed CLASS FIELD (`isClosureFieldLvalue` —
+    // a class field keeps an INDEPENDENT +1, so a reference taken over for
+    // the call refers to something that exists).
+    bool propertyGetterLendsClosureField(sema::PropertySymbol* ps);
     // #429 (closure FIELD-STORE) / §28.9: store `newVal` into the class closure
     // field at `fieldAddr` with retain-new / release-old, giving the field an
     // INDEPENDENT +1. Order: load-old → retain-or-transfer-new → store-new →

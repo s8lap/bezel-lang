@@ -39806,6 +39806,83 @@ bool Emitter::calleeReadsClosureField(const ast::Expr* callee) {
 }
 
 
+// fix #9163 (§28.9 / §27.5 / §28.3 / §28.3.11, v0.359): does this
+// property's getter LEND a HOLDER's function value — is the getter's body a
+// READ of a function-typed CLASS FIELD, so that the value the read yields is
+// the FIELD's own value and the field keeps the only reference on it?
+//
+// THE SHAPE. An EXPRESSION-bodied getter (§23.2's `property P: T => expr;`,
+// or an accessor's `get => expr;` inside a block-form property) has no frame
+// of its own: its body is INLINED in the reader's frame
+// (`computedGetterOf` → `lowerExpr(*getter)`, LlvmBackend_Exprs.cpp). When
+// that body reads a FIELD (`property P: (Hx) -> int => _q;`), the read is a
+// BORROW of the field's own reference — §28.9's *Accessor faces are uniform
+// across type kinds* ("A property or indexer **read** is a lend for every
+// declared type … a getter never transfers a reclamation obligation to its
+// reader") and §28.3's *Function-typed holders* ("A function value **read**
+// from any holder — a field, a property or indexer … — carries the empty
+// set"). The reader owns nothing, and the FIELD's reference is the only one.
+//
+// WHY THE QUESTION IS NEW. `calleeReadsClosureField` asks about the CALLEE
+// expression itself: the callee's symbol is a FieldSymbol / auto-property, so
+// the holder is the field. Here the callee's symbol is a PropertySymbol — a
+// COMPUTED property — and the holder is the field the GETTER reads, one level
+// down. #9124 fixed the auto-property spelling of the same question (the
+// holder is the property's own backing field); this predicate is the
+// computed-property spelling, where the holder is the field INSIDE the
+// getter.
+//
+// MEASURED (issue #9163): a heap-use-after-free in `lam$1`, freed by
+// `bz$lam$1$envdtor` — the callee displaces the field (`x.Drop()` sets
+// `_q := lambda(x: Hx) => 0;`), which releases the field's reference; if it
+// was the last one, the closure object (with the capture cells §27.5
+// heap-allocates in it) is freed while its body still reads them.
+//
+// THE GATES.
+//   * not an indexer (a different emitter);
+//   * not slot-dispatched (`propGetSlot_` / `ifacePropertyGetIndex_`): a
+//     virtual or interface read runs the OVERRIDE's getter, a different body,
+//     whose borrow this classification cannot see — the interface spelling is
+//     #9147's own arm, which takes a reference of its own for the same
+//     reason;
+//   * the getter must be the EXPRESSION-bodied one (`computedGetterOf` — the
+//     body the READ SITE inlines). The BLOCK-bodied getter is the other
+//     predicate's business: it is emitted OUT OF LINE and its `return` either
+//     TRANSFERS the returned local's +1 to the reader or RETAINS one
+//     reference for the reader (`blockGetterMintsClosureRef`, #8763), so the
+//     reader DOES own a reference there and needs none of its own;
+//   * the body must read a function-typed CLASS FIELD (`isClosureFieldLvalue`
+//     — the SAME predicate the field store and `calleeReadsClosureField` use):
+//     a class field keeps an INDEPENDENT +1 on the closure cell (retained at
+//     store, released on the owner's disposal), so a reference taken over for
+//     the call refers to something that EXISTS. A record's function-typed
+//     component is a BORROW (§9) and holds no such reference; a static field
+//     is excluded too — §22.12 rule 2's static store never disposes, so
+//     every admissible static keeps its referents alive to process exit
+//     (§22.13) and there is no reference to take over. Neither is touched.
+//
+// The transparent wrappers are stripped first, exactly as
+// `calleeReadsClosureField` strips them: §17.12's null-forgiving `!` (`x!`
+// is `x`'s own read) and §17.4's `as` cast (`x as T` is "a borrow of `x`",
+// the SAME value) both name the SAME holder the operand names.
+bool Emitter::propertyGetterLendsClosureField(sema::PropertySymbol* ps) {
+    if (!ps) return false;
+    if (ps->isIndexer) return false;
+    if (propGetSlot_.count(ps) || ifacePropertyGetIndex_.count(ps))
+        return false;
+    // The getter's body — the expression the READ SITE inlines.
+    const ast::Expr* body = computedGetterOf(ps);
+    if (!body) return false;
+    const ast::Expr* e = body;
+    while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
+        e = pb->operand.get();
+    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e))
+        if (te->op == "as" && te->operand)
+            e = te->operand.get();
+    return e && isClosureFieldLvalue(*e);
+}
+
+
 // #429 (closure FIELD-STORE) / §28.9: see the declaration in
 // LlvmBackend_impl.hpp. Store `newVal` into the class closure field at
 // `fieldAddr` with retain-new / release-old, giving the field an INDEPENDENT
