@@ -65,6 +65,78 @@ bool indexerArgMatches(const sema::TypeRef* p, const sema::TypeRef* a) {
     return indexerArgMatchesUnder(p, nullptr, 0, a, nullptr, 0);
 }
 
+// fix #9137 (§11.2 / §23.4 / §27.1 / §27.2 / §22.3 / §28.1, v0.359): the
+// FUNCTION-typed index-parameter comparison — the codegen twin of sema's
+// `Resolver::typeRefEqualImpl`'s `Kind::Function` arm
+// (src/sema/TypeResolution_Checks.cpp).
+//
+// WHY IT IS NEEDED. §23.4 overloads an indexer by its parameter TYPE LIST, and
+// §27.1 makes a function type a first-class type — so an indexer's parameter
+// may be function-typed (`property [q: () -> int]: int`). The interface-
+// conformance mirror (`findIndexer`, below) matches a class's indexer
+// against the interface's by comparing their parameter TYPES, and the
+// comparison this file has always used (`indexerArgMatchesUnder`) answers
+// `false` for every kind it does not spell out — `Kind::Function` among
+// them. A class indexer with a function-typed parameter therefore NEVER
+// matched the interface's, `findIndexer` returned null, the itable slot kept
+// its `ConstantPointerNull` initialiser, and every interface-typed read of
+// that indexer CALLED ADDRESS 0x0.
+//
+// MEASURED on r30-c1 (issue #9137): SIGSEGV with pc = 0x0 for the getter,
+// the setter and the compound assignment; the CLASS-typed read of the same
+// indexer answered 8 and an `int`-parameter interface indexer answered 7,
+// so the defect is specific to a function-typed index parameter read through
+// an interface-typed receiver.
+//
+// sema already ACCEPTS the conformance: `checkAbstractImplementations`'
+// indexer-obligation loop (src/sema/TypeResolution_Checks.cpp) compares the
+// two parameter types with `Resolver::typeRefEqualSameScope`, whose
+// `Kind::Function` arm compares the arity, each parameter's modifier and
+// type, and the return's ownedness and type. This arm is that comparison,
+// with the codegen side's substitution (`SlotSubst`) folded in — which is
+// also what a GENERIC interface needs (`IG<T>` declaring `[f: (T) -> int]`
+// against a class declaring `[f: (int) -> int]`: the bare `T` sits INSIDE
+// the function type, so the substitution has to descend into it).
+//
+// SCOPE — the PARAMETER-vs-PARAMETER question only. The CALL-SITE overload
+// selection (`selectIndexer`, below) keeps `indexerArgMatchesUnder`, which
+// answers PARAMETER-vs-ARGUMENT and mirrors sema's own `allParamsMatch`
+// (src/sema/ExprTypecheck_Exprs.cpp) — that matcher answers `false` for a
+// function kind as well, and widening it would change WHICH overload a call
+// site binds, a question this issue does not raise.
+bool indexerParamTypeMatchesUnder(const sema::TypeRef* p, const SlotSubst* ps,
+                                   std::size_t pf, const sema::TypeRef* a,
+                                   const SlotSubst* as, std::size_t af) {
+    SlotResolved pr = resolveSlotParam(p, ps, pf);
+    SlotResolved ar = resolveSlotParam(a, as, af);
+    const sema::TypeRef* pt = pr.type;
+    const sema::TypeRef* at = ar.type;
+    if (!pt || !at || pt->kind != at->kind) return false;
+    if (pt->kind != sema::TypeRef::Kind::Function)
+        return indexerArgMatchesUnder(p, ps, pf, a, as, af);
+    // §27.2: a nullable function type is a DISTINCT type from its non-nullable
+    // twin — the same §7.1 rule `indexerArgMatchesUnder` applies to the
+    // Primitive and Named arms.
+    if (pt->nullable != at->nullable) return false;
+    if (pt->funcParams.size() != at->funcParams.size()) return false;
+    for (std::size_t i = 0; i < pt->funcParams.size(); ++i) {
+        // §22.3 / §27.1: the parameter's MODIFIER is part of the function
+        // type's identity (`owned` / `ref` / `out` are not plain).
+        if (pt->funcParams[i].modifier != at->funcParams[i].modifier)
+            return false;
+        // §27.1: the parameter's TYPE, resolved through the frame the function
+        // type itself was resolved at (`pr.frame` / `ar.frame`).
+        if (!indexerParamTypeMatchesUnder(pt->funcParams[i].type, ps, pr.frame,
+                                          at->funcParams[i].type, as, ar.frame))
+            return false;
+    }
+    // §28.1 / §28.9: the return's OWNEDNESS is part of the function type.
+    if (pt->funcReturnOwned != at->funcReturnOwned) return false;
+    // §27.1: the return type.
+    return indexerParamTypeMatchesUnder(pt->funcReturn, ps, pr.frame,
+                                        at->funcReturn, as, ar.frame);
+}
+
 // fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): an
 // indexer's k-th index-parameter TYPE / total ARITY, resolved from either
 // its LOCAL ast::PropertyDecl (`ps->decl`) or, for an IMPORTED indexer (no
@@ -181,6 +253,18 @@ const sema::TypeRef* interfaceIndexerElementType(
 // for why the two must move together — so a null return here always
 // corresponds to a program sema has already rejected, never a
 // silently-wrong itable install.
+//
+// fix #9137 (§11.2 / §23.4 / §27.1, v0.359): that correspondence did NOT
+// hold for a FUNCTION-typed index parameter. The parameter-TYPE comparison
+// this function used (`indexerArgMatchesUnder`) answered `false` for every
+// kind it did not spell out, `Kind::Function` among them, so a class
+// indexer with a function-typed parameter never matched the interface's —
+// while sema, whose `Resolver::typeRefEqualSameScope` DOES compare function
+// types structurally, ACCEPTED the conformance. The result was a null itable
+// slot and an interface-typed read that CALLED ADDRESS 0x0 (MEASURED: SIGSEGV
+// with pc = 0x0, for the getter, the setter and the compound assignment).
+// The comparison now goes through `indexerParamTypeMatchesUnder`, whose
+// function arm mirrors sema's `Kind::Function` arm.
 const sema::PropertySymbol* Emitter::findIndexer(
     const sema::TypeSymbol* ts, const sema::PropertySymbol* ifaceIdx) const {
     if (!ts || !ifaceIdx) return nullptr;
@@ -211,10 +295,15 @@ const sema::PropertySymbol* Emitter::findIndexer(
             if (indexerParamCount(ps) != nparams) continue;
             bool all = true;
             for (std::size_t k = 0; k < nparams; ++k) {
-                if (!indexerArgMatchesUnder(indexerParamType(ctx_, ps, k),
-                                            &levels[li].subst, 0,
-                                            indexerParamType(ctx_, ifaceIdx, k),
-                                            &ifaceSubst, 0)) {
+                // fix #9137 (§11.2 / §23.4 / §27.1, v0.359): the
+                // FUNCTION-typed parameter arm — `indexerArgMatchesUnder`
+                // answered `false` for a function kind, so a class indexer
+                // with a function-typed parameter never matched the
+                // interface's and the itable slot stayed null (the
+                // interface-typed read then CALLED ADDRESS 0x0).
+                if (!indexerParamTypeMatchesUnder(
+                        indexerParamType(ctx_, ps, k), &levels[li].subst, 0,
+                        indexerParamType(ctx_, ifaceIdx, k), &ifaceSubst, 0)) {
                     all = false;
                     break;
                 }
@@ -3236,6 +3325,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
                                {builder_.getInt32(ifIt->second)}),
             "idxget");
         std::vector<llvm::Value*> callArgs;
+        std::vector<llvm::Value*> idxArgVals;   // fix #9137: the closure producer
         callArgs.push_back(obj);
         for (std::size_t k = 0; k < nparams &&
              k < ix.indices.size(); ++k) {
@@ -3244,9 +3334,41 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
             if (!argVal) return nullptr;
             callArgs.push_back(coerceNumericToType(argVal, paramTys[k + 1],
                                                    false));
+            idxArgVals.push_back(argVal);
         }
         llvm::Value* r = builder_.CreateCall(gFnTy, fnPtr, callArgs);
         emitPendingCheck();
+        // fix #9137 (§28.14 / §27.5 / §28.9 / §23.4 / §23.5, v0.359): the
+        // ITABLE-dispatch twin of #9068's vtable-dispatch release. §23.5
+        // forbids `ref`/`out` on an indexer parameter list, so an indexer's
+        // function-typed parameter is plain and therefore CALL-BOUNDED under
+        // §28.14 — the dispatched accessor holds the callback for the call's
+        // duration and keeps no reference afterwards, so the producer's +1 is
+        // the CALLER's to drop once the accessor has returned (§28.9: the
+        // closure object is runtime-managed, so its own reference must be
+        // dropped exactly once).
+        //
+        // This path could not be reached before #9137's fix: an indexer with
+        // a FUNCTION-typed parameter never matched its interface obligation
+        // (the parameter-type comparison had no function arm), so the itable
+        // slot stayed null and every interface-typed read of such an indexer
+        // CALLED ADDRESS 0x0 — the leak was masked by the crash. With the
+        // dispatch working, the missing release shows: MEASURED on r30-c1 +
+        // this fix, 64 byte(s) in 1 allocation per read (the closure object
+        // alone — the probe's lambda captures nothing).
+        //
+        // The predicate inside the helper is `isPlusOneClosureProducer`, so
+        // only a lambda literal or a method reference written AT the index
+        // position is released; a caller-owned local passed as the index
+        // (`var g := lambda() => …; fl[g];`) is not matched, and its +1
+        // belongs to the local's own scope (§28.14's METHOD twin). Same
+        // discipline as `releaseIndexArgStringProducers`'s identifier
+        // exclusion.
+        //
+        // Gated on `!diverged_` (the accessor threw), mirroring #429's and
+        // #9068's discipline: the release is not emitted into unreachable IR,
+        // and the unwind edge's leak is the safe direction.
+        if (!diverged_) releaseIndexArgClosureProducers(ix, ps, idxArgVals);
         // fix #2814 (§28.3 "Unbound owned temporaries", v0.240): the INDEX half
         // of the same sentence the property half (#2751) covers — "used only by
         // borrowing operations within the expression … as a member or INDEX
@@ -4254,6 +4376,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
                                {builder_.getInt32(ifIt->second)}),
             "idxset");
         std::vector<llvm::Value*> callArgs;
+        std::vector<llvm::Value*> idxArgVals;   // fix #9137: the closure producer
         callArgs.push_back(obj);
         for (std::size_t k = 0; k < nparams &&
              k < ix.indices.size(); ++k) {
@@ -4262,6 +4385,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
             if (!argVal) return false;
             callArgs.push_back(coerceNumericToType(argVal, paramTys[k + 1],
                                                    false));
+            idxArgVals.push_back(argVal);
         }
         // fix #2859 (§7.2/§5.1/§2.8.2/§23.4, v0.240): the INTERFACE-indexer
         // setter twin of #2927. valTy is the interface-indexer's element type,
@@ -4274,6 +4398,28 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
         callArgs.push_back(val);
         builder_.CreateCall(sFnTy, fnPtr, callArgs);
         emitPendingCheck();
+        // fix #9137 (§28.14 / §27.5 / §28.9 / §23.4 / §23.5, v0.359): the
+        // ITABLE-dispatch twin of #9068's vtable-dispatch release, and the
+        // setter twin of the getter's release immediately above. §23.5
+        // forbids `ref`/`out` on an indexer parameter list, so an indexer's
+        // function-typed parameter is plain and therefore CALL-BOUNDED under
+        // §28.14: the dispatched setter holds the callback for the call's
+        // duration and keeps no reference afterwards, so the producer's +1 is
+        // the CALLER's to drop once the setter has returned (§28.9).
+        //
+        // This path could not be reached before #9137's fix (the itable slot
+        // for a function-typed index parameter stayed null and the dispatch
+        // CALLED ADDRESS 0x0), so the leak was masked by the crash. MEASURED
+        // on r30-c1 + this fix: 64 byte(s) in 1 allocation per setter call.
+        //
+        // The predicate inside the helper is `isPlusOneClosureProducer`, so
+        // only a lambda literal or a method reference written AT the index
+        // position is released; a caller-owned local passed as the index is
+        // not matched, and its +1 belongs to the local's own scope.
+        //
+        // Gated on `!diverged_` (the setter threw), mirroring #429's, #9068's
+        // and #4078's discipline.
+        if (!diverged_) releaseIndexArgClosureProducers(ix, ps, idxArgVals);
         // fix #2540 (§23.4/§28.9/§11, v0.236): the INDEXER twin of
         // lowerVirtualPropertySet's #2535 paired call-site retain
         // (LlvmBackend_Exprs.cpp ~5178 — `lowerVirtualPropertySet`'s
@@ -5265,6 +5411,30 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
         setArgs.push_back(newVal);
         builder_.CreateCall(sFnTy, setPtr, setArgs);
         emitPendingCheck();
+        // fix #9137 (§28.14 / §27.5 / §28.9 / §23.4 / §23.5 / §6.6, v0.359):
+        // the ITABLE-dispatch twin of #9110's release in the compound path's
+        // imported arm (above). The compound path lowers the index ONCE and
+        // shares it between the getter and the setter (§6.6), so the
+        // producer's +1 is dropped exactly once, here — after the setter,
+        // the last consumer of the index.
+        //
+        // §23.5 forbids `ref`/`out` on an indexer parameter list, so an
+        // indexer's function-typed parameter is plain and therefore
+        // CALL-BOUNDED under §28.14: the dispatched accessors hold the
+        // callback for the calls' duration and keep no reference afterwards,
+        // so the producer's +1 is the CALLER's to drop (§28.9). The
+        // predicate inside the helper is `isPlusOneClosureProducer`, so only
+        // a lambda literal or a method reference written AT the index
+        // position is released.
+        //
+        // This path could not be reached before #9137's fix (the itable slot
+        // for a function-typed index parameter stayed null and the dispatch
+        // CALLED ADDRESS 0x0), so the leak was masked by the crash.
+        // MEASURED on r30-c1 + this fix: 64 byte(s) in 1 allocation per
+        // compound assignment.
+        //
+        // Gated on `!diverged_` (the same discipline as #9110's own release).
+        if (!diverged_) releaseIndexArgClosureProducers(*ix, ps, idxArgVals);
         // fix #2847 (§23.4 / §6.6 / §9.7, v0.240): the INTERFACE-itable
         // compound-assign twin of the class-vtable branch's
         // `releaseCompoundProducers(newVal, rhs, /*classBacked=*/true)` below
