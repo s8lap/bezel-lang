@@ -4443,6 +4443,49 @@ private:
     sema::LocalSymbol* borrowingArrayLiteralLocalFieldStoreSource(
         const ast::Expr& e) const;
 
+    // fix #9182 (§28.11 *Borrowing collections* → *Storing a borrow*,
+    // clause 2; §28.3 *Producers* K1.5; §28.9 *Trivial-dispose classes*,
+    // v0.359): a TYPE/SHAPE-based recognizer, in the #3706 / #7209 lineage,
+    // for "is `e` a bare read of a scope-bound local bound (directly, or
+    // through an alias chain) to a FRESH `new` production of a
+    // declaration-less builtin CLASS?" — `var inner := new
+    // Dictionary<string, int>();`.
+    //
+    // The gap it closes: `isBorrowableType` (this file) classifies EVERY
+    // declaration-less builtin CLASS as a VALUE type — it reads
+    // `declaration->kind` and a builtin has no user `TypeDecl` (#7825 records
+    // the same mis-classification and adds `isBorrowableOwnedSinkType` for
+    // it) — so `borrowSourceForExpr` above structurally cannot name such a
+    // local as a live borrow source. §28.3's *Producers* table (K1.5) makes
+    // the local an OWNED atom and §28.9 gives a trivial-dispose instance a
+    // compiler-inserted free at its holder's release point ("scope end for
+    // locals and `using var`"), so the local's value dies at its own scope
+    // end: storing it where a longer-lived collection outlives that scope is
+    // §28.11 clause 2's rejected store. MEASURED (#9182, r30-c1 @
+    // d3f56e723): the store compiled clean with no diagnostic and the slot
+    // then read freed memory (ASan heap-use-after-free). The user-class twin
+    // was already rejected.
+    //
+    // Wired into the §28.11 COLLECTION store sinks only
+    // (`checkCollectionBorrowStoreEscape`, `checkIndexerSetBorrowStoreEscape`)
+    // — the rule this issue cites — and consulted LAST, after the general
+    // `ownedLocalBorrowSource` machinery and after #7209's
+    // collection-literal arm, so every shape that machinery already decides
+    // keeps its verdict (the §28.3 borrowed-FIELD store is deliberately NOT
+    // reached: #8813's lambda-body owned-field store is a §28.8 move, and
+    // that rule's own skip list governs it).
+    //
+    // Shape-based like #3706's recognizer above (it reads the local's
+    // DECLARATION, not `states_`), with the ONE flow fact that a `move`d
+    // source is a §28.8 TRANSFER and not a borrow store. The heads are the
+    // compiler's own declaration-less borrow-bearing builtin class set
+    // (`common::isBorrowBearingBuiltinClassHead`). Returns the local whose
+    // declaration binds the fresh production — the scope-bound source the
+    // diagnostic names — or null.
+    // per §28.3, §28.9, §28.11
+    sema::LocalSymbol* freshBuiltinClassLocalStoreSource(
+        const ast::Expr& e) const;
+
     // Compute the owned scope-bound source local that the initializer/RHS
     // expression `rhs` borrows from, or null if it borrows nothing owned.
     // Used to populate LocalOwnership.source so an aliasing local can be

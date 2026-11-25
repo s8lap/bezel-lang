@@ -15443,6 +15443,104 @@ sema::LocalSymbol* MethodOwnership::borrowingArrayLiteralLocalFieldStoreSource(
     return ls;
 }
 
+// fix #9182 (§28.11 *Borrowing collections* → *Storing a borrow*, clause 2;
+// §28.3 *Producers* K1.5; §28.9 *Trivial-dispose classes*, v0.359): a
+// TYPE/SHAPE-based recognizer, in the #3706 / #7209 lineage, for "is `e` a
+// bare read of a scope-bound local bound directly to a FRESH `new` production
+// of a declaration-less builtin CLASS?" — `var inner := new
+// Dictionary<string, int>();`.
+//
+// THE GAP. The store sinks' source-finder asks `ownedLocalBorrowSource` →
+// `borrowSourceForExpr`, whose Shape 1 gates on the borrow-vs-copy predicate
+// `returnedExprMayBorrow` → `isBorrowableType` — and `isBorrowableType`
+// answers FALSE for EVERY declaration-less builtin CLASS (the plain builtin
+// collections, `StringBuilder`, `Random`): it classifies on
+// `declaration->kind`, and a builtin has no user `TypeDecl`, so it falls
+// through to the builtin-exception-only carve-out (#7825 records the same
+// mis-classification and adds `isBorrowableOwnedSinkType` for it). A bare read
+// of such a local was therefore never seen as a BORROW, at ANY store sink, so
+// §28.11's clause-2 store rule never fired for it.
+//
+// WHY THE SOURCE IS SCOPE-BOUND. §28.3's *Producers* table (K1.5) classifies
+// "a fresh `new` production bound to a local" as an OWNED atom, and §28.9's
+// *Trivial-dispose classes* gives every trivial-dispose instance a
+// compiler-inserted FREE at its holder's release point — "scope end for
+// locals and `using var`" — releasing "the instance's own allocation
+// (including the intrinsic backing storage of the compiler-known borrowing
+// collections)". So the local's backing IS reclaimed at the local's own scope
+// end: it is a scope-bound holder whose value dies there. MEASURED (#9182, on
+// r30-c1 @ d3f56e723): `var inner := new Dictionary<string, int>();` inside a
+// method, stored into a field-held `Dictionary<string, Dictionary<string,
+// int>>`'s VALUE slot, compiled clean with NO diagnostic and the slot then
+// read freed memory (ASan heap-use-after-free; the free is `bz_dict_free` at
+// the local's scope end, §28.9). The USER-CLASS twin (`var inner := new
+// Res();` over a user class `Res`) was already rejected by the same sinks —
+// the shape parity this recognizer restores.
+//
+// This recognizer is deliberately SHAPE-based, like #3706's
+// `borrowingArrayLiteralLocalFieldStoreSource` (the collection-literal twin
+// of this very gap): it reads the local's DECLARATION, not `states_`, so it
+// is independent of the ownership pass's classification of the production.
+// The ONE flow fact it does read is the local's own state: a `move`d source
+// is MovedFrom, and `coll[i] := move item` is a §28.8 TRANSFER into the slot,
+// not a borrow store — so the recognizer requires the local to still hold its
+// value.
+//
+// THE ALIAS HOP. `var alias := inner;` binds `alias` to a BORROW of `inner`
+// (§28.3 K3.13), so a store of `alias` is a store of a borrow of the
+// scope-bound `inner` — the user-class twin says so ("borrow of `inner`
+// passed to `.Add(...)`"), and this recognizer follows the same chain to the
+// same source. The hop is bounded, so a self-referential declaration cannot
+// loop.
+//
+// SCOPE. The heads are the compiler's own "declaration-less borrow-bearing
+// builtin class" set (`common::isBorrowBearingBuiltinClassHead`) — the same
+// boundary `isBorrowableOwnedSinkType` draws for the same reason. A user
+// class is NOT matched (it has a declaration, and `borrowSourceForExpr`
+// already names it), so the user-class twin's behaviour is untouched.
+// per §28.3, §28.9, §28.11
+sema::LocalSymbol* MethodOwnership::freshBuiltinClassLocalStoreSource(
+    const ast::Expr& e) const {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    if (!id) return nullptr;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    // Bounded alias chain: at most four hops, so a cyclic declaration
+    // cannot loop.
+    for (int hop = 0; hop < 4 && ls; ++hop) {
+        // The binding's DECLARATION: a plain `var` or a `using var` (both are
+        // `ast::LocalDecl`). A `const` is excluded: §21.1 rejects a runtime
+        // `const` over an owned production, so that spelling is §21.1's
+        // business, not this rule's (the same exclusion #8165 records for the
+        // fresh-materializer local).
+        const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+        if (!ld || !ld->initializer) return nullptr;
+        // The production: a fresh `new` of a declaration-less builtin CLASS.
+        const auto* ne =
+            dynamic_cast<const ast::NewExpr*>(ld->initializer.get());
+        if (ne) {
+            const sema::TypeRef* rt =
+                ne->type ? ctx_.resolvedType(*ne->type) : ctx_.exprType(e);
+            if (!rt || rt->kind != sema::TypeRef::Kind::Named ||
+                rt->declaration)
+                return nullptr;
+            if (!common::isBorrowBearingBuiltinClassHead(rt->headName()))
+                return nullptr;
+            // The FLOW half: the local must still hold its value. A `move`d
+            // source is MovedFrom (a transfer, not a borrow store).
+            if (!isOwnedTrackedLocal(ls)) return nullptr;
+            return ls;
+        }
+        // The alias hop: `var alias := inner;` — the initializer is a bare
+        // read of another local, so `alias` is a re-borrow of it (§28.3
+        // K3.13). A `move` initializer is NOT matched (it is a transfer).
+        const auto* aid =
+            dynamic_cast<const ast::IdentifierExpr*>(ld->initializer.get());
+        if (!aid) return nullptr;
+        ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*aid));
+    }
+    return nullptr;
+}
+
 // fix #6468 (§15.4 / §28.11 *Value-copy members*, v0.338): recognize the
 // construction forms and return the element expressions each places into its
 // destination. See the declaration comment (Ownership_impl.hpp) for the spec
@@ -17846,6 +17944,28 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
                 srcIsBorrowingArrayLiteralLocal = true;
             }
         }
+        // fix #9182 (§28.11 *Borrowing collections* → *Storing a borrow*,
+        // clause 2; §28.3 *Producers* K1.5; §28.9, v0.359): the
+        // BUILTIN-CLASS leg — `var inner := new Dictionary<string, int>();`
+        // passed to `.Add(...)` on a longer-lived collection. The general
+        // machinery above cannot name such a local (its borrow-vs-copy
+        // predicate `isBorrowableType` classifies every declaration-less
+        // builtin CLASS as a VALUE type — it reads `declaration->kind`, and
+        // a builtin has no user `TypeDecl`; #7825 records the same
+        // mis-classification and adds `isBorrowableOwnedSinkType` for it),
+        // so the scope-bound owned local behind the read was never seen as a
+        // borrow source and §28.11's clause-2 rejection never fired for it.
+        // MEASURED (#9182, r30-c1 @ d3f56e723): the store compiled clean
+        // with NO diagnostic and the slot then read freed memory (ASan
+        // heap-use-after-free). The USER-CLASS twin was already rejected
+        // above, so this restores the shape parity rather than adding a
+        // rule. The recognizer is consulted LAST — after the general
+        // machinery AND after #7209's collection-literal arm (the shapes are
+        // disjoint: a bare read of a local vs a literal), so every shape the
+        // machinery above already decides keeps its verdict. // per §28.3,
+        // §28.9, §28.11
+        if (!src && !bulkStoring)
+            src = freshBuiltinClassLocalStoreSource(*a.value);
         if (!src) {
             // §28.3 *Diagnostics* "The trust-admission report" (v0.307,
             // #4605). §28.11's store rule admits a borrow whose source is the
@@ -18593,6 +18713,25 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
     // body's own `states_` does not contain `r`.
     if (!src && fromLambdaBody)
         src = enclosingFrameOwnedLocalBorrowSource(*as.value, elemKinds);
+    // fix #9182 (§28.11 *Borrowing collections* → *Storing a borrow*,
+    // clause 2; §28.3 *Producers* K1.5; §28.9, v0.359): the BUILTIN-CLASS
+    // leg — `var inner := new Dictionary<string, int>(); _d[k] := inner;`.
+    // `ownedLocalBorrowSource` above cannot name such a local: its
+    // borrow-vs-copy predicate `isBorrowableType` classifies every
+    // declaration-less builtin CLASS as a VALUE type (it reads
+    // `declaration->kind`, and a builtin has no user `TypeDecl`; #7825
+    // records the same mis-classification and adds
+    // `isBorrowableOwnedSinkType` for it), so the scope-bound owned local
+    // behind the read was never seen as a borrow source and §28.11's
+    // clause-2 rejection never fired for it. MEASURED (#9182, r30-c1 @
+    // d3f56e723): the store compiled clean with NO diagnostic and the slot
+    // then read freed memory (ASan heap-use-after-free; the free is
+    // `bz_dict_free` at the local's scope end, §28.9). The USER-CLASS twin
+    // was already rejected by the sink above, so this restores the shape
+    // parity rather than adding a rule. The recognizer is consulted LAST,
+    // after the general machinery, so every shape that machinery already
+    // decides keeps its verdict. // per §28.3, §28.9, §28.11
+    if (!src) src = freshBuiltinClassLocalStoreSource(*as.value);
     if (!src) return false;
     bool reject = false;
     if (kind == RecvKind::Escapes) {
