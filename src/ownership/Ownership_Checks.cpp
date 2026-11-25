@@ -32296,12 +32296,23 @@ namespace {
 // instance's teardown disposes (spec form 4's chain-hop restriction). A borrow
 // (non-`owned`) field hop resolves NO bound — across it the storing object is
 // externally owned and may outlive the chain head.
+//
+// fix-forward #9274: a STATIC `owned` field is NOT a hop. Form 4 needs "a member
+// chain rooted at `this` or a local binding in which every hop is an `owned`
+// field" (§28.14, v0.359); a static field is owned by the program (§22.13
+// program-exit disposal), not by `this`, so `this`'s teardown never severs a
+// registration stored there. A bare static `_bus` is therefore not an implicit
+// `this._bus` hop: it falls to form 5 (the receiver), which admits no
+// capture-bearing argument.
 bool symIsOwnedField(sema::Symbol* sym) {
     auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
     if (!fs) return false;
-    for (std::string_view m : fs->modifiers)
-        if (m == "owned") return true;
-    return false;
+    bool owned = false;
+    for (std::string_view m : fs->modifiers) {
+        if (m == "static") return false;
+        if (m == "owned") owned = true;
+    }
+    return owned;
 }
 }  // namespace
 

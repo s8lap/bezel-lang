@@ -64,6 +64,13 @@ const char* kScopedForward =
     "`scoped` parameter of a call on the same bounding object (`this`) "
     "(§28.14, v0.175)";
 
+// §28.14's value-read diagnostic for `handler`, verbatim (a `+=` whose `lhs`
+// resolves no `this` bound is walked as a value read, as before #9274).
+const char* kScopedValueRead =
+    "`handler` is a `scoped` parameter — it may only be invoked, stored into a "
+    "`scoped` field of `this`, or forwarded to a `scoped` parameter of a call "
+    "on `this`; it may not be read as a value (§28.14, v0.175)";
+
 const char* const kCounter =
     "module P; "
     "public class Counter2 "
@@ -293,6 +300,125 @@ BEZEL_TEST(ownership_9274_scoped_forward_owned_chain,
         "public class Program "
         "  public static method Main() "
         "    Console.WriteLine(\"ok\"); "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, kScopedForward));
+}
+
+// fix-forward #9274 — a STATIC `owned` field is not a `this`-rooted hop. Form 4
+// needs "a member chain rooted at `this` or a local binding in which every hop
+// is an `owned` field" (§28.14, v0.359); a static field is owned by the program
+// (§22.13), so `this`'s teardown never severs the registration, and the bare
+// `_bus` falls to form 5 (the receiver), which "admits no capture-bearing
+// arguments". The first #9274 pass read a bare static owned field as an
+// implicit `this._bus` hop and ADMITTED these three shapes: each was then an
+// ASan SEGV in `Counter2.Hit`, because the static bus invokes the closure over
+// the caller's freed `c` (review r43-rev-c53-9201-ff, probes x_static_*). RED on
+// the first #9274 pass, GREEN (rejected) with the fix-forward.
+
+// `_bus.Add(handler)` in an INSTANCE method, `_bus` a `static owned readonly`
+// EventSource (probe x_static_inst).
+BEZEL_TEST(ownership_9274_scoped_forward_owned_chain,
+           static_owned_field_add_in_instance_method_rejected_spec_28_14_form_4) {
+    auto r = runAot(
+        "module P; "
+        "public class Counter2 "
+        "  private _n: int := 0; "
+        "  public method Hit(t: double) => _n := _n + 1; "
+        "  public property N: int => _n; "
+        "end Counter2; "
+        "public class Hub "
+        "  private static owned readonly _bus: EventSource<double> := new EventSource<double>(); "
+        "  public method On(scoped handler: (double) -> ()) "
+        "    _bus.Add(handler); "
+        "  end On; "
+        "  public static method Fire(t: double) => _bus.Raise(t); "
+        "end Hub; "
+        "public class Program "
+        "  public static method Main() "
+        "    for var i in 0..<200 do "
+        "      do "
+        "        using var c := new Counter2(); "
+        "        using var hub := new Hub(); "
+        "        hub.On(lambda(t) => c.Hit(t)); "
+        "      end; "
+        "      Hub.Fire(1.0); "
+        "    end; "
+        "    Console.WriteLine(\"done\"); "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, kScopedForward));
+}
+
+// `_bus += handler` (§17.2: the desugared `_bus.Add(handler)`) in an
+// INSTANCE method on the same static field (probe x_static_pluseq).
+BEZEL_TEST(ownership_9274_scoped_forward_owned_chain,
+           static_owned_field_plus_eq_in_instance_method_rejected_spec_28_14_form_4_spec_17_2) {
+    auto r = runAot(
+        "module P; "
+        "public class Counter2 "
+        "  private _n: int := 0; "
+        "  public method Hit(t: double) => _n := _n + 1; "
+        "  public property N: int => _n; "
+        "end Counter2; "
+        "public class Hub "
+        "  private static owned readonly _bus: EventSource<double> := new EventSource<double>(); "
+        "  public method On(scoped handler: (double) -> ()) "
+        "    _bus += handler; "
+        "  end On; "
+        "  public static method Fire(t: double) => _bus.Raise(t); "
+        "end Hub; "
+        "public class Program "
+        "  public static method Main() "
+        "    for var i in 0..<200 do "
+        "      do "
+        "        using var c := new Counter2(); "
+        "        using var hub := new Hub(); "
+        "        hub.On(lambda(t) => c.Hit(t)); "
+        "      end; "
+        "      Hub.Fire(1.0); "
+        "    end; "
+        "    Console.WriteLine(\"done\"); "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, kScopedValueRead));
+}
+
+// `_bus.Add(handler)` in a STATIC owned-return method (there is no `this`
+// at all) (probe x_static_static).
+BEZEL_TEST(ownership_9274_scoped_forward_owned_chain,
+           static_owned_field_add_in_static_method_rejected_spec_28_14_form_4) {
+    auto r = runAot(
+        "module P; "
+        "public class Counter2 "
+        "  private _n: int := 0; "
+        "  public method Hit(t: double) => _n := _n + 1; "
+        "  public property N: int => _n; "
+        "end Counter2; "
+        "public class Tk "
+        "  public method Touch() => Console.Write(\"\"); "
+        "end Tk; "
+        "public class Hub "
+        "  private static owned readonly _bus: EventSource<double> := new EventSource<double>(); "
+        "  public static method On(scoped handler: (double) -> ()): owned Tk "
+        "    _bus.Add(handler); "
+        "    return new Tk(); "
+        "  end On; "
+        "  public static method Fire(t: double) => _bus.Raise(t); "
+        "end Hub; "
+        "public class Program "
+        "  public static method Main() "
+        "    for var i in 0..<200 do "
+        "      do "
+        "        using var c := new Counter2(); "
+        "        using var tk := Hub.On(lambda(t) => c.Hit(t)); "
+        "      end; "
+        "      Hub.Fire(1.0); "
+        "    end; "
+        "    Console.WriteLine(\"done\"); "
         "  end Main; "
         "end Program;");
     BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
