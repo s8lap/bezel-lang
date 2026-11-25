@@ -2785,10 +2785,25 @@ static const ast::Expr* callReceiverTarget(const ast::CallExpr& ce) {
 // concrete-slot predicate is #6161's (primitive, or a Named type with a
 // declaration); a type-parameter slot may bind (§14.5 phase 2) and is left to
 // the existing resolution.
+//
+// fix #8784 (§27.3 *Expression body* + §22.6 *Lambda-literal arguments*,
+// v0.359): the predicate no longer EXCLUDES an expression body. §27.3: "the
+// body expression's type is the return type, and a body of type `()` makes a
+// procedure lambda" — so an expression body of type `()` is a procedure lambda
+// exactly as a block body is, and the same §22.6 rule rules out a
+// value-returning slot. The recorded type now says `-> ()` for that body (the
+// lambda arm records the procedure return), so the same test decides both
+// spellings. Before this the EXCLUDED expression body left the filter silent
+// and the overload resolution ignored the function-typed parameter's RETURN
+// type: the first-declared candidate was lowered, and a value-returning slot
+// then called a `()`-returning body through a value-returning function
+// pointer — a garbage value read (MEASURED SEGV). An expression body whose
+// type is NOT the unit type (a value body, an unresolvable body, a `throw`
+// body) is unaffected: its recorded return is not `()`.
 bool ExprTC::procedureLambdaInapplicableAt(const ast::Expr* arg,
                                            const TypeRef* paramTy) {
     auto* lam = dynamic_cast<const ast::LambdaExpr*>(arg);
-    if (!lam || lam->isAsync || lam->exprBody || !paramTy ||
+    if (!lam || lam->isAsync || !paramTy ||
         paramTy->kind != TypeRef::Kind::Function)
         return false;
     const TypeRef* lt = ctx_.exprType(*lam);
@@ -2823,12 +2838,23 @@ void ExprTC::checkDeferredProcedureLambdaArgs(
         if (it == deferredProcedureLambdas_.end()) continue;
         deferredProcedureLambdas_.erase(it);
         if (!procedureLambdaInapplicableAt(lam, formalTypeAt(j))) continue;
+        // fix #8784 (§27.3 *Expression body*, v0.359): the wording follows
+        // the body's form. A BLOCK body reaches this check with no
+        // value-carrying `return`; an EXPRESSION body reaches it with a body
+        // of type `()` — the same verdict, spelled as the §27.3 sentence
+        // ("a body of type `()`") the non-overload path already uses for it
+        // (#6643). The two spellings are the same rule; only the parenthetical
+        // differs.
         ctx_.diagnostics().report(
             Severity::Error, lam->span.begin,
-            "a procedure-bodied lambda (no path executes a "
-            "value-carrying `return`) does not convert to a "
-            "function type whose return type is a value "
-            "(\xc2\xa7""27.3)");
+            lam->exprBody
+                ? "a procedure-bodied lambda (a body of type `()`) does not "
+                  "convert to a function type whose return type is a value "
+                  "(\xc2\xa7""27.3)"
+                : "a procedure-bodied lambda (no path executes a "
+                  "value-carrying `return`) does not convert to a "
+                  "function type whose return type is a value "
+                  "(\xc2\xa7""27.3)");
     }
 }
 

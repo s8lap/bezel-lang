@@ -18101,26 +18101,44 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         const bool lamBodyIsThrow =
             lam->exprBody &&
             dynamic_cast<const ast::ThrowExpr*>(lam->exprBody.get()) != nullptr;
-        if (!hasAscription && !lam->isAsync && lamTargetRet &&
-            !lamTargetAmbiguous && lam->exprBody && !lam->isBlockBody &&
-            !lamBodyIsThrow &&
-            (lamTargetRet->kind == TypeRef::Kind::Primitive ||
-             (lamTargetRet->kind == TypeRef::Kind::Named &&
-              lamTargetRet->declaration))) {
+        // fix #8784 (§27.3 *Expression body* + §22.6 *Lambda-literal
+        // arguments*, v0.359): the §27.3 classification of an EXPRESSION
+        // body, computed ONCE and read by the admission check below, by
+        // the return-type inference and by the deferred re-check (#6268).
+        //
+        // §27.3: "Expression-bodied lambdas need no inference rule: the body
+        // expression's type is the return type, and a body of type `()` makes
+        // a procedure lambda." A unit-returning BUILT-IN member call
+        // (`Console.WriteLine` / `Console.Write` / `Array<T>.Add`) is
+        // deliberately left UNTYPEED by sema ("Write / WriteLine -> unit
+        // (leave untyped)", the built-in static accept-list), so the body's
+        // recorded type is MISSING where the spec says it is `()`. The (b)
+        // test below reads that missing type as the unit type — the same
+        // reading this check has always used.
+        bool lamExprBodyIsUnit = false;
+        if (lam->exprBody && !lam->isBlockBody && !lamBodyIsThrow) {
             const TypeRef* bodyTy = ctx_.exprType(*lam->exprBody);
-            bool unitBody = bodyTy && bodyTy->kind == TypeRef::Kind::Unit;
-            if (!bodyTy && ctx_.diagnostics().errorCount() == lamBodyErrsBefore) {
+            lamExprBodyIsUnit = bodyTy && bodyTy->kind == TypeRef::Kind::Unit;
+            if (!bodyTy &&
+                ctx_.diagnostics().errorCount() == lamBodyErrsBefore) {
                 // (b): a call whose CALLEE carries no type — a unit-returning
                 // built-in member call.
                 if (const auto* ce = dynamic_cast<const ast::CallExpr*>(
                         lam->exprBody.get())) {
                     if (ce->callee) {
                         const TypeRef* calleeTy = ctx_.exprType(*ce->callee);
-                        unitBody = !calleeTy;
+                        lamExprBodyIsUnit = !calleeTy;
                     }
                 }
             }
-            if (unitBody) {
+        }
+        if (!hasAscription && !lam->isAsync && lamTargetRet &&
+            !lamTargetAmbiguous && lam->exprBody && !lam->isBlockBody &&
+            !lamBodyIsThrow &&
+            (lamTargetRet->kind == TypeRef::Kind::Primitive ||
+             (lamTargetRet->kind == TypeRef::Kind::Named &&
+              lamTargetRet->declaration))) {
+            if (lamExprBodyIsUnit) {
                 ctx_.diagnostics().report(
                     Severity::Error, lam->exprBody->span.begin,
                     "a procedure-bodied lambda (a body of type `()`) does not "
@@ -18209,6 +18227,50 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 inferredReturn = ascribedRet;
             } else if (lam->exprBody) {
                 inferredReturn = ctx_.exprType(*lam->exprBody);
+                // fix #8784 (§27.3 *Expression body*, v0.359): the body's type
+                // IS the lambda's return type, and a body of type `()` makes a
+                // procedure lambda. A unit-returning built-in call leaves the
+                // body's type MISSING (the built-in accept-list leaves it
+                // untyped), so the lambda's inferred return was missing too —
+                // and every reader of the lambda's function type then saw
+                // "unknown" where the spec says `()`:
+                //   * the §22.6 overload grid (`gradeLambdaLiteralCell`) left
+                //     the cell UNGRADED, so the resolution ignored the
+                //     function-typed parameter's RETURN type;
+                //   * the #6243 certain-evidence filter
+                //     (`procedureLambdaInapplicableAt`) did not rule out a
+                //     value-returning slot;
+                //   * the #6268 deferred §27.3 check had nothing to re-judge.
+                // In an overload set that made the resolution pick the
+                // FIRST-DECLARED candidate, and a value-returning slot then
+                // called a `()`-returning body through a value-returning
+                // function pointer — a garbage value read (MEASURED SEGV).
+                // Record the procedure return here, so the lambda's type is
+                // `() -> ()` exactly as §27.3 says.
+                if (!inferredReturn && lamExprBodyIsUnit) {
+                    inferredReturn = ctx_.makeTypeRef();
+                    inferredReturn->kind = TypeRef::Kind::Unit;
+                }
+                // fix #8784 (§27.3 / §22.6 *Lambda-literal arguments*,
+                // v0.359): the target came from ONE member of an overload
+                // set, so the §27.3 admission check above is SUSPENDED (the
+                // formal it was threaded is not necessarily the member
+                // resolution picks) and the call / `new` site re-runs it
+                // against the candidate the resolution chooses
+                // (`checkDeferredProcedureLambdaArgs`, #6268). That re-run
+                // covered only BLOCK bodies — #6268's own predicate excluded
+                // `exprBody` — so an EXPRESSION-bodied procedure lambda in
+                // an overload set was never re-judged, and the resolution
+                // ignored the function-typed parameter's RETURN type.
+                // Register it beside #6268's own registration (the block-body
+                // one below), so the chosen candidate's formal is judged.
+                // An ASCRIBED lambda is not registered: its ascription is its
+                // written return type and the ascription's own §5.1 check
+                // governs it (the same exclusion the admission check above
+                // makes).
+                if (lamTargetRet && lamTargetAmbiguous && !lam->isAsync &&
+                    !hasAscription && lamExprBodyIsUnit)
+                    deferredProcedureLambdas_.insert(lam);
             } else {
                 // §27.3 (v0.226, #2107): recursively collect EVERY value-
                 // carrying `return e;` type in the block body (descending
