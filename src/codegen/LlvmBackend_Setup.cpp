@@ -1,5 +1,6 @@
 #include "codegen/LlvmBackend_impl.hpp"
 #include "codegen/LlvmBackend_Console.hpp"  // fix #9213: the ONE built-in `Console.ReadLine()` classifier (lowering + consumer-side classification)
+#include "codegen/LlvmBackend_CallBoundedDecl.hpp"  // fix #9150 / #9151: the ONE §28.14 call-bounded declaration proof (no-body + imported callee)
 #include "codegen/LlvmBackend_EnumMembers.hpp"  // fix #3862 (§10.4, v0.357): the ONE enum-member gate (lowering + ownership walk)
 #include "codegen/LlvmBackend_IndexerParams.hpp"  // fix #9102: the ONE indexer index-parameter shape (lowering + escape walk)
 #include "codegen/LlvmBackend_TextReader.hpp"  // fix #9199: the ONE built-in `TextReader.ReadToEnd()` classifier (lowering + consumer-side classification)
@@ -41876,6 +41877,118 @@ namespace {
 // caller's reference is still balanced (the field's store retains), but the
 // VALUE then outlives the caller's scope in that field, so the walker files
 // the local as one whose capture cells must not be freed with the scope.
+// fix #9151 (§28.14 / §28.9 / §12.1 / §2.5 / §11.2, v0.359): the IMPORTED
+// callee arm of the §28.14 call-bounded proof — a closure LOCAL passed to a
+// member of a class declared in ANOTHER module.
+//
+// THE DEFECT THIS ADMITS (issue #9151). The METHOD arm of the escape walk
+// opened with `if (!ms || ms->isOperator || ctx.isImported(ms)) return false;`
+// — an IMPORTED callee has no `ast::MethodDecl` here (the loader reconstructs
+// a `sema::MethodSymbol` with reconstructed `ParameterSymbol`s and no AST), so
+// the premise failed closed, the argument was an ESCAPE,
+// `collectClosureReleaseEligible` did not arm the local's scope-end
+// `bz_closure_release`, and the local's own +1 was never dropped. MEASURED on
+// r30-c1 @ 6c504f755 with `bezelc --sanitize=address`, the issue's own
+// two-module 200-iteration repro:
+//
+//     Direct leak of 12800 byte(s) in 200 object(s) allocated from:
+//     Indirect leak of 1600 byte(s) in 200 object(s) allocated from:
+//     Indirect leak of 1600 byte(s) in 200 object(s) allocated from:
+//     SUMMARY: AddressSanitizer: 16000 byte(s) leaked in 600 allocation(s).
+//
+// WHY THE EXPORTED DECLARATION IS ENOUGH. §28.14 (v0.359), *The call-bounded
+// default*: "A function-typed parameter declared *without* `scoped` is
+// **call-bounded** … These obligations are compiler-verified for user-authored
+// callees." The EXPORTER verified them — §28.14's obligations are checked for
+// every user-authored body, in the module that writes it, so the imported
+// callee's body (and any override of it, in the exporter's module or a
+// downstream one) was verified THERE. What the importing module cannot see is
+// the DECLARATION, and the declaration is exactly what the proof needs: the
+// formal's modifier (the exporter copies `ast::Param::modifier` verbatim into
+// `MetaParam::modifier`, so `scoped` survives the module boundary — the same
+// channel `indexerParamModifier` reads for an imported INDEXER, #9102) and the
+// formal's type (a function type, or not).
+//
+// THE ONE THING THE DECLARATION MUST ALSO RULE OUT is §28.14's own exception —
+// a callee that "mints a deferred-activation frame" keeps the callback "for
+// that frame's life". The frame is announced by the RETURN SLOT, so this arm
+// declines a Task-family / iterable-family return, a function-typed return and
+// a return whose origin is unknown — a CLASS type parameter the importer's
+// subclass may instantiate at such a head (§12.1: return types must match
+// exactly, so the base's declaration decides what an override may return).
+//
+// The proof itself is the ONE copy in LlvmBackend_CallBoundedDecl.hpp, shared
+// with the LOCAL no-body callee (LlvmBackend_Calls2.cpp) so the two cannot
+// drift.
+static bool importedCalleeFormalIsCallBounded(const sema::SemaContext& ctx,
+                                               const sema::MethodSymbol& ms,
+                                               const ast::CallExpr& call,
+                                               std::size_t ai) {
+    if (ai >= call.args.size() || !call.args[ai].value) return false;
+    const ast::CallArgument& a = call.args[ai];
+    if (!a.modifier.empty()) return false;
+    // Map the argument to its formal (positional or named) — the same mapping
+    // the LOCAL arm uses, over the CANONICAL formal accessors
+    // (`sema::formalParamCount` / `sema::formalParamName`), so this arm reads
+    // the same formal list the rest of the compiler reads (the same accessors
+    // #9056's arm (d) reads).
+    const std::size_t np = sema::formalParamCount(ms);
+    std::size_t pidx = np;
+    if (a.name.empty()) {
+        for (std::size_t j = 0; j < ai; ++j)
+            if (!call.args[j].name.empty()) return false;
+        pidx = ai;
+    } else {
+        for (std::size_t j = 0; j < np; ++j)
+            if (sema::formalParamName(ms, j) == a.name) { pidx = j; break; }
+    }
+    if (pidx >= np) return false;
+    // An `async` callee mints a task frame that may hold the callback for the
+    // frame's life (§28.14 *Call-bounded × deferred activation*) → decline.
+    for (auto mod : ms.modifiers)
+        if (mod == "async") return false;
+    CallBoundedDeclaration d;
+    // The formal's modifier and its RESOLVED type, both carried by the
+    // exported metadata (§2.5: `MetaParam::modifier` / `MetaParam::type`) and
+    // both read through the CANONICAL both-sources accessors
+    // (`sema::formalParamModifier` / `sema::formalParamResolvedType`); the
+    // return slot through `sema::methodReturnResolvedType`, whose imported arm
+    // IS the wire return type.
+    d.formalModifier = sema::formalParamModifier(ms, pidx);
+    d.formalType = sema::formalParamResolvedType(ms, pidx);
+    d.returnType = sema::methodReturnResolvedType(ms, ctx);
+    // The return type's ORIGIN: the imported metadata records a type parameter
+    // by NAME, so the origin is decided by the names in scope — the ENCLOSING
+    // CLASS's type parameters (a subclass may instantiate one at a Task-family
+    // or iterable head → decline) and the METHOD's own (abstract in every
+    // override → frame-free).
+    if (d.returnType && d.returnType->kind == sema::TypeRef::Kind::Named) {
+        const std::string_view head = d.returnType->headName();
+        bool classTypeParam = false;
+        if (const auto* ts = dynamic_cast<const sema::TypeSymbol*>(ms.parent))
+            for (const auto* gp : ts->genericParams) {
+                const auto* g =
+                        dynamic_cast<const sema::GenericParamSymbol*>(gp);
+                if (g && g->name == head) { classTypeParam = true; break; }
+            }
+        bool methodOwn = false;
+        for (const auto* gp : ms.genericParams) {
+            const auto* g = dynamic_cast<const sema::GenericParamSymbol*>(gp);
+            if (g && g->name == head) { methodOwn = true; break; }
+        }
+        if (classTypeParam)
+            d.returnOrigin = CallBoundedDeclaration::ReturnOrigin::Unknown;
+        else if (methodOwn)
+            d.returnOrigin =
+                    CallBoundedDeclaration::ReturnOrigin::MethodTypeParam;
+        else
+            d.returnOrigin = CallBoundedDeclaration::ReturnOrigin::Concrete;
+    } else {
+        d.returnOrigin = CallBoundedDeclaration::ReturnOrigin::Concrete;
+    }
+    return declaredFormalIsCallBounded(d);
+}
+
 inline bool closureArgBindsMethodOwnTypeParamBorrow(
         const sema::SemaContext& ctx, const ast::CallExpr& call,
         std::size_t ai, bool* viaFnvalFieldStore = nullptr) {
@@ -41884,6 +41997,23 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
     auto* ms = dynamic_cast<sema::MethodSymbol*>(
         call.callee ? ctx.exprSymbol(*call.callee) : nullptr);
     if (!ms || ms->isOperator) return false;
+    // fix #9151 (§28.14 / §28.9 / §12.1, v0.359): an IMPORTED callee is proved
+    // from its EXPORTED DECLARATION (the formal's modifier and type, and the
+    // return slot) — see `importedCalleeFormalIsCallBounded` above. The
+    // exporter verified §28.14's obligations for the callee's body in its own
+    // module; the importer cannot see that body, but it CAN see the
+    // declaration, and the call-bounded default is a property of the
+    // PARAMETER.
+    //
+    // THIS ARM ADMITS THE CALL-BOUNDED SHAPE ONLY — a PLAIN function-typed
+    // formal. A `scoped` formal (STORAGE-bounded: the callee may keep the
+    // callback) is not call-bounded and is NOT admitted here; the arm that
+    // owns the `scoped` shape must see it, so this arm must be the FIRST of
+    // the imported arms, not the last. Everything else fails closed (ESCAPE →
+    // leak, never an early release).
+    if (ctx.isImported(ms) &&
+        importedCalleeFormalIsCallBounded(ctx, *ms, call, ai))
+        return true;
     if (ctx.isImported(ms) && !dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
         // fix #9056 (§28.14 / §28.9 / §2.5, v0.359): arm (d) below, for an
         // IMPORTED non-generic callee — the bound-LOCAL spelling of
