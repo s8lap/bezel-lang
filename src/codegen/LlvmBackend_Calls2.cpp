@@ -29981,8 +29981,38 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     const sema::TypeRef* recvTy = ctx_.exprType(*nm.target);
     bool nullableValueRecv = recvTy && isNullableValueTy(recvTy) &&
                              recv->getType()->isStructTy();
+    // fix #9243 (§7.5, §26.5 rule 2, §26.1, v0.359): a VALUE-shaped receiver
+    // — a primitive, an enum, a built-in value type, or the console stream's
+    // i32 stream id (stdlib §2.1 / §7.4) — is not a POINTER, so the
+    // "fail-fast on non-pointer" guard below DROPPED the `?.` call: the `?.`
+    // spelling of an EXTENSION member over such a receiver compiled, ran to
+    // nothing, and the enclosing store degraded to a zero value (codegen's
+    // #2434 backstop) — while the `.` spelling of the SAME member on the SAME
+    // receiver PERFORMED it. MEASURED on the base (r30-c1 @ d66898662): over
+    // `extension int`, `x.F()` printed `1` and `x?.F()` printed NOTHING (and
+    // emitted the #2434 degrade note); the same over `extension DateTime` and
+    // over `extension TextWriter` (`w: TextWriter := Console.Out`). §7.5
+    // (v0.359): "`x?.M` returns null if `x` is null; otherwise it performs the
+    // access", and the member is resolved as `x.M` is (§26.5 rule 2) — so the
+    // two spellings of ONE member may not disagree.
+    //
+    // The receiver is admitted when the CALLEE's own `this` IS that value —
+    // read through `extensionThisType` (§26.1), the SAME helper the `.`
+    // spelling's receiver shaping uses, so the value crosses the call exactly
+    // as the `.` spelling passes it. A class/interface/record target takes its
+    // `this` by POINTER (`byPointer`), so it is not this fix's population and
+    // is left alone.
+    llvm::Type* calleeThisTy = nullptr;
+    bool calleeThisByPointer = false;
+    if (isExtensionMethod(ms))
+        calleeThisTy = extensionThisType(ms, &calleeThisByPointer);
+    const bool valueRecv =
+        !nullableValueRecv && !recv->getType()->isPointerTy() && recvTy &&
+        !recvTy->nullable && calleeThisTy && !calleeThisByPointer &&
+        calleeThisTy == recv->getType();
     // For a plain reference receiver, fail-fast on non-pointer (old guard).
-    if (!nullableValueRecv && !recv->getType()->isPointerTy()) return nullptr;
+    if (!nullableValueRecv && !recv->getType()->isPointerTy() && !valueRecv)
+        return nullptr;
 
     auto* entryBB = builder_.GetInsertBlock();
     auto* callBB =
@@ -29994,6 +30024,15 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
         // hasValue and branch; the value slot is only used when hasValue is true.
         llvm::Value* hasVal = nullablePrimHasValue(recv);  // i1
         builder_.CreateCondBr(hasVal, callBB, endBB);
+    } else if (valueRecv) {
+        // §7.5 (v0.359): "`x?.M` returns null if `x` is null; otherwise it
+        // performs the access." A NON-nullable VALUE receiver is never null —
+        // its static type admits no null — so the short-circuit's null arm is
+        // DEAD. The branch is still emitted (with a constant-false condition)
+        // so the result PHI below keeps its two well-formed CFG edges, exactly
+        // as the pointer arm's are; the RESULT is still lifted to the
+        // always-nullable form (§7.5: "The result type is always nullable").
+        builder_.CreateCondBr(builder_.getInt1(false), endBB, callBB);
     } else {
         llvm::Value* isNull = builder_.CreateICmpEQ(
             recv, llvm::ConstantPointerNull::get(ptrTy()));
