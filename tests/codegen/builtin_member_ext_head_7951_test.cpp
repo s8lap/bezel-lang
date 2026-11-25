@@ -9,9 +9,9 @@
 // (N1) a non-applicable head no longer excuses the name, in the `.` and `?.`
 //      forms; an applicable head (the built-in itself) still does.
 // (N2) an extension PROPERTY an imported module declares on a built-in head is
-//      not carried across the module boundary (a different defect, issue
-//      #7952), so the refusal must not claim that no extension declares the
-//      name: it says the imported property is not visible.
+//      APPLIED since fix #9247 (§26.5 rule 2, v0.359): the imported block
+//      reaches the importing module and the property is read. This bullet
+//      FLIPPED with that fix — see the row's own comment.
 // (N3) the ambiguity error of fix #5140 (§2.3, v0.309) on a bare head is not
 //      followed by a second "no member" error on the same access.
 //
@@ -139,9 +139,33 @@ BEZEL_TEST(builtin_member_ext_head_7951, own_head_still_excuses_26_5) {
 
 // ---- N2: an imported extension property on a built-in head ----------------
 
-// The refusal must not say that no extension declares the name when an
-// imported block does (issue #7952 is why the property cannot be read).
-BEZEL_TEST(builtin_member_ext_head_7951, imported_builtin_property_refusal_is_not_false_26_5) {
+// fix #9247 (BEHAVIOUR FLIP, §26.5 rule 2 / §26.4 / §2.8.2 clause 2, v0.359):
+// the imported block is now APPLIED, so the property is READ — and it reads
+// the value the SAME-MODULE program reads.
+//
+// This row PINNED THE OLD BEHAVIOUR: before #9247's fix, an imported
+// `extension DateTime` block was classified as RESOLUTION-ONLY (the head
+// predicate read a compiler built-in's declaration-less TypeRef as a free
+// type variable), the exporter therefore shipped the block WITHOUT its
+// property body, and the importer refused the read with "no member `Tick2` on
+// built-in type `DateTime`" plus the note "an extension property that an
+// imported module declares on a built-in type is not visible to this
+// compiler".
+//
+// §26.5 rule 2 (v0.359) searches "the current module and all imported
+// modules" for extension blocks on the receiver's type, and §2.8.2 clause 2
+// requires an external instantiation to behave "identically to a same-module
+// instantiation" — so the refusal was wrong: the same-module program reads
+// `Tick2` and prints the value below. The flip is to the STRONGER assertion:
+// the program now RUNS and prints the exact value the same-module program
+// prints (MEASURED on the fixed tree: 1276922880000000000).
+//
+// (The old row's two diagnostic needles are gone because there is no
+// diagnostic any more; its third needle — that the refusal must NOT claim
+// "no §26.5 extension declares a member named" — is now covered by the
+// module area's rows for the same defect:
+// tests/module/imported_extension_builtin_head_9247_test.cpp.)
+BEZEL_TEST(builtin_member_ext_head_7951, imported_builtin_property_is_read_26_5) {
     std::vector<ModuleSource> mods;
     mods.push_back({"Lib",
                     "module Lib;\n"
@@ -159,15 +183,12 @@ BEZEL_TEST(builtin_member_ext_head_7951, imported_builtin_property_refusal_is_no
                     "  end Main;\n"
                     "end C;\n"});
     JitResult r = runAotModules(mods, "App");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
-        r, "no member `Tick2` on built-in type `DateTime`"));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
-        r, "an extension property that an imported module declares on a "
-           "built-in type is not visible to this compiler"));
-    BEZEL_EXPECT_FALSE(diagnosticMessageContains(
-        r, "no \xC2\xA7""26.5 extension declares a member named"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    // The value the SAME-MODULE program prints for the same receiver
+    // (`new DateTime(2024, 3, 16)`, whose `Ticks` doubled) — §2.8.2 clause 2.
+    BEZEL_EXPECT_EQ(r.stdoutText, "1276922880000000000\n");
 }
 
 // Cross-module N1: an imported `extension int` property named `Shared` does

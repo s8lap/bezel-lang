@@ -434,4 +434,49 @@ inline bool typeRefBindsFreeTypeVariable(const TypeRef* t) {
     return false;
 }
 
+// fix #9247 (§26.4 / §26.5 rule 2, v0.359): does this extension HEAD bind a
+// free type variable?
+//
+// §26.4 (v0.359) says where a free type variable comes from, and it says it
+// precisely: "In the extended type's ARGUMENT positions, each bare
+// single-segment non-nullable identifier introduces a fresh block-level type
+// parameter — always". So a free type variable lives in an ARGUMENT position,
+// NEVER in the head's own name: the head names the extended TYPE, and §26.2
+// rejects a head that is a type parameter outright ("Type parameters
+// (`extension T` is meaningless)").
+//
+// `typeRefBindsFreeTypeVariable` above answers the question for a type
+// reference that sits in an ARGUMENT position. This one answers it for the
+// HEAD, and the difference is the whole of #9247:
+//
+//   * the head's OWN declaration-less name is a COMPILER BUILT-IN — a built-in
+//     has no `ast::TypeDecl`, so its TypeRef carries `declaration == nullptr`
+//     exactly like a free type variable's does — NOT a free type variable;
+//   * a head that names NO resolvable type at all is not this case either: the
+//     resolver reports "unresolved type name" and the declaration is refused
+//     (MEASURED: `extension Box` over an unknown `Box` is rejected at the
+//     declaration), so such a head never reaches the artifact interface.
+//
+// MEASURED (issue #9247, on r30-c1 @ 009b0c5de): a library module's
+// `public extension TextReader` was classified by the head predicate as a
+// RESOLUTION-ONLY block, so the importer REFUSED the call with §2.8.2's "the
+// artifact interface cannot carry that block's shape: its head binds a free
+// type variable" — although the head names a concrete built-in class and the
+// exporter DID emit the block's `bz$ext$<module>.TextReader$<M>` symbol.
+// §26.5 rule 2 (v0.359) searches "the current module and all imported
+// modules" for extension blocks on the receiver's type, so an imported block
+// over a built-in head must be APPLIED.
+//
+// The predicate is shared with `typeRefBindsFreeTypeVariable` above for the
+// same reason that one is: the EXPORTER and the IMPORTER must classify a
+// carried block identically, or the importer would dispatch a non-dispatchable
+// block (a silent wrong answer) or refuse a dispatchable one (a false
+// rejection, §2.8.2's "No restrictions beyond visibility").
+inline bool extensionHeadBindsFreeTypeVariable(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return false;
+    for (const TypeRef* ga : t->genericArgs)
+        if (typeRefBindsFreeTypeVariable(ga)) return true;
+    return false;
+}
+
 } // namespace bezel::sema

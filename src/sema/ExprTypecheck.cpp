@@ -17664,14 +17664,27 @@ Symbol* ExprTC::lookupExtensionMember(
         //
         // The predicate is the exporter's own (module/ModuleMetadataBuilder.cpp
         // `convertExtension`), via the shared
-        // `sema::typeRefBindsFreeTypeVariable` — the two sides must classify
-        // a carried block identically, or the importer would dispatch a
+        // `sema::extensionHeadBindsFreeTypeVariable` — the two sides must
+        // classify a carried block identically, or the importer would dispatch a
         // non-dispatchable block (a silent wrong answer) or refuse a
         // dispatchable one (a false rejection).
+        //
+        // fix #9247 (§26.4 / §26.5 rule 2, v0.359): the predicate asks the HEAD
+        // question — §26.4 introduces a free type variable only in the extended
+        // type's ARGUMENT positions, so the head's own declaration-less name (a
+        // COMPILER BUILT-IN, which has no `ast::TypeDecl` and so carries
+        // `declaration == nullptr`) is not one. The former head-level test also
+        // fired on that name, so an IMPORTED `public extension TextReader` was
+        // classified as a RESOLUTION-ONLY block and the call was REFUSED with
+        // §2.8.2's "the artifact interface cannot carry that block's shape" —
+        // although the block's head names a concrete built-in class and the
+        // exporter DID emit its `bz$ext$<module>.<T>$<M>` symbol. §26.5 rule 2
+        // searches "the current module and all imported modules" for extension
+        // blocks on the receiver's type, so such a block must be dispatched.
         const bool shapeOnlyBlock =
             importedExtensionModule_.count(ext) != 0 &&
             (!decl->genericConstraints.empty() ||
-             typeRefBindsFreeTypeVariable(target));
+             extensionHeadBindsFreeTypeVariable(target));
         // §26.5 (#773/#714): the extension's free type variables are EITHER
         // named in a `where T: …` constraint (`extension Bag<T> where T: class`)
         // OR introduced implicitly as the generic-arg placeholder name in the

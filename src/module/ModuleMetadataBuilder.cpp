@@ -2874,17 +2874,31 @@ static bool convertExtension(const sema::ExtensionSymbol& ext,
     // semantics. So the shape is CARRIED (its head, its `where` clause and its
     // member names), and the importer refuses to dispatch it, naming it.
     //
-    // The predicate is `sema::typeRefBindsFreeTypeVariable` — SHARED with the
-    // importer (sema/ExprTypecheck.cpp), which must classify a carried block
-    // the same way or it would dispatch a non-dispatchable block (a silent
-    // wrong answer) or refuse a dispatchable one (a false rejection).
+    // The predicate is `sema::extensionHeadBindsFreeTypeVariable` — SHARED with
+    // the importer (sema/ExprTypecheck.cpp), which must classify a carried
+    // block the same way or it would dispatch a non-dispatchable block (a
+    // silent wrong answer) or refuse a dispatchable one (a false rejection).
+    //
+    // fix #9247 (§26.4 / §26.5 rule 2, v0.359): the predicate asks the HEAD
+    // question — §26.4 introduces a free type variable only in the extended
+    // type's ARGUMENT positions, so the head's own declaration-less name (a
+    // COMPILER BUILT-IN, which has no `ast::TypeDecl` and so carries
+    // `declaration == nullptr`) is not one. The former head-level test also
+    // fired on that name, so a `public extension TextReader` was classified as
+    // a RESOLUTION-ONLY block: the exporter shipped it as a shape and the
+    // importer REFUSED the call with §2.8.2's "the artifact interface cannot
+    // carry that block's shape", although the block's head names a concrete
+    // built-in class and the exporter DID emit its `bz$ext$<module>.<T>$<M>`
+    // symbol. §26.5 rule 2 searches "the current module and all imported
+    // modules" for extension blocks on the receiver's type, so such a block
+    // must be dispatched.
     //
     // The `where`-clause half is the OTHER shape §26.4 names: the clause's
     // constraint is read at the receiver's instantiation, so the block applies
     // to some receivers and not others — an APPLICABILITY FILTER (§26.5.1),
     // never a ranking signal — and the exported symbol cannot express it.
     outShapeOnly = !decl->genericConstraints.empty() ||
-                   sema::typeRefBindsFreeTypeVariable(target);
+                   sema::extensionHeadBindsFreeTypeVariable(target);
     // fix #6898 (§26.4 / §2.8.2 clause 2, v0.340): a GROUND head such as
     // `extension IList<int>` binds nothing, so its member is the exact
     // exported `bz$ext$IList$M` symbol and dispatches like any other
