@@ -39601,6 +39601,99 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             }
         }
     }
+    // fix #9057 (stdlib §7.4, §2.1, v0.359): `TextReader.ReadToEnd(): string`.
+    //
+    // stdlib §7.4 declares, on the abstract `TextReader`,
+    //
+    //     public method ReadToEnd(): string;
+    //
+    // and stdlib §2.1 declares `Console.In` as that class's ONE instance
+    // ("`TextReader` has no concrete subclass in this library: its one
+    // instance is `Console.In`"). The built-in `TextReader` carries NO
+    // member surface in sema — it has no `TypeDecl`, so the ordinary member
+    // lookup finds nothing — and the call was therefore left UNTYPED. (The
+    // #8383 lane that gave the call its lowering arm recorded exactly this
+    // as the SEMANTIC half it left behind: "sema leaves the call untyped
+    // (the built-in `TextReader` has no member surface there)".)
+    //
+    // WHY THE MISSING TYPE IS A WRONG-OUTPUT DEFECT AND NOT A COSMETIC ONE.
+    // An untyped initializer infers NOTHING for the local it binds (§21.1's
+    // `var greeting := "Hello"; // type inferred`), and codegen's §9.6
+    // string-member dispatch REQUIRES a `string`-typed receiver
+    // (`tryLowerStringMethod`'s `tt->primitive == PrimitiveType::String`
+    // gate, `src/codegen/LlvmBackend_Exprs.cpp`). So the type did not merely
+    // fail to be pretty: it never REACHED the dispatch, and
+    //
+    //     var raw := Console.In.ReadToEnd();
+    //     var c := raw.ToUpper();
+    //
+    // lowered the `raw.ToUpper()` call to NOTHING — the local `c` was
+    // zero-initialised behind #2434's warning and the program printed `0`
+    // (issue #9057). The chained `Console.In.ReadToEnd().ToLower()` fails the
+    // same way: its RECEIVER is the untyped call.
+    //
+    // (`raw.Length` is the one member that survived: codegen's degenerate
+    // receiver fallback reads the length field of whatever `%bz.string` the
+    // receiver lowers to — `LlvmBackend_Exprs.cpp`'s `isStringFallbackTarget`
+    // arm — so it guessed the layout right by accident. `var e: string :=
+    // raw;` is the other survivor: the ASCRIPTION gives `e` its type, and
+    // the member dispatch then has a `string` receiver to work with.)
+    //
+    // THE DISCRIMINATOR IS CODEGEN'S OWN (`classifyTextReaderReadToEnd`,
+    // `src/codegen/LlvmBackend_Calls2.cpp`), so the two halves agree on
+    // WHICH call is the built-in member:
+    //
+    //   * the SYNTACTIC receiver `Console.In` — the built-in `Console`
+    //     class's `In` property read, which sema leaves UNTYPED outside a
+    //     call-argument position (§2.1's rule, of which `Console.In` is an
+    //     instance), so it is recognised structurally, exactly as codegen
+    //     recognises it; a VALUE named `Console` is not the built-in class
+    //     (#8126, §2.7 rule 1);
+    //   * a VALUE of the built-in `TextReader` type — a declaration-less
+    //     Named ref whose head is `TextReader` — so a USER class of that
+    //     name keeps its own member surface.
+    //
+    // THE ARITY GATE. §7.4's declaration takes NO parameter, so only the
+    // zero-argument call is the built-in member — codegen's classifier
+    // requires `call.args.empty()`, and the arity-wrong call must keep the
+    // diagnostic it has today (codegen's #2966 gate reads "SEMA never typed
+    // the call either" as one of its conjuncts, so typing the arity-wrong
+    // call would SILENCE that refusal). The gate reads the call's arity from
+    // `currentCallArity_`, the counter the member-resolution paths already
+    // use; a BARE reference (`var f := Console.In.ReadToEnd;`) is not a call
+    // and is not typed here either.
+    if (ma.target && ma.member == "ReadToEnd" && &ma == calleeOfCallCtx_ &&
+        currentCallArity_ == 0) {
+        bool builtinReceiver = false;
+        // (1) `Console.In.ReadToEnd()` — the syntactic receiver.
+        if (auto* inner = dynamic_cast<const ast::MemberAccessExpr*>(
+                ma.target.get())) {
+            if (inner->member == "In" && inner->target) {
+                if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
+                        inner->target.get())) {
+                    // fix #8126 (§2.7 rule 1, v0.355): a VALUE named `Console`
+                    // is member access on the user's own object, not the
+                    // built-in reader.
+                    if (cid->name == "Console" &&
+                        receiverMayReachBuiltinStaticArm(
+                            ctx_.exprSymbol(*cid)))
+                        builtinReceiver = true;
+                }
+            }
+        }
+        // (2) `r.ReadToEnd()` on a value of the built-in `TextReader` type.
+        if (!builtinReceiver) {
+            const TypeRef* rt = ctx_.exprType(*ma.target);
+            if (rt && rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                rt->headName() == "TextReader")
+                builtinReceiver = true;
+        }
+        if (builtinReceiver) {
+            ctx_.setExprType(&ma,
+                             ctx_.primitiveTypeRef(PrimitiveType::String));
+            return;
+        }
+    }
     // fix #4961 (spec §28.14, v0.307): "forming a method reference over
     // a capture-free-register position is a compile error". The capture-free
     // register covers `ISharedEvent<T>.Subscribe` and
