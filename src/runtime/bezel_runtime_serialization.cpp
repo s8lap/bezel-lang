@@ -2772,6 +2772,17 @@ void* bz_binder_read_case_discriminator(void* derp) {
             d->json_obj_preread = 0;  // consumed
             d->in_object = true;
         } else {
+            // fix #9048 (§9.8 / stdlib §2.15, v0.359): the choice's object is a
+            // VALUE, so the ',' that separates it from the value before it — an
+            // array element after the first, a member value — is taken HERE,
+            // exactly as the record/class sibling bz_binder_begin_object does
+            // (see its fix #8129 note).  Without it the reader stopped after the
+            // FIRST element of an array of choices: the cursor still sat on the
+            // ',' and the '{' check below rejected the next element with
+            // "Choice deserialize: expected '{' (§9.8)" — while the SAME shape
+            // read as a record or an enum (whose readers take the separator)
+            // deserialized every element.
+            if (!bz_jder_take_value_separator(d)) return nullptr;
             bz_jder_skip_ws(d);
             if (d->pos >= d->len || d->data[d->pos] != '{') {
                 bz_ser_throw("Choice deserialize: expected '{' (§9.8)", nullptr);
