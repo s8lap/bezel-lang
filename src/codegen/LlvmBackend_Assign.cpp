@@ -104,6 +104,21 @@ bool indexerArgMatches(const sema::TypeRef* p, const sema::TypeRef* a) {
 // (src/sema/ExprTypecheck_Exprs.cpp) — that matcher answers `false` for a
 // function kind as well, and widening it would change WHICH overload a call
 // site binds, a question this issue does not raise.
+//
+// fix #9137 follow-up (§4.7 / §11.2 / §15.1 / §27.1, v0.359): the
+// comparison must AGREE WITH SEMA FOR EVERY KIND sema accepts, and the
+// function arm alone does not. A function type is compared SLOT BY SLOT, so
+// the comparison descends into its RETURN type and into its PARAMETER slots'
+// types — and those slots can be UNIT (`() -> ()`, a procedure) or an INLINE
+// ARRAY (`() -> [3]int`, `([3]int) -> ()`). Sema's `typeRefEqualImpl` has a
+// `Kind::Unit` arm (answering `true`) and a `Kind::InlineArray` arm
+// (comparing ownedness, the folded size and the element type); the codegen
+// comparison had NEITHER, so it fell through to `indexerArgMatchesUnder`,
+// which answers `false` for every kind it does not spell out. The result was
+// the SAME null itable slot and the SAME call to address 0x0 — MEASURED on
+// r30-c1 for `() -> ()`, for `(int) -> ()`, for `() -> (int) -> ()`, for
+// `() -> [3]int` and for `([3]int) -> ()`, while the `() -> int` shape
+// dispatched correctly.
 bool indexerParamTypeMatchesUnder(const sema::TypeRef* p, const SlotSubst* ps,
                                    std::size_t pf, const sema::TypeRef* a,
                                    const SlotSubst* as, std::size_t af) {
@@ -112,6 +127,57 @@ bool indexerParamTypeMatchesUnder(const sema::TypeRef* p, const SlotSubst* ps,
     const sema::TypeRef* pt = pr.type;
     const sema::TypeRef* at = ar.type;
     if (!pt || !at || pt->kind != at->kind) return false;
+    // fix #9137 follow-up (§4.7 / §7.1 / §11.2 / §15.1 / §27.1, v0.359): the
+    // UNIT and INLINE-ARRAY arms — the two kinds sema's `typeRefEqualImpl`
+    // ACCEPTS and `indexerArgMatchesUnder` answers `false` for (it spells out
+    // only Primitive and Named, and returns `false` for every other kind).
+    //
+    // WHY THEY ARE NEEDED. A function type is compared SLOT BY SLOT (§27.1:
+    // slot types, modifiers and return type), so the RETURN type of an
+    // indexer's function-typed parameter is compared through this very
+    // function. `() -> ()` — a procedure, the commonest function type there
+    // is — has a UNIT return, and `() -> [3]int` has an INLINE-ARRAY return;
+    // a function type with an INLINE-ARRAY PARAMETER slot is compared the
+    // same way. Sema compares those kinds (`Resolver::typeRefEqualImpl`'s
+    // `Kind::Unit` arm answers `true`; its `Kind::InlineArray` arm compares
+    // the ownedness, the FOLDED size and the element type), so sema ACCEPTED
+    // the conformance while codegen did not match it: `findIndexer` returned
+    // null, the itable slot kept its `ConstantPointerNull` initialiser, and
+    // the interface-typed read CALLED ADDRESS 0x0 (MEASURED: SIGSEGV with
+    // pc = 0x0 — the same null-slot signature as the function arm).
+    //
+    // The two arms below are sema's arms, read through the codegen side's
+    // substitution (`SlotSubst`) and its nullability convention (the
+    // ORIGINAL spelling's nullability OR the resolved type's, as
+    // `indexerArgMatchesUnder` computes it).
+    if (pt->kind == sema::TypeRef::Kind::Unit) {
+        // §4.7: "`()` is the type with exactly one value" — there is exactly
+        // ONE unit type, so two unit refs are the SAME type, not a family of
+        // spellings. §7.1: `()` and `()?` are distinct types, so the
+        // nullability still has to agree.
+        const bool pn = (p && p->nullable) || pt->nullable;
+        const bool an = (a && a->nullable) || at->nullable;
+        return pn == an;
+    }
+    if (pt->kind == sema::TypeRef::Kind::InlineArray) {
+        // §15.1: "The size N is part of the type. `[3]int` and `[4]int` are
+        // distinct types that do not interconvert." The size counts only when
+        // BOTH sides' sizes are FOLDED (the compile-time size is known): an
+        // unfolded side (-1) leaves the size out of the comparison, exactly
+        // as sema's `Kind::InlineArray` arm does. §15.1 admits no nullable
+        // inline-array form, so the nullability below is always equal.
+        const bool pn = (p && p->nullable) || pt->nullable;
+        const bool an = (a && a->nullable) || at->nullable;
+        if (pn != an) return false;
+        if (pt->arrayOwned != at->arrayOwned) return false;
+        if (pt->arraySizeValue >= 0 && at->arraySizeValue >= 0 &&
+            pt->arraySizeValue != at->arraySizeValue)
+            return false;
+        // §15.1: the element type, resolved through the frame the inline
+        // array itself was resolved at.
+        return indexerParamTypeMatchesUnder(pt->arrayElement, ps, pr.frame,
+                                            at->arrayElement, as, ar.frame);
+    }
     if (pt->kind != sema::TypeRef::Kind::Function)
         return indexerArgMatchesUnder(p, ps, pf, a, as, af);
     // §27.2: a nullable function type is a DISTINCT type from its non-nullable
