@@ -3886,6 +3886,33 @@ private:
     // disposal: it is a different call node, so the comparison fails and the
     // temporary keeps its own registration.
     const ast::CallExpr* chainCallResultHandedOff_ = nullptr;
+    // fix #9270 (§28.3.11 *Unbound owned temporaries*, §28.8, v0.359): the
+    // chain calls that sit in an ARM of a handed-off CONDITIONAL EXPRESSION
+    // (`return (if b then C.Make()() else new W());`). The conditional's value
+    // IS the selected arm's value, so the destination that takes the
+    // conditional takes the arm's chain-call result: it is handed off exactly
+    // as a bare chain-call initializer / return value is. Armed and restored
+    // together with `chainCallResultHandedOff_` by `lowerChainCallHandedOff`.
+    std::vector<const ast::CallExpr*> chainCallArmsHandedOff_;
+    // fix #9270 (§28.3.11, v0.359): >0 while lowering an operand that runs
+    // only on SOME paths of the full expression — the right operand of a
+    // short-circuit `and` / `or`, an arm of a conditional expression. The CG60
+    // chain-call arm reads it to place its `ccres.slot` in the ENTRY block
+    // (see `lowerCallDispatch`), so the slot dominates the scope-end disposal
+    // that §28.3.11 registers for it.
+    unsigned conditionalOperandDepth_ = 0;
+    // fix #9270: is `call` the chain call a destination handed off — the node
+    // itself, or one in an arm of a handed-off conditional expression?
+    bool isChainCallResultHandedOff(const ast::CallExpr* call) const {
+        if (chainCallResultHandedOff_ == call) return true;
+        for (const ast::CallExpr* c : chainCallArmsHandedOff_)
+            if (c == call) return true;
+        return false;
+    }
+    // fix #9270: the chain calls in the ARMS of the conditional expression `e`
+    // (a postfix `!` peeled, nested conditionals followed).
+    static void collectConditionalArmChainCalls(
+        const ast::Expr* e, std::vector<const ast::CallExpr*>& out);
     // fix #9138 (§28.3.11, v0.359): the chain call `e` produces, or null when
     // `e` is not the chain-call shape — a call whose CALLEE is a call. A
     // postfix `!` (§17.8: "purely a type-system assertion … classifies
@@ -3896,7 +3923,8 @@ private:
     // slot, the discard, the owning location), so the CG60 arm registers no
     // §28.3.11 disposal of its own for it. `e` that is not a chain call is
     // lowered unchanged.
-    llvm::Value* lowerChainCallHandedOff(const ast::Expr* e);
+    llvm::Value* lowerChainCallHandedOff(const ast::Expr* e,
+                                         bool handArmsOff = true);
     // fix #9138 (§28.3.11, §28.3, v0.359): does a call through the FUNCTION
     // type `fnTy` hand its caller an OWNED result? The same test the CG60 arm
     // applies to the chain call's callee (`funcReturnOwned`, or a Task-family /

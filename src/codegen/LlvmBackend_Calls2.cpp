@@ -11145,12 +11145,43 @@ const ast::CallExpr* Emitter::chainCallResultNode(const ast::Expr* e) {
 // handed-off expression is affected: a chain call nested inside it (an
 // argument position, a member read) is a different node and keeps its own
 // §28.3.11 temporary disposal.
-llvm::Value* Emitter::lowerChainCallHandedOff(const ast::Expr* e) {
+//
+// fix #9270 (§28.3.11 *Unbound owned temporaries*, §28.8, §20, v0.359): a
+// CONDITIONAL EXPRESSION `(if c then X else Y)` is a pass-through: its value
+// IS the selected arm's value (§28.3's producers row: the arm-meet of the
+// branches, "exactly one arm's value is produced at runtime and is discharged
+// once"). A destination that takes the conditional therefore takes the arm's
+// chain-call result, and that result is handed off exactly as a bare chain-call
+// initializer is. Without this the chain-call arm registered a disposal of its
+// own for the value AND the destination disposed it (a double dispose, which
+// the dominance ICE of issue #9270 had been hiding).
+void Emitter::collectConditionalArmChainCalls(
+    const ast::Expr* e, std::vector<const ast::CallExpr*>& out) {
+    if (!e) return;
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
+        if (pb->operand) e = pb->operand.get();
+    auto* ce = dynamic_cast<const ast::ConditionalExpr*>(e);
+    if (!ce) return;
+    for (const ast::Expr* arm : {ce->thenValue.get(), ce->elseValue.get()}) {
+        if (const ast::CallExpr* cc = chainCallResultNode(arm))
+            out.push_back(cc);
+        else
+            collectConditionalArmChainCalls(arm, out);
+    }
+}
+
+llvm::Value* Emitter::lowerChainCallHandedOff(const ast::Expr* e,
+                                              bool handArmsOff) {
     if (!e) return nullptr;
     const ast::CallExpr* saved = chainCallResultHandedOff_;
+    std::vector<const ast::CallExpr*> savedArms;
+    savedArms.swap(chainCallArmsHandedOff_);
     chainCallResultHandedOff_ = chainCallResultNode(e);
+    if (handArmsOff)
+        collectConditionalArmChainCalls(e, chainCallArmsHandedOff_);
     llvm::Value* v = lowerExpr(*e);
     chainCallResultHandedOff_ = saved;
+    chainCallArmsHandedOff_.swap(savedArms);
     return v;
 }
 
@@ -13942,7 +13973,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // The UNBOUND case is untouched: the result is an owned temporary
             // and this registration is its §28.3.11 disposal.
             if (chainResultOwned &&
-                chainCallResultHandedOff_ != &call &&
+                !isChainCallResultHandedOff(&call) &&
                 calleeTy->funcReturn &&
                 calleeTy->funcReturn->kind == sema::TypeRef::Kind::Named &&
                 calleeTy->funcReturn->declaration &&
@@ -13992,6 +14023,42 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         ccResSlot = entryAlloca(ccRes->getType());
                         ccResSlot->setName("ccres.slot");
                         asyncHandlerSpillSlots_.push_back(ccResSlot);
+                    } else if (conditionalOperandDepth_ > 0 && !smStateStruct_ &&
+                               ccRes->getType()->isPointerTy()) {
+                        // fix #9270 (§28.3.11 *Unbound owned temporaries*,
+                        // §17.2 short-circuit evaluation, §20 conditional
+                        // expression, v0.359): this chain call sits in an
+                        // operand that runs only on SOME paths — the right
+                        // operand of a short-circuit `and` / `or`, an arm of a
+                        // conditional expression.
+                        //
+                        // THE DEFECT (issue #9270). `builder_.CreateAlloca`
+                        // below puts the alloca at the CURRENT insertion point —
+                        // inside `sc.rhs` / `cond.then` / `cond.else` — while
+                        // the scope-end disposal §28.3.11 registers for the
+                        // temporary is emitted at the end of the ENCLOSING
+                        // scope, which the alloca does not dominate:
+                        //
+                        //   Instruction does not dominate all uses!
+                        //     %ccres.slot = alloca ptr, align 8
+                        //   bezelc: codegen error: IR verification failed
+                        //
+                        // THE FIX. An ENTRY-block alloca, NULL-initialised in the
+                        // entry block (`entryAllocaNullPtr`, #2733's
+                        // discipline), dominates every path. A path that never
+                        // evaluated this operand reaches the scope-end disposal
+                        // with the slot NULL and the null-guarded disposal skips
+                        // it; the disposal nulls the slot after reclaiming, so
+                        // the next loop iteration starts null again. The value
+                        // is therefore released exactly once on a path that
+                        // evaluated it and never on one that did not.
+                        //
+                        // Declined in a state-machine body (`smStateStruct_`):
+                        // an `async` body takes the frame-spilled slot above, and
+                        // a sync iterator's resume function is issue #9179's
+                        // shape, which this slot does not claim.
+                        ccResSlot = entryAllocaNullPtr();
+                        ccResSlot->setName("ccres.slot");
                     } else {
                         ccResSlot = builder_.CreateAlloca(
                             ccRes->getType(), nullptr, "ccres.slot");

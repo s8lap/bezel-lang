@@ -19281,11 +19281,11 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // initializer is handed off: a chain call NESTED in an argument position
     // (`var x := Take(C.Make()());`) is a different node and keeps §28.3.11's
     // temporary disposal — that call's result is not bound to a local at all.
-    const ast::CallExpr* savedChainCallResultHandedOff =
-        chainCallResultHandedOff_;
-    chainCallResultHandedOff_ = chainCallResultNode(init);
-    llvm::Value* v = init ? lowerExpr(*init) : nullptr;
-    chainCallResultHandedOff_ = savedChainCallResultHandedOff;
+    //
+    // fix #9270 (§28.3.11, §28.8, v0.359): the arms of a CONDITIONAL
+    // initializer are handed off too (`lowerChainCallHandedOff` arms them), for
+    // the same reason: the conditional's value is the selected arm's value.
+    llvm::Value* v = lowerChainCallHandedOff(init, /*handArmsOff=*/false);
     expectedFunctionType_ = savedExpectedForLambdaDecl;
     // fix #4342: restore the flags (saved above) so a subsequent LocalDecl
     // in the same enclosing scope starts from the right state. The early-

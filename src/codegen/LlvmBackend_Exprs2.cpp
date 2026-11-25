@@ -110,7 +110,12 @@ llvm::Value* Emitter::lowerShortCircuit(const ast::BinaryExpr& bin) {
     else       builder_.CreateCondBr(l, endBB, rhsBB);
 
     builder_.SetInsertPoint(rhsBB);
+    // fix #9270 (§28.3.11, §17.2 short-circuit evaluation, v0.359): the right
+    // operand runs on only SOME paths, so an owned chain-call result in it takes
+    // an entry-block `ccres.slot` (see the CG60 arm of `lowerCallDispatch`).
+    ++conditionalOperandDepth_;
     llvm::Value* r = lowerExpr(*bin.right);
+    --conditionalOperandDepth_;
     if (!r) {
         // #2805: returning null HERE is what left `sc.rhs`/`sc.end`
         // unterminated — `rhsBB` has already been branched into above, so
@@ -19665,7 +19670,12 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
     // nullable widening (below) may need to emit instructions in this block
     // after we've seen both branches' LLVM types.
     builder_.SetInsertPoint(thenBB);
+    // fix #9270 (§28.3.11, §20, v0.359): an arm runs on only SOME paths, so an
+    // owned chain-call result in it takes an entry-block `ccres.slot` (see the
+    // CG60 arm of `lowerCallDispatch`).
+    ++conditionalOperandDepth_;
     llvm::Value* tv = lowerExpr(*c.thenValue);
+    --conditionalOperandDepth_;
     bool thenDiv = diverged_;  // CG40: e.g. `cond ? throw E : b`
     if (tv && resultTy && !thenDiv)
         tv = coerceNumericToType(tv, resultTy,
@@ -19674,7 +19684,9 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
     // (terminator CreateBr(endBB) deferred — emitted after widening below)
 
     builder_.SetInsertPoint(elseBB);
+    ++conditionalOperandDepth_;
     llvm::Value* ev = lowerExpr(*c.elseValue);
+    --conditionalOperandDepth_;
     bool elseDiv = diverged_;
     if (ev && resultTy && !elseDiv)
         ev = coerceNumericToType(ev, resultTy,
