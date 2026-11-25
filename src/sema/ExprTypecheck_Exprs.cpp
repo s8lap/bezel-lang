@@ -4764,6 +4764,61 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     if (TypeRef* rt = ctx_.importedMemberType(cms))
                         ctx_.setExprType(&e, rt);
                 }
+            } else if (auto* ms = dynamic_cast<MethodSymbol*>(sym)) {
+                // fix #9155 (§27.6 / §2.7 / §27.7, v0.359): a BARE
+                // method-group identifier in VALUE position is a METHOD
+                // REFERENCE. §2.7 rule 1 puts the enclosing type's
+                // accessible members in a bare VALUE READ ("between local
+                // scope and module declarations"), and §27.6 says "Method
+                // references work for static methods, instance methods ...
+                // properties, and extension methods" — "A reference's
+                // FORMED TYPE is the callee's own signature read as a
+                // function type".
+                //
+                // The QUALIFIED spelling (`C.OnS` / `obj.OnS`) publishes
+                // that formed type (resolveMemberAccess's §27.6 branch,
+                // issue #436); the BARE spelling published NOTHING, so
+                // every consumer that reads the expression's type saw an
+                // untyped value. The missing type is not cosmetic:
+                //
+                //   * `var f := P; ... f(1)` — the local the initializer
+                //     binds takes ITS type from the initializer's exprType
+                //     (the local's inferred type IS that type), so the
+                //     local has NO type, the call through it has no
+                //     function type to call, and it lowers to NOTHING: the
+                //     enclosing statement emits nothing (#3079) or the
+                //     assignment's store is dropped (#2961) — the program
+                //     answers wrongly at exit 0 (issue #9155);
+                //   * `Console.WriteLine(P)` printed NOTHING (the qualified
+                //     twin prints `(int) -> int`);
+                //   * `var o: Object := P;` SEGFAULTED (the qualified twin
+                //     prints `(int) -> int`).
+                //
+                // MEASURED on r30-c1 @ 658bf14cc (the base) — the base is
+                // silent on all three (no error at any severity).
+                //
+                // The type published here is `buildMethodRefType`'s — the
+                // SAME builder the §5.1 `checkAssignable` arm uses for this
+                // spelling (fix #4897) — so it is the type the QUALIFIED
+                // spelling forms: the callee's own signature read as a
+                // function type. The receiver slot is already absent from
+                // `ms->params`, so a bare INSTANCE method reference binds
+                // the implicit `this` (codegen's #880/#881 thunk path) and
+                // forms `() -> R`, exactly as `this.M` does.
+                //
+                // SCOPE — a method that declares type parameters of its own
+                // is NOT typed here. The bare spelling of a generic method
+                // reference names its type arguments on the IDENTIFIER
+                // (`G<int>`, §27.6 / §14.5), and codegen's thunk formation
+                // reads that list from the member access only — so the bare
+                // generic spelling is REFUSED there ("the reference to the
+                // generic method `G` cannot be formed", #5814). Typing it
+                // here would publish an ERASED signature for a reference the
+                // compiler refuses to form.
+                if (ms->genericParams.empty()) {
+                    if (TypeRef* ft = buildMethodRefType(ms))
+                        ctx_.setExprType(&e, ft);
+                }
             }
             // §12.7: flow narrowing. Inside the controlled block of `if x is T`
             // (or the else of `if x is not T`), a reference to the narrowed
