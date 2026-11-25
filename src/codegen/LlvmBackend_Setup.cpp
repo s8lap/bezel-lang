@@ -25206,9 +25206,12 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             const sema::TypeRef* vTy = iniTy->genericArgs[1];
             Disposal d{it->second, nullptr};
             d.drainedEntry = true;
+            // fix #9050 (F1): classify the RESOLVED key (§14.1); see
+            // lowerDictDrainFor's decode, which mints the string at K = string.
+            const sema::TypeRef* kCls = resolveTypeParamRef(kTy);
             d.drainedEntryKeyIsString =
-                kTy->kind == sema::TypeRef::Kind::Primitive &&
-                kTy->primitive == sema::PrimitiveType::String;
+                kCls->kind == sema::TypeRef::Kind::Primitive &&
+                kCls->primitive == sema::PrimitiveType::String;
             // Build LLVM types for field GEPs (K and V*).
             d.drainedEntryKeyType = lowerTypeRef(kTy);
             d.drainedEntryValType = lowerTypeRef(vTy);  // ptr for class

@@ -8886,9 +8886,14 @@ bool Emitter::lowerForBody(const ast::ForStmt& fs) {
             const sema::TypeRef* kTy = iterElemTy->genericArgs[0];
             const sema::TypeRef* vTy = iterElemTy->genericArgs[1];
             id.drainedEntry = true;
+            // fix #9050 (F1): the string-vs-not release test reads the
+            // RESOLVED key (§14.1), the same one lowerDictDrainFor's decode
+            // reads; at `K = string` the unresolved parameter skipped the
+            // release of the key string the decode minted.
+            const sema::TypeRef* kCls = resolveTypeParamRef(kTy);
             id.drainedEntryKeyIsString =
-                kTy->kind == sema::TypeRef::Kind::Primitive &&
-                kTy->primitive == sema::PrimitiveType::String;
+                kCls->kind == sema::TypeRef::Kind::Primitive &&
+                kCls->primitive == sema::PrimitiveType::String;
             id.drainedEntryKeyType = lowerTypeRef(kTy);
             id.drainedEntryValType = lowerTypeRef(vTy);
             id.drainedEntryValDisposer =

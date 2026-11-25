@@ -214,6 +214,49 @@ const char* kControlTheNonGenericTwin =
     "  end Main;\n"
     "end Program;\n";
 
+// FIX-FORWARD F1 (review r43-rev-m83-9050, probe p05d). `OwningDictionary<K, V>
+// .Drain()` in a generic class at `K = string`: the drain's key DECODE (now
+// classified on the resolved key) mints a +1 `bz_string_t` per drained entry,
+// and the entry's scope-end release is what discharges it. That release
+// classified on the UNRESOLVED parameter, so no release ran and every drained
+// entry leaked its key header plus the key bytes. The key is never read here:
+// the leak is the minted-but-never-released key alone. 200 iterations under
+// ASan/LSan.
+const char* kDrainReleasesTheMintedKey =
+    "module M; import System;\n"
+    "public class Conn\n"
+    "  public Name: string;\n"
+    "  public constructor(n: string) Name := n; end;\n"
+    "  destructor end destructor;\n"
+    "end Conn;\n"
+    "public class Repo<K> where K: hashable\n"
+    "  private owned _d: OwningDictionary<K, Conn> := new OwningDictionary<K, Conn>();\n"
+    "  public method Put(k: K, owned c: Conn) => _d[k] := c;\n"
+    "  public method DrainCount(): int\n"
+    "    var n := 0;\n"
+    "    for var e in _d.Drain() do\n"
+    "      using var x := move e;\n"
+    "      n := n + 1;\n"
+    "    end;\n"
+    "    return n;\n"
+    "  end DrainCount;\n"
+    "end Repo;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var n := 0;\n"
+    "    var i := 0;\n"
+    "    while i < 200 do\n"
+    "      using var r := new Repo<string>();\n"
+    "      r.Put(\"a\", new Conn(\"x\"));\n"
+    "      r.Put($\"b{i}\", new Conn(\"y\"));\n"
+    "      n := n + r.DrainCount();\n"
+    "      i := i + 1;\n"
+    "    end;\n"
+    "    Console.WriteLine(n);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
 void expectOut(const char* src, const char* out) {
     JitResult r = runAot(src);
     BEZEL_EXPECT_TRUE(r.ran);
@@ -259,4 +302,12 @@ BEZEL_TEST(ownership_dict_generic_string_key_read_out_9050,
 BEZEL_TEST(ownership_dict_generic_string_key_read_out_9050,
            control_the_non_generic_twin_is_unchanged_spec_4_8) {
     expectOut(kControlTheNonGenericTwin, "removed True\n1\n");
+}
+
+BEZEL_TEST(ownership_dict_generic_string_key_read_out_9050,
+           drain_releases_the_minted_string_key_spec_28_9) {
+    JitResult r = runAotChecked(kDrainReleasesTheMintedKey);
+    BEZEL_EXPECT_TRUE(r.ran);          // no leak, no double-free
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("400\n"));
 }

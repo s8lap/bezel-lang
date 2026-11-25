@@ -6153,8 +6153,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                             emitDisposeAndReclaim(valPtr);
                         }
                         // Step 2: if K is string, release the owned key at field[0].
-                        if (kTy->kind == sema::TypeRef::Kind::Primitive &&
-                            kTy->primitive == sema::PrimitiveType::String) {
+                        // fix #9050 (F1): the RESOLVED key (§14.1).
+                        const sema::TypeRef* kCls = resolveTypeParamRef(kTy);
+                        if (kCls->kind == sema::TypeRef::Kind::Primitive &&
+                            kCls->primitive == sema::PrimitiveType::String) {
                             llvm::Value* keyFldPtr =
                                 builder_.CreateStructGEP(entStTy, cell, 0, "dde.key.ptr");
                             llvm::Value* keyPtr =
