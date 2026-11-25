@@ -29299,6 +29299,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // the widening block below for the nullable-FFI-buffer reason
             // the type-driven walk would otherwise miss it.
             bool externOwnedBare = false;
+            // fix #9245 (§21.9 / §28.3.11, v0.359): the CHAIN-CALL owned
+            // producer — a call whose CALLEE is itself a call
+            // (`C.Make()();`, where `Make(): () -> owned W`). It is a §28.3
+            // owned production, but its §28.3.11 disposal is ALREADY emitted
+            // by codegen (the chain-call result slot plus the scope-end
+            // disposal `lowerCallDispatch` registers for an UNBOUND chain-call
+            // result — LlvmBackend_Calls2.cpp), so §21.9's own reclaim flag
+            // must NOT be set for it: two frees of one value. See the arm that
+            // sets this flag and the `trivialDisposeProducer` assignment.
+            bool chainCallOwnedProducer = false;
 
             // fix #2680 (§21.9, v0.278): widen the owned-producer predicate
             // to FIVE shapes the existing walk under-rejected (silent leak —
@@ -29455,6 +29465,89 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 }
                             }
                         }
+                        // fix #9245 (§21.9, v0.359): the CHAINED-CALL callee
+                        // — a function value produced by a CALL
+                        // (`C.Make()();`, where `Make(): () -> owned W`).
+                        //
+                        // ⚠ WHY THE SYMBOL ARMS ABOVE CANNOT REACH IT. The
+                        // callee of the OUTER call is the inner CallExpr, so
+                        // it resolves to no LocalSymbol / ParameterSymbol /
+                        // FieldSymbol to read a `declType` from, and the
+                        // MethodSymbol path (`calleeReturnsOwned`) reads the
+                        // INNER call's own return — a function VALUE, which
+                        // is not an owned production. The `owned`-return fact
+                        // this §21.9 walk needs is therefore unavailable, and
+                        // the statement fell through to the unused-result
+                        // WARNING only. MEASURED on r30-c1: `C.Make()();` over
+                        // a destructor-bearing `W` compiled with rc 0 and the
+                        // §21.9 warning, while its local-function-value twin
+                        // (`var f := C.Make(); f();`) is a hard error.
+                        //
+                        // THE FACT, READ WHERE IT LIVES. The `owned`-return
+                        // marker of a function VALUE is on its Function
+                        // TypeRef's `funcReturnOwned` — the same place the
+                        // FieldSymbol arm above reads it. The callee's STATIC
+                        // TYPE carries it here, because the callee is an
+                        // expression (`C.Make()`) whose type IS the function
+                        // type `() -> owned W` this call is about to invoke.
+                        //
+                        // §21.9 keys the escalation on the RESULT's static
+                        // type — "a bare-statement call whose result type is a
+                        // non-trivial-dispose class or an interface is the hard
+                        // error whether the result is an owned production or a
+                        // borrow" — so the discarded `owned W` of `C.Make()()`
+                        // is exactly the case the section makes a hard error,
+                        // and it must draw the SAME diagnostic as the twins
+                        // (the `reject` arm below; the warning is suppressed
+                        // by the `s21_9Escalated` latch, §21.9's escalation
+                        // "replaces" the warning — #6572).
+                        //
+                        // NARROW BY CONSTRUCTION: the arm is gated on the
+                        // callee being ITSELF a call, so no other callee
+                        // shape's verdict changes.
+                        if (dynamic_cast<const ast::CallExpr*>(
+                                ce2->callee.get())) {
+                            if (TypeRef* ct =
+                                    ctx_.exprType(*ce2->callee)) {
+                                if (ct->kind == TypeRef::Kind::Function &&
+                                    ct->funcReturnOwned) {
+                                    ownedProduced = true;
+                                    // The chain call's OWNED result is an
+                                    // UNBOUND owned temporary, and §28.3.11
+                                    // disposes it at the end of its full
+                                    // expression — WHICH CODGEN ALREADY DOES
+                                    // for exactly this shape: the chain-call
+                                    // lowering (`lowerCallDispatch`) mints the
+                                    // `ccres.slot` and registers the scope-end
+                                    // disposal for it (LlvmBackend_Calls2.cpp,
+                                    // #9082 / #9138 / #9141).
+                                    //
+                                    // ⚠ SO §21.9's OWN reclaim flag
+                                    // (`disposeOwnedValue`) MUST NOT BE SET FOR
+                                    // THIS SHAPE. It is the OTHER half of
+                                    // `ownedProduced`: §21.9's hard error fires
+                                    // on a NON-trivial-dispose result (the
+                                    // issue's case), while the flag is the
+                                    // trivial-dispose RECLAIM — a second free of
+                                    // a value codegen already frees.
+                                    // MEASURED (r30-c1 + this arm, ASan):
+                                    // `C.Make()();` in a 200-iteration loop over
+                                    // a trivial-dispose `W` →
+                                    //   "ERROR: AddressSanitizer:
+                                    //    heap-use-after-free … READ of size 8
+                                    //    … freed by thread T0 here: free …
+                                    //    in main (the chain-call result's
+                                    //    disposal)"
+                                    // i.e. the §21.9 flag's free ran FIRST and
+                                    // codegen's own chain-call disposal then
+                                    // READ the freed object's vtable. The
+                                    // BOUND twin (`var f := C.Make(); f();`) has
+                                    // no chain-call disposal, so its §21.9 flag
+                                    // is the only free and it stays correct.
+                                    chainCallOwnedProducer = true;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -29586,7 +29679,21 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // builtin CLASS and found no destructor and no instance
                     // `owned` member — i.e. this producer's type is
                     // TRIVIAL-DISPOSE (§28.9's derived-property computation).
-                    trivialDisposeProducer = !reject;
+                    //
+                    // fix #9245 (§21.9 / §28.3.11, v0.359): the CHAIN-CALL
+                    // owned producer is EXCLUDED from the reclaim flag. It is
+                    // an unbound owned temporary whose §28.3.11 disposal
+                    // codegen already emits for the chain-call shape (the
+                    // `ccres.slot` + scope-end disposal in
+                    // `lowerCallDispatch`), so §21.9's `disposeOwnedValue`
+                    // would be a SECOND free of the same value — MEASURED
+                    // (ASan): a heap-use-after-free in
+                    // `C.Make()();` over a trivial-dispose `W`, the §21.9
+                    // free running first and codegen's chain-call disposal
+                    // then reading the freed object's vtable. The hard-error
+                    // half of this walk is UNAFFECTED: a non-trivial-dispose
+                    // result is rejected before this line is reached.
+                    trivialDisposeProducer = !reject && !chainCallOwnedProducer;
                 }
                 if (reject) {
                     // fix #6572 (§21.9, v0.338): latch the escalation so the
