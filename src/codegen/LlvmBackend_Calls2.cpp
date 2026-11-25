@@ -30059,8 +30059,15 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
     int64_t esz = (int64_t)module_->getDataLayout().getTypeAllocSize(entryStTy);
 
     using K = sema::TypeRef::Kind;
-    bool isStringKey = keyTy->kind == K::Primitive &&
-                       keyTy->primitive == sema::PrimitiveType::String;
+    // fix #9050 (stdlib §4.17 / §4.8, spec §3.6, v0.359): the KEY type
+    // PARAMETER resolves to its concrete substitution at every instantiation
+    // (§14.1), so this classification must read the RESOLVED type — the table
+    // the snapshot reads was built in the resolved key's shape, so the
+    // snapshot and the decode must agree on it (the `Dictionary` twin of this
+    // site is `wrapDictionaryAsIEnumerable`, LlvmBackend_Assign.cpp).
+    const sema::TypeRef* keyClsTy = resolveTypeParamRef(keyTy);
+    bool isStringKey = keyClsTy->kind == K::Primitive &&
+                       keyClsTy->primitive == sema::PrimitiveType::String;
     bool useGen = !isStringKey;
 
     auto* keysOutSlot = entryAlloca(ptrTy());

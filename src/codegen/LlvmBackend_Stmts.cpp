@@ -10454,6 +10454,20 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
 
     const sema::TypeRef* keyTy = dictTy->genericArgs[0];
     const sema::TypeRef* valTy = dictTy->genericArgs[1];
+    // fix #9050 (stdlib §4.8 / spec §3.6, v0.359): the KEY type PARAMETER
+    // resolves to its concrete substitution at every instantiation (§14.1), so
+    // the string-vs-generic classification below must read the RESOLVED type.
+    // The table's own backing is chosen from the resolved key
+    // (`genericBackingType` resolves it — fix #567), so the snapshot and the
+    // decode must agree on that shape; reading the unresolved parameter made
+    // them disagree at `K = string`. MEASURED: the entry iteration then
+    // snapshotted the keys in the STRING shape (`bz_dict_keys_str`) but
+    // decoded them in the generic branch, so the entry's Key was a NULL
+    // pointer and the snapshot's per-key bytes were never freed (a leak): a
+    // key copied out of the dictionary matched nothing (`Remove` returned
+    // false; `ContainsKey`/`TryGetValue`/the indexer all missed it) and
+    // printing it faulted.
+    const sema::TypeRef* keyClsTy = resolveTypeParamRef(keyTy);
 
     // fix #3976 (stdlib §4.17, v0.295): fix #3947 rejected a no-CompareTo
     // eligible key at `.Add`/`.ContainsKey`/etc (LlvmBackend_Calls.cpp's
@@ -10514,8 +10528,8 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     auto* valsOutSlot = entryAlloca(ptrTy()); // void**
 
     using K = sema::TypeRef::Kind;
-    bool isStringKey = keyTy->kind == K::Primitive &&
-                       keyTy->primitive == sema::PrimitiveType::String;
+    bool isStringKey = keyClsTy->kind == K::Primitive &&
+                       keyClsTy->primitive == sema::PrimitiveType::String;
 
     if (useGen) {
         // Generic-key dict: bz_dict_keys_gen(dict, void*** keys_out, int64_t* n)
@@ -11442,8 +11456,15 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
         // Decode key.
         llvm::Value* keyDecoded;
         using K = sema::TypeRef::Kind;
-        bool isStringKey = keyTy->kind == K::Primitive &&
-                           keyTy->primitive == sema::PrimitiveType::String;
+        // fix #9050 (stdlib §4.9 / §4.8, spec §3.6, v0.359): the drained
+        // table's backing is chosen from the RESOLVED key type
+        // (`genericBackingType` above resolves it — fix #567), so this
+        // classification must read the resolved type too; at `K = string` the
+        // two disagreed and the drained entry's Key was decoded as a NULL
+        // pointer instead of the string the table holds.
+        const sema::TypeRef* keyClsTy = resolveTypeParamRef(keyTy);
+        bool isStringKey = keyClsTy->kind == K::Primitive &&
+                           keyClsTy->primitive == sema::PrimitiveType::String;
         if (isStringKey) {
             // rawKeyPtr is a malloc'd char* (the key bytes; null-terminated).
             // Build a bz_string_t object from it — same pattern as
@@ -11849,9 +11870,16 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
                 if (entryElem && e->genericArgs.size() >= 2 && e->genericArgs[0] &&
                     e->genericArgs[1]) {
                     const sema::TypeRef* kt = e->genericArgs[0];
+                    // fix #9050 (stdlib §4.8 / spec §3.6, v0.359): the erased
+                    // ENTRY view reads the table's keys in the shape the table
+                    // itself was built in — the RESOLVED key type (§14.1); at
+                    // `K = string` the unresolved parameter made the view
+                    // snapshot a string-keyed table in the generic shape, and
+                    // the entry it yielded carried no key at all.
+                    const sema::TypeRef* ktCls = resolveTypeParamRef(kt);
                     entryStringKey =
-                        kt->kind == sema::TypeRef::Kind::Primitive &&
-                        kt->primitive == sema::PrimitiveType::String;
+                        ktCls->kind == sema::TypeRef::Kind::Primitive &&
+                        ktCls->primitive == sema::PrimitiveType::String;
                     // The ENTRY materialization applies ONLY when the scan's
                     // element type IS the {K, V} pair layout — the NON-NULLABLE
                     // `DictionaryEntry<K,V>`. The NULLABLE

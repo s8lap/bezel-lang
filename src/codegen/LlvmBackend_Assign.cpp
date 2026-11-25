@@ -16612,8 +16612,18 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
     // genericBackingType here without the Dictionary's own TypeRef, which the
     // iEnumTy does not carry — its genericArgs[0] is the entry, not the dict.)
     using K = sema::TypeRef::Kind;
-    bool isStringKey = keyTy->kind == K::Primitive &&
-                       keyTy->primitive == sema::PrimitiveType::String;
+    // fix #9050 (stdlib §4.8 / spec §3.6, v0.359): the KEY type PARAMETER
+    // resolves to its concrete substitution at every instantiation (§14.1), so
+    // this classification must read the RESOLVED type — the table the
+    // snapshot reads was built in the resolved key's shape, so the snapshot
+    // and the decode must agree on it. MEASURED: at `K = string` in a generic
+    // class the unresolved parameter made this wrap snapshot a string-keyed
+    // table in the GENERIC shape, so the wrapped entry carried no key (the
+    // `IEnumerable<DictionaryEntry<K, V>>` coercion of such a dictionary
+    // faulted on the first key).
+    const sema::TypeRef* keyClsTy = resolveTypeParamRef(keyTy);
+    bool isStringKey = keyClsTy->kind == K::Primitive &&
+                       keyClsTy->primitive == sema::PrimitiveType::String;
     bool useGen = !isStringKey;
 
     // --- snapshot keys + values ---

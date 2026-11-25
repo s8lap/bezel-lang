@@ -2853,8 +2853,20 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
 
             bool useGen = genericBackingType(recvTy, 0, /*isSet=*/false, nullptr) != nullptr;
             using K = sema::TypeRef::Kind;
-            bool isStringKey = keyTy->kind == K::Primitive &&
-                               keyTy->primitive == sema::PrimitiveType::String;
+            // fix #9050 (stdlib §4.8 / §5, spec §3.6, v0.359): the KEY type
+            // PARAMETER resolves to its concrete substitution at every
+            // instantiation (§14.1), so this classification must read the
+            // RESOLVED type: the table's backing is chosen from the resolved
+            // key (`genericBackingType` above resolves it — fix #567), and the
+            // snapshot and the decode must agree on that shape. MEASURED: at
+            // `K = string` in a generic class the two disagreed — the keys
+            // were snapshotted in the STRING shape but decoded in the generic
+            // branch — so the materialised entry's Key was a NULL pointer and
+            // `Select(kv => kv.Key)` projected a null key (printing it
+            // faulted).
+            const sema::TypeRef* keyClsTy = resolveTypeParamRef(keyTy);
+            bool isStringKey = keyClsTy->kind == K::Primitive &&
+                               keyClsTy->primitive == sema::PrimitiveType::String;
 
             // Build element TypeRef for the lazy pipeline's element tracking.
             {
