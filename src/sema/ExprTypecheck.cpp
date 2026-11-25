@@ -17155,6 +17155,30 @@ static bool isRootObjectValueReceiver(const TypeRef* receiver,
     return receiver != ctx.primitiveTypeRef(PrimitiveType::Object);
 }
 
+// fix #9021 (§2.7 rule 1 / §27.8, v0.359): a receiver that resolves to a
+// TYPE is not an INSTANCE. §2.7 rule 1: "If `A` resolves to a *type*, the
+// rest of the chain resolves against that type's members, declared or
+// inherited"; §27.8 makes a type ALIAS name the aliased type ("Type aliases
+// — generic or not — see through to the aliased type for identity,
+// equality, method dispatch, and overload resolution"). The three symbol
+// kinds a type name carries are a `TypeSymbol` (a class, record, enum,
+// choice or interface), a `TypeAliasSymbol` (§27.8) and a
+// `NestedTypeSymbol` (§11.6) — the same three the #8795 / #7934 arms read.
+//
+// The SYMBOL is the discriminator, never the EXPRESSION TYPE: an alias
+// carries the ALIASED type as its expression type, so reading the type
+// made a type name look like an instance of it.
+static bool isTypeNameReceiver(const ast::Expr* target, SemaContext& ctx) {
+    if (!target) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(target);
+    if (!id) return false;
+    Symbol* sym = ctx.exprSymbol(*id);
+    if (!sym) return false;
+    return dynamic_cast<TypeSymbol*>(sym) != nullptr ||
+           dynamic_cast<TypeAliasSymbol*>(sym) != nullptr ||
+           dynamic_cast<NestedTypeSymbol*>(sym) != nullptr;
+}
+
 // fix #7973 (§8.1, v0.350): the names §8.1's `Object` declaration lists —
 // transcribed mechanically from the declaration block above, so the compiler
 // and the spec state the same list.
@@ -17299,6 +17323,18 @@ void ExprTC::checkObjectClosedSurfaceCall(const ast::CallExpr& ce) {
     // (resolveMemberAccess reads `currentType_` for them), so the enclosing
     // type stands in. A generic-receiver head (`G<int>.ReferenceEquals`, the
     // IdentifierExpr with `typeArgs`) is a type name, not a value.
+    //
+    // fix #9021 (§2.7 rule 1 / §11.7 / §22.12 / §27.8, v0.359): the gate
+    // must read the receiver's SYMBOL, not its EXPRESSION TYPE. A type ALIAS
+    // is a TYPE NAME (§2.7 rule 1: a type alias names a type; §27.8: an
+    // alias sees through to the aliased type), but it carries the ALIASED
+    // type as its expression type — so `KA.ReferenceEquals(a, b)` (with
+    // `type KA := K;`) was refused as "an instance of `K`", although it is
+    // the very call `K.ReferenceEquals(a, b)` admits (§11.7: "`Object`'s
+    // static `ReferenceEquals` (§8.1) is inherited by a static class as by
+    // every class"; §22.12 lets a derived type name it). MEASURED on r30-c1
+    // @ c00f5a63f: that single diagnostic, and nothing else.
+    const bool typeNameReceiver = isTypeNameReceiver(target, ctx_);
     std::string instanceOf;
     if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(target)) {
         if ((tid->name == "this" || tid->name == "base") && !targetTy &&
@@ -17308,7 +17344,7 @@ void ExprTC::checkObjectClosedSurfaceCall(const ast::CallExpr& ce) {
         else if (!tid->typeArgs.empty())
             targetTy = nullptr;
     }
-    if (instanceOf.empty() && targetTy &&
+    if (instanceOf.empty() && !typeNameReceiver && targetTy &&
         targetTy->kind == TypeRef::Kind::Named) {
         instanceOf = std::string(namedTypeSimpleName(targetTy));
         if (instanceOf.empty()) instanceOf = "?";

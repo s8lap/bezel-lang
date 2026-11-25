@@ -1387,6 +1387,25 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 dynamic_cast<sema::TypeSymbol*>(ctx_.exprSymbol(*id)))
             if (ts->kind == ast::TypeDeclKind::Class)
                 pt = sema::PrimitiveType::Object;
+        // fix #9021 (§2.7 rule 1 / §11.7 / §22.12 / §27.8, v0.359): the same
+        // call through a type ALIAS — `KA.ReferenceEquals(a, b)` with
+        // `type KA := K;`. §27.8: "Type aliases — generic or not — see
+        // through to the aliased type for identity, equality, method
+        // dispatch, and overload resolution" — so the alias names the SAME
+        // inherited static (§11.7 / §22.12) and the comparison is the ROOT's
+        // (§8.4). MEASURED on r30-c1 @ c00f5a63f: the alias spelling was
+        // refused by sema's #8776 gate ("cannot call the static member
+        // `ReferenceEquals` through an instance of `K`" — FALSE, `KA` is a
+        // type name), so this arm never saw it.
+        if (pt == sema::PrimitiveType::None) {
+            if (auto* aliasSym = dynamic_cast<sema::TypeAliasSymbol*>(
+                    ctx_.exprSymbol(*id))) {
+                if (sema::TypeSymbol* aliased =
+                        sema::resolveAliasToTypeSymbol(ctx_, aliasSym))
+                    if (aliased->kind == ast::TypeDeclKind::Class)
+                        pt = sema::PrimitiveType::Object;
+            }
+        }
     }
     if (pt == sema::PrimitiveType::None) return nullptr;
     const auto& m = ma->member;

@@ -9675,10 +9675,10 @@ bool Emitter::isPrimIntrinsicMethodRef(const ast::Expr* e) const {
 // class is specified, the implicit base is `Object`" — and the member must be
 // `ReferenceEquals`, the ONE static §8.1 declares.
 //
-// A record, an enum, a choice and an interface are NOT admitted (#9021 owns
-// those holes): they reach `Object` by BOXING (§8.6) or not at all (§11.2),
-// so §26.5 rule 2's "no member" answer is theirs — this predicate does not
-// widen the admission.
+// A record, an enum, a choice and an interface are NOT admitted: they reach
+// `Object` by BOXING (§8.6) or not at all (§11.2), so §26.5 rule 2's "no
+// member" answer is theirs — and fix #9021 gives them that diagnostic
+// (sema), so this predicate does not widen the admission.
 bool Emitter::isClassTypeNameRefEqualsRef(
         const ast::MemberAccessExpr& ma) const {
     if (ma.member != "ReferenceEquals") return false;
@@ -9688,7 +9688,20 @@ bool Emitter::isClassTypeNameRefEqualsRef(
     // CALL-form arm reads (LlvmBackend_Calls2.cpp's tryLowerPrimitiveStaticCall
     // #8795 arm), so the two spellings agree on WHAT is admitted.
     auto* ts = dynamic_cast<sema::TypeSymbol*>(ctx_.exprSymbol(*id));
-    return ts && ts->kind == ast::TypeDeclKind::Class;
+    if (ts) return ts->kind == ast::TypeDeclKind::Class;
+    // fix #9021 (§2.7 rule 1 / §27.8, v0.359): a type ALIAS names the same
+    // type (§27.8: an alias "see[s] through to the aliased type for
+    // identity, equality, method dispatch, and overload resolution"), so the
+    // inherited static it names is the ROOT's (§11.7 / §22.12) — the READ
+    // form of the alias spelling is the READ form of the class-type-name
+    // spelling.
+    if (auto* aliasSym =
+            dynamic_cast<sema::TypeAliasSymbol*>(ctx_.exprSymbol(*id))) {
+        if (sema::TypeSymbol* aliased =
+                sema::resolveAliasToTypeSymbol(ctx_, aliasSym))
+            return aliased->kind == ast::TypeDeclKind::Class;
+    }
+    return false;
 }
 
 // fix #2781 (§8.1 / §14.2 / §27.6): mirror of isPrimIntrinsicMethodRef for

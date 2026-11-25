@@ -8679,12 +8679,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // type name reaches the static. The ROOT spelling keeps its
                 // own (name-based) test: `Object` is a primitive TypeRef, not
                 // a TypeSymbol, so it is not a class type name.
+                //
+                // fix #9021 (§8.4 / §27.8, v0.359): a type ALIAS names the
+                // same type (§27.8), so the ALIAS spelling is the same call
+                // and the same advisory — otherwise the alias spelling would
+                // be a way to SILENCE §8.4's warning.
                 bool rootOrClassTypeName = oid->name == "Object";
                 if (!rootOrClassTypeName) {
                     if (auto* ts =
                             dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*oid)))
                         rootOrClassTypeName =
                             ts->kind == ast::TypeDeclKind::Class;
+                }
+                if (!rootOrClassTypeName) {
+                    if (auto* aliasSym = dynamic_cast<TypeAliasSymbol*>(
+                            ctx_.exprSymbol(*oid))) {
+                        if (TypeSymbol* aliased =
+                                resolveAliasToTypeSymbol(aliasSym))
+                            rootOrClassTypeName =
+                                aliased->kind == ast::TypeDeclKind::Class;
+                    }
                 }
                 if (rootOrClassTypeName && ce.args.size() == 2) {
                     auto isValueTypeArg = [](const TypeRef* t) -> bool {
@@ -13748,10 +13762,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             // own arity, distinct from the universal Object instance surface.
             // The guard suppresses the universal-arity check for them,
             // leaving their existing per-method arity validation (if any)
-            // untouched. `Object.ReferenceEquals(a, b)` (§8.1, static) also
-            // lands here and its arity is intentionally NOT checked by this
-            // block — it is the static Object surface, not the per-type
-            // instance surface this fix targets.
+            // untouched. `Object.ReferenceEquals(a, b)` (§8.1, static) lands
+            // here too — but that one IS the universal surface's own static,
+            // so its arity IS checked below (fix #9021).
             bool targetIsStaticReceiver = false;
             if (umTarget && dynamic_cast<const ast::IdentifierExpr*>(umTarget)) {
                 if (auto* tSym = ctx_.exprSymbol(*umTarget)) {
@@ -13768,6 +13781,59 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     }
                 } else {
                     targetIsStaticReceiver = true;
+                }
+            }
+            // fix #9021 (§8.1 / §22.6 / §22.12 / §11.7 / §26.5 rule 2 /
+            // §27.8, v0.359): §8.1 declares EXACTLY ONE static —
+            // `public static method ReferenceEquals(a: Object?, b: Object?):
+            // bool;` — and it is reached through the root `Object` type name
+            // (§3.4) and through a CLASS type name (§11.7: "`Object`'s static
+            // `ReferenceEquals` (§8.1) is inherited by a static class as by
+            // every class"; §22.12 lets a derived type name an inherited
+            // static), and §27.8 makes an ALIAS name that same type.
+            //
+            // NO type name supplies any OTHER of the universal names: the
+            // other four (`GetType`, `Equals`, `GetHashCode`, `ToString`) are
+            // INSTANCE members of §8.1's block, and §26.5 rule 2 says a type
+            // name supplies none ("a call or read `T.M` that none of them
+            // supplies names no member"). So for `ReferenceEquals` the §8.1
+            // arity applies to a type-name receiver: a call that binds no
+            // declared form of it is a compile error (§22.6).
+            //
+            // The `targetIsStaticReceiver` guard above exists for the STDLIB
+            // statics that share a universal name with their OWN arity
+            // (`char.ToString(c: char)`, `Convert.ToString(value: int)`) —
+            // §8.1's own static is not one of those, so the guard must not
+            // swallow it. MEASURED on r30-c1 @ c00f5a63f: `Object.
+            // ReferenceEquals(k)` and `K.ReferenceEquals(k)` compiled with
+            // only the #3079 "failed to lower" warning and printed NOTHING,
+            // while the QUALIFIED root spelling (`System.Object.
+            // ReferenceEquals(k)`, §8.1: "`Object`'s module is `System`") was
+            // already refused with this block's wording — its receiver is not
+            // a bare `IdentifierExpr`, so the guard never claimed it.
+            bool typeNameSuppliesRootStatic = false;
+            if (umName == "ReferenceEquals" && umTarget) {
+                if (auto* tid =
+                        dynamic_cast<const ast::IdentifierExpr*>(umTarget)) {
+                    Symbol* tsym = ctx_.exprSymbol(*tid);
+                    if (!tsym) {
+                        // The root `Object` spelling: `Object` is an
+                        // intrinsic (§8.1) with no TypeSymbol of its own
+                        // ("`Object` is a compiler intrinsic"), so the bare
+                        // name with no symbol IS the root.
+                        typeNameSuppliesRootStatic = tid->name == "Object";
+                    } else if (auto* ts =
+                                   dynamic_cast<sema::TypeSymbol*>(tsym)) {
+                        typeNameSuppliesRootStatic =
+                            ts->kind == ast::TypeDeclKind::Class;
+                    } else if (auto* aliasSym =
+                                   dynamic_cast<sema::TypeAliasSymbol*>(tsym)) {
+                        // §27.8: an alias names the aliased type.
+                        if (TypeSymbol* aliased =
+                                resolveAliasToTypeSymbol(aliasSym))
+                            typeNameSuppliesRootStatic =
+                                aliased->kind == ast::TypeDeclKind::Class;
+                    }
                 }
             }
             // #2446 false-reject guard: primitives (string, int, …) and the
@@ -13930,7 +13996,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                      umName == "GetType"    ||
                      umName == "Dispose")         expectedArity = 0;
             else if (umName == "ReferenceEquals") expectedArity = 2;
-            if (expectedArity >= 0 && !targetIsStaticReceiver &&
+            if (expectedArity >= 0 &&
+                    (!targetIsStaticReceiver || typeNameSuppliesRootStatic) &&
                     !receiverHasTypeSpecificOverloads && !formatSpecRejected &&
                     !constraintFormattableToString) {
                 const std::size_t nargs = ce.args.size();
@@ -48582,6 +48649,44 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             targetType->kind != ast::TypeDeclKind::Choice;
         if (typeNameDispose) isUniversalObjectMember = false;
         //
+        // fix #9021 (§8.1 / §11.2 / §11.7 / §22.12 / §26.5 rule 2, v0.359):
+        // §8.1's ONE static — `ReferenceEquals` — is inherited by every CLASS
+        // (§11.7: "`Object`'s static `ReferenceEquals` (§8.1) is inherited by
+        // a static class as by every class"; §22.12 lets a derived type name
+        // it), so a CLASS type name supplies it — the #8795 arm below types
+        // `K.ReferenceEquals(a, b)` as the root's own static.
+        //
+        // A RECORD, an ENUM, a CHOICE and an INTERFACE type name supply it
+        // NOT. §8.1: "records, enums, choices, primitives, inline arrays, and
+        // the unit type derive via boxing (§8.6) when used in `Object`-typed
+        // positions" — a record, an enum and a choice reach `Object` by
+        // BOXING, in an `Object`-typed position, not through an inheritance
+        // chain — so a type name of those kinds carries no inherited static.
+        // §11.2 says it outright for an interface: an interface declares no
+        // member named `ReferenceEquals`. §26.5 rule 2's answer is then the
+        // compile error: "a call or read `T.M` that none of them supplies
+        // names no member and is the same compile error".
+        //
+        // WITHOUT this, the universal-member exemption above (the five names
+        // §8.1's `Object` declaration lists, exempt for ANY receiver)
+        // suppressed that diagnostic, so the access stayed UNTYPED, reached
+        // codegen and degraded to the #3079 "failed to lower" warning —
+        // printing NOTHING. MEASURED on r30-c1 @ c00f5a63f: `R.
+        // ReferenceEquals(r, r2)` (a record), `E.ReferenceEquals(E.A, E.B)`
+        // (an enum), `Ch.ReferenceEquals(...)` (a choice) and `I.
+        // ReferenceEquals(...)` (an interface) each compiled with only that
+        // warning.
+        //
+        // The CALL form only, like the `Dispose` narrowing above: the READ
+        // form (`R.ReferenceEquals` as a bare expression) is a §27.6
+        // METHOD-REFERENCE FORMATION, whose own rule the #7350 / #8065
+        // question tracks — the same deferral the #7934 `Dispose` fix made.
+        const bool typeNameRefEquals =
+            receiverIsTypeName && mm == "ReferenceEquals" && targetType &&
+            calleeOfCallCtx_ == &ma &&
+            targetType->kind != ast::TypeDeclKind::Class;
+        if (typeNameRefEquals) isUniversalObjectMember = false;
+        //
         // fix #8359 (§27.6, v0.350 / §8.7, v0.350 / §26.5 rule 2, v0.355 /
         // §28.2, v0.355): the READ spelling of the same access through an
         // ENUM or a CHOICE type name — `E.Dispose;` — is a compile error
@@ -48897,8 +49002,38 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             else
                 typeNameDisposeRemedy =
                     "call `Dispose()` on a VALUE of the type instead";
+            // fix #9021 (§8.1 / §11.2 / §11.7 / §26.5 rule 2, v0.359): the
+            // type-name `ReferenceEquals` case gets its OWN wording, like the
+            // type-name `Dispose` case above. The member is not missing from
+            // the KIND (a record HAS `Equals`, `GetHashCode` and `ToString`
+            // through its `Object` slot, §8.3 / §9.2) — it is missing from
+            // the TYPE NAME, and the remedy is the same for every kind: write
+            // the root's own static.
+            std::string typeNameRefEqualsReason;
+            if (targetType->kind == ast::TypeDeclKind::Interface)
+                typeNameRefEqualsReason =
+                    "an interface declares no member named "
+                    "`ReferenceEquals` (\xc2\xa7""11.2)";
+            else
+                typeNameRefEqualsReason =
+                    "a record, an enum and a choice reach `Object` by BOXING "
+                    "(\xc2\xa7""8.6) \xe2\x80\x94 in an `Object`-typed "
+                    "position, not through an inheritance chain \xe2\x80\x94 so "
+                    "they inherit no static";
             std::string noMemberMsg =
-                typeNameDispose
+                typeNameRefEquals
+                    ? (std::string("no member `ReferenceEquals` on type `") +
+                       std::string(targetType->name) +
+                       "` (\xc2\xa7""11.3, \xc2\xa7""12.1, \xc2\xa7""26.5 rule 2): "
+                       "through a type name the chain resolves against the "
+                       "type's nested types, enum constants and static "
+                       "members, declared or inherited (\xc2\xa7""26.5 rule 2) "
+                       "\xe2\x80\x94 and `ReferenceEquals` is none of them: "
+                       "\xc2\xa7""8.1 declares it as the ONE static of the root "
+                       "`Object`, which \xc2\xa7""11.7 has every CLASS inherit, "
+                       "while " + typeNameRefEqualsReason +
+                       " \xe2\x80\x94 write `Object.ReferenceEquals(a, b)`")
+                    : typeNameDispose
                     ? (std::string("no member `Dispose` on type `") +
                        std::string(targetType->name) +
                        "` (§11.3, §12.1, §26.5 rule 2): through a type name "
