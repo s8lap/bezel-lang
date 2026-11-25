@@ -11,6 +11,10 @@
                                     // `Contains` parameter's declared type, substituted
                                     // with the receiver's type arguments (§14.1)
 #include "sema/TypeResolution.hpp"  // fix #2320: typeRefEqual for ctor overload re-resolution
+#include "sema/TypeResolution_impl.hpp"  // fix #9187: Resolver::typeRefEqualSameScope —
+                                    // the §27.1 function-type identity the indexer
+                                    // overload matcher compares a function-typed
+                                    // index parameter with (see allParamsMatch)
 
 #include <cmath>
 #include <cstdlib>   // std::strtof — fix #5194 (§4.3, v0.312)
@@ -7164,6 +7168,77 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 if (p->primitive != a->primitive) return false;
                             } else if (p->kind == TypeRef::Kind::Named) {
                                 if (p->declaration != a->declaration)
+                                    return false;
+                            } else if (p->kind == TypeRef::Kind::Function) {
+                                // fix #9187 (§23.4 / §27.1 / §27.1.1 / §22.6
+                                // step 4 / §15.1, v0.359): the FUNCTION-typed
+                                // arm — an indexer's parameter may be
+                                // function-typed (§27.1 makes a function type
+                                // first-class, and §23.5 forbids only `ref`/`out`
+                                // on an indexer parameter list), and §23.4
+                                // overloads an indexer by its parameter TYPE
+                                // LIST.
+                                //
+                                // THE DEFECT. The matcher answered `false` for
+                                // every kind it did not spell out — a
+                                // `TypeRef::Kind::Function` parameter among them
+                                // — so a function-typed index parameter NEVER
+                                // matched its argument. The selection therefore
+                                // fell through to the `arityOnly` fallback below,
+                                // which is the FIRST arity-matching candidate:
+                                // an indexer overloaded ONLY by function-typed
+                                // parameters always bound the FIRST declared
+                                // overload, on class- and interface-typed
+                                // receivers alike (MEASURED on r30-c1: `c[lambda()
+                                // => 7]` over `() -> string` / `() -> int` printed
+                                // 1, not 2; with FIVE such overloads the program
+                                // CRASHED with a SIGSEGV at pc = 0x0, because the
+                                // wrong overload's body called the closure
+                                // through a signature that did not match the
+                                // lambda's own).
+                                //
+                                // THE RULE. §22.6's resolution pipeline ranks the
+                                // APPLICABLE candidates by an EXACT match (step
+                                // 4), and for a lambda-literal argument §22.6
+                                // (*Lambda-literal arguments*) grades the
+                                // position by the lambda's INFERRED RETURN TYPE:
+                                // "The candidate is **exact** at the position when
+                                // the inferred return type equals the return slot
+                                // after type-argument substitution, and
+                                // *converting* otherwise". A function type's
+                                // identity is its arity, its parameter slots'
+                                // modifiers and types, and its return type's
+                                // ownedness and type (§27.1); §22.6 (*Parameter
+                                // count at a function-typed position*) makes a
+                                // candidate whose slot has a different parameter
+                                // COUNT inapplicable, and §15.1 makes an inline
+                                // array's size part of its type (`[3]int` and
+                                // `[4]int` are distinct).
+                                //
+                                // `Resolver::typeRefEqualSameScope` is sema's
+                                // structural-equality predicate — the SAME
+                                // comparison `Resolver::typeRefEqualImpl`'s
+                                // `Kind::Function` arm performs for the interface
+                                // conformance check (and the exact twin of
+                                // codegen's `indexerParamTypeMatchesUnder`
+                                // FUNCTION arm, which #9137 added for the
+                                // interface dispatch): the arity, each
+                                // parameter's modifier and type, and the return's
+                                // ownedness and type, recursively. A function
+                                // value's type is compared SLOT BY SLOT, so a
+                                // `() -> [3]int` parameter does not match a
+                                // `() -> [4]int` argument and a `() -> int` one
+                                // does not match a `() -> string` argument.
+                                //
+                                // NO WIDENING ARM. The exact-match tier is the
+                                // only one added: the arity-only fallback below
+                                // is preserved untouched, so an indexer whose
+                                // function-typed parameter admits the argument
+                                // only through a conversion (a `() -> long`
+                                // parameter and an `int`-returning lambda) still
+                                // binds, exactly as the single-indexer widening
+                                // path always did.
+                                if (!Resolver::typeRefEqualSameScope(p, a))
                                     return false;
                             } else {
                                 return false;

@@ -105,6 +105,14 @@ bool indexerArgMatches(const sema::TypeRef* p, const sema::TypeRef* a) {
 // function kind as well, and widening it would change WHICH overload a call
 // site binds, a question this issue does not raise.
 //
+// fix #9187 (§23.4 / §27.1 / §22.6 step 4, v0.359): that SCOPE note is now
+// HISTORY. The CALL-SITE selection DOES compare a function-typed parameter
+// with its argument — `indexerArgMatchesForSelection` (below) routes the
+// FUNCTION kind to this very function's function arm, and sema's
+// `allParamsMatch` grew the matching arm, so the two sides agree and the
+// selected overload is the one §22.6's exact-match ranking names. The
+// PARAMETER-vs-PARAMETER comparison here is UNCHANGED.
+//
 // fix #9137 follow-up (§4.7 / §11.2 / §15.1 / §27.1, v0.359): the
 // comparison must AGREE WITH SEMA FOR EVERY KIND sema accepts, and the
 // function arm alone does not. A function type is compared SLOT BY SLOT, so
@@ -201,6 +209,47 @@ bool indexerParamTypeMatchesUnder(const sema::TypeRef* p, const SlotSubst* ps,
     // §27.1: the return type.
     return indexerParamTypeMatchesUnder(pt->funcReturn, ps, pr.frame,
                                         at->funcReturn, as, ar.frame);
+}
+
+// fix #9187 (§23.4 / §27.1 / §27.1.1 / §22.6 step 4 / §15.1, v0.359): the
+// parameter-vs-argument comparison of the indexer's overload selection, with
+// the FUNCTION-typed arm.
+//
+// THE DEFECT. The comparison the selection used (`indexerArgMatches`)
+// answers `false` for every kind it does not spell out — a
+// `TypeRef::Kind::Function` parameter among them — so a function-typed index
+// parameter NEVER matched its argument, and `selectIndexer` fell back to the
+// FIRST arity-matching candidate: an indexer overloaded ONLY by function-typed
+// parameters always bound the FIRST declared overload, and the program then
+// ran the WRONG overload's body (MEASURED on r30-c1: `c[lambda() => 7]` over
+// `() -> string` / `() -> int` printed 1, not 2; with FIVE such overloads the
+// program CRASHED with a SIGSEGV at pc = 0x0 — the wrong overload's body
+// called the closure through a signature that did not match the lambda's own).
+//
+// THE ARM. `indexerParamTypeMatchesUnder` is the comparison that HAS the
+// function arm — #9137's FUNCTION-typed parameter comparison, the codegen
+// twin of sema's `Resolver::typeRefEqualImpl`'s `Kind::Function` arm: the
+// arity, each parameter's modifier and type, and the return's ownedness and
+// type, compared slot by slot (§27.1), so a `() -> [3]int` parameter does not
+// match a `() -> [4]int` argument (§15.1) and a `() -> int` one does not
+// match a `() -> string` argument.
+//
+// ONLY THE FUNCTION KIND IS RE-ROUTED. `indexerParamTypeMatchesUnder` also
+// spells out the UNIT and INLINE-ARRAY kinds, which `indexerArgMatches`
+// answers `false` for — and so does SEMA's indexer overload matcher
+// (ExprTypecheck_Exprs.cpp's `allParamsMatch`, whose non-Primitive non-Named
+// kinds are declined). Re-routing those kinds here would make codegen pick a
+// DIFFERENT overload than sema picked, so they keep the old comparison and
+// the two sides keep agreeing.
+//
+// It is the same predicate sema's indexer overload matcher now uses
+// (`Resolver::typeRefEqualSameScope`), so codegen lowers exactly the overload
+// sema typed.
+bool indexerArgMatchesForSelection(const sema::TypeRef* p,
+                                    const sema::TypeRef* a) {
+    if (p && p->kind == sema::TypeRef::Kind::Function)
+        return indexerParamTypeMatchesUnder(p, nullptr, 0, a, nullptr, 0);
+    return indexerArgMatches(p, a);
 }
 
 // fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): an
@@ -412,7 +461,10 @@ const sema::PropertySymbol* Emitter::selectIndexer(
             bool all = true;
             for (std::size_t k = 0; k < nargs; ++k) {
                 const sema::TypeRef* pty = indexerParamType(ctx_, ps, k);
-                if (!indexerArgMatches(pty, argTys[k])) { all = false; break; }
+                if (!indexerArgMatchesForSelection(pty, argTys[k])) {
+                    all = false;
+                    break;
+                }
             }
             if (all) return ps;  // exact full-parameter-list match
         }
