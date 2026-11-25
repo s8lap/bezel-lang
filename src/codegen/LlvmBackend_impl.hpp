@@ -18257,7 +18257,7 @@ private:
     // DEFINED in LlvmBackend_Disposal.cpp next to the
     // boxedRecordValueFreer / boxedChoiceValueFreer that depend on it.
     bool boxValueNeedsStringRetain(const ast::Expr* valueExpr,
-                                    const sema::TypeRef* valTy) const;
+                                    const sema::TypeRef* valTy);
 
     // fix #9197 (§28.9 / §28.11 / §14.1, v0.359): the dictionary's VALUE
     // type as the INSTANTIATION sees it — the ONE effective type the box's

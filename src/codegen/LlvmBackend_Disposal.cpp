@@ -8255,7 +8255,7 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
 // genuine +1 owner and the call result's own +1 is released
 // separately.
 bool Emitter::boxValueNeedsStringRetain(const ast::Expr* valueExpr,
-                                          const sema::TypeRef* valTy) const {
+                                          const sema::TypeRef* valTy) {
     if (!valTy) return false;  // nothing to retain
     // fix #9197 (§28.9 / §28.11 / §14.1, v0.359): the NULLABLE gate reads the
     // DECLARED value type — a declared `T?` is the `{i8, T}` wrapper shape,
@@ -8380,7 +8380,119 @@ bool Emitter::boxValueNeedsStringRetain(const ast::Expr* valueExpr,
         // shape that returns a borrowed choice value would re-introduce
         // the UAF and want a +1-source check analogous to the record arm
         // — filed as #3974 sibling work outside this lane's scope.
-        return false;
+        //
+        // fix #9254 / fix-forward #9197 (§28.9 / stdlib §4.8 / §9.7,
+        // v0.359): that trust was MEASURED wrong — the BORROW shapes are reachable, and the box
+        // released a reference it never took. A NAMED choice local, a
+        // parameter, a field, or any other non-construction source shares
+        // its payload string with the box's byte copy; the source keeps its
+        // own reference (a local releases it at its scope end), so the box's
+        // freer (`boxedChoiceValueFreer`) dropped the source's reference:
+        // `var s := Shape.Named(..); d["a"] := s;` followed by a read of `s`
+        // was a heap-use-after-free, and storing the same value twice
+        // aborted with "refcount over-release (string)". Inside a generic
+        // body EVERY source is such a borrow — a `T` value can only arrive
+        // through a parameter, field or local — so the generic path, whose
+        // release half now resolves `T`, needs this take half to be sound.
+        //
+        // The case-construction half of the old comment was ALSO measured
+        // wrong for a BORROW payload argument: outside an armed local the
+        // §35.3 construction stores the argument's pointer raw (the #6170
+        // retain fires only for an armed local's construction), so
+        // `d["a"] := Shape.Named(str)` with `str` a local or parameter,
+        // followed by `d.Clear()` and a read of `str`, was a
+        // heap-use-after-free as well.
+        //
+        // The choice arm is now the record arm's twin. The box takes NO
+        // reference only where the value provably hands it one of its own:
+        //  * a case construction of THIS choice every string payload
+        //    argument of which is a +1 producer (`isPlusOneStringProducer`)
+        //    or a literal, and no payload of which is a string-bearing
+        //    record or choice, or a payload-free case (`Shape.Empty`) —
+        //    nothing to retain;
+        //  * a synthesized `Deserialize` (fresh by construction);
+        //  * a call to a method whose ENTIRE body is such a construction
+        //    (`=> C.K(<producer>)` or a lone `return C.K(<producer>);`) —
+        //    the narrow twin of `isProvablyFreshRecordFactoryMethod`.
+        // Every other shape — a named local, a parameter, a field, any other
+        // call, a construction with a borrow argument or a nested
+        // string-owning payload — retains, which makes the box a genuine
+        // owner of one reference, given back by `boxedChoiceValueFreer`. A
+        // retain the source side never balances is at worst a leak, never a
+        // use-after-free, so the conservative default is the sound one.
+        if (!valueExpr) return true;
+        const sema::TypeSymbol* chTs = vt->declaration;
+        // Is `e` a case construction of `chTs` that owns the +1 of every
+        // string it holds?
+        auto freshConstruction = [&](const ast::Expr* e) -> bool {
+            if (!e) return false;
+            auto* call = dynamic_cast<const ast::CallExpr*>(e);
+            const ast::Expr* c = call ? call->callee.get() : e;
+            if (!c) return false;
+            auto* cc = dynamic_cast<const sema::ChoiceCaseSymbol*>(
+                ctx_.exprSymbol(*c));
+            if (!cc || !cc->caseDecl) return false;
+            bool ofThisChoice = false;
+            for (const sema::ChoiceCaseSymbol* k : choiceCasesOf(chTs))
+                if (k == cc) { ofThisChoice = true; break; }
+            if (!ofThisChoice) return false;
+            if (!call) return cc->caseDecl->payload.empty();
+            for (const auto& a : call->args)
+                if (!a.name.empty()) return false;  // named args: unmapped
+            for (std::size_t i = 0; i < cc->caseDecl->payload.size(); ++i) {
+                const ast::Param& pf = cc->caseDecl->payload[i];
+                if (!pf.type) continue;
+                const sema::TypeRef* ft = ctx_.resolvedType(*pf.type);
+                if (!ft) return false;
+                const ast::Expr* arg =
+                    (i < call->args.size() && call->args[i].value)
+                        ? call->args[i].value.get() : nullptr;
+                if (ft->kind == sema::TypeRef::Kind::Primitive &&
+                    ft->primitive == sema::PrimitiveType::String) {
+                    if (!arg) return false;
+                    if (isPlusOneStringProducer(arg) ||
+                        dynamic_cast<const ast::StringLiteralExpr*>(arg) ||
+                        dynamic_cast<const ast::VerbatimStringExpr*>(arg))
+                        continue;
+                    return false;  // a borrow string argument
+                }
+                if (ft->nullable || ft->kind != sema::TypeRef::Kind::Named ||
+                    !ft->declaration)
+                    continue;  // not walked by the retain / release twins
+                // A nested string-owning record / choice payload: its
+                // strings' ownership is not proved here — retain.
+                if ((ft->declaration->kind == ast::TypeDeclKind::Record &&
+                     recordHasStringFields(ft)) ||
+                    (ft->declaration->kind == ast::TypeDeclKind::Choice &&
+                     choiceHasStringFields(ft->declaration)))
+                    return false;
+            }
+            return true;
+        };
+        if (freshConstruction(valueExpr)) return false;
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(valueExpr)) {
+            if (isSynthesizedValueLikeChoiceDeserializeCall(call))
+                return false;
+            const auto* ms = call->callee
+                ? dynamic_cast<const sema::MethodSymbol*>(
+                      ctx_.exprSymbol(*call->callee))
+                : nullptr;
+            // SEAM-ACCESSOR: the same `ms->decl` body read
+            // `isProvablyFreshRecordFactoryMethod` makes; a method with no
+            // attached body is not provably fresh, so it retains.
+            const auto* md =
+                ms ? dynamic_cast<const ast::MethodDecl*>(ms->decl) : nullptr;
+            if (md && md->bodyKind == ast::MethodBodyKind::Expression &&
+                freshConstruction(md->exprBody.get()))
+                return false;
+            if (md && md->bodyKind == ast::MethodBodyKind::Block &&
+                md->stmts.size() == 1) {
+                auto* rs =
+                    dynamic_cast<const ast::ReturnStmt*>(md->stmts[0].get());
+                if (rs && freshConstruction(rs->value.get())) return false;
+            }
+        }
+        return true;
     }
     return false;
 }
