@@ -1847,9 +1847,32 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                         // and inherits it from an owned one, so an `owned`
                         // FrozenArray<string> field releases its elements here
                         // exactly as a scope-end local does.
+                        //
+                        // fix #9263 / §3.6 / §28.7 / §28.9 / §28.11 (v0.359): the
+                        // SET joins too, for the same reason as at the
+                        // drop-on-overwrite twin (LlvmBackend_Setup.cpp,
+                        // `lowerOwnedCollectionFieldStore`): a `Set<T>` whose
+                        // element is a NULLABLE string is ARRAY-backed
+                        // (`genericBackingType` declines a nullable element), so
+                        // `new Set<string?>()` is a `bz_array_t*` whose free is
+                        // the `bz_array_free(val, disp)` below. Its insert (the
+                        // array family's `Add`, `arrIsStringElem`) takes the +1
+                        // for a `string?` element as for a `string` one (§3.6's
+                        // *Nullable forms*), and its `Remove` / `Clear` / free
+                        // give it back — so the holder's disposal must release
+                        // the field's elements, or the LAST set assigned to the
+                        // field leaks its elements when the holder dies.
+                        // MEASURED (issue #9263): one assignment to an `owned
+                        // _s: Set<string?>` field leaked 35 B / 2 allocations
+                        // (one string) at the holder's disposal.
+                        // The DICT-backed `Set<string>` is unaffected: the
+                        // `Set` / `SortedSet` arm below intercepts it (its
+                        // elements are KEYS, released by
+                        // `bz_set_string_keys_release`).
                         return n == "Array" || n == "Stack" || n == "Queue" ||
                                n == "IList" || n == "IReadOnlyList" ||
-                               n == "LinkedList" || n == "FrozenArray";
+                               n == "LinkedList" || n == "FrozenArray" ||
+                               n == "Set";
                     }(it->collTy->headName()))
                 elemDisp = stringElementReleaseThunk();
             // fix #9183 (§28.9 / §28.11, v0.359): the FIELD path must decide

@@ -40895,9 +40895,37 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
                 // co-owns its elements too (its copying From takes or
                 // inherits the +1), so the displaced value of an overwritten
                 // `owned` FrozenArray<string> field releases them.
+                //
+                // fix #9263 / §3.6 / §28.7 / §28.9 / §28.11 (v0.359): the SET
+                // joins the list. A `Set<T>` whose element is a NULLABLE string
+                // is ARRAY-backed, not dict-backed: `genericBackingType`
+                // declines a nullable element (its `isString` test requires a
+                // non-nullable string, and every other eligibility arm is
+                // `!ty->nullable`-gated), so `new Set<string?>()` is a
+                // `bz_array_t*` and its free is the `bz_array_free` below with
+                // the per-element disposer. Its insert — the array family's
+                // `Add` (`arrIsStringElem`, LlvmBackend_Calls.cpp) — takes the
+                // +1 for a `string?` element exactly as for a `string` one
+                // (§3.6's *Nullable forms* reads the element category of `V?`
+                // as `V`), and its `Remove` / `Clear` / free give it back
+                // (§28.11's element-slot policy is a PAIR: the store takes a
+                // reference of its own, the slot's release gives it back). So
+                // the DISPLACED set must give the +1 back, or every overwrite
+                // leaks one reference per element of the displaced set.
+                // MEASURED (issue #9263): overwriting an `owned _s: Set<string?>`
+                // field 200 times leaked 7290 B / 400 allocations — one string
+                // (32-byte header + buffer) per overwrite.
+                // The DICT-backed `Set<string>` is unaffected: the
+                // `setDictBacked` arm below intercepts it (its elements are
+                // KEYS, released by `bz_set_string_keys_release`), and the
+                // `isStringElementSlotPaired` conjunct above reads the raw
+                // element type, so a generic `Set<T>` field (whose element is
+                // the placeholder `T`) is unchanged — that shape is issue
+                // #6992, not this one.
                 return n == "Array" || n == "Stack" || n == "Queue" ||
                        n == "IList" || n == "IReadOnlyList" ||
-                       n == "LinkedList" || n == "FrozenArray";
+                       n == "LinkedList" || n == "FrozenArray" ||
+                       n == "Set";
             }(collTy->headName()))
         elemDisp = stringElementReleaseThunk();
 
