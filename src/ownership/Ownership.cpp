@@ -21800,6 +21800,17 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
             MethodOwnership mo(ctx);
             mo.setReceiverType(receiverType);
             mo.setReceiverMemberName(std::string(md->name));
+            // fix #9053 (§28.3 K3.1, §28.11, §14.2, §14.4, v0.359): the
+            // body's generic scope, for the owning-collection element-category
+            // question (a type-parameter element type is a class/interface at
+            // every instantiation only under the stdlib's `where T: class`
+            // constraint). `genericCtx`'s enclosing leg is the scope to read:
+            // it is the enclosing TYPE's parameters for a type member, and the
+            // extension block's synthetic ones for an extension member.
+            // See MethodOwnership::setGenericScope. // per §14.2
+            mo.setGenericScope(
+                &md->genericParams, &md->genericConstraints,
+                genericCtx.enclosingParams, genericCtx.enclosingConstraints);
             // #2073 / §28.10: a method body is "generic" for lint purposes
             // when EITHER the method declares its own `<T>` parameters OR the
             // enclosing type is generic (`class C<T> method M(c: T) using var
@@ -21850,6 +21861,15 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
         // `owned` parameter chained into an `owned` slot was neither marked
         // moved-from nor marker-checked — a measured heap-use-after-free.
         mo.setEnclosingCtor(ctorSymbolOf(m, ctx));
+        // fix #9053 (§28.3 K3.1, §28.11, §14.2, §14.4, v0.359): the body's
+        // generic scope, for the owning-collection element-category question.
+        // A constructor declares no type parameters of its own (A.4), so only
+        // the ENCLOSING type's scope is installed here. See
+        // MethodOwnership::setGenericScope. // per §14.2
+        mo.setGenericScope(
+            nullptr, nullptr,
+            enclosingType ? &enclosingType->genericParams : nullptr,
+            enclosingType ? &enclosingType->genericConstraints : nullptr);
         // fix #6630 (§28.3 sink rule, v0.340): a constructor body has a
         // receiver too (a static constructor does not).
         if (!cd->isStatic) {
@@ -21859,6 +21879,15 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
         mo.run(cd->body, paramSymsOf(m, ctx));
     } else if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
         MethodOwnership mo(ctx);
+        // fix #9053 (§28.3 K3.1, §28.11, §14.2, v0.359): the body's generic
+        // scope, for the owning-collection element-category question. A
+        // destructor declares no parameters (A.4), so only the ENCLOSING
+        // type's scope is installed here. See
+        // MethodOwnership::setGenericScope. // per §14.2
+        mo.setGenericScope(
+            nullptr, nullptr,
+            enclosingType ? &enclosingType->genericParams : nullptr,
+            enclosingType ? &enclosingType->genericConstraints : nullptr);
         // §28.8.1 (#763): analyse the destructor body with isDestructor=true so
         // the field-restoration check is suppressed (a torn-down object's owned
         // fields may be left moved-from after a discharged `move this.f`).
@@ -21905,6 +21934,14 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
             enclosingType && !enclosingType->genericParams.empty();
         if (od->bodyKind == ast::MethodBodyKind::Block) {
             MethodOwnership mo(ctx);
+            // fix #9053 (§28.3 K3.1, §28.11, §14.2, v0.359): the body's
+            // generic scope, for the owning-collection element-category
+            // question. An operator declares no type parameters of its own
+            // (A.4), so only the enclosing-type leg is installed.
+            // See MethodOwnership::setGenericScope. // per §14.2
+            mo.setGenericScope(
+                nullptr, nullptr,
+                opGenericCtx.enclosingParams, opGenericCtx.enclosingConstraints);
             mo.run(od->stmts, paramSymsOf(m, ctx), /*isAsync=*/false,
                    /*isDestructor=*/false, od->returnType.get(),
                    od->returnOwned, /*isStatic=*/true, &opGenericCtx,

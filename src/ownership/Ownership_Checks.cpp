@@ -21569,11 +21569,49 @@ bool MethodOwnership::indexerSetterTakesOwned(const ast::Expr& target) {
             const std::size_t elemIdx = (cn == "OwningDictionary") ? 1 : 0;
             if (tt->genericArgs.size() > elemIdx && tt->genericArgs[elemIdx]) {
                 const sema::TypeRef* elemT = tt->genericArgs[elemIdx];
-                return elemT->kind == sema::TypeRef::Kind::Named &&
-                       elemT->declaration &&
-                       (elemT->declaration->kind == ast::TypeDeclKind::Class ||
-                        elemT->declaration->kind ==
-                            ast::TypeDeclKind::Interface);
+                if (elemT->kind == sema::TypeRef::Kind::Named &&
+                    elemT->declaration)
+                    return elemT->declaration->kind ==
+                               ast::TypeDeclKind::Class ||
+                           elemT->declaration->kind ==
+                               ast::TypeDeclKind::Interface;
+                // fix #9053 (§28.3 K3.1, §28.11, §14.2, §14.4, §3.6 rule 2,
+                // v0.359): the element type is a bare TYPE PARAMETER of this
+                // body — the shape a type parameter shares with a built-in
+                // (§14.1 / #6530: a declaration-less single-part Named
+                // TypeRef), so the DECLARED-TYPE test above cannot see it and
+                // the store into the owning slot was not recognised as the
+                // K3.1 consuming store it is. The element CATEGORY (§28.11 /
+                // §3.6 rule 2) decides the slot's ownership:
+                //
+                //   * `OwningArray<T>` (stdlib §4.5) and `OwningDictionary<
+                //     K, V>` (stdlib §4.9) declare `where T: class` / `where V:
+                //     class`, and the compiler rejects a value-typed element
+                //     at the instantiation site (§14.4's owning-element
+                //     restriction) — so EVERY admissible instantiation has a
+                //     class/interface element and the slot takes owned.
+                //   * `OwningBuffer<T>` (stdlib §4.14) is the RECORDED
+                //     EXCEPTION: it admits value-typed elements with plain
+                //     value slots, so its slot takes owned only when the
+                //     parameter is class-FORCED (`where T: class`, §14.2).
+                //
+                // A head that names none of this body's own type parameters
+                // is not a type parameter at all (a built-in, an imported
+                // type) and keeps the answer it had.
+                if (elemT->kind == sema::TypeRef::Kind::Named &&
+                    !elemT->declaration && elemT->genericArgs.empty() &&
+                    elemT->astNode && elemT->astNode->name &&
+                    elemT->astNode->name->parts.size() == 1) {
+                    const std::string_view head =
+                        elemT->astNode->name->parts.front();
+                    if (!owningElemParamIsDeclaredHere(head)) return false;
+                    if (cn == "OwningBuffer")
+                        return owningElemParamIsClassForced(head);
+                    return true;
+                }
+                // Element type unresolved: fall through to false (conservative
+                // — mirrors ChannelSender's §6.9 gate in builtinOwnedSinkArg).
+                return false;
             }
             // Element type unresolved or a generic parameter: fall through to
             // false (conservative — mirrors ChannelSender's §6.9 gate in
@@ -27215,6 +27253,55 @@ bool MethodOwnership::typeParamIsValueConstrained(std::string_view head) const {
                                           genericCtx_->methodConstraints) ||
            captureParamIsValueConstrained(head,
                                           genericCtx_->enclosingConstraints);
+}
+
+// fix #9053 (§28.3 K3.1, §28.11, §14.2, §14.4, §3.6 rule 2, v0.359): the
+// OWNING-COLLECTION ELEMENT-CATEGORY question's scope — the two predicates
+// the indexer-set sink asks. See the declaration in Ownership_impl.hpp.
+//
+// The scope is `setGenericScope`'s, NOT `genericCtx_`'s: the constructor path
+// deliberately leaves `genericCtx_` null (populating it there would change
+// the §28.3 clause-4 capture reduction inside constructors), and a generic
+// class's CONSTRUCTOR is one of the bodies the issue's rule must reach.
+//
+// `owningElemParamIsDeclaredHere` is the POSITIONAL recognition the
+// codebase already uses for a bare type parameter (`typeParamIsDeclaredHere`
+// above, `computeBareReturnContext`'s name-set test): the head must name one
+// of the body's own parameters, so a 0-arity builtin sharing the
+// declaration-less Named shape is not captured.
+// // per §14.2, §28.11
+bool MethodOwnership::owningElemParamIsDeclaredHere(
+        std::string_view head) const {
+    auto inParams = [&](const std::vector<ast::GenericParam>* ps) -> bool {
+        if (!ps) return false;
+        for (const ast::GenericParam& g : *ps)
+            if (g.name == head) return true;
+        return false;
+    };
+    return inParams(genericScopeMethodParams_) ||
+           inParams(genericScopeEnclosingParams_);
+}
+
+// fix #9053 (§14.2, §28.11, §3.6 rule 2, v0.359): is this type parameter
+// FORCED to a class/interface at every substitution? §14.2's `class`
+// constraint says exactly that, so the element category is settled at the
+// declaration rather than per instantiation. Mirrors the `where T: value`
+// exclusion above (captureParamIsValueConstrained) — the same clause-5 test,
+// the other constraint kind. // per §14.2, §3.6 rule 2
+bool MethodOwnership::owningElemParamIsClassForced(
+        std::string_view head) const {
+    if (!owningElemParamIsDeclaredHere(head)) return false;
+    auto hasClass = [&](const std::vector<ast::GenericConstraint>* cs) {
+        if (!cs) return false;
+        for (const ast::GenericConstraint& gc : *cs) {
+            if (gc.typeParam != head) continue;
+            for (const ast::ConstraintItem& item : gc.items)
+                if (item.kind == "class") return true;
+        }
+        return false;
+    };
+    return hasClass(genericScopeMethodConstraints_) ||
+           hasClass(genericScopeEnclosingConstraints_);
 }
 
 // fix #5661 (§28.3 *Argument contributions* clause 4, v0.326): see the

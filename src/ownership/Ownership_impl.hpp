@@ -704,6 +704,28 @@ public:
     void setReceiverMemberName(std::string name) {
         receiverMemberName_ = std::move(name);
     }
+    // fix #9053 (§28.3 K3.1, §28.11, §14.2, §14.4, §3.6 rule 2, v0.359): the
+    // analysed body's GENERIC SCOPE — this member's own type parameters and
+    // the enclosing type's, with their `where` constraints — for the
+    // OWNING-COLLECTION ELEMENT-CATEGORY question (is the slot's element type
+    // a class/interface at every instantiation?).
+    //
+    // A channel of its OWN, deliberately not `genericCtx_` (the bare-return
+    // rule's context): that one is deliberately left null on the CONSTRUCTOR
+    // path, and populating it there would change the §28.3 clause-4 CAPTURE
+    // reduction's classification inside constructors (`captureTypeIsBorrow
+    // Bearing` reads `typeParamAdmitsClassOrInterface`) — a behaviour change
+    // this fix does not own and issue #9053 does not ask for. // per §28.3, §14.2
+    void setGenericScope(
+        const std::vector<ast::GenericParam>* methodParams,
+        const std::vector<ast::GenericConstraint>* methodConstraints,
+        const std::vector<ast::GenericParam>* enclosingParams,
+        const std::vector<ast::GenericConstraint>* enclosingConstraints) {
+        genericScopeMethodParams_ = methodParams;
+        genericScopeMethodConstraints_ = methodConstraints;
+        genericScopeEnclosingParams_ = enclosingParams;
+        genericScopeEnclosingConstraints_ = enclosingConstraints;
+    }
     // fix #6767: the end-of-pass join — every site naming an instantiation
     // of an obligated record (directly, or through a chain of generic types
     // whose parameter it is substituted by) whose receiver holds a borrow
@@ -6286,6 +6308,15 @@ private:
     sema::TypeSymbol* receiverType_ = nullptr;
     // fix #6767: see setReceiverMemberName above.
     std::string receiverMemberName_;
+    // fix #9053: see setGenericScope above — the owning-collection
+    // element-category question's own generic scope.
+    const std::vector<ast::GenericParam>* genericScopeMethodParams_ = nullptr;
+    const std::vector<ast::GenericConstraint>* genericScopeMethodConstraints_ =
+        nullptr;
+    const std::vector<ast::GenericParam>* genericScopeEnclosingParams_ =
+        nullptr;
+    const std::vector<ast::GenericConstraint>*
+        genericScopeEnclosingConstraints_ = nullptr;
     // fix #6630 / #6634: widens collectIdentifiersIn to every Expr-bearing
     // kind for the receiver-capture leg only (see collectIdentifiersIn).
     mutable bool deepCaptureWalk_ = false;
@@ -7487,6 +7518,24 @@ private:
     // // per §28.1 v0.326, §14.2
     bool typeParamIsDeclaredHere(std::string_view head) const;
     bool typeParamIsValueConstrained(std::string_view head) const;
+
+    // fix #9053 (§28.3 K3.1, §28.11, §14.2, §14.4, §3.6 rule 2, v0.359): the
+    // OWNING-COLLECTION ELEMENT-CATEGORY question's own two predicates, over
+    // the scope `setGenericScope` installs (NOT `genericCtx_` — see that
+    // setter's header):
+    //
+    //   * `owningElemParamIsDeclaredHere(head)` — does `head` name one of the
+    //     analysed body's own type parameters (method-level or enclosing-type-
+    //     level)? Recognized POSITIONALLY, so a 0-arity builtin sharing the
+    //     declaration-less Named shape (`Guid`, `Range`, …) is not mistaken
+    //     for a type parameter.
+    //   * `owningElemParamIsClassForced(head)` — is that parameter `where
+    //     T: class`? §14.2's `class` constraint states exactly that every
+    //     substitution is a class or interface, so the element category
+    //     (§28.11 / §3.6 rule 2) is settled at the declaration.
+    // // per §14.2, §28.11, §3.6 rule 2
+    bool owningElemParamIsDeclaredHere(std::string_view head) const;
+    bool owningElemParamIsClassForced(std::string_view head) const;
 
     // fix #3746 (§28.3 *Captured owned bindings*, v0.286): the ONE both-kinds
     // form of the question above — "is this symbol a binding whose owned value
