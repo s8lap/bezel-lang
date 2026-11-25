@@ -2005,6 +2005,8 @@ void* bz_string_from_utf16z(const void* p);
 // `bz_console_read_char` returns the next code point, or -1 at EOF.
 void* bz_console_read_line();
 int32_t bz_console_read_char();
+// fix #9312: `TextReader.ReadToEnd()` — the rest of stdin, UTF-8 decoded, +1.
+void* bz_console_read_to_end();
 
 // stdlib §10.3 / fix #977 / #985: RawBytes.From(buffer: Array<byte>) — copies
 // the byte array into a fresh malloc'd buffer and wraps it with its length in a

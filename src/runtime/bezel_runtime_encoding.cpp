@@ -569,6 +569,28 @@ extern "C" void* bz_console_read_line() {
     return s;
 }
 
+// All the rest of standard input as a fresh +1 string (stdlib §7.4
+// `TextReader.ReadToEnd(): string`, v0.359; fix #9312): the text AS READ,
+// newlines included, decoded from UTF-8 into the §4.6 narrowest width exactly
+// as `bz_console_read_line` decodes a line, so the two readers agree on what a
+// character of standard input is. Never NULL: an exhausted input is the empty
+// string. Malformed UTF-8 takes the same per-byte fallback as the line reader.
+// CR handling is the open question #9305 and is NOT decided here.
+extern "C" void* bz_console_read_to_end() {
+    size_t cap = 4096, n = 0;
+    uint8_t* buf = (uint8_t*)malloc(cap);
+    for (;;) {
+        if (n == cap) { cap *= 2; buf = (uint8_t*)realloc(buf, cap); }
+        size_t got = fread(buf + n, 1, cap - n, stdin);
+        if (got == 0) break;
+        n += got;
+    }
+    void* s = bz_decode_utf8_range(buf, (int64_t)n);
+    if (!s) s = bz_console_raw_byte_string(buf, (int64_t)n);
+    free(buf);
+    return s;
+}
+
 // The next code point of standard input, or -1 at the end of it.
 extern "C" int32_t bz_console_read_char() {
     int b0 = getc(stdin);

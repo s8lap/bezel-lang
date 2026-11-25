@@ -11075,136 +11075,31 @@ namespace {
 // BOTH receivers denote the same reader — standard input.
 // ===========================================================================
 
-// THE READ. A `fgets` loop on `stdin` — the same `stdin` / `fgets` / `strlen`
-// setup `emitConsoleReadLine` makes — accumulating the bytes INCLUDING their
-// newlines into one heap buffer.
-//
-// WHY NOT A LOOP OF `ReadLine()` CALLS. `emitConsoleReadLine` strips the
-// trailing '\n' (stdlib §2.1's `Console.ReadLine` returns the line WITHOUT its
-// terminator), while §7.4's `ReadToEnd` returns the text AS READ — the
-// issue's own repro expects 12 for "hello\nworld\n", the newline included. A
-// `ReadLine` loop would answer 10.
-//
-// THE STRING. The same shape `emitConsoleReadLine` builds: {data, len,
-// width=1, rc=1} — the width-1 (Latin-1) storage §4.6's per-string width
-// model prescribes for byte input, and the producer's reference count
-// (§4.6 / #422). The width-1 convention is the console reader family's own
-// (`Console.ReadLine` stores its bytes the same way), so `ReadToEnd` and
-// `ReadLine` agree on what a byte of standard input is.
-//
-// THE LOOP. The accumulator and the byte count are carried in PHIs, so the
-// read needs no slot: the buffer is the only stack object (as in
-// `emitConsoleReadLine`).
+// THE READ. The runtime's `bz_console_read_to_end` reads ALL the rest of
+// standard input, newlines included (§7.4's `ReadToEnd` returns the text AS
+// READ — the issue's own repro expects 12 for "hello\nworld\n"; a `ReadLine`
+// loop would answer 10), and decodes the UTF-8 into a string of the §4.6
+// narrowest width, as `bz_console_read_line` does for a line (fix #9312), so
+// `ReadToEnd` and `ReadLine` agree on what a character of standard input is.
 llvm::Value* emitTextReaderReadToEnd(llvm::IRBuilder<>& builder,
                                      llvm::Module* module,
                                      llvm::LLVMContext& llvmCtx,
-                                     llvm::Function* currentFn,
-                                     llvm::StructType* stringTy) {
-    auto* i8Ty = llvm::Type::getInt8Ty(llvmCtx);
+                                     llvm::Function* /*currentFn*/,
+                                     llvm::StructType* /*stringTy*/) {
+    // fix #9312 (stdlib §7.4 / §2.1, v0.359): the runtime reader decodes the
+    // UTF-8 of standard input into the §4.6 narrowest width — the same
+    // decoding `bz_console_read_line` applies to a line — and returns the
+    // producer's +1 string (#422 / #8592), so no byte-per-code-point string
+    // is built here.
     auto* ptrT = llvm::PointerType::get(llvmCtx, 0);
-    auto* i64Ty = llvm::Type::getInt64Ty(llvmCtx);
-    const unsigned BUFSZ = 4096;
-    auto* bufTy = llvm::ArrayType::get(i8Ty, BUFSZ);
-    // The read buffer lives in the entry block, as `entryAlloca` does.
-    llvm::BasicBlock& entry = currentFn->getEntryBlock();
-    llvm::IRBuilder<> tmp(&entry, entry.begin());
-    llvm::AllocaInst* buf = tmp.CreateAlloca(bufTy);
-    llvm::Value* bufPtr = builder.CreateGEP(
-        bufTy, buf, {builder.getInt64(0), builder.getInt64(0)});
-    // fgets(buf, BUFSZ, stdin) — the same declarations `emitConsoleReadLine`
-    // makes. The module-level lookup means the SECOND declaration of `fgets` /
-    // `strlen` / `stdin` in the same module finds the first, so the emitted
-    // module carries one of each.
-    llvm::Function* fgetsFn = module->getFunction("fgets");
-    if (!fgetsFn) {
-        auto* ft = llvm::FunctionType::get(
-            ptrT, {ptrT, builder.getInt32Ty(), ptrT}, false);
-        fgetsFn = llvm::Function::Create(
-            ft, llvm::GlobalValue::ExternalLinkage, "fgets", module);
+    llvm::Function* fn = module->getFunction("bz_console_read_to_end");
+    if (!fn) {
+        auto* ft = llvm::FunctionType::get(ptrT, {}, false);
+        fn = llvm::Function::Create(
+            ft, llvm::GlobalValue::ExternalLinkage, "bz_console_read_to_end",
+            module);
     }
-    llvm::GlobalVariable* stdinGV = module->getGlobalVariable("stdin");
-    if (!stdinGV) {
-        stdinGV = new llvm::GlobalVariable(
-            *module, ptrT, false,
-            llvm::GlobalValue::ExternalLinkage, nullptr, "stdin");
-    }
-    llvm::Value* stdinVal = builder.CreateLoad(ptrT, stdinGV, "stdin");
-    llvm::Function* strlenFn = module->getFunction("strlen");
-    if (!strlenFn) {
-        auto* ft2 = llvm::FunctionType::get(i64Ty, {ptrT}, false);
-        strlenFn = llvm::Function::Create(
-            ft2, llvm::GlobalValue::ExternalLinkage, "strlen", module);
-    }
-    // `declareC`, spelled locally: this arm is a file-local function, so it
-    // cannot reach the emitter's member helper.
-    auto declareC = [&](const char* name, llvm::Type* ret,
-                        std::vector<llvm::Type*> args) -> llvm::Function* {
-        if (auto* f = module->getFunction(name)) return f;
-        auto* ft = llvm::FunctionType::get(ret, args, /*variadic=*/false);
-        return llvm::Function::Create(
-            ft, llvm::GlobalValue::ExternalLinkage, name, module);
-    };
-    llvm::Function* mallocFn = declareC("malloc", ptrT, {i64Ty});
-    llvm::Function* reallocFn = declareC("realloc", ptrT, {ptrT, i64Ty});
-    llvm::Function* memcpyFn = declareC("memcpy", ptrT, {ptrT, ptrT, i64Ty});
-    // The accumulator starts as an empty (NUL-terminated) one-byte buffer.
-    llvm::Value* acc0 =
-        builder.CreateCall(mallocFn, {builder.getInt64(1)}, "rte.acc0");
-    builder.CreateStore(llvm::ConstantInt::get(i8Ty, 0), acc0);
-    auto* loopBB = llvm::BasicBlock::Create(llvmCtx, "rte.loop", currentFn);
-    auto* bodyBB = llvm::BasicBlock::Create(llvmCtx, "rte.body", currentFn);
-    auto* endBB = llvm::BasicBlock::Create(llvmCtx, "rte.end", currentFn);
-    llvm::BasicBlock* predBB = builder.GetInsertBlock();
-    builder.CreateBr(loopBB);
-    builder.SetInsertPoint(loopBB);
-    llvm::PHINode* accPhi = builder.CreatePHI(ptrT, 2, "rte.acc");
-    accPhi->addIncoming(acc0, predBB);
-    llvm::PHINode* lenPhi = builder.CreatePHI(i64Ty, 2, "rte.len");
-    lenPhi->addIncoming(builder.getInt64(0), predBB);
-    llvm::Value* fgRet = builder.CreateCall(
-        fgetsFn, {bufPtr, builder.getInt32(BUFSZ), stdinVal}, "rte.fgets");
-    llvm::Value* isEOF = builder.CreateICmpEQ(
-        fgRet, llvm::ConstantPointerNull::get(ptrT), "rte.eof");
-    builder.CreateCondBr(isEOF, endBB, bodyBB);
-    builder.SetInsertPoint(bodyBB);
-    llvm::Value* n = builder.CreateCall(strlenFn, {bufPtr}, "rte.n");
-    // acc = realloc(acc, len + n + 1)
-    llvm::Value* need = builder.CreateAdd(lenPhi, n, "rte.need0");
-    need = builder.CreateAdd(need, builder.getInt64(1), "rte.need");
-    llvm::Value* acc1 = builder.CreateCall(reallocFn, {accPhi, need}, "rte.acc1");
-    // memcpy(acc + len, buf, n)
-    llvm::Value* dst = builder.CreateGEP(i8Ty, acc1, lenPhi, "rte.dst");
-    builder.CreateCall(memcpyFn, {dst, bufPtr, n});
-    // acc[len + n] = 0
-    llvm::Value* tailIdx = builder.CreateAdd(lenPhi, n, "rte.tailidx");
-    llvm::Value* tail = builder.CreateGEP(i8Ty, acc1, tailIdx, "rte.tail");
-    builder.CreateStore(llvm::ConstantInt::get(i8Ty, 0), tail);
-    accPhi->addIncoming(acc1, bodyBB);
-    lenPhi->addIncoming(tailIdx, bodyBB);
-    builder.CreateBr(loopBB);
-    builder.SetInsertPoint(endBB);
-    // The string: {data, len, width=1, rc=1}.
-    uint64_t strBytes = module->getDataLayout().getTypeAllocSize(stringTy);
-    llvm::Value* strObj =
-        builder.CreateCall(mallocFn, {builder.getInt64(strBytes)}, "rte.obj");
-    builder.CreateStore(accPhi, builder.CreateStructGEP(stringTy, strObj, 0));
-    builder.CreateStore(lenPhi, builder.CreateStructGEP(stringTy, strObj, 1));
-    builder.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
-                        builder.CreateStructGEP(stringTy, strObj, 2));
-    // #422: the producer's reference, rc := 1.
-    builder.CreateStore(builder.getInt64(1),
-                        builder.CreateStructGEP(stringTy, strObj, 3));
-    // fix #8592 (§28.9 / §28.11, v0.357): and the report of the new string
-    // every producer makes (see Emitter::initStringRc).
-    llvm::Function* bornFn = module->getFunction("bz_string_born");
-    if (!bornFn) {
-        auto* ft3 = llvm::FunctionType::get(llvm::Type::getVoidTy(llvmCtx),
-                                            {ptrT}, false);
-        bornFn = llvm::Function::Create(
-            ft3, llvm::GlobalValue::ExternalLinkage, "bz_string_born", module);
-    }
-    builder.CreateCall(bornFn, {strObj});
-    return strObj;
+    return builder.CreateCall(fn, {}, "rte.result");
 }
 
 }  // namespace
