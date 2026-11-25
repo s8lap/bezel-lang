@@ -13782,8 +13782,53 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 !calleeTy->funcReturn->nullable) {
                 llvm::AllocaInst* ccResSlot = pendingChainCallLocalSlot_;
                 if (!ccResSlot) {
-                    ccResSlot = builder_.CreateAlloca(
-                        ccRes->getType(), nullptr, "ccres.slot");
+                    // fix #9141 (§28.3.11 *Unbound owned temporaries*, §30.1
+                    // *`async` methods*, §30.2 / §30.13, v0.359): in an ASYNC
+                    // body the slot must be an ENTRY-BLOCK alloca, heap-spilled
+                    // into the frame, exactly like the other anonymous
+                    // cross-suspend temporaries (the #5292 wrap slot, the
+                    // #2754 FFI temp).
+                    //
+                    // THE DEFECT (issue #9141). `builder_.CreateAlloca` puts the
+                    // alloca at the CURRENT insertion point — inside the state
+                    // block the chain call lowers into. The scope-end disposal
+                    // §28.3.11 registers for this temporary is emitted at the
+                    // END of the method body, which in an `async` body is a LATER
+                    // state block (the one the `await` resumes into), and the
+                    // alloca does not dominate it: MEASURED on r30-c1 @
+                    // 58063e63f, `bezelc` rejects the module with
+                    //
+                    //   Instruction does not dominate all uses!
+                    //     %ccres.slot = alloca ptr, align 8
+                    //     %32 = load ptr, ptr %ccres.slot, align 8
+                    //   bezelc: codegen error: IR verification failed
+                    //
+                    // An ENTRY-block alloca dominates every state block, and
+                    // `asyncHandlerSpillSlots_` promotes it into the frame's
+                    // heap-spill area (`promoteDemotedSlotsToFrame`), so the
+                    // pointer SURVIVES a real cross-thread suspend — a plain
+                    // stack slot would be garbage on the worker's fresh stack
+                    // (the same reason the named locals round-trip through
+                    // `smAllocaToField_`). The spill area is `calloc`'d, so a
+                    // path that reaches the disposal without the store reads
+                    // null and the null-guarded disposal skips.
+                    //
+                    // The SYNCHRONOUS twin is untouched: `builder_.CreateAlloca`
+                    // stays there, so a sync body's IR is byte-identical to the
+                    // base's (the disposal is emitted in a block the current
+                    // alloca dominates, so the sync shape never needed the
+                    // entry-block slot).
+                    const bool inAsyncResumeBody =
+                        smStateStruct_ && asyncResumeFn_ &&
+                        currentFn_ == asyncResumeFn_;
+                    if (inAsyncResumeBody) {
+                        ccResSlot = entryAlloca(ccRes->getType());
+                        ccResSlot->setName("ccres.slot");
+                        asyncHandlerSpillSlots_.push_back(ccResSlot);
+                    } else {
+                        ccResSlot = builder_.CreateAlloca(
+                            ccRes->getType(), nullptr, "ccres.slot");
+                    }
                 } else {
                     pendingChainCallLocalSlot_ = nullptr;
                 }
