@@ -1476,7 +1476,30 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // is not disposed under this rule (it would otherwise be
                 // disposed twice)". So the CG60 chain-call arm registers no
                 // §28.3.11 disposal of its own for it.
-                rhs = lowerChainCallHandedOff(as->value.get());
+                //
+                // ONLY when the target IS an owning location. This arm serves
+                // every `localSlot` target, parameters included, and a PLAIN
+                // parameter (`p: W`) is a borrow of the caller's value: it
+                // disposes nothing, so a store into it is not a transfer into
+                // an owning location and the CG60 registration stays the
+                // value's only disposal (handing it off there leaked it on
+                // every call). A `var` local disposes what it holds at its
+                // scope end, and so does an `owned` parameter (§28.3: the
+                // callee owns it); a `ref` / `out` parameter writes the
+                // caller's slot and keeps the arm's own disposal, as before.
+                bool assignTargetOwns = false;
+                if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->target.get())) {
+                    sema::Symbol* tsym = ctx_.exprSymbol(*tid);
+                    if (dynamic_cast<sema::LocalSymbol*>(tsym))
+                        assignTargetOwns = true;
+                    else if (auto* tps =
+                                 dynamic_cast<sema::ParameterSymbol*>(tsym))
+                        assignTargetOwns = tps->modifier == "owned";
+                }
+                rhs = assignTargetOwns
+                          ? lowerChainCallHandedOff(as->value.get())
+                          : lowerExpr(*as->value);
                 rhs = rescueUnitAssignRhs(rhs, *as);
                 // fix #2961 (§28.9/§28.3, v0.240): the `:=` arms of lowerStmt
                 // bailed silently on a null RHS — no diagnostic of any severity.
@@ -1596,9 +1619,23 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // twice)", so the location's owner disposes it exactly once
                 // and the CG60 chain-call arm registers no §28.3.11 disposal
                 // of its own for it. (A non-`owned` field is rejected by the
-                // ownership pass before codegen runs, so the target here is
-                // always an owning location.)
-                rhs = lowerChainCallHandedOff(as->value.get());
+                // ownership pass before codegen runs.)
+                //
+                // NOT through a plain `ref` / `out` PARAMETER, which also
+                // reaches this fallback: it aliases the caller's binding, and
+                // the caller does not dispose what a callee stores there, so
+                // the CG60 registration stays that value's only disposal (an
+                // `out owned` parameter does hand the value to its caller).
+                bool fallbackTargetOwns = true;
+                if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->target.get()))
+                    if (auto* tps = dynamic_cast<sema::ParameterSymbol*>(
+                            ctx_.exprSymbol(*tid)))
+                        fallbackTargetOwns = tps->modifier == "owned" ||
+                                             tps->modifier == "out owned";
+                rhs = fallbackTargetOwns
+                          ? lowerChainCallHandedOff(as->value.get())
+                          : lowerExpr(*as->value);
                 rhs = rescueUnitAssignRhs(rhs, *as);
                 // fix #2961 — same Warning the localSlot arm emits above; the
                 // generic lvalueAddr fallback covers every non-local-slot
@@ -3582,7 +3619,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // callee hands the value to its caller (the plain-call twin
                 // `return Make();` over an `owned`-returning method does
                 // exactly this), and the caller's own regime disposes it once.
-                v = lowerChainCallHandedOff(rs->value.get());
+                //
+                // ONLY into an OWNING return slot: a function in
+                // `borrowReturnFns_` (a method or lambda whose declared return
+                // is a plain class/interface type) hands its caller a BORROW
+                // the caller never disposes, so there the CG60 registration
+                // stays the value's only disposal.
+                v = borrowReturnFns_.count(builder_.GetInsertBlock()->getParent())
+                        ? lowerExpr(*rs->value)
+                        : lowerChainCallHandedOff(rs->value.get());
                 returnedRecordStringArgsToRetain_ = std::move(savedArgs);
                 recordLocalStringHolderSink_ = savedSink;
                 // The two-statement spelling: `var e := new E(f[0], n); …

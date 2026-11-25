@@ -3111,7 +3111,17 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             // block-bodied `return e;` transfers it into the return slot. The
             // CG60 chain-call arm registers no §28.3.11 disposal of its own for
             // it.
-            llvm::Value* v = lowerChainCallHandedOff(lam.exprBody.get());
+            //
+            // ONLY for a VALUE-completing task (`resultTy` non-null). A
+            // no-value `Task` (`async lambda() => C.Make()();` at a
+            // `() -> Task` slot) "ignores the value and completes with no
+            // result" (the completion below passes null), so the task never
+            // owns the value: it is §28.3.11's unbound temporary, and the CG60
+            // registration is its only disposal. Handing it off there leaked
+            // it on every await.
+            llvm::Value* v = resultTy
+                                 ? lowerChainCallHandedOff(lam.exprBody.get())
+                                 : lowerExpr(*lam.exprBody);
             // fix #3960: read-and-reset, exactly like lowerReturnStmt's
             // block-body twin (LlvmBackend_Stmts.cpp) — lowerAwait has now
             // consumed the flag (if set) to suppress the source task's free;

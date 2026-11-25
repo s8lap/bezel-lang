@@ -1659,6 +1659,26 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             }
         }
     }
+    // fix #9138 (§28.3.11 *Unbound owned temporaries*, §27.3, §28.3, v0.359):
+    // does an EXPRESSION body hand its value to the caller as an OWNED
+    // result? Read off the SLOT the lambda is typed at (the expected function
+    // type, else the lambda's own type), not off `retTy`:
+    //   * at a procedure slot (`var f: () -> () := lambda() => C.Make()();`)
+    //     the lambda is §27.3's result-discarding procedure lambda — its
+    //     closure still has the BODY's type here, but no caller ever receives
+    //     the value;
+    //   * at a non-`owned` slot (an untyped `lambda() => C.Make()()` is typed
+    //     `() -> W`) the caller receives a BORROW and never disposes it.
+    // In both the body's chain-call result is §28.3.11's unbound temporary
+    // and the CG60 registration is its only disposal; only an OWNED return
+    // may be handed off (see the expression-body lowering below).
+    const sema::TypeRef* lamSlotFnTy =
+        (expectedFunctionType_ &&
+         expectedFunctionType_->kind == sema::TypeRef::Kind::Function)
+            ? expectedFunctionType_
+            : ctx_.exprType(lam);
+    const bool exprBodyValueReturnsOwned =
+        functionTypeReturnsOwned(lamSlotFnTy);
     // If return type is still i32 (unresolved generic), try the expected
     // function type's return type (from the call site context).
     if (retTy == i32() && expectedFunctionType_ &&
@@ -4317,6 +4337,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         retRcSemaTy = minted;
     const sema::TypeRef* savedLambdaRetSemaTy = currentLambdaReturnSemaTy_;
     currentLambdaReturnSemaTy_ = retRcSemaTy;
+    // fix #9138: a BLOCK body's `return` hands off by the same slot test as
+    // the expression body (`exprBodyValueReturnsOwned` above).
+    if (!exprBodyValueReturnsOwned) borrowReturnFns_.insert(fn);
     currentReturnTypeNode_ = nullptr;
     locals_.clear();
     paramSlots_.clear();
@@ -5461,7 +5484,19 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // face (LlvmBackend_Stmts.cpp's ReturnStmt arm). A chain-call result
         // the body RETURNS is transferred into the return slot, so the CG60
         // arm registers no §28.3.11 disposal of its own for it.
-        if (!v) v = lowerChainCallHandedOff(lam.exprBody.get());
+        //
+        // ONLY when the body's value is RETURNED OWNED
+        // (`exprBodyValueReturnsOwned` above). A UNIT lambda (`retTy` is
+        // void, or a `() -> ()` slot) returns nothing, and a lambda at a
+        // non-`owned` slot returns a borrow its caller never disposes; in
+        // both the result is §28.3.11's unbound temporary ("not bound to any
+        // name, not `move`d, and not returned" to an owner) and the CG60
+        // registration is its only disposal. Handing it off there leaked it
+        // on every call.
+        if (!v)
+            v = (retTy->isVoidTy() || !exprBodyValueReturnsOwned)
+                    ? lowerExpr(*lam.exprBody)
+                    : lowerChainCallHandedOff(lam.exprBody.get());
         if (!terminatorOrNull(builder_.GetInsertBlock())) {
             if (v && !retTy->isVoidTy()) {
                 // fix #541 / §7.1: when the lambda's expected return type is a

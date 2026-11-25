@@ -11230,6 +11230,18 @@ llvm::Value* Emitter::lowerChainCallHandedOff(const ast::Expr* e) {
     return v;
 }
 
+bool Emitter::functionTypeReturnsOwned(const sema::TypeRef* fnTy) {
+    if (!fnTy || fnTy->kind != sema::TypeRef::Kind::Function) return false;
+    if (fnTy->funcReturnOwned) return true;
+    if (!fnTy->funcReturn ||
+        fnTy->funcReturn->kind != sema::TypeRef::Kind::Named)
+        return false;
+    const std::string_view head = fnTy->funcReturn->headName();
+    return common::isTaskFamilyHead(head) ||
+           common::isIterableInterfaceHead(head) ||
+           common::isOwningTypeHead(head);
+}
+
 llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     // fix #7600 (§22.5, v0.350): the written-order pre-pass runs BEFORE every

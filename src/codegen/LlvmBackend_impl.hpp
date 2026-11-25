@@ -3791,6 +3791,24 @@ private:
     // §28.3.11 disposal of its own for it. `e` that is not a chain call is
     // lowered unchanged.
     llvm::Value* lowerChainCallHandedOff(const ast::Expr* e);
+    // fix #9138 (§28.3.11, §28.3, v0.359): does a call through the FUNCTION
+    // type `fnTy` hand its caller an OWNED result? The same test the CG60 arm
+    // applies to the chain call's callee (`funcReturnOwned`, or a Task-family /
+    // iterable / owning-type head, whose unmarked type is itself the
+    // announcement). A body face may hand a chain-call result off to its
+    // RETURN only when this holds: otherwise the caller receives a borrow it
+    // never disposes, and the CG60 registration is the value's only disposal.
+    static bool functionTypeReturnsOwned(const sema::TypeRef* fnTy);
+    // fix #9138 (§28.3.11, §28.3, v0.359): the bodies (a method's, a
+    // synchronous lambda's) whose RETURN SLOT is NOT an owning destination —
+    // the declared return is a plain class/interface type, so the caller
+    // receives a BORROW and never disposes it. A `return` in one of these
+    // functions does not hand a chain-call result off: the CG60 registration
+    // stays its only disposal, as before #9138. Keyed by the LLVM function
+    // the `return` is emitted into, so a nested body (a lambda, an async
+    // frame) is judged by its OWN entry, never by its enclosing method's.
+    // Insert-only: an entry names a function, which never changes slot.
+    llvm::SmallPtrSet<const llvm::Function*, 16> borrowReturnFns_;
     // fix #633 / §33.4: when Main(args: Array<string>) is emitted, the args
     // array is built in the function prolog (before any scope opens) and must be
     // disposed at the function-body root scope exit.  This optional Disposal is

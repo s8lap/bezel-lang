@@ -11420,6 +11420,21 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         ~CurrentMethodGuard() { slot = prev; }
     };
     CurrentMethodGuard methodGuard{currentMethod_, ms};
+    // fix #9138 (§28.3.11, §28.3 *Factory methods and sourceless returns*,
+    // v0.359): a method whose declared return does not announce an OWNED
+    // result (no `owned`, and not a Task-family / iterable / owning-type head,
+    // whose unmarked type is itself the announcement) returns a BORROW: its
+    // caller never disposes the result, so a `return` here must not hand a
+    // chain-call result off (`borrowReturnFns_`).
+    if (ms && fn && !sema::methodReturnsOwned(*ms, ctx_)) {
+        const sema::TypeRef* rt = sema::methodReturnResolvedType(*ms, ctx_);
+        const bool headOwns =
+            rt && rt->kind == sema::TypeRef::Kind::Named &&
+            (common::isTaskFamilyHead(rt->headName()) ||
+             common::isIterableInterfaceHead(rt->headName()) ||
+             common::isOwningTypeHead(rt->headName()));
+        if (!headOwns) borrowReturnFns_.insert(fn);
+    }
     // fix #6870 (§14.2 / §11.8, v0.343): the ERASED TEMPLATE's body
     // reads a reference-constrained type parameter as a `ptr` (not as the `int`
     // placeholder) — the same representation declareFunctions gave this
@@ -12255,7 +12270,21 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         // hands its operand off the same way). A chain-call result the arrow
         // body RETURNS is transferred into the return slot, so the CG60 arm
         // registers no §28.3.11 disposal of its own for it.
-        if (!v) v = lowerChainCallHandedOff(ci.exprBody);
+        //
+        // ONLY when the body's value IS returned. A UNIT arrow method
+        // (`method Fire() => C.Make()();`, no declared return type, so `fn`
+        // returns void) returns nothing: `emitReturn` drops the value, the
+        // result is §28.3.11's unbound temporary ("not bound to any name, not
+        // `move`d, and not returned"), and the CG60 registration is its only
+        // disposal. Handing it off there leaked it on every call.
+        //
+        // Nor when the method returns a BORROW (`borrowReturnFns_`, set at
+        // this function's entry): the caller never disposes it, so the CG60
+        // registration stays the value's only disposal.
+        if (!v)
+            v = (fn->getReturnType()->isVoidTy() || borrowReturnFns_.count(fn))
+                    ? lowerExpr(*ci.exprBody)
+                    : lowerChainCallHandedOff(ci.exprBody);
         // CG40 / §17.12: an expression body whose whole expression diverges
         // (`=> throw E`, or any expr that branches to the unwind/propagate
         // target) has already terminated the current block — lowerExpr returns

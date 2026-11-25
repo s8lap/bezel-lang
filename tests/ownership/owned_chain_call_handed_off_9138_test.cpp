@@ -350,3 +350,141 @@ BEZEL_TEST(owned_chain_call_handed_off_9138,
     JitResult r = runAotChecked(unboundProgram());
     expectClean(r, 0, "600\n");
 }
+
+// ---------------------------------------------------------------------------
+// The NOT-handed-off positions (fix-forward of the first #9138 cut).
+//
+// A hand-off is right only where a destination really takes the value. The
+// first cut also handed the result off in four positions where NOTHING takes
+// it, so once the CG60 arm's registration was suppressed nobody disposed the
+// value and every iteration leaked it (MEASURED under LSan on that cut: 200
+// leaked allocations, destructor count 0; the base before it: clean, 200):
+//
+//   * a UNIT expression body — `lambda() => C.Make()();` at a `() -> ()` slot,
+//     a unit arrow method `method Fire() => C.Make()();`, and an async lambda
+//     at a `() -> Task` slot. The body's value is not returned (a unit callable
+//     has no return value; §30.6's no-value `Task` completes with no result),
+//     so it is §28.3.11's unbound temporary: "the result of an
+//     `owned`-returning call … that is not bound to any name, not `move`d, and
+//     not returned … Such a temporary is disposed at the end of the full
+//     expression in which it is produced".
+//   * a `:=` into a PLAIN parameter `p := C.Make()();`. A plain parameter is a
+//     borrow of the caller's value (§28.3); it disposes nothing, so it is not
+//     an owning location and the store is not a transfer into one.
+//
+// `W` counts its destructor runs, so each row checks "exactly once" both ways:
+// no leak (LSan) and the count printed is the number of values produced.
+
+namespace {
+
+const char* kCountingClass =
+    "public class W "
+    "  public static Drops: int := 0; "
+    "  public V: int := 3; "
+    "  destructor "
+    "    W.Drops := W.Drops + 1; "
+    "  end destructor; "
+    "end W; ";
+
+std::string unitLambdaBodyProgram() {
+    return std::string("module M; ") + kCountingClass +
+        "public class C "
+        "  " + kProducer +
+        "  public static method Main(): int "
+        "    var f: () -> () := lambda() => C.Make()(); "
+        "    for var j in 0..<200 do "
+        "      f(); "
+        "    end; "
+        "    Console.WriteLine(W.Drops); "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+}
+
+std::string unitArrowMethodProgram() {
+    return std::string("module M; ") + kCountingClass +
+        "public class C "
+        "  " + kProducer +
+        "  public static method Fire() => C.Make()(); "
+        "  public method Shoot() => C.Make()(); "
+        "  public static method Main(): int "
+        "    var c := new C(); "
+        "    for var j in 0..<200 do "
+        "      C.Fire(); "
+        "      c.Shoot(); "
+        "    end; "
+        "    Console.WriteLine(W.Drops); "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+}
+
+std::string asyncUnitLambdaBodyProgram() {
+    return std::string("module M; ") + kCountingClass +
+        "public class C "
+        "  " + kProducer +
+        "  public static async method Main(): Task<int> "
+        "    var f: () -> Task := async lambda() => C.Make()(); "
+        "    for var j in 0..<200 do "
+        "      await f(); "
+        "    end; "
+        "    Console.WriteLine(W.Drops); "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+}
+
+std::string plainParameterAssignProgram() {
+    return std::string("module M; ") + kCountingClass +
+        "public class C "
+        "  " + kProducer +
+        "  public static method Touch(p: W): int "
+        "    p := C.Make()(); "
+        "    return p.V; "
+        "  end Touch; "
+        "  public static method Main(): int "
+        "    var t := 0; "
+        "    var k := new W(); "
+        "    for var j in 0..<200 do "
+        "      t := t + C.Touch(k); "
+        "    end; "
+        "    Console.WriteLine(t); "
+        "    Console.WriteLine(W.Drops); "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+}
+
+}  // namespace
+
+// RED on the first cut (200 leaked allocations, count 0): the lambda's unit
+// body handed its value off as "returned", and the lambda then dropped it.
+BEZEL_TEST(owned_chain_call_not_handed_off_9138,
+           unit_lambda_expression_body_result_is_disposed_exactly_once) {
+    JitResult r = runAotChecked(unitLambdaBodyProgram());
+    expectClean(r, 0, "200\n");
+}
+
+// RED on the first cut (400 leaked allocations, count 0): the static and the
+// instance unit arrow method each handed the value off as "returned".
+BEZEL_TEST(owned_chain_call_not_handed_off_9138,
+           unit_arrow_method_body_result_is_disposed_exactly_once) {
+    JitResult r = runAotChecked(unitArrowMethodProgram());
+    expectClean(r, 0, "400\n");
+}
+
+// RED on the first cut (200 leaked allocations, count 0): a no-value `Task`
+// completes with no result, so the async body's value is not the task's.
+BEZEL_TEST(owned_chain_call_not_handed_off_9138,
+           async_unit_lambda_expression_body_result_is_disposed_exactly_once) {
+    JitResult r = runAotChecked(asyncUnitLambdaBodyProgram());
+    expectClean(r, 0, "200\n");
+}
+
+// RED on the first cut (200 leaked allocations, count 0): the `:=` arm
+// handed the value off to a plain parameter, which disposes nothing.
+BEZEL_TEST(owned_chain_call_not_handed_off_9138,
+           plain_parameter_assign_result_is_disposed_exactly_once) {
+    JitResult r = runAotChecked(plainParameterAssignProgram());
+    expectClean(r, 0, "600\n200\n");
+}

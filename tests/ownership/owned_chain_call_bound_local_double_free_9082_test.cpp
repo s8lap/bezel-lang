@@ -72,10 +72,12 @@
 // THE FIX (src/codegen/LlvmBackend_Calls2.cpp). The CG60 chain-call arm
 // registers no scope-end disposal for a result that is BOUND to a local: the
 // local's own regime (§28.3.10) is the single disposer. `lowerLocalDecl`
-// tells the arm which call is the initializer (`chainCallResultBoundToLocal_`),
-// captured at `lowerCallDispatch`'s entry so that only the OUTERMOST call of
-// the initializer sees it — a chain call nested in an ARGUMENT position is not
-// bound to a local and keeps §28.3.11's temporary disposal.
+// tells the arm which call is the initializer by arming
+// `chainCallResultHandedOff_` with that CALL NODE (#9138 generalised #9082's
+// boolean to the node, shared with the other hand-off positions), so only the
+// initializer's own chain call is handed off — a chain call nested in an
+// ARGUMENT position is a different node, is not bound to a local, and keeps
+// §28.3.11's temporary disposal.
 //
 // ORACLE. `runAotChecked` — the checked AOT path with the AddressSanitizer
 // over the GENERATED module and LeakSanitizer at exit. The rows LOOP (200
