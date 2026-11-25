@@ -524,6 +524,20 @@ static void bz_timer_ensure() {
     g_timer = t;
 }
 
+// fix #9055 (stdlib §6.3, v0.359): run `cb` on the timer thread once `ms`
+// milliseconds have passed (immediately at shutdown, like every timer entry).
+// The Semaphore's TryAcquireAsync(timeout) parks its waiter on the semaphore
+// and arms this for the timeout, instead of holding a pool worker in
+// sem_timedwait (bezel_runtime_sync.cpp).
+void bz_timer_schedule_after(int64_t ms, std::function<void()> cb) {
+    if (!g_scheduler) bz_scheduler_init(4);
+    bz_timer_ensure();
+    if (ms < 0) ms = 0;
+    g_timer->schedule(std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(ms),
+                      std::move(cb));
+}
+
 // ---------------------------------------------------------------------------
 // domain_drain — drains one domain's queue on a pool worker (§30.13 / #618)
 // ---------------------------------------------------------------------------

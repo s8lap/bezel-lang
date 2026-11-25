@@ -843,5 +843,6 @@ void  bz_ctoken_unregister(bz_cancel_state_t* s, int64_t tok); // concurrency
 std::mutex& bz_sub_live_mutex();                             // events
 std::unordered_set<void*>& bz_sub_live_set();                // events
 void* bz_task_make_oce(void* oce_vtable);                    // concurrency
+void  bz_timer_schedule_after(int64_t ms, std::function<void()> cb); // concurrency (#9055)
 
 #endif // BEZEL_RUNTIME_INTERNAL_HPP

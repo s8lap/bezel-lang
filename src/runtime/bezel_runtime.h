@@ -2688,8 +2688,8 @@ void* bz_mutex_try_acquire_async(void* mutex, int64_t timeout_ms,
 //   §28.2).  Called by SemaphoreToken's disposer (scope exit / Dispose()).
 //   Frees the bz_semaphore_token_t and drops its core ref.
 // bz_semaphore_dispose(sem) — dispose the Semaphore object (idempotent),
-//   drops the Semaphore's own core ref.  sem_t destroyed only when all tokens
-//   are also released (via semaphore_core_release → core_refs → 0).
+//   drops the Semaphore's own core ref.  The core is destroyed only when all
+//   tokens and waiters are also released (semaphore_core_release → 0).
 // ---------------------------------------------------------------------------
 void* bz_semaphore_new(int initial_count, int max_count);
 void* bz_semaphore_acquire(void* sem);
@@ -2709,9 +2709,11 @@ void  bz_semaphore_dispose(void* sem);
 //   Returns bz_task_t* whose result is bz_semaphore_token_t* (success)
 //   or null (timeout).
 //
-// Design mirrors bz_mutex_acquire_async (§6.2 / v0.139): uncontended fast
-// path via sem_trywait; contended path submits a pool worker that blocks on
-// sem_wait / sem_timedwait; cancellation pre-checked before pool submission.
+// Design (fix #9055, stdlib §6.3, v0.359): a free permit completes the task
+// at once; otherwise the acquisition parks a waiter on the semaphore (no
+// thread blocks) and a token disposal hands it the permit; TryAcquireAsync's
+// timeout is a timer entry. Cancellation is checked before parking and when
+// a permit reaches the waiter (bezel_runtime_sync.cpp).
 // ---------------------------------------------------------------------------
 void* bz_semaphore_acquire_async(void* sem, void* token, void* oce_vtable);
 void* bz_semaphore_try_acquire_async(void* sem, int64_t timeout_ms,

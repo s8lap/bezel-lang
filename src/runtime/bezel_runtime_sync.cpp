@@ -487,46 +487,90 @@ void* bz_mutex_try_acquire_async(void* mp, int64_t timeout_ms,
 // ---------------------------------------------------------------------------
 // Semaphore and SemaphoreToken runtime (stdlib §6.3, issue #647)
 //
-// bz_semaphore_t — a POSIX counting semaphore with a refcounted core.
+// bz_semaphore_core_t — a counting semaphore (a permit count and a FIFO of
+// waiting acquisitions under one std::mutex) with a refcounted core.
 //
 // Lifetime via reference counting (mirrors bz_mutex_t / fix #634):
 //
-//   Every holder that can dereference a bz_semaphore_t* acquires +1 on
-//   core_refs and releases -1 when done; the last release (core_refs → 0)
-//   destroys the sem_t and deletes the struct.
+//   Every holder that can dereference the core acquires +1 on core_refs and
+//   releases -1 when done; the last release (core_refs → 0) deletes it.
 //
 //   Holders and their acquire / release sites:
 //     - Semaphore object: bz_semaphore_new acquires +1 (starts at 1);
 //       bz_semaphore_dispose releases -1 after marking disposed.
-//     - SemaphoreToken handle: bz_semaphore_acquire / bz_semaphore_try_acquire
-//       acquires +1; bz_semaphore_token_release releases -1 after posting.
+//     - SemaphoreToken handle: every successful acquisition acquires +1;
+//       bz_semaphore_token_release releases -1 after returning the permit.
+//     - a parked async waiter holds +1 until it is granted (the reference
+//       then becomes its token's) or withdrawn; a TryAcquireAsync timeout
+//       timer entry holds its own +1 until it has fired.
 //
 //   This prevents bz_semaphore_dispose from destroying the core while live
-//   SemaphoreToken handles still hold a bz_semaphore_t* (UAF-safe: Token
+//   SemaphoreToken handles or waiters still hold it (UAF-safe: Token
 //   outliving Semaphore is safe).
 //
 // bz_semaphore_token_t — the owned guard returned by Acquire / TryAcquire.
-//   Holds a borrowed pointer to bz_semaphore_t (core ref) and an idempotent
+//   Holds a borrowed pointer to the core (core ref) and an idempotent
 //   released flag (§28.2 exactly-once release).
 //
-// Async acquire design (mirrors bz_mutex_acquire_async exactly):
-//   Uncontended fast path — sem_trywait succeeds → already-done task.
-//   Contended / positive-timeout path — pool worker calls sem_timedwait;
-//     when the semaphore is posted the worker allocates the token and
-//     calls bz_task_complete.  Cancellation: pre-checked; if cancelled
-//     while the pool worker is blocking, the worker detects it after
-//     sem_timedwait returns (either the timed wait expired or the OS
-//     woke it up on a sem_post from the holder's token release) and faults
-//     the task with OCE.
+// Waiting (fix #9055, stdlib §6.3 "Permits", v0.359: "An acquisition
+// attempted while no permit remains waits — `Acquire`/`AcquireAsync` until
+// one is returned, `TryAcquire`/`TryAcquireAsync` until then or until the
+// timeout, whichever comes first"):
+//
+//   An acquisition that finds no permit appends a waiter to the core's FIFO,
+//   and returning a permit (disposing a token) HANDS it to the oldest waiter
+//   instead of banking it, so a permit is never banked while anyone waits
+//   (invariant: permits > 0 implies the FIFO is empty). The waiter kinds:
+//     - AcquireAsync / TryAcquireAsync: the waiter is a PARKED record that
+//       carries the pending task; the hand-off completes the task with a new
+//       token, which resumes the awaiting continuation in its own domain.
+//       No thread waits. (Before #9055 each such acquisition held one of the
+//       scheduler's four pool workers blocked in sem_wait, so four waiters
+//       starved every other continuation in the program — the holder's
+//       `Task.Delay` included — and nothing ever returned the permit.)
+//       TryAcquireAsync's timeout is a timer entry (bz_timer_schedule_after)
+//       that withdraws a still-waiting record and completes it with null.
+//     - Acquire / TryAcquire(timeout): legal only where a thread may block
+//       (outside a domain, or when a permit is free — the §30.12 would-park
+//       guard in codegen, emitGuardedBlockingAcquire, probes with
+//       TryAcquire(0) inside a domain); the calling thread waits on the
+//       core's condition variable for its stack-allocated waiter's grant.
+//   No order among waiters is specified (stdlib §6.3); FIFO is this
+//   implementation's choice.
+//
+//   Cancellation (§6.2's contract, which §6.3 adopts): a token cancelled
+//   before the call faults the task at once. A parked waiter's token is
+//   checked when a permit reaches it: a cancelled waiter is faulted with
+//   OperationCanceledException and the permit passes on to the next waiter
+//   (or is banked), so a cancelled acquisition never holds the permit — the
+//   same observation point the pre-#9055 pool worker had (after its
+//   sem_wait returned).
 // ---------------------------------------------------------------------------
 
 struct bz_semaphore_t;
+struct bz_semaphore_core_t;
+
+// fix #9055: one acquisition waiting in a core's FIFO. Blocking acquisitions
+// use a stack instance (only `state` is read); async ones a heap record.
+struct bz_sem_waiter_t {
+    // 0 = waiting (in the FIFO), 1 = granted a permit, 2 = left the FIFO with
+    // no permit (cancelled at the hand-off, or withdrawn by its timeout).
+    // Guarded by the core's mtx.
+    int                 state = 0;
+    bool                is_async = false;
+    // Async waiters only.
+    bz_task_t*          task = nullptr;        // the pending acquisition task
+    bz_cancel_state_t*  cs = nullptr;          // retained token state (null = None)
+    void*               oce_vtable = nullptr;  // OperationCanceledException vtable
+    // The FIFO's reference, plus the timeout timer entry's for TryAcquireAsync.
+    std::atomic<int>    refs{1};
+};
 
 // fix #8000 (§12.7 / §8.2, v0.355): the #6776 Mutex split. The refcounted
 // core (below) keeps every field the semaphore had; the Semaphore OBJECT is
 // now a separate calloc'd handle that opens with its runtime type tag
 // (bz_semaphore_vtable, bezel_runtime_refcounting.cpp), so `o is Semaphore`
-// at an `Object` carrier is answered. Tokens and pool workers hold the CORE,
+// at an `Object` carrier is answered. Tokens and waiters hold the CORE,
 // never the handle, so either release protocol may free the handle:
 //   - the TYPED path (bz_semaphore_dispose): the core owns the handle
 //     (`core->handle`) and frees it with its last reference — the handle
@@ -536,7 +580,12 @@ struct bz_semaphore_t;
 //     core before dropping the Semaphore's reference, and then reclaims the
 //     handle itself.
 struct bz_semaphore_core_t {
-    sem_t                sem;
+    // fix #9055: the permit count and the waiter FIFO, both under `mtx`
+    // (replacing the POSIX sem_t, whose only waiting form blocks a thread).
+    std::mutex                    mtx;
+    std::condition_variable       cv;        // blocking waiters' grant signal
+    int64_t                       permits = 0;
+    std::deque<bz_sem_waiter_t*>  waiters;   // FIFO; permits > 0 ⇒ empty
     std::atomic<int>    core_refs{1};
     // fix #8000: the handle this core was created for, freed with the core's
     // last reference on the typed path; null once the class protocol's
@@ -547,11 +596,10 @@ struct bz_semaphore_core_t {
     // enforced at release time, because no release path can exceed it: a
     // permit is returned ONLY by disposing a SemaphoreToken, and a token
     // exists only because an acquisition consumed a permit, so the count
-    // can never rise above where it started. POSIX sem_post has no upper
-    // bound of its own, but the ceiling is structurally unreachable. The
-    // construction-time ArgumentException guard (codegen LlvmBackend_Exprs2.cpp
-    // — max < 1 or initial > max) is the whole reachable effect of
-    // maxCount. (Stored as int for diagnostics.)
+    // can never rise above where it started. The construction-time
+    // ArgumentException guard (codegen LlvmBackend_Exprs2.cpp — max < 1 or
+    // initial > max) is the whole reachable effect of maxCount. (Stored as
+    // int for diagnostics.)
     int                 maxCount;
 };
 
@@ -591,10 +639,13 @@ static void semaphore_core_ref(bz_semaphore_core_t* s) {
 
 static void semaphore_core_release(bz_semaphore_core_t* s) {
     if (s->core_refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        sem_destroy(&s->sem);
         free(s->handle);   // null once the class protocol reclaimed it (#8000)
         delete s;
     }
+}
+
+static void sem_waiter_release(bz_sem_waiter_t* w) {
+    if (w->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) delete w;
 }
 
 // Internal helper: make an already-done task carrying a void* result.
@@ -626,6 +677,112 @@ static bz_task_t* semaphore_make_faulted_task(void* oce_vtable) {
     return task;
 }
 
+// fix #9055: a pending (not yet done) acquisition task, routed to the
+// caller's domain (fix #713) so its completion resumes the awaiter there.
+static bz_task_t* semaphore_make_pending_task() {
+    if (!g_scheduler) bz_scheduler_init(4);
+    bz_main_domain_get();
+    auto* task = new bz_task_t();
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }
+    return task;
+}
+
+// fix #9055: take a permit if one is free, else park an async waiter for
+// `task` (the caller's pending task) in the FIFO. The waiter takes a core
+// ref and a token-state ref. Returns null when a permit was taken.
+// `timed` gives the waiter a second reference, the timeout timer entry's.
+static bz_sem_waiter_t* semaphore_take_or_park(bz_semaphore_core_t* s,
+                                               bz_task_t* task,
+                                               bz_cancel_state_t* cs,
+                                               void* oce_vtable, bool timed) {
+    std::lock_guard<std::mutex> lk(s->mtx);
+    if (s->permits > 0) {
+        --s->permits;
+        return nullptr;
+    }
+    auto* w = new bz_sem_waiter_t();
+    w->is_async = true;
+    w->task = task;
+    w->cs = cs;
+    w->oce_vtable = oce_vtable;
+    w->refs.store(timed ? 2 : 1, std::memory_order_relaxed);
+    semaphore_core_ref(s);          // the waiter's core ref (→ its token on grant)
+    bz_cancel_state_retain(cs);     // the waiter's token-state ref
+    s->waiters.push_back(w);
+    return w;
+}
+
+// fix #9055: return one permit — hand it to the oldest live waiter, or bank
+// it when none waits. Called with the returning token's core ref still held,
+// so `s` outlives the call. Tasks are completed outside the lock.
+static void semaphore_return_permit(bz_semaphore_core_t* s) {
+    bz_sem_waiter_t* granted = nullptr;   // an async waiter that gets the permit
+    std::vector<bz_sem_waiter_t*> cancelled;
+    {
+        std::lock_guard<std::mutex> lk(s->mtx);
+        for (;;) {
+            if (s->waiters.empty()) { ++s->permits; break; }
+            bz_sem_waiter_t* w = s->waiters.front();
+            s->waiters.pop_front();
+            // §6.2 (adopted by §6.3): a cancelled acquisition never holds the
+            // permit — fault it and offer the permit to the next waiter.
+            // #716: acquire load — synchronizes-with the cancel's release-store.
+            if (w->is_async && w->cs &&
+                w->cs->cancelled.load(std::memory_order_acquire)) {
+                w->state = 2;
+                cancelled.push_back(w);
+                continue;
+            }
+            w->state = 1;
+            if (w->is_async) granted = w;
+            else s->cv.notify_all();   // its thread re-checks `state` under mtx
+            break;
+        }
+    }
+    for (bz_sem_waiter_t* w : cancelled) {
+        bz_cancel_state_release(w->cs);
+        bz_task_complete_error_obj(w->task, bz_task_make_oce(w->oce_vtable));
+        semaphore_core_release(s);     // the waiter's core ref (never the last: see above)
+        sem_waiter_release(w);         // the FIFO's reference
+    }
+    if (granted) {
+        bz_cancel_state_release(granted->cs);
+        // The waiter's core ref transfers to the token.
+        void* tokPtr = semaphore_token_make(s);
+        bz_task_complete(granted->task, &tokPtr, (int64_t)sizeof(void*));
+        sem_waiter_release(granted);   // the FIFO's reference
+    }
+}
+
+// fix #9055: the blocking acquisition (Acquire, TryAcquire with a positive
+// timeout). Waits on the core's condition variable for a permit handed to
+// this thread's stack waiter; `timeout_ms < 0` waits without a bound.
+// Returns true when a permit was taken.
+static bool semaphore_take_blocking(bz_semaphore_core_t* s, int64_t timeout_ms) {
+    std::unique_lock<std::mutex> lk(s->mtx);
+    if (s->permits > 0) {
+        --s->permits;
+        return true;
+    }
+    if (timeout_ms == 0) return false;
+    bz_sem_waiter_t w;              // blocking kind (is_async = false)
+    s->waiters.push_back(&w);
+    auto granted = [&w] { return w.state == 1; };
+    if (timeout_ms < 0) {
+        s->cv.wait(lk, granted);
+        return true;
+    }
+    if (s->cv.wait_until(lk, std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(timeout_ms),
+                         granted))
+        return true;
+    // Timed out still waiting: leave the FIFO (no permit was handed to us).
+    auto it = std::find(s->waiters.begin(), s->waiters.end(), &w);
+    if (it != s->waiters.end()) s->waiters.erase(it);
+    return false;
+}
+
 extern "C" {
 
 // §6.3: Semaphore — allocate a new counting semaphore.  core_refs = 1.
@@ -646,7 +803,7 @@ void* bz_semaphore_new(int initial_count, int max_count) {
     auto* s = new bz_semaphore_core_t();
     s->maxCount = max_count;
     // core_refs = 1 via the in-struct initializer.
-    sem_init(&s->sem, /*pshared=*/0, (unsigned int)initial_count);
+    s->permits = initial_count;
     auto* h = (bz_semaphore_t*)calloc(1, sizeof(bz_semaphore_t));
     if (!h) bz_alloc_fail("Semaphore");
     h->vtable = (void*)bz_semaphore_vtable;  // fix #8000 (§8.2): identity at allocation
@@ -661,9 +818,7 @@ void* bz_semaphore_new(int initial_count, int max_count) {
 // is released.
 void* bz_semaphore_acquire(void* sp) {
     auto* s = ((bz_semaphore_t*)sp)->core;
-    // sem_wait restarts on EINTR.
-    int rc;
-    do { rc = sem_wait(&s->sem); } while (rc == -1 && errno == EINTR);
+    semaphore_take_blocking(s, -1);
     semaphore_core_ref(s);
     auto* tok = semaphore_token_make(s);
     return tok;
@@ -671,41 +826,26 @@ void* bz_semaphore_acquire(void* sp) {
 
 // bz_semaphore_try_acquire — attempt to acquire with a millisecond timeout.
 // Returns an owned bz_semaphore_token_t* on success, or null on timeout.
-// Uses sem_timedwait with CLOCK_REALTIME (per POSIX).
+// A zero / negative timeout tries without waiting.
 void* bz_semaphore_try_acquire(void* sp, int64_t timeout_ms) {
     auto* s = ((bz_semaphore_t*)sp)->core;
-    int rc;
-    if (timeout_ms <= 0) {
-        // Zero / negative timeout: try without waiting.
-        rc = sem_trywait(&s->sem);
-    } else {
-        struct timespec deadline;
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_sec  += timeout_ms / 1000;
-        deadline.tv_nsec += (timeout_ms % 1000) * 1000000LL;
-        if (deadline.tv_nsec >= 1000000000LL) {
-            deadline.tv_sec  += 1;
-            deadline.tv_nsec -= 1000000000LL;
-        }
-        do {
-            rc = sem_timedwait(&s->sem, &deadline);
-        } while (rc == -1 && errno == EINTR);
-    }
-    if (rc != 0) return nullptr;  // timeout or unavailable → null (owned SemaphoreToken?)
+    if (!semaphore_take_blocking(s, timeout_ms <= 0 ? 0 : timeout_ms))
+        return nullptr;  // timeout or unavailable → null (owned SemaphoreToken?)
     semaphore_core_ref(s);
     auto* tok = semaphore_token_make(s);
     return tok;
 }
 
 // bz_semaphore_token_release — release the held permit.  Idempotent per §28.2:
-// the first call posts the semaphore; subsequent calls are no-ops.
+// the first call returns the permit (to the oldest waiter, fix #9055);
+// subsequent calls are no-ops.
 // Called by the SemaphoreToken's disposer (scope exit / explicit Dispose()).
 void bz_semaphore_token_release(void* tokp) {
     if (!tokp) return;
     auto* tok = (bz_semaphore_token_t*)tokp;
     if (!tok->released) {
         tok->released = true;
-        sem_post(&tok->sem->sem);
+        semaphore_return_permit(tok->sem);
     }
     // Release the core ref the Token holds; may destroy the semaphore core if
     // the Semaphore object was already disposed (Token-outlives-Semaphore).
@@ -716,23 +856,24 @@ void bz_semaphore_token_release(void* tokp) {
 
 // fix #8000 (§28.4 / §8.7, v0.355): bz_semtoken_vtable slot 2 — the
 // class-protocol Dispose of a SemaphoreToken held at an `owned … :
-// IDisposable` slot: post the permit and drop the token's core reference like
-// bz_semaphore_token_release, but leave the handle for the caller's reclaim
-// step. Idempotent on `released`, because that protocol dispatches it again
-// before the reclaim.
+// IDisposable` slot: return the permit and drop the token's core reference
+// like bz_semaphore_token_release, but leave the handle for the caller's
+// reclaim step. Idempotent on `released`, because that protocol dispatches it
+// again before the reclaim.
 void bz_semtoken_obj_dispose(void* tokp) {
     if (!tokp) return;
     auto* tok = (bz_semaphore_token_t*)tokp;
     if (tok->released) return;
     tok->released = true;
-    sem_post(&tok->sem->sem);
+    semaphore_return_permit(tok->sem);
     semaphore_core_release(tok->sem);
 }
 
 // §6.3: Semaphore.Dispose — dispose the Semaphore object.  Marks disposed
-// (for idempotency) and releases the Semaphore object's core ref.  The sem_t
-// is destroyed only when the last SemaphoreToken is also released (via
-// semaphore_core_release → core_refs → 0).  Idempotent: second call is no-op.
+// (for idempotency) and releases the Semaphore object's core ref.  The core
+// is destroyed only when the last SemaphoreToken (and waiter) is also
+// released (via semaphore_core_release → core_refs → 0).  Idempotent: second
+// call is no-op.
 // fix #706: exchange(true) is atomic — concurrent Dispose from two domains
 // cannot both proceed to semaphore_core_release.
 void bz_semaphore_dispose(void* sp) {
@@ -758,13 +899,10 @@ void bz_semaphore_obj_dispose(void* sp) {
 // ---------------------------------------------------------------------------
 // §6.3 async variants (issue #647, v0.140): AcquireAsync / TryAcquireAsync.
 //
-// Design: mirrors bz_mutex_acquire_async / bz_mutex_try_acquire_async exactly.
-// Fast path: sem_trywait succeeds → already-done task (no pool worker).
-// Slow/contended path: pool worker calls sem_wait / sem_timedwait blocking;
-//   on success allocates a token and calls bz_task_complete.  Cancellation:
-//   pre-checked before pool submission; if already cancelled → fault immediately.
-//   Post-acquire cancel: worker checks the token post-sem_wait and posts back
-//   before faulting (the semaphore was only briefly held by the pool worker).
+// fix #9055 (stdlib §6.3, v0.359): a free permit completes the task at once;
+// otherwise the acquisition PARKS a waiter in the core's FIFO and a later
+// token disposal hands it the permit (semaphore_return_permit). See the
+// section header for the waiting and cancellation design.
 // ---------------------------------------------------------------------------
 
 // bz_semaphore_acquire_async — per §6.3 / #647.
@@ -779,49 +917,15 @@ void* bz_semaphore_acquire_async(void* sp, void* token, void* oce_vtable) {
         return semaphore_make_faulted_task(oce_vtable);
     }
 
-    // Uncontended fast path: try without blocking.
-    int rc = sem_trywait(&s->sem);
-    if (rc == 0) {
+    // The task exists before the waiter is visible in the FIFO: a token
+    // disposal on another thread may complete it as soon as it is parked.
+    bz_task_t* task = semaphore_make_pending_task();
+    if (!semaphore_take_or_park(s, task, cs, oce_vtable, /*timed=*/false)) {
+        // A permit was free: complete now (await's already-done fast path).
         semaphore_core_ref(s);
-        auto* tok = semaphore_token_make(s);
-        return semaphore_make_done_task(tok);
-    }
-
-    // Contended path: submit a pool worker.
-    if (!g_scheduler) bz_scheduler_init(4);
-    bz_main_domain_get();
-    auto* task = new bz_task_t();
-    // fix #713: route to the caller's domain.
-    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
-      task->domain = d; domain_ref(d); }
-
-    // Worker holds a core ref so the semaphore core cannot be destroyed while
-    // the pool thread is blocking inside sem_wait.
-    semaphore_core_ref(s);
-
-    // Retain the token pointer for the pool worker (mirrors bz_mutex_acquire_async).
-    bz_cancel_state_retain(cs);
-
-    g_scheduler->submit([task, s, cs, oce_vtable]() {
-        int rc2;
-        do { rc2 = sem_wait(&s->sem); } while (rc2 == -1 && errno == EINTR);
-        // Check cancel AFTER acquiring (the brief hold is released if cancelled).
-        // #716: acquire load — synchronizes-with release-store in bz_cts_cancel.
-        if (cs && cs->cancelled.load(std::memory_order_acquire)) {
-            sem_post(&s->sem);              // give the permit back
-            semaphore_core_release(s);       // release the worker's extra core ref
-            bz_cancel_state_release(cs);
-            void* excObj = bz_task_make_oce(oce_vtable);
-            bz_task_complete_error_obj(task, excObj);
-            return;
-        }
-        bz_cancel_state_release(cs);
-        // Acquire succeeded and not cancelled: build a token.
-        // The core ref the worker held is transferred to the new bz_semaphore_token_t.
-        auto* tok = semaphore_token_make(s);
-        void* tokPtr = tok;
+        void* tokPtr = semaphore_token_make(s);
         bz_task_complete(task, &tokPtr, (int64_t)sizeof(void*));
-    });
+    }
     return task;
 }
 
@@ -839,76 +943,53 @@ void* bz_semaphore_try_acquire_async(void* sp, int64_t timeout_ms,
         return semaphore_make_faulted_task(oce_vtable);
     }
 
-    // Uncontended fast path (zero timeout also uses trywait).
-    int rc = sem_trywait(&s->sem);
-    if (rc == 0) {
-        semaphore_core_ref(s);
-        auto* tok = semaphore_token_make(s);
-        return semaphore_make_done_task(tok);
-    }
-
-    // If zero/negative timeout: no permits available; return null immediately.
+    // Zero / negative timeout: take a free permit or return null at once.
     if (timeout_ms <= 0) {
-        void* nullPtr = nullptr;
-        bz_main_domain_get();
-        auto* task2 = new bz_task_t();
-        // fix #713: route to the caller's domain.
-        { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
-          task2->domain = d; domain_ref(d); }
-        task2->result = malloc(sizeof(void*));
-        memcpy(task2->result, &nullPtr, sizeof(void*));
-        task2->result_size = (int64_t)sizeof(void*);
-        task2->done = true;
-        return task2;
+        bool took;
+        {   std::lock_guard<std::mutex> lk(s->mtx);
+            took = s->permits > 0;
+            if (took) --s->permits; }
+        void* result = nullptr;
+        if (took) {
+            semaphore_core_ref(s);
+            result = semaphore_token_make(s);
+        }
+        return semaphore_make_done_task(result);
     }
 
-    // Positive timeout + no permits currently available: submit timed blocking.
-    if (!g_scheduler) bz_scheduler_init(4);
-    bz_main_domain_get();
-    auto* task = new bz_task_t();
-    // fix #713: route to the caller's domain.
-    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
-      task->domain = d; domain_ref(d); }
-
-    semaphore_core_ref(s);
-    int64_t tms = timeout_ms;
-    bz_cancel_state_retain(cs);
-
-    g_scheduler->submit([task, s, tms, cs, oce_vtable]() {
-        struct timespec deadline;
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_sec  += tms / 1000;
-        deadline.tv_nsec += (tms % 1000) * 1000000LL;
-        if (deadline.tv_nsec >= 1000000000LL) {
-            deadline.tv_sec  += 1;
-            deadline.tv_nsec -= 1000000000LL;
-        }
-        int rc2;
-        do {
-            rc2 = sem_timedwait(&s->sem, &deadline);
-        } while (rc2 == -1 && errno == EINTR);
-        if (rc2 != 0) {
-            // Timeout → null result.
-            semaphore_core_release(s);
-            bz_cancel_state_release(cs);
-            void* nullPtr = nullptr;
-            bz_task_complete(task, &nullPtr, (int64_t)sizeof(void*));
-            return;
-        }
-        // Acquired: check cancellation post-acquire.
-        // #716: acquire load — synchronizes-with release-store in bz_cts_cancel.
-        if (cs && cs->cancelled.load(std::memory_order_acquire)) {
-            sem_post(&s->sem);
-            semaphore_core_release(s);
-            bz_cancel_state_release(cs);
-            void* excObj = bz_task_make_oce(oce_vtable);
-            bz_task_complete_error_obj(task, excObj);
-            return;
-        }
-        bz_cancel_state_release(cs);
-        auto* tok = semaphore_token_make(s);
-        void* tokPtr = tok;
+    bz_task_t* task = semaphore_make_pending_task();
+    bz_sem_waiter_t* w =
+        semaphore_take_or_park(s, task, cs, oce_vtable, /*timed=*/true);
+    if (!w) {
+        semaphore_core_ref(s);
+        void* tokPtr = semaphore_token_make(s);
         bz_task_complete(task, &tokPtr, (int64_t)sizeof(void*));
+        return task;
+    }
+
+    // Arm the timeout. The timer entry holds its own core ref: the waiter's
+    // core ref moves to its token on a grant, and the token (and with it the
+    // core) may be gone before the timer fires.
+    semaphore_core_ref(s);
+    bz_timer_schedule_after(timeout_ms, [s, w]() {
+        bool withdrawn = false;
+        {   std::lock_guard<std::mutex> lk(s->mtx);
+            if (w->state == 0) {
+                // Still waiting: the timeout came first — leave the FIFO.
+                auto it = std::find(s->waiters.begin(), s->waiters.end(), w);
+                if (it != s->waiters.end()) s->waiters.erase(it);
+                w->state = 2;
+                withdrawn = true;
+            } }
+        if (withdrawn) {
+            bz_cancel_state_release(w->cs);
+            void* nullPtr = nullptr;
+            bz_task_complete(w->task, &nullPtr, (int64_t)sizeof(void*));
+            semaphore_core_release(s);   // the waiter's core ref
+            sem_waiter_release(w);       // the FIFO's reference
+        }
+        sem_waiter_release(w);           // the timer entry's reference
+        semaphore_core_release(s);       // the timer entry's core ref
     });
     return task;
 }
