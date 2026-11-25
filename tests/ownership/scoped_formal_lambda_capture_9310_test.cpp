@@ -428,3 +428,208 @@ BEZEL_TEST(scoped_formal_lambda_capture_9310,
         "  end On; "));
     expectReject(r, kStoredInField);
 }
+
+// ---------------------------------------------------------------------------
+// fix-forward 2 #9310 — the carrier forms the walk did not trace, and the
+// record-component store.
+//
+// §28.3 *Provenance* clause 4 (v0.359): "Invoking a function value yields a
+// value carrying the invoked value's set"; K7: "At every control-flow join —
+// statement merges, `??`, `if` expressions, expression-position `case` arms
+// …", whose meet carries "the union of the arms' source sets (K2.2)" (the
+// `??` operands and an expression-`case`'s arm values are the value's forms,
+// as a conditional's arms are); §28.3 *Function-typed
+// holders*: "a record component … a store of a function value admits a
+// capture-free value and rejects one whose source set is non-empty (… a local
+// carrying either)" — the argument for a component at the generated primary
+// constructor and a `with` assignment to it. §28.14: the callback "may not …
+// store it in any other object". Each row below was ADMITTED on the second
+// commit and died with an AddressSanitizer SEGV in `Counter2$Hit` (the
+// reviewer's probes p02, p19, p33, p13, p14, p35, p10, p36, p34).
+
+namespace {
+std::string fboxRecHub(const std::string& member) {
+    return std::string(kPrelude) +
+           "public class FBox "
+           "  public f: ((double) -> ())? := null; "
+           "  public method Fire(t: double) => f?(t); "
+           "end FBox; "
+           "public record FRec(F: (double) -> ()); "
+           "public class Hub "
+           "  private static owned readonly _keep: FBox := new FBox(); "
+           "  public static method Fire(t: double) => _keep.Fire(t); " +
+           member + "end Hub; " + kDriver;
+}
+
+const char* kStoredInRecord =
+    "so it may not be stored in a function-typed record component";
+}  // namespace
+
+// 15 — p19: a MAKER lambda's nested lambda captures the formal (clause 1:
+// "a lambda's captures include the free bindings of every lambda nested in
+// its body"), so `mk()` carries it (clause 4) into the static chain.
+BEZEL_TEST(scoped_formal_lambda_capture_9310,
+           invoked_maker_result_into_static_store_rejected_spec_28_14_spec_28_3_clause_4) {
+    auto r = runAot(fboxHub(
+        "  public method On(scoped handler: (double) -> ()) "
+        "    var mk := lambda() => lambda(t: double) => handler(t); "
+        "    _keep.f := mk(); "
+        "  end On; "));
+    expectReject(r, kStoredInField);
+}
+
+// 16 — p33: the invocation's result bound to a local first, then stored.
+BEZEL_TEST(scoped_formal_lambda_capture_9310,
+           invoked_maker_result_local_into_static_store_rejected_spec_28_14_spec_28_3_clause_4) {
+    auto r = runAot(fboxHub(
+        "  public method On(scoped handler: (double) -> ()) "
+        "    var mk := lambda() => lambda(t: double) => handler(t); "
+        "    var g := mk(); "
+        "    _keep.f := g; "
+        "  end On; "));
+    expectReject(r, kStoredInField);
+}
+
+// 17 — p13: the carrier is the `??` right operand.
+BEZEL_TEST(scoped_formal_lambda_capture_9310,
+           coalesce_right_operand_carrier_into_static_store_rejected_spec_28_14_spec_28_3) {
+    auto r = runAot(fboxHub(
+        "  public method On(scoped handler: (double) -> ()) "
+        "    var g: ((double) -> ())? := null; "
+        "    _keep.f := g ?? lambda(t: double) => handler(t); "
+        "  end On; "));
+    expectReject(r, kStoredInField);
+}
+
+// 18 — p14: the `??` value bound to a local, then stored.
+BEZEL_TEST(scoped_formal_lambda_capture_9310,
+           coalesce_carrier_local_into_static_store_rejected_spec_28_14_spec_28_3) {
+    auto r = runAot(fboxHub(
+        "  public method On(scoped handler: (double) -> ()) "
+        "    var g: ((double) -> ())? := null; "
+        "    var f := g ?? lambda(t: double) => handler(t); "
+        "    _keep.f := f; "
+        "  end On; "));
+    expectReject(r, kStoredInField);
+}
+
+// 19 — p35: a carrier LOCAL is the `??` left operand.
+BEZEL_TEST(scoped_formal_lambda_capture_9310,
+           coalesce_left_operand_carrier_local_into_static_store_rejected_spec_28_14_spec_28_3) {
+    auto r = runAot(fboxHub(
+        "  public method On(scoped handler: (double) -> ()) "
+        "    var f: ((double) -> ())? := lambda(t: double) => handler(t); "
+        "    _keep.f := f ?? lambda(t: double) => Console.Write(\"\"); "
+        "  end On; "));
+    expectReject(r, kStoredInField);
+}
+
+// 20 — p36: an expression-`case` arm value carries the formal.
+BEZEL_TEST(scoped_formal_lambda_capture_9310,
+           case_expr_arm_carrier_into_static_store_rejected_spec_28_14_spec_28_3) {
+    auto r = runAot(fboxHub(
+        "  public method On(scoped handler: (double) -> ()) "
+        "    var k := 0; "
+        "    _keep.f := (case k of 0 => lambda(t: double) => handler(t), "
+        "                _ => lambda(t: double) => Console.Write(\"\")); "
+        "  end On; "));
+    expectReject(r, kStoredInField);
+}
+
+// 21 — p10: the expression-`case` value bound to a local, then stored.
+BEZEL_TEST(scoped_formal_lambda_capture_9310,
+           case_expr_arm_carrier_local_into_static_store_rejected_spec_28_14_spec_28_3) {
+    auto r = runAot(fboxHub(
+        "  public method On(scoped handler: (double) -> ()) "
+        "    var k := 0; "
+        "    var f := (case k of 0 => lambda(t: double) => handler(t), "
+        "              _ => lambda(t: double) => Console.Write(\"\")); "
+        "    _keep.f := f; "
+        "  end On; "));
+    expectReject(r, kStoredInField);
+}
+
+// 22 — p02: the closure is the argument for a function-typed record
+// component; `r.F` reads it back with the empty set (clause 5).
+BEZEL_TEST(scoped_formal_lambda_capture_9310,
+           lambda_over_scoped_formal_into_record_component_rejected_spec_28_14_spec_28_3_holders) {
+    auto r = runAot(fboxRecHub(
+        "  public method On(scoped handler: (double) -> ()) "
+        "    var r := new FRec(lambda(t: double) => handler(t)); "
+        "    _keep.f := r.F; "
+        "  end On; "));
+    expectReject(r, kStoredInRecord);
+}
+
+// 23 — p34: a carrier LOCAL as the component argument ("a local carrying
+// either").
+BEZEL_TEST(scoped_formal_lambda_capture_9310,
+           carrier_local_into_record_component_rejected_spec_28_14_spec_28_3_holders) {
+    auto r = runAot(fboxRecHub(
+        "  public method On(scoped handler: (double) -> ()) "
+        "    var f := lambda(t: double) => handler(t); "
+        "    var r := new FRec(f); "
+        "    _keep.f := r.F; "
+        "  end On; "));
+    expectReject(r, kStoredInRecord);
+}
+
+// 24 — the `with` assignment to the component (§28.3 *Function-typed
+// holders*: "a `with` assignment to it").
+BEZEL_TEST(scoped_formal_lambda_capture_9310,
+           lambda_over_scoped_formal_in_record_with_rejected_spec_28_14_spec_28_3_holders) {
+    auto r = runAot(fboxRecHub(
+        "  public method On(scoped handler: (double) -> ()) "
+        "    var r := new FRec(lambda(t: double) => Console.Write(\"\")); "
+        "    var r2 := r with(F := lambda(t: double) => handler(t)); "
+        "    _keep.f := r2.F; "
+        "  end On; "));
+    expectReject(r, kStoredInRecord);
+}
+
+// §28.3 *Function-typed holders* lists "any collection slot", and a function
+// value read from a collection carries the empty set (clause 5); §28.14's
+// call-bounded twin says it outright: "stored into any collection, a local one
+// included". A carrier stored in a LOCAL collection was admitted, and read
+// back out of it (`arr[0]`, a `for`) it reached the static chain (the
+// reviewer's p03, p04, p05; ASan SEGV in `Counter2$Hit`).
+namespace {
+const char* kStoredInLocalCollection =
+    "so it may not be stored into a collection, a local one included";
+}  // namespace
+
+// 25 — p03: a local array literal's element, read back by index.
+BEZEL_TEST(scoped_formal_lambda_capture_9310,
+           lambda_over_scoped_formal_in_local_array_literal_rejected_spec_28_14_spec_28_3_holders) {
+    auto r = runAot(fboxHub(
+        "  public method On(scoped handler: (double) -> ()) "
+        "    var arr: Array<(double) -> ()> := "
+        "      [lambda(t: double) => handler(t)]; "
+        "    _keep.f := arr[0]; "
+        "  end On; "));
+    expectReject(r, kStoredInLocalCollection);
+}
+
+// 26 — p04: `Add` on a LOCAL collection, read back by index.
+BEZEL_TEST(scoped_formal_lambda_capture_9310,
+           lambda_over_scoped_formal_added_to_local_collection_rejected_spec_28_14_spec_28_3_holders) {
+    auto r = runAot(fboxHub(
+        "  public method On(scoped handler: (double) -> ()) "
+        "    var lst := new Array<(double) -> ()>(); "
+        "    lst.Add(lambda(t: double) => handler(t)); "
+        "    _keep.f := lst[0]; "
+        "  end On; "));
+    expectReject(r, kStoredInLocalCollection);
+}
+
+// 27 — p05: a `for` over a literal holding the carrier.
+BEZEL_TEST(scoped_formal_lambda_capture_9310,
+           for_over_literal_holding_lambda_over_scoped_formal_rejected_spec_28_14_spec_28_3_holders) {
+    auto r = runAot(fboxHub(
+        "  public method On(scoped handler: (double) -> ()) "
+        "    for var g in [lambda(t: double) => handler(t)] do "
+        "      _keep.f := g; "
+        "    end; "
+        "  end On; "));
+    expectReject(r, kStoredInLocalCollection);
+}

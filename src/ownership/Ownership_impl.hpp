@@ -8324,8 +8324,9 @@ private:
     // bind the parameter ("may not return it, move it into non-`scoped`
     // storage, or store it in any other object") bind the closure too.
     // `scopedCarrierSource` answers "does `e` carry a scoped formal?" (a
-    // lambda literal capturing one, a conditional / `!` / collection literal
-    // over such a value, or a local bound from one); `scopedCarrierEscape`
+    // lambda literal capturing one, a conditional / `??` / expression-`case`
+    // / `!` over such a value, an invocation of one, or
+    // a local bound from one); `scopedCarrierEscape`
     // reports a carrier at a sink (return); `scopedCarrierAtCallArg` judges a
     // carrier handed to a call argument position. Syntactic, like the rest of
     // the callee walk.
@@ -8360,6 +8361,17 @@ private:
     void scopedCarrierFinish();
     bool scopedCarrierSourceIn(const ast::Expr& e, std::string_view& nameOut,
                                std::unordered_set<const ast::Expr*>& visited);
+    // fix-forward #9310 (§28.3 *Function-typed holders*, §28.14, v0.359): a
+    // carrier stored into a function-typed record component — a generated
+    // primary constructor's argument or a `with` override.
+    void scopedCarrierReportRecordStore(const ast::Expr& value,
+                                        std::string_view formalName);
+    void scopedCarrierWithStore(const ast::WithExpr& we);
+    // fix-forward 2 #9310: a carrier stored into a collection slot not
+    // reachable beyond the call (a collection literal's element, a local
+    // collection's mutator).
+    void scopedCarrierReportCollectionStore(const ast::Expr& value,
+                                            std::string_view formalName);
     // > 0 while the callee walk is inside a lambda BODY: a `return` there
     // returns from the lambda, not from the method.
     int scopedLambdaDepth_ = 0;

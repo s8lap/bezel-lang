@@ -34115,14 +34115,60 @@ bool MethodOwnership::scopedCarrierSourceIn(
                 scopedCarrierSourceIn(*cd->thenValue, nameOut, visited)) ||
                (cd->elseValue &&
                 scopedCarrierSourceIn(*cd->elseValue, nameOut, visited));
+    // fix-forward #9310 (K7, §28.3 closure bullet, v0.359): K7 makes `??`
+    // and expression-position `case` arms control-flow joins exactly as `if`
+    // expressions are ("At every control-flow join — statement merges, `??`,
+    // `if` expressions, expression-position `case` arms, loop back edges"),
+    // and the meet of borrowed arms carries "the union of the arms' source
+    // sets (K2.2)", the union §28.3's closure bullet reads a function value's
+    // set through. So the `??` operands and an expression-`case`'s
+    // expression-bodied arm values are the value's forms exactly as a
+    // conditional's two arms are, and either carrying the formal makes the
+    // whole value a carrier. The scrutinee and guards are reads, never the
+    // value; a block arm is not walked (the #9043 precedent).
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->op != "??") return false;
+        return (be->left && scopedCarrierSourceIn(*be->left, nameOut, visited)) ||
+               (be->right &&
+                scopedCarrierSourceIn(*be->right, nameOut, visited));
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        for (const auto& arm : cx->arms)
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression &&
+                arm.exprBody &&
+                scopedCarrierSourceIn(*arm.exprBody, nameOut, visited))
+                return true;
+        return false;
+    }
+    // fix-forward #9310 (§28.3 *Provenance* clause 4, v0.359): "Invoking a
+    // function value yields a value carrying the invoked value's set" — so
+    // `mk()` over `var mk := lambda() => lambda(t) => handler(t)` carries the
+    // formal `mk` captures (clause 1, the nested lambda's free bindings
+    // included). A METHOD call's callee is no carrier (a method's
+    // function-typed return is capture-free under the sink rule, clause 4),
+    // so only a callee that is itself a carrier — a local, a lambda literal,
+    // a conditional over one — passes its set on. Only a function-typed
+    // result is a value that can hold the callback: `g()` returning `int`
+    // stores no closure.
+    if (dynamic_cast<const ast::CallExpr*>(&e) ||
+        dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        const ast::Expr* callee = nullptr;
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e))
+            callee = ce->callee.get();
+        else
+            callee = static_cast<const ast::NullCondCallExpr&>(e).callee.get();
+        const sema::TypeRef* rt = ctx_.exprType(e);
+        if (!callee || !rt || rt->kind != sema::TypeRef::Kind::Function)
+            return false;
+        return scopedCarrierSourceIn(*callee, nameOut, visited);
+    }
     if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e))
         return pb->operand &&
                scopedCarrierSourceIn(*pb->operand, nameOut, visited);
-    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
-        for (const auto& el : cl->elements)
-            if (el && scopedCarrierSourceIn(*el, nameOut, visited)) return true;
-        return false;
-    }
+    // A collection literal holding a carrier is not itself traced as one: the
+    // element store is the rejected sink (`scopedCalleeWalkExpr`'s collection
+    // literal arm, fix-forward 2 #9310), so the literal reports once wherever
+    // it then flows.
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
         sema::Symbol* sym = ctx_.exprSymbol(*id);
         auto it = sym ? scopedCarrierLocals_.find(sym)
@@ -34246,6 +34292,69 @@ bool MethodOwnership::scopedCarrierEscape(const ast::Expr& e,
     return true;
 }
 
+// fix-forward #9310 (§28.3 *Function-typed holders*, §28.14, v0.359): a
+// carrier of a `scoped` formal stored into a function-typed record component,
+// at the generated primary constructor (`scopedCarrierAtCallArg`) or by a
+// `with` override (`scopedCarrierWithStore`).
+void MethodOwnership::scopedCarrierReportRecordStore(
+    const ast::Expr& value, std::string_view formalName) {
+    report(Severity::Error, value.span.begin,
+           std::string("this closure captures `") + std::string(formalName) +
+               "`, a `scoped` parameter — a closure that captures it carries "
+               "it (§28.3), so it may not be stored in a function-typed "
+               "record component, which reads it back with the empty source "
+               "set: the callback may be stored only in a `scoped` field of "
+               "the bounding object itself (§28.14; §28.3 *Function-typed "
+               "holders*; v0.359)");
+}
+
+// fix-forward 2 #9310 (§28.14, §28.3 *Function-typed holders*, v0.359): a
+// carrier stored into a collection slot that is not reachable beyond the call
+// — a collection literal's element, or a built-in mutator on a local
+// collection. §28.3 lists "any collection slot" among the function-typed
+// holders, and a function value read from a collection carries the empty set
+// (clause 5), so the element would hand the callback past its bound; §28.14
+// states the call-bounded twin outright: "stored into any collection, a local
+// one included".
+void MethodOwnership::scopedCarrierReportCollectionStore(
+    const ast::Expr& value, std::string_view formalName) {
+    report(Severity::Error, value.span.begin,
+           std::string("this closure captures `") + std::string(formalName) +
+               "`, a `scoped` parameter — a closure that captures it carries "
+               "it (§28.3), so it may not be stored into a collection, a "
+               "local one included: a function value read from a collection "
+               "carries the empty source set, and the callback may be stored "
+               "only in a `scoped` field of the bounding object itself "
+               "(§28.14; §28.3 *Function-typed holders*; v0.359)");
+}
+
+// fix-forward #9310: §28.3 *Function-typed holders* names "a `with`
+// assignment to it" (§9.5) beside the construction argument as a record
+// component's store, so a `with` override with a carrier at a function-typed
+// component is the same store. The override list is name-keyed, matched to
+// the component as `checkRecordWithFnComponentStore` matches it.
+void MethodOwnership::scopedCarrierWithStore(const ast::WithExpr& we) {
+    if (!we.source) return;
+    const sema::TypeRef* rt = ctx_.exprType(*we.source);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    const sema::TypeSymbol* ts = rt->declaration;
+    if (ts->kind != ast::TypeDeclKind::Record) return;
+    std::vector<std::pair<std::string_view, const sema::TypeRef*>> positional;
+    std::vector<std::pair<std::string_view, const sema::TypeRef*>> byName;
+    recordStorageComponents(ts, positional, byName);
+    for (const ast::WithExpr::InitAssign& ia : we.assigns) {
+        if (!ia.value) continue;
+        const sema::TypeRef* compTy = nullptr;
+        for (const auto& c : byName)
+            if (c.first == ia.name) { compTy = c.second; break; }
+        if (!compTy || compTy->kind != sema::TypeRef::Kind::Function) continue;
+        std::string_view carried;
+        if (scopedCarrierSource(*ia.value, carried))
+            scopedCarrierReportRecordStore(*ia.value, carried);
+    }
+}
+
 void MethodOwnership::scopedCarrierAtCallArg(
     const ast::Expr& callNode, const ast::Expr* callee, const ast::NewExpr* ne,
     const std::vector<ast::CallArgument>* args, std::size_t argPos,
@@ -34277,6 +34386,26 @@ void MethodOwnership::scopedCarrierAtCallArg(
                        "argument; §28.3; v0.359)");
         return;
     }
+    // fix-forward #9310 (§28.3 *Function-typed holders*, §28.14, v0.359): an
+    // argument for a FUNCTION-TYPED record component at the record's
+    // generated primary constructor is a store into that component — "a
+    // record component … At every function-typed holder … a store of a
+    // function value admits a capture-free value and rejects one whose
+    // source set is non-empty (… a local carrying either)". A closure
+    // carrying a `scoped` formal stored there is the callback "stored in any
+    // other object" (§28.14), and the component reads it back with the empty
+    // set (§28.3 *Provenance* clause 5), so `_keep.f := r.F` would let it
+    // outlive the bound. The same component test `checkRecordFnComponentStore`
+    // applies to a call-bounded capture (`recordCtorArgComponentTypes`, the
+    // generated-primary selection included).
+    if (ne) {
+        std::vector<const sema::TypeRef*> comp =
+            recordCtorArgComponentTypes(*ne);
+        if (argPos < comp.size() && comp[argPos] &&
+            comp[argPos]->kind == sema::TypeRef::Kind::Function)
+            scopedCarrierReportRecordStore(arg, formalName);
+        return;
+    }
     // A built-in collection mutator on a receiver reachable beyond the call
     // stores the closure beyond the call.
     if (!ne && builtinCollectionStoreCallee(callee)) {
@@ -34289,6 +34418,11 @@ void MethodOwnership::scopedCarrierAtCallArg(
                        "carries it (§28.3), so it may not be stored into a "
                        "collection reachable beyond the call (§28.14, "
                        "v0.359)");
+        // fix-forward 2 #9310: a LOCAL collection's slot is a collection
+        // slot too (§28.3 *Function-typed holders*, "any collection slot"),
+        // and its element reads back with the empty set (clause 5).
+        else if (ma && ma->target)
+            scopedCarrierReportCollectionStore(arg, formalName);
     }
 }
 
@@ -34783,16 +34917,27 @@ void MethodOwnership::scopedCalleeWalkExpr(const ast::Expr& e) {
         return;
     }
     if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        scopedCarrierWithStore(*we);  // fix-forward #9310
         if (we->source) scopedCalleeWalkExpr(*we->source);
         for (const auto& ia : we->assigns)
             if (ia.value) scopedCalleeWalkExpr(*ia.value);
         return;
     }
     if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
-        for (const auto& k : cl->keys)
-            if (k) scopedCalleeWalkExpr(*k);
-        for (const auto& el : cl->elements)
-            if (el) scopedCalleeWalkExpr(*el);
+        // fix-forward 2 #9310 (§28.14 / §28.3 *Function-typed holders*,
+        // v0.359): a collection literal's element is a collection slot, and a
+        // carrier stored there is stored "in any other object" — a local
+        // literal included, since the element reads back with the empty set
+        // (§28.3 *Provenance* clause 5), so `arr[0]` or a `for` over it would
+        // hand the callback past its bound.
+        for (const auto* part : {&cl->keys, &cl->elements})
+            for (const auto& el : *part) {
+                if (!el) continue;
+                std::string_view carried;
+                if (scopedCarrierSource(*el, carried))
+                    scopedCarrierReportCollectionStore(*el, carried);
+                scopedCalleeWalkExpr(*el);
+            }
         return;
     }
     if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
