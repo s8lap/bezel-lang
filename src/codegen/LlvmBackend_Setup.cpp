@@ -34328,6 +34328,64 @@ static bool isBuiltinArrayFunctionElementStore(const ast::Expr* callee, size_t i
     return el->kind == sema::TypeRef::Kind::Function;
 }
 
+// fix #9320 (§28.9 / §28.11 / §14.1, v0.359): the GENERIC twin of
+// `isBuiltinArrayFunctionElementStore` above — is argument `ai` of `call` a
+// function value that the callee STORES into a collection slot that TAKES a
+// reference of its own?
+//
+// The DIRECT spelling (`arr.Add(f)` on a built-in `Array<() -> int>`) is the
+// predicate above. The GENERIC spelling is a USER method whose formal is a
+// bare type parameter (the METHOD's own, or the CLASS's own) that the call's
+// instantiation binds to a function type, and whose body stores the formal
+// into an `Array<T>` / `IList<T>` PARAMETER's element slot. At that
+// substitution the slot is the §28.11 *runtime-managed reference* row: the
+// store "stores the reference" — the collection owns a reference of its own
+// and gives it back when the slot goes away — so the callee keeps NOTHING the
+// caller passed and the caller's local must still release its own reference at
+// its scope end.
+//
+// The callee-body walk is the fail-closed one: every other use of the formal
+// answers false, and a declined position stays an ESCAPE (a leak, never an
+// early release).
+static bool isGenericFunctionElementStore(const ast::CallExpr& call,
+                                           std::size_t ai,
+                                           const sema::SemaContext& ctx) {
+    if (ai >= call.args.size() || !call.args[ai].value) return false;
+    if (!call.args[ai].modifier.empty() || !call.args[ai].name.empty())
+        return false;
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(
+        call.callee ? ctx.exprSymbol(*call.callee) : nullptr);
+    if (!ms || ms->isOperator) return false;
+    // An IMPORTED callee's body is not compiled here, so the walk cannot see
+    // it: this declines (the conservative direction — a leak, never an early
+    // release), the same refusal `isCallBoundedClosureArgPosition` makes.
+    if (ctx.isImported(ms)) return false;
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md) return false;
+    // POSITIONAL, exact arity — the only shape in which the syntactic index
+    // is the PARAMETER index (the same discipline
+    // `isCallBoundedClosureArgPosition` uses).
+    if (call.args.size() != md->params.size()) return false;
+    if (ai >= md->params.size()) return false;
+    const ast::Param& p = md->params[ai];
+    if (!p.modifier.empty() || !p.type) return false;
+    if (p.type->kind != ast::TypeKind::Named || !p.type->name ||
+        p.type->name->parts.size() != 1 || p.type->nullable)
+        return false;
+    const std::string_view formalHead = p.type->name->parts.front();
+    // The argument's own type: the substitution's element category. A
+    // function type — the §28.11 runtime-managed-reference row — is the only
+    // one whose slot takes a reference of its own.
+    const sema::TypeRef* at = ctx.exprType(*call.args[ai].value);
+    if (!at || at->kind != sema::TypeRef::Kind::Function || at->nullable)
+        return false;
+    const auto taking =
+        typeParamFunctionTakingCollectionParams(ctx, *ms, formalHead);
+    if (taking.empty()) return false;
+    return calleeBodyUsesFormalOnlyByInvocationOrTakingCollectionStore(
+        ctx, *md, p.name, taking);
+}
+
 // fix #3874 (§4.14/§4.15/§4.16/§8.6/§28.9, v0.294): is argument `i` of a call
 // whose callee is `callee` the `other` argument of `SequenceEqual` on a
 // T-element span receiver — ArraySpan<T>/ReadOnlyArraySpan<T> (§4.15,
@@ -44297,6 +44355,35 @@ struct ClosureEscapeWalker {
                 // conservative escape.
                 if (!safeArg && argIsTarget(c->args[ai].value.get()) &&
                     isBuiltinArrayFunctionElementStore(c->callee.get(), ai, ctx)) {
+                    inReferenceTakingSite_ = true;
+                    storedIntoSharedRefSlot_ = true;
+                }
+                // fix #9320 (§28.9 / §28.11 / §14.1, v0.359): the GENERIC
+                // twin of the relief above. The value is stored into a
+                // collection slot that TAKES a reference of its own, but the
+                // store is inside a USER method's body: the callee's formal
+                // is a bare type parameter that the call's instantiation
+                // binds to a function type, and the callee stores it into an
+                // `Array<T>` / `IList<T>` parameter's element slot (§28.11's
+                // runtime-managed-reference row — the same row the built-in
+                // `Array<Fn>` reads).
+                //
+                // The verdict is the same as the built-in twin's: the value
+                // still ESCAPES the frame (the collection holds it), but the
+                // LOCAL's own reference is still the local's — the collection
+                // co-owns a reference of its own — so the local releases it
+                // at its scope end while its capture cells stay with its env
+                // destructor (the `storedIntoSharedRefSlot_` discipline).
+                //
+                // Without this the argument read as a plain ESCAPE, so the
+                // local's scope-end release was never armed: the callee's
+                // store took the collection's reference, the caller's
+                // reference was stranded, and the closure cell leaked per
+                // call (issue #9320: 12800 B / 200 allocations over 200
+                // iterations of a GENERIC `Array<T>.Add(x)` at T := a
+                // function type).
+                if (!safeArg && argIsTarget(c->args[ai].value.get()) &&
+                    isGenericFunctionElementStore(*c, ai, ctx)) {
                     inReferenceTakingSite_ = true;
                     storedIntoSharedRefSlot_ = true;
                 }

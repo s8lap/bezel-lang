@@ -1030,6 +1030,41 @@ bool calleeBodyUsesFormalOnlyByInvocationInspectionOrTakingFieldStore(
         std::string_view name,
         const std::unordered_set<const void*>& takingFields);
 
+// fix #9320 (§28.9 / §28.11 / §14.1, v0.359): the METHOD-PARAMETER twin of
+// `typeParamFunctionTakingFields`: the callee method's own PARAMETERS whose
+// declared type is `Array<T>` / `IList<T>` with `T` the type parameter the
+// formal is declared at (the METHOD's own, or the CLASS's own).
+//
+// A store of the formal into such a parameter's ELEMENT slot is a §28.11
+// *runtime-managed reference* slot at a function-type substitution — the store
+// "stores the reference", and the collection's free gives it back — so the
+// callee keeps nothing the caller passed and the caller's own reference must
+// still be released at its scope end. `IReadOnlyList<T>` and
+// `FrozenArray<T>` are NOT here: they have no element store to admit (the
+// same exclusion the FIELD spelling makes).
+//
+// Empty when the callee's method or its class declares no such type
+// parameter, or when it declares no such parameter.
+std::unordered_set<const void*> typeParamFunctionTakingCollectionParams(
+        const sema::SemaContext& ctx, const sema::MethodSymbol& ms,
+        std::string_view tpName);
+
+// fix #9320 (§28.9 / §28.11 / §14.1, v0.359): the STRICT invocation-only walk
+// (`calleeBodyUsesFormalOnlyByInvocation`), PLUS the TAKING COLLECTION
+// STORES — a store of the formal into an `Array<T>` / `IList<T>` PARAMETER of
+// the callee whose element type is the formal's type parameter. At a
+// function-type substitution that slot TAKES the element's own reference
+// (§28.11), so the callee keeps nothing the caller passed.
+//
+// The walk is the fail-closed one: every other use of the formal — a store
+// anywhere else, a return, a capture, a forward, a read into a callee-local —
+// still answers false, and a declined position stays an ESCAPE (a leak, never
+// an early release).
+bool calleeBodyUsesFormalOnlyByInvocationOrTakingCollectionStore(
+        const sema::SemaContext& ctx, const ast::MethodDecl& md,
+        std::string_view name,
+        const std::unordered_set<const void*>& takingCollectionParams);
+
 // fix #9061 (§28.9 / §8.1 / §27.5, v0.359): the dynamic function-value storage
 // fields (Emitter::dynFnvalStorageFields_) of the module being lowered, for the
 // free-function walks below; set by the Emitter once the pre-pass has run.

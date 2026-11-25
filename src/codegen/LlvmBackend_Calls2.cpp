@@ -22640,6 +22640,16 @@ struct FormalInvocationOnlyWalk {
     // store (lowerClosureFieldStore's generic-`T` arm) TAKES the field's own
     // reference. Null: no such store is admitted (fail closed).
     const std::unordered_set<const void*>* takingFieldStores = nullptr;
+    // fix #9320 (§28.9 / §28.11 / §14.1, v0.359): the METHOD-PARAMETER twin
+    // of `takingFieldStores`: the callee method's own PARAMETERS whose
+    // declared type is `Array<T>` / `IList<T>` with `T` the type parameter the
+    // formal is declared at. A store of the formal into such a parameter's
+    // ELEMENT slot is a §28.11 *runtime-managed reference* slot at a
+    // function-type substitution — the store "stores the reference", and the
+    // collection's free gives it back — so the callee keeps nothing the
+    // caller passed and the caller's own reference must still be released at
+    // its scope end. Null: no such store is admitted (fail closed).
+    const std::unordered_set<const void*>* takingCollectionParams = nullptr;
     // fix #8933: the depth of the forwarding chain already walked (a cycle
     // in the call graph must not recurse forever; the limit fails closed).
     int forwardDepth = 0;
@@ -22742,6 +22752,19 @@ struct FormalInvocationOnlyWalk {
         const sema::TypeRef* t = sema::storageComponentType(fs, *ctx);
         if (!t) return 0;
         return t->genericArgs.empty() ? 1 : 2;
+    }
+    // fix #9320 (§28.9 / §28.11 / §14.1, v0.359): is `target` one of the
+    // TAKING COLLECTION PARAMETERS — a parameter of the callee whose declared
+    // type is `Array<T>` / `IList<T>` at the formal's type parameter? The
+    // builder (`typeParamFunctionTakingCollectionParams`) admits only such a
+    // parameter, so membership is the whole proof: the slot it names is the
+    // §28.11 shared-reference slot whose store takes the element's own
+    // reference at a function-type substitution.
+    bool isTakingCollectionParam(const ast::Expr* target) const {
+        if (!takingCollectionParams || !ctx || !target) return false;
+        const sema::Symbol* fs = ctx->exprSymbol(*target);
+        if (!fs) return false;
+        return takingCollectionParams->count(static_cast<const void*>(fs)) != 0;
     }
     bool isName(const ast::Expr* e) const {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -22960,9 +22983,16 @@ struct FormalInvocationOnlyWalk {
                 // The collection twin: `items[i] := formal` into an
                 // `Array<T>` / `IList<T>` field — the indexer set TAKES the
                 // slot's reference and gives back the one it displaces.
+                //
+                // fix #9320 (§28.9 / §28.11 / §14.1, v0.359): the METHOD-
+                // PARAMETER twin: `items[i] := formal` into an `Array<T>` /
+                // `IList<T>` PARAMETER of the callee. The same §28.11 slot
+                // policy applies (the indexer set TAKES the slot's reference),
+                // so the callee keeps nothing the caller passed.
                 if (auto* ix = dynamic_cast<const ast::IndexExpr*>(
                         as->target.get());
-                    ix && takingFieldKind(ix->target.get()) == 2) {
+                    ix && (takingFieldKind(ix->target.get()) == 2 ||
+                           isTakingCollectionParam(ix->target.get()))) {
                     expr(ix->target.get());
                     args(ix->indices);
                     return;
@@ -23078,10 +23108,19 @@ struct FormalInvocationOnlyWalk {
             // substitution that slot is a paired shared-reference slot: the
             // store TAKES the element's own reference and the collection's
             // free gives it back, so the call keeps nothing the caller passed.
-            if (lambdaDepth == 0 && takingFieldStores) {
+            //
+            // fix #9320 (§28.9 / §28.11 / §14.1, v0.359): the METHOD-
+            // PARAMETER twin — `items.Add(x)` where `items` is an `Array<T>` /
+            // `IList<T>` PARAMETER of the callee (`T` the formal's own type
+            // parameter). The same §28.11 slot policy applies, so the callee
+            // keeps nothing the caller passed and the caller's own reference
+            // must still be released at its scope end.
+            if (lambdaDepth == 0 && (takingFieldStores ||
+                                     takingCollectionParams)) {
                 if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                         c->callee.get());
-                    ma && takingFieldKind(ma->target.get()) == 2) {
+                    ma && (takingFieldKind(ma->target.get()) == 2 ||
+                           isTakingCollectionParam(ma->target.get()))) {
                     const std::size_t elemAt =
                         ma->member == "Add" && c->args.size() == 1    ? 0
                         : ma->member == "Insert" && c->args.size() == 2 ? 1
@@ -23402,6 +23441,98 @@ std::unordered_set<const void*> typeParamFunctionTakingFields(
             out.insert(static_cast<const void*>(m));
     }
     return out;
+}
+
+// fix #9320 (§28.9 / §28.11 / §14.1, v0.359): the METHOD-PARAMETER twin of
+// `typeParamFunctionTakingFields`: the callee method's own PARAMETERS whose
+// declared type is `Array<T>` / `IList<T>` with `T` the type parameter the
+// formal is declared at (the METHOD's own, or the CLASS's own).
+//
+// WHY A PARAMETER IS A TAKING STORE. §28.11's element-slot policy puts a
+// function type in the *runtime-managed reference* row, whose borrowing-family
+// column reads "shared references": the store "stores the reference" — the
+// collection owns a reference of ITS OWN on the element it stores, and gives
+// that reference back when the slot goes away (the collection's free /
+// Remove / Clear). At a function-type substitution of `T` the element slot of
+// an `Array<T>` / `IList<T>` IS that slot (`isFunctionSlotPairedCollectionName`
+// in the codegen's take site), so a store of the formal into such a
+// parameter's element slot TAKES the element's own reference — the callee
+// keeps nothing the caller passed, and the caller's own reference must still
+// be released at its scope end.
+//
+// `IReadOnlyList<T>` and `FrozenArray<T>` are NOT here: they have no element
+// store to admit (the same exclusion `typeParamFunctionTakingFields` makes
+// for the FIELD spelling).
+//
+// FAIL CLOSED: a parameter whose declared type is not spelled `Array<T>` /
+// `IList<T>` at `tpName` is not admitted, and neither is a `tpName` the
+// callee's method or its class does not declare.
+std::unordered_set<const void*> typeParamFunctionTakingCollectionParams(
+        const sema::SemaContext& ctx, const sema::MethodSymbol& ms,
+        std::string_view tpName) {
+    std::unordered_set<const void*> out;
+    if (tpName.empty()) return out;
+    // The type parameter must be declared by the METHOD or by its CLASS — the
+    // two places a bare type parameter can come from (§14.1).
+    bool declared = false;
+    for (const sema::Symbol* gp : ms.genericParams)
+        if (gp && gp->name == tpName) { declared = true; break; }
+    if (!declared && ms.parent)
+        for (const sema::Symbol* gp : ms.parent->genericParams)
+            if (gp && gp->name == tpName) { declared = true; break; }
+    if (!declared) return out;
+    auto isBareTp = [&](const sema::TypeRef* r) {
+        return r && r->kind == sema::TypeRef::Kind::Named &&
+               !r->declaration && r->genericArgs.empty() &&
+               r->headName() == tpName;
+    };
+    for (const sema::Symbol* p : ms.params) {
+        auto* ps = dynamic_cast<const sema::ParameterSymbol*>(p);
+        if (!ps || !ps->declType) continue;
+        const sema::TypeRef* t = ctx.resolvedType(*ps->declType);
+        if (!t || t->kind != sema::TypeRef::Kind::Named) continue;
+        const std::string_view h = t->headName();
+        if ((h == "Array" || h == "IList") && t->genericArgs.size() == 1 &&
+            !t->nullable && isBareTp(t->genericArgs[0]))
+            out.insert(static_cast<const void*>(p));
+    }
+    return out;
+}
+
+// fix #9320 (§28.9 / §28.11 / §14.1, v0.359): the STRICT invocation-only walk
+// (`calleeBodyUsesFormalOnlyByInvocation`), PLUS the TAKING COLLECTION
+// STORES — a store of the formal into an `Array<T>` / `IList<T>` PARAMETER of
+// the callee whose element type is the formal's type parameter. At a
+// function-type substitution that slot TAKES the element's own reference
+// (§28.11's *runtime-managed reference* row), so the callee keeps nothing the
+// caller passed and the caller's own reference must still be released at its
+// scope end.
+//
+// The walk is the fail-closed one: every other use of the formal — a store
+// anywhere else, a return, a capture, a forward, a read into a callee-local —
+// still answers false, and a declined position stays an ESCAPE (a leak, never
+// an early release).
+bool calleeBodyUsesFormalOnlyByInvocationOrTakingCollectionStore(
+        const sema::SemaContext& ctx, const ast::MethodDecl& md,
+        std::string_view name,
+        const std::unordered_set<const void*>& takingCollectionParams) {
+    if (name.empty() || takingCollectionParams.empty()) return false;
+    for (auto mod : md.modifiers)
+        if (mod == "virtual" || mod == "abstract" || mod == "override")
+            return false;
+    FormalInvocationOnlyWalk w{name};
+    w.allowInspection = false;
+    w.takingCollectionParams = &takingCollectionParams;
+    w.ctx = &ctx;
+    if (md.bodyKind == ast::MethodBodyKind::Expression) {
+        if (!md.exprBody) return false;
+        w.expr(md.exprBody.get());
+    } else if (md.bodyKind == ast::MethodBodyKind::Block) {
+        w.stmts(md.stmts);
+    } else {
+        return false;
+    }
+    return w.ok;
 }
 
 static bool calleeBodyUsesFormalOnlyOrTakingFieldStoreImpl(
