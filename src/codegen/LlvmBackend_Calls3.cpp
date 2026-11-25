@@ -4604,17 +4604,20 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // PER REFERENCE (§27.6 / #1170), exactly like an inline lambda literal.
         // The enumerator must own it and release it at dispose; without that
         // the cell leaked (64 B per operator call) — the leak the §5
-        // method-reference selector family carried. A BARE identifier is a
-        // cell only for a STATIC method (the instance spelling binds `this`
-        // through `currentThis_`); a MemberAccessExpr is a cell for either.
-        // Mirror `isPlusOneClosureProducer`'s shape exactly, so the release
-        // never arms on a reference that produced no cell.
-        auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*a));
-        if (!ms) return false;
-        if (dynamic_cast<const ast::MemberAccessExpr*>(a)) return true;
-        if (dynamic_cast<const ast::IdentifierExpr*>(a) && isStaticMethod(ms))
-            return true;
-        return false;
+        // method-reference selector family carried.
+        //
+        // fix #9292 (§27.6 / §28.9, v0.359): a BARE identifier naming an
+        // INSTANCE method (`Select(Conv)`) mints the same cell as the
+        // qualified spelling (#9216 made `isPlusOneClosureProducer` admit the
+        // bare identifier whatever the method's staticness). This site used to
+        // mirror the old static-only predicate, so the bare instance group's
+        // 72 B cell (64 B + the 8 B receiver capture) was never owned. Ask the
+        // SHARED predicate, restricted to a method symbol (a function-typed
+        // property read is a borrow here, as before), so the owned set cannot
+        // drift from the produced set again.
+        if (!dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*a)))
+            return false;
+        return isPlusOneClosureProducer(a);
     };
     // Thread the enumerator pointer through bz_lazy_own_closure(e) iff the
     // operator's closure arg was a fresh +1 closure cell (an inline lambda or
