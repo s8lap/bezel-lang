@@ -13190,51 +13190,77 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
         if ((ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(target))))
             propName = std::string(ma->member);
-        // fix #9214 (stdlib §4.19, §23.3, v0.359): `FrozenArray<T>.Length`
-        // is a GET-ONLY property — stdlib §4.19 declares
-        // `public readonly property Length: int;` on a compiler-intrinsic
-        // type whose prose says it "has no mutating member" — so it is not
-        // an assignable location (§23.3: "A read-only property in block
-        // form omits `set`"; §23.1: a `readonly` auto-property's
-        // assignment "is a store to the backing field (no setter exists
-        // to invoke, §22.7 rule 1)" and is admitted only in a field
-        // initializer or a constructor of the declaring type — which a
-        // compiler-intrinsic `FrozenArray<T>` never has).
+        // fix #9214 / #9250 (stdlib §4.19 / §3.1 / §4.14 / §9.6, §23.3,
+        // §23.1, §17.6, v0.359): the BUILT-IN read-only `Length` properties.
         //
-        // WHY THIS BRANCH IS NEEDED. The builtin collection members carry
-        // NO `PropertySymbol` (they are typed by
+        // The stdlib declares `Length` on four heads the compiler knows, and
+        // every one of them is a GET-ONLY property:
+        //
+        //   §3.1  StringBuilder — `public readonly property Length: int;`
+        //   §4.14 OwningBuffer<T> — `public pure readonly property Length: int;`
+        //   §4.19 FrozenArray<T> — `public readonly property Length: int;`
+        //        (the section's own prose: it "has no mutating member")
+        //   §9.6  String — `public pure readonly property Length: int;`
+        //
+        // so none of them is an assignable location (§23.3: "A read-only
+        // property in block form omits `set`"; §23.1: a `readonly`
+        // auto-property's assignment "is a store to the backing field (no
+        // setter exists to invoke, §22.7 rule 1)" and is admitted only in a
+        // field initializer or a constructor of the declaring type — which a
+        // compiler-intrinsic `StringBuilder` / `OwningBuffer<T>` /
+        // `FrozenArray<T>` / `string` never has). §17.6 adds "Read-only
+        // locations cannot be incremented."
+        //
+        // WHY THIS BRANCH IS NEEDED. The builtin members carry NO
+        // `PropertySymbol` (they are typed by
         // `common::isBuiltinIntLengthPropertyHead`, not by a property
         // symbol), so `ps` stayed null here and EVERY rule below — all of
         // them keyed on the `PropertySymbol` — was skipped. The write then
         // reached codegen, where a builtin member has no lvalue address to
         // store into: the store was DROPPED and the program compiled with
         // only the `internal:` #4045 backstop warning. MEASURED on r30-c1
-        // (`9ff2f909f`): `f.Length := 3;` on a `FrozenArray<int>` local
-        // compiled with exit 0 and the single diagnostic "internal:
-        // assignment target lvalue address failed to resolve (store dropped
-        // — target retains its previous value) — #4045"; the increment
-        // spelling `f.Length++` produced NO diagnostic at all.
+        // (`cb9f7153e`): `t.Length := 3;` on a `string` local, `sb.Length :=
+        // 3;` on a `StringBuilder`, `b.Length := 3;` on an `OwningBuffer<byte>`
+        // and `b.S.Length := 3;` through a `string` field each compiled with
+        // exit 0 and the single diagnostic "internal: assignment target lvalue
+        // address failed to resolve (store dropped — target retains its
+        // previous value) — #4045"; the increment spelling `t.Length++`
+        // produced NO diagnostic at all.
+        //
+        // THE HEAD SET IS THE REGISTRY'S, NOT A HAND-LISTED ONE.
+        // `common::isBuiltinIntLengthPropertyHead` is the single authority for
+        // "which built-in heads declare an int `Length` property" — it names
+        // §3.1 StringBuilder, §4.14 OwningBuffer<T> and §4.19 FrozenArray<T>
+        // (the `kBuiltinIntLengthPropertyHeads` set in
+        // `src/common/BuiltinRegistry.cpp`) — so the three heads are ONE
+        // registry read, not three hand-spelled names that could drift from
+        // the stdlib. The `string` head is the one that is not a class: it is
+        // the §9.6 primitive, so its receiver TypeRef is `Kind::Primitive`
+        // with `primitive == PrimitiveType::String`.
         //
         // THE DIAGNOSTIC is the compiler's ORDINARY read-only-property one,
         // byte-identical in shape to the one a user get-only property gets
         // ("cannot assign to read-only property `P` — it has no setter
-        // (§23.3)") — the same text, with this property's name.
+        // (§23.3)") — the same text, with this property's name. The increment
+        // spelling takes the §17.6 wording through the `incOp` parameter the
+        // shared check already carries.
         //
-        // THE RECEIVER PREDICATE names the BUILT-IN `FrozenArray<T>` and
-        // nothing else. The always-available names ARE shadowable (§2.3:
-        // "every other always-available name may be shadowed by local
-        // declarations under the normal name-resolution rules"; §2.7 rule 1
-        // resolves the bare name first), so a user `class FrozenArray<T>`
-        // wins the name and its OWN members answer — a user type's WRITABLE
-        // `Length` must keep compiling. `isUserDeclaredTypeSym` is the
-        // house's discriminator for that (§2.3 / #5272: a `builtinClassSym`
-        // is shaped `decl == nullptr && moduleName.empty()`, so a user's
-        // TypeSymbol is its exact complement — a real `ast::TypeDecl`
-        // in-module, or a populated `moduleName` when imported).
+        // THE RECEIVER PREDICATE names the BUILT-IN heads and nothing else.
+        // The always-available names ARE shadowable (§2.3: "every other
+        // always-available name may be shadowed by local declarations under
+        // the normal name-resolution rules"; §2.7 rule 1 resolves the bare
+        // name first), so a user `class FrozenArray<T>` / `class StringBuilder`
+        // / `class OwningBuffer<T>` wins the name and its OWN members answer
+        // — a user type's WRITABLE `Length` must keep compiling.
+        // `isUserDeclaredTypeSym` is the house's discriminator for that
+        // (§2.3 / #5272: a `builtinClassSym` is shaped `decl == nullptr &&
+        // moduleName.empty()`, so a user's TypeSymbol is its exact complement
+        // — a real `ast::TypeDecl` in-module, or a populated `moduleName` when
+        // imported).
         //
-        // THE TWO SHAPES of a built-in receiver are the ones the #9185 read
-        // fix names: the STUB shape (a factory result — `declaration` = the
-        // synthetic `builtinClassSym("FrozenArray")`) and the
+        // THE TWO SHAPES of a built-in class receiver are the ones the #9185
+        // read fix names: the STUB shape (a factory result — `declaration` =
+        // the synthetic `builtinClassSym("FrozenArray")`) and the
         // declaration-less ANNOTATION shape (a synthetic ast node, as
         // `var f: FrozenArray<int> := ...` resolves). MEASURED: both reach
         // this branch — the local, the field and the bare-annotation
@@ -13247,14 +13273,29 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
         // filed separately.)
         else if (ma->member == "Length" && ma->target) {
             const sema::TypeRef* rt = ctx_.exprType(*ma->target);
-            bool isFrozenTy =
-                rt && rt->kind == sema::TypeRef::Kind::Named &&
-                !rt->nullable &&
-                ((rt->declaration
-                      ? (!isUserDeclaredTypeSym(rt->declaration) &&
-                         rt->declaration->name == "FrozenArray")
-                      : (rt->astNode && rt->headName() == "FrozenArray")));
-            if (isFrozenTy) {
+            bool isBuiltinReadonlyLength = false;
+            if (rt && !rt->nullable) {
+                if (rt->kind == sema::TypeRef::Kind::Primitive) {
+                    // stdlib §9.6: `String`'s `Length` — the `string`
+                    // primitive carries NO TypeSymbol at all, so it is
+                    // recognised by its PrimitiveType (the same test the
+                    // §9.6 property-read arm makes).
+                    isBuiltinReadonlyLength =
+                        rt->primitive == PrimitiveType::String;
+                } else if (rt->kind == sema::TypeRef::Kind::Named) {
+                    std::string_view head;
+                    if (rt->declaration) {
+                        if (!isUserDeclaredTypeSym(rt->declaration))
+                            head = rt->declaration->name;
+                    } else {
+                        head = rt->headName();
+                    }
+                    isBuiltinReadonlyLength =
+                        !head.empty() &&
+                        common::isBuiltinIntLengthPropertyHead(head);
+                }
+            }
+            if (isBuiltinReadonlyLength) {
                 ctx_.diagnostics().report(
                     Severity::Error, loc,
                     std::string("cannot ") +
