@@ -6518,7 +6518,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         if (smStateStruct_ && smSelf_ &&
             (smKind_ == SuspendKind::Yield || isAsyncYield)) {
             // Save all suspend-locals to the state frame before yielding.
-            for (auto& [allocaSlot, fieldIdx] : smSpillsInFrameOrder()) {  // fix #3504
+            //
+            // fix #9166 (§27.5 / §28.9 / §29.3, v0.359): the SNAPSHOT below
+            // is what the post-operand re-spill compares against. The yield
+            // OPERAND's evaluation can BOX a local of this method (§27.5's
+            // capture cell), and boxing RE-MAPS that local's frame field; the
+            // spill that ran before the operand therefore missed the new
+            // mapping. See the re-spill after the operand for the whole
+            // argument and the measurements.
+            const std::vector<std::pair<llvm::AllocaInst*, unsigned>>
+                spillSlotsBefore = smSpillsInFrameOrder();
+            for (auto& [allocaSlot, fieldIdx] : spillSlotsBefore) {  // fix #3504
                 llvm::Value* fptr = builder_.CreateStructGEP(
                     smStateStruct_, smSelf_, fieldIdx);
                 llvm::Value* curVal = builder_.CreateLoad(
@@ -6577,6 +6587,60 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // ret true, async → complete the per-advance task with true + ret void.
             if (ys->value) {
                 llvm::Value* v = lowerExpr(*ys->value);
+                // fix #9166 (§27.5 / §28.9 / §29.3, v0.359): the yield
+                // OPERAND's evaluation can BOX a local of this method — a
+                // lambda literal in the operand that captures such a local
+                // forms a §27.5 capture cell — and boxing RE-MAPS that
+                // local's frame field: the cell HOLDER takes the local's own
+                // field (a ptr field) and the local's pre-boxing slot takes
+                // the frame's separate PRE-BOX field (boxLocalSlot,
+                // LlvmBackend_Exprs2.cpp; the frame reserves both fields
+                // because `computeFrameCapturedLocals` knows the local is
+                // captured).
+                //
+                // The spill above ran BEFORE the operand, so it wrote the
+                // pre-boxing VALUE into the holder's ptr field and never
+                // wrote the holder at all: across the suspension the holder
+                // held a truncated integer where the cell pointer belongs.
+                // MEASURED on r30-c1 (62d96b17b) with the classification
+                // fix of #9166 in place: the scope-end cell free then freed
+                // that garbage (`free` of a non-pointer — a SEGV under ASan),
+                // and a read of the captured local after the resume SEGV'd at
+                // the garbage address (a shape that crashes on the base too).
+                //
+                // Re-spill when (and only when) the operand changed the
+                // mapping: the frame then carries the holder — the cell
+                // pointer — in the local's own field and the pre-boxing value
+                // in the pre-box field, which is exactly what the resume's
+                // restore reads. A yield operand that boxes nothing keeps the
+                // single spill it always had (no code-size change, no change
+                // of what the frame carries).
+                {
+                    const auto spillSlotsAfter = smSpillsInFrameOrder();
+                    bool changed =
+                        spillSlotsAfter.size() != spillSlotsBefore.size();
+                    if (!changed) {
+                        for (std::size_t i = 0; i < spillSlotsAfter.size();
+                             ++i) {
+                            if (spillSlotsAfter[i].first !=
+                                    spillSlotsBefore[i].first ||
+                                spillSlotsAfter[i].second !=
+                                    spillSlotsBefore[i].second) {
+                                changed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (changed) {
+                        for (auto& [allocaSlot, fieldIdx] : spillSlotsAfter) {
+                            llvm::Value* fptr = builder_.CreateStructGEP(
+                                smStateStruct_, smSelf_, fieldIdx);
+                            llvm::Value* curVal = builder_.CreateLoad(
+                                allocaSlot->getAllocatedType(), allocaSlot);
+                            builder_.CreateStore(curVal, fptr);
+                        }
+                    }
+                }
                 if (v) {
                     // #1102B / §7.1: for an `IEnumerable<T?>` iterator the element
                     // slot is the tagged nullable-value struct `{i8,T}`; a bare

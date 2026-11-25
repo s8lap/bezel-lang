@@ -57833,6 +57833,36 @@ void Emitter::collectCellFreeEligible(
                 if (ts->value) expr(ts->value.get(), false); return; }
             if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
                 if (es->expr) expr(es->expr.get(), false); return; }
+            // fix #9166 (§27.5 / §28.3 / §28.9 / §29.3, v0.359): a
+            // `yield return` OPERAND is a full expression — §29.3:
+            // "`yield return expression;` produces the next value and
+            // suspends" — and a lambda literal in it is a lambda literal
+            // like any other. This walker had NO YieldStmt arm, so every
+            // lambda written in a yield operand was INVISIBLE to the
+            // classification: an IIFE there never reached
+            // `capturedByNonEscaping` (the #2182 arm of `expr` below), the
+            // captured local never entered `cellFreeEligible_`, and its
+            // §27.5 capture cell was therefore never freed at the declaring
+            // scope's end — the cell leaked once per evaluation.
+            // MEASURED on r30-c1 (62d96b17b): `yield return (lambda() => q
+            // + 1)();` in a 200-yield iterator leaked 800 byte(s) in 200
+            // allocation(s) (4 B per evaluation, allocated in
+            // `bz$iter$M.It$Each$MoveNext`), while the issue's own
+            // local-initializer twin (`var v := (lambda() => q + 1)(); yield
+            // return v;`) was clean. The arm below is the whole fix: the
+            // operand is walked exactly like the local initializer's
+            // expression, so the IIFE is classified non-escaping and the
+            // cell's scope-end free is armed.
+            //
+            // The operand's own lambda is walked with `topPos=false`: the
+            // yielded VALUE transfers to the consumer, so a lambda written
+            // there (not invoked) escapes the method — the classification
+            // the escaping arm gives it is the correct one, and it is the
+            // same verdict the walker gives such a lambda in any other
+            // escaping position.
+            if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+                if (ys->value) expr(ys->value.get(), false);
+                return; }
             if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
                 if (is->ifBranch.condition)
                     expr(is->ifBranch.condition.get(), false);
