@@ -13267,10 +13267,10 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
         // spellings are all rejected.
         //
         // (The FrozenArray INDEXER rule, fix #1723, sits in the same
-        // function and uses the LOOSER head-name-only predicate, so it
-        // wrongly rejects a user `class FrozenArray<T>`'s writable indexer
-        // — MEASURED on the base, and left alone here: a different rule,
-        // filed separately.)
+        // function and used the LOOSER head-name-only predicate, so it
+        // wrongly rejected a user `class FrozenArray<T>`'s writable indexer
+        // — MEASURED on the base; fixed by #9251, which gates that rule on
+        // the same `isUserDeclaredTypeSym` discriminator.)
         else if (ma->member == "Length" && ma->target) {
             const sema::TypeRef* rt = ctx_.exprType(*ma->target);
             bool isBuiltinReadonlyLength = false;
@@ -13361,9 +13361,54 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
                 // because there is no syntactic identifier on the
                 // TypeRef — the declaration's SYMBOL name is the only
                 // signal, hence the second disjunct below.
+                //
+                // fix #9251 (§2.3 / §2.7 rule 1 / §2.2, stdlib §4.19 /
+                // §30.14, v0.359): the rule is a property of the STANDARD
+                // LIBRARY'S `FrozenArray<T>` — a type whose indexer is
+                // declared `get`-only and whose contents "can never change
+                // after construction" (stdlib §4.19) — and the always-
+                // available names ARE shadowable: §2.3's table puts
+                // `FrozenArray<T>` in the `System.Collections.Generic`
+                // row, whose "Shadowable?" column reads "Yes", and the
+                // paragraph after the table says "every other always-
+                // available name may be shadowed by local declarations
+                // under the normal name-resolution rules"; §2.7 rule 1
+                // resolves the bare name first ("local scope, then the
+                // enclosing type's accessible members, THEN THE CURRENT
+                // MODULE'S DECLARATIONS, then unambiguous imported bare
+                // names"). So a USER `class FrozenArray<T>` wins the bare
+                // name, is an ordinary class, and its OWN indexer answers
+                // — a writable one is a legal assignment target.
+                //
+                // The predicate keyed on the receiver's HEAD NAME alone, so
+                // the user's class matched it and its writable indexer was
+                // REJECTED ("cannot assign through a `FrozenArray<T>`
+                // indexer" — §4.19 / §30.14). MEASURED on the base
+                // r30-c1 (009b0c5de): the user's `f[0] := 3;` was
+                // rejected in every receiver shape — the `new` result, the
+                // bare annotation `var f: FrozenArray<int>`, a field's type
+                // and a `type FA := FrozenArray<int>` alias — while the
+                // built-in's own shapes (`FrozenArray<int>.From(...)` and
+                // the built-in annotation) were rejected CORRECTLY.
+                //
+                // THE DISCRIMINATOR is the RESOLVED DECLARATION, not the
+                // name: `isUserDeclaredTypeSym` (sema/Symbol.hpp) is the
+                // house predicate for "did a user declaration take the
+                // spelling?" (§2.3 / #5272) — a `builtinClassSym` is
+                // shaped `decl == nullptr && moduleName.empty()`, so a
+                // user's `TypeSymbol` is its exact complement (a real
+                // `ast::TypeDecl` in-module, or a populated `moduleName`
+                // when imported). A null declaration is NOT a user type
+                // (the built-in's own declaration-less Named shape — the
+                // bare annotation, §30.14's metadata spelling — answers
+                // false), so the name-keyed disjuncts keep the built-in's
+                // rejection exactly as it was. This is the sibling `Length`
+                // rule's own discriminator in the same function (fix
+                // #9214, stdlib §4.19 / §23.3).
                 bool isFrozenTy =
                     rt && rt->kind == sema::TypeRef::Kind::Named &&
                     !rt->nullable &&
+                    !isUserDeclaredTypeSym(rt->declaration) &&
                     (rt->headName() == "FrozenArray" ||
                      (rt->declaration &&
                       rt->declaration->name == "FrozenArray"));
