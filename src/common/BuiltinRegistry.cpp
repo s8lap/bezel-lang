@@ -2822,6 +2822,51 @@ std::vector<BuiltinParamForm> builtinParamForms(std::string_view typeHead,
     return out;
 }  // per §22.5 / §22.6 / §5.1 / §7.3, stdlib §2.3-§9.6
 
+// fix #9146 (stdlib §4.9, §4.14, §27.1.1 fourth bullet, §28.3.5 rows 1 and
+// 4, v0.359): the built-in parameter positions whose DECLARED TYPE is a
+// function type whose RETURN slot carries the `owned` marker.
+//
+// The rows are the standard library's own declaration blocks:
+//
+//   stdlib §4.14 (`OwningBuffer<T>`, the CLASS-typed presentation):
+//     public constructor(length: int, init: (int) -> owned T);
+//   stdlib §4.9 (`OwningDictionary<K, V> where V: class`):
+//     public method GetOrAdd(key: K, factory: (K) -> owned V): V;
+//
+// NOT transcribed: the BORROWING `Dictionary<K, V>`'s
+// `GetOrAdd(key: K, factory: (K) -> V): V` (stdlib §4.8) — its factory's
+// return slot carries NO `owned` marker, the dictionary owns nothing, and the
+// stored value is a borrow: a plain `(K) -> V` factory is CORRECT there.
+//
+// NOT transcribed: the VALUE-typed `OwningBuffer<T>` presentation's
+// `init: (int) -> T` (stdlib §4.14) — the `owned` marker belongs to the
+// class-typed presentation only, and the row's `returnTypeArg` reads the
+// element type, so the value-typed instantiation is out of the rule's reach
+// (a value type is not a concrete class/interface slot either).
+namespace {
+const std::vector<BuiltinOwnedFnSlot>& builtinOwnedFnSlotRows() {
+    static const std::vector<BuiltinOwnedFnSlot> kRows = {
+        // §4.14 — `OwningBuffer<T>(length: int, init: (int) -> owned T)`.
+        // The element type is the instantiation's FIRST type argument.
+        {"OwningBuffer", "", 1, 0},
+        // §4.9 — `OwningDictionary<K, V>.GetOrAdd(key: K, factory: (K) ->
+        // owned V)`. The value type is the instantiation's SECOND type
+        // argument.
+        {"OwningDictionary", "GetOrAdd", 1, 1},
+    };
+    return kRows;
+}
+}  // namespace
+
+const BuiltinOwnedFnSlot* builtinOwnedFnSlot(std::string_view typeHead,
+                                              std::string_view member) {
+    const std::string_view head = normaliseBuiltinParamHead(typeHead);
+    for (const auto& r : builtinOwnedFnSlotRows()) {
+        if (r.head == head && r.member == member) return &r;
+    }
+    return nullptr;
+}  // per stdlib §4.9 / §4.14, §27.1.1, §28.3.5 rows 1 and 4, v0.359
+
 bool isBuiltinCtorLoweredByName(std::string_view head) {
     return contains(kBuiltinCtorLoweredByNameHeads, head);
 }  // per §22.5 / §17.7, fix #3425 (the #3098 `lowerNew` arm)

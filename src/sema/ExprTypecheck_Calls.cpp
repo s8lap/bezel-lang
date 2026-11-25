@@ -19696,6 +19696,43 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         else if (m == "GetOrAdd" && recvTy &&
                                  recvTy->genericArgs.size() > 1 &&
                                  recvTy->genericArgs[1]) {
+                            // fix #9146 (stdlib §4.9, §27.1.1 fourth bullet,
+                            // §28.3.5 rows 1 and 4, v0.359): the built-in
+                            // METHOD arm's parameter check. A built-in method
+                            // has no `ast::Param` list, so its arguments never
+                            // reach `checkAssignable` — the §27.1.1
+                            // modifier-slot question is asked nowhere on this
+                            // path — and the ONE built-in parameter table's
+                            // `kinds` column has no bit for a FUNCTION type,
+                            // so the position carried no type opinion either.
+                            // `OwningDictionary<K, V>`'s
+                            // `factory: (K) -> owned V` (stdlib §4.9) is such
+                            // a position: a plain function value (a
+                            // `(K) -> V` variable, or a method group over a
+                            // borrow-returning method) was admitted at it,
+                            // and the dictionary STORES the value (taking
+                            // ownership) and disposes it at scope end — so the
+                            // dictionary disposed a borrow of storage
+                            // someone else owns: a heap-use-after-free
+                            // (#9146).
+                            //
+                            // The BORROWING `Dictionary<K, V>`'s factory is
+                            // declared `(K) -> V` (stdlib §4.8, no `owned`
+                            // marker): the dictionary owns nothing there and
+                            // the stored value is a borrow, so a plain
+                            // `(K) -> V` factory is CORRECT and stays
+                            // admitted — the table carries no row for it.
+                            //
+                            // The rule, its predicate and its sentence are ONE
+                            // (`checkPlainFunctionValueAtOwnedSlot`), shared
+                            // with the user-declared arm (#9127) and with the
+                            // built-in CONSTRUCTOR arm, so the three cannot
+                            // drift.
+                            if (checkBuiltinOwnedFnArg(
+                                    colName, m, ce.args, recvTy,
+                                    "argument to `" + std::string(colName) +
+                                        "." + std::string(m) + "`"))
+                                return;
                             // per §4.8 / §4.9: the second argument must be a factory
                             // function `(K) -> V`.  Check it when the arg is present
                             // and its type has been resolved.

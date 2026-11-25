@@ -916,6 +916,46 @@ std::vector<BuiltinFormals> builtinParamNameCandidates(std::string_view typeHead
 std::vector<BuiltinFormals> builtinCtorParamNameCandidates(
     std::string_view typeHead, std::size_t argCount);
 
+// fix #9146 (stdlib §4.9, §4.14, §27.1.1 fourth bullet, §28.3.5 rows 1 and
+// 4, v0.359): the built-in parameter POSITIONS whose DECLARED TYPE is a
+// FUNCTION TYPE whose RETURN slot carries the `owned` marker — `(…) -> owned
+// K`.
+//
+// The `kinds` column of the ONE built-in parameter table has no bit for a
+// FUNCTION type, so these positions carry NO type opinion there — and a
+// built-in constructor or method has no `ast::Param` list, so its arguments
+// never reach `checkAssignable` either. The §27.1.1 modifier-slot question
+// ("Modifier slots (`owned`/`ref`/`out`/`out owned`/`scoped`) must match
+// exactly") was therefore asked NOWHERE on the built-in path: a plain
+// function value (a `(..) -> K` variable, or a method group over a
+// borrow-returning method) was admitted at `OwningBuffer<T>`'s `init: (int)
+// -> owned T` (stdlib §4.14) and at `OwningDictionary<K, V>`'s `factory: (K)
+// -> owned V` (stdlib §4.9). Both callees TAKE the result's ownership and
+// dispose it, so the callee disposed a borrow of storage someone else owns —
+// a heap-use-after-free (#9146's repro, under ASan).
+//
+// The rows are the standard library's own declaration blocks (§4.9 and
+// §4.14), transcribed in BuiltinRegistry.cpp.
+struct BuiltinOwnedFnSlot {
+    // The built-in type head, as the parameter table spells it.
+    std::string_view head;
+    // The member; EMPTY for a CONSTRUCTOR.
+    std::string_view member;
+    // The parameter position the declared function type sits at.
+    std::size_t position;
+    // The index of the INSTANTIATION's type argument the declared RETURN slot
+    // is read out of: the buffer's element type (0) and the dictionary's
+    // value type (1).
+    std::size_t returnTypeArg;
+};
+
+// fix #9146 (stdlib §4.9, §4.14, §27.1.1, §28.3.5 rows 1 and 4, v0.359): the
+// row for the built-in member `typeHead.member` (or for the built-in
+// CONSTRUCTOR `typeHead`, when `member` is empty), or nullptr when that pair
+// declares no `(…) -> owned K` parameter. The head is the stdlib spelling.
+const BuiltinOwnedFnSlot* builtinOwnedFnSlot(std::string_view typeHead,
+                                              std::string_view member);
+
 // fix #6782 (spec §7 "parameter pass" and §7.3 "Assigning `null` to a
 // non-nullable target", v0.340): is parameter `position` of the built-in member
 // `typeHead.member` (or of the built-in constructor `typeHead`, when `member` is

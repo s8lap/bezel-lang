@@ -5047,6 +5047,122 @@ bool ExprTC::isConcreteSlotReturnType(const TypeRef* t) const {
             t->declaration->kind == ast::TypeDeclKind::Interface);
 }
 
+// fix #9127 / fix #9146 (§27.1.1 fourth bullet, §28.3.5 rows 1 and 4, v0.359):
+// the ONE definition of the "a plain function value may not be passed where
+// the target's return slot is `owned`" rule.
+//
+// `src` is the function VALUE's type; `targetReturnOwned` says whether the
+// TARGET's return slot carries the `owned` marker; `srcExpr` is the source
+// EXPRESSION; `what` names the position in the diagnostic.
+//
+// WHY THE RULE EXISTS. §27.1.1's fourth bullet: "Modifier slots (`owned`/
+// `ref`/`out`/`out owned`/`scoped`) must match exactly". §28.3.5 row 4's
+// function-value-invocation cell reads the plain concrete class/interface
+// slot: a call through a `() -> K` slot is a "Borrow … The result is never
+// owned"; row 1's is "Function-value invocation: Owned", so the CALLER
+// disposes each result. A value whose return slot is the plain `K`, passed
+// where the target declares `owned`, hands the caller's disposal obligation a
+// borrow of storage someone else owns — a heap-use-after-free.
+//
+// WHO CALLS IT. The USER-declared parameter arm (`checkAssignable`, #9127) and
+// the BUILT-IN constructor/method arm (`checkBuiltinOwnedFnArg`, #9146). The
+// predicate and the sentence are ONE, so the two arms cannot drift: a
+// built-in `(…) -> owned K` slot and a user-declared one answer the same
+// question the same way.
+//
+// The carves, all inherited from #9127: a fresh lambda LITERAL is the
+// callee-side-checked spelling (#9040/#1820: its body must supply a fresh or
+// owned value) and is skipped; an `owned`-returning value is not a plain
+// value; and the mint-announcing return slots (the `Task`-family, the
+// iterable heads) and a bare type parameter are not concrete class/interface
+// slots at all (per `isConcreteSlotReturnType`).
+//
+// Returns true when the diagnostic was REPORTED (the caller stops).
+bool ExprTC::checkPlainFunctionValueAtOwnedSlot(
+    const TypeRef* src, bool targetReturnOwned, const ast::Expr* srcExpr,
+    const std::string& what, SourceLocation loc) {
+    if (!targetReturnOwned) return false;
+    if (!src || src->kind != TypeRef::Kind::Function) return false;
+    // A fresh lambda literal: the callee-side-checked spelling.
+    if (srcExpr && dynamic_cast<const ast::LambdaExpr*>(srcExpr)) return false;
+    // An `owned`-returning value is not a plain value.
+    if (src->funcReturnOwned) return false;
+    // The SOURCE's return slot must be the plain concrete class/interface.
+    if (!isConcreteSlotReturnType(src->funcReturn)) return false;
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        std::string("the ") + what + " has a function type whose "
+        "return slot is the plain `" +
+        std::string(src->funcReturn->headName()) +
+        "` but the target's is `owned` \xe2\x80\x94 a call through a "
+        "plain concrete class/interface slot yields a borrow, while "
+        "a call through an `owned` slot hands the caller a value it "
+        "must dispose, so the caller would dispose a borrow of "
+        "storage someone else owns; modifier slots are part of a "
+        "function signature's identity and there is no conversion "
+        "between them (\xc2\xa7""27.1.1, \xc2\xa7""28.3.5 rows 1 and 4 "
+        "v0.359)");
+    return true;
+}
+
+// fix #9146 (stdlib §4.9, §4.14, §27.1.1 fourth bullet, §28.3.5 rows 1 and
+// 4, v0.359): the BUILT-IN constructor/method argument check at a parameter
+// whose DECLARED type is a function type whose RETURN slot carries the
+// `owned` marker — `(…) -> owned K`.
+//
+// THE DEFECT. A built-in constructor or method has no `ast::Param` list, so
+// its arguments never reach `checkAssignable` — the §27.1.1 modifier-slot
+// question is asked nowhere on that path — and the ONE built-in parameter
+// table's `kinds` column has no bit for a FUNCTION type, so the position
+// carried no type opinion either. A plain function value (a `(..) -> K`
+// variable, or a method group over a borrow-returning method) was therefore
+// admitted at `OwningBuffer<T>`'s `init: (int) -> owned T` (stdlib §4.14)
+// and at `OwningDictionary<K, V>`'s `factory: (K) -> owned V` (stdlib §4.9).
+// Both callees TAKE the result's ownership and dispose it — the buffer's
+// destructor cascades through its slots, the dictionary stores the value
+// (taking ownership) — so the callee disposed a borrow of storage someone
+// else owns: a heap-use-after-free (#9146's repro, under ASan).
+//
+// THE RULE, read exactly as the USER-declared arm reads it (#9127): the
+// predicate and the sentence are ONE (`checkPlainFunctionValueAtOwnedSlot`),
+// so a built-in `(…) -> owned K` slot and a user-declared one cannot drift.
+//
+// The declared RETURN slot is read out of the INSTANTIATION (the buffer's
+// element type, the dictionary's value type) and the `owned` marker applies
+// to the CLASS-typed presentation only (stdlib §4.14's two presentations: the
+// class-typed one declares `init: (int) -> owned T`, the value-typed one
+// declares `init: (int) -> T`) — the value-typed instantiation is untouched,
+// and the rule is inert there anyway, since a value type is not a concrete
+// class/interface slot.
+//
+// Returns true when the diagnostic was REPORTED (the caller stops).
+bool ExprTC::checkBuiltinOwnedFnArg(
+    std::string_view head, std::string_view member,
+    const std::vector<ast::CallArgument>& args, const TypeRef* instTy,
+    const std::string& what) {
+    const common::BuiltinOwnedFnSlot* slot =
+        common::builtinOwnedFnSlot(head, member);
+    if (!slot) return false;
+    if (slot->position >= args.size()) return false;
+    const ast::CallArgument& a = args[slot->position];
+    if (!a.value || a.isDiscard) return false;
+    // §22.3: a `ref`/`out`/`scoped` modifier aliases the caller's slot under
+    // its own rule; the slot's type is not the admission question here.
+    if (!a.modifier.empty()) return false;
+    if (!instTy || instTy->genericArgs.size() <= slot->returnTypeArg)
+        return false;
+    const TypeRef* declaredReturn = instTy->genericArgs[slot->returnTypeArg];
+    if (!declaredReturn) return false;
+    // The declared `owned` return slot: the class-typed presentation (a
+    // concrete class/interface element or value type).
+    if (!isConcreteSlotReturnType(declaredReturn)) return false;
+    TypeRef* argTy = ctx_.exprType(*a.value);
+    if (!argTy || argTy->kind == TypeRef::Kind::Error) return false;
+    return checkPlainFunctionValueAtOwnedSlot(
+        argTy, /*targetReturnOwned=*/true, a.value.get(), what,
+        a.value->span.begin);
+}
+
 // fix #1820 (§28.3, v0.223 ruling): is `e` a fresh owned-producing
 // expression — `new T()` over a class/interface, or a call whose callee
 // returns `owned` (per `common::calleeReturnsOwned`, which covers
@@ -10330,23 +10446,14 @@ void ExprTC::checkAssignable(
         // on the SOURCE slot via the same predicate as above; the
         // mint-announcing slots (`Task`-family, iterable heads) and a bare
         // type parameter are not touched.
-        if (!freshLambda && !selFrom->funcReturnOwned &&
-            to->funcReturnOwned && isConcreteSlotReturnType(selFrom->funcReturn)) {
-            ctx_.diagnostics().report(
-                Severity::Error, loc,
-                std::string("the ") + what + " has a function type whose "
-                "return slot is the plain `" +
-                std::string(selFrom->funcReturn->headName()) +
-                "` but the target's is `owned` \xe2\x80\x94 a call through a "
-                "plain concrete class/interface slot yields a borrow, while "
-                "a call through an `owned` slot hands the caller a value it "
-                "must dispose, so the caller would dispose a borrow of "
-                "storage someone else owns; modifier slots are part of a "
-                "function signature's identity and there is no conversion "
-                "between them (\xc2\xa7""27.1.1, \xc2\xa7""28.3.5 rows 1 and 4 "
-                "v0.359)");
+        //
+        // fix #9146: the rule, its predicate and its sentence are ONE
+        // (`checkPlainFunctionValueAtOwnedSlot`), shared with the BUILT-IN
+        // constructor/method arm — a built-in `(…) -> owned K` slot answers
+        // this question the same way.
+        if (checkPlainFunctionValueAtOwnedSlot(selFrom, to->funcReturnOwned,
+                                               fromExpr, what, loc))
             return;
-        }
         // §27.3 (v0.217, #2101): a fresh lambda's param/return SHAPES stay
         // target-typed (the skipShapeCheck carve above) — EXCEPT that a
         // return-type ASCRIPTION, when written, must agree with the target's

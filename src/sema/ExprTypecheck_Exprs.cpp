@@ -2189,6 +2189,30 @@ void ExprTC::checkBuiltinNullableCtorArgs(const ast::NewExpr& ne,
 // does), so the constant narrowing and the widening table are not restated.
 void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
                                       const std::string& head) {
+    // fix #9146 (stdlib §4.14, §27.1.1 fourth bullet, §28.3.5 rows 1 and 4,
+    // v0.359): the built-in CONSTRUCTOR arm's parameter check. A built-in
+    // constructor has no `ast::Param` list, so its arguments never reach
+    // `checkAssignable` — the §27.1.1 modifier-slot question is asked nowhere
+    // on this path — and the ONE built-in parameter table's `kinds` column has
+    // no bit for a FUNCTION type, so the position carried no type opinion
+    // either. `OwningBuffer<T>`'s `init: (int) -> owned T` (stdlib §4.14, the
+    // class-typed presentation) is such a position: a plain function value (a
+    // `(int) -> K` variable, or a method group over a borrow-returning
+    // method) was admitted at it, and the buffer's destructor cascades
+    // through its slots — so the buffer disposed a borrow of storage someone
+    // else owns: a heap-use-after-free (#9146's repro, under ASan).
+    //
+    // The rule, its predicate and its sentence are ONE
+    // (`checkPlainFunctionValueAtOwnedSlot`), shared with the user-declared
+    // arm (#9127) and with the built-in METHOD arm
+    // (`checkBuiltinOwnedFnArg`), so the three cannot drift.
+    {
+        const TypeRef* tgt =
+            ne.type ? ctx_.resolvedType(*ne.type) : ctx_.exprType(ne);
+        const std::string what = "argument to `" + head + "` constructor";
+        if (checkBuiltinOwnedFnArg(head, /*member=*/"", ne.args, tgt, what))
+            return;
+    }
     // fix #8136 (stdlib §4.8, v0.355; §5.1 / §22.6 / §7): a positional-ctor-only
     // builtin record whose DECLARED POSITIONAL PARAMETERS ARE ITS OWN TYPE
     // PARAMETERS — `DictionaryEntry<K, V>` (stdlib §4.8,

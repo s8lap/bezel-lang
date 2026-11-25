@@ -1451,6 +1451,58 @@ private:
     // slot, or a record/enum/choice/builtin value type.
     bool isConcreteSlotReturnType(const TypeRef* t) const;
 
+    // fix #9127 / fix #9146 (§27.1.1 fourth bullet, §28.3.5 rows 1 and 4,
+    // v0.359): the ONE definition of the "a plain function value may not be
+    // passed where the target's return slot is `owned`" rule, shared by the
+    // USER-declared parameter arm (`checkAssignable`) and the BUILT-IN
+    // constructor/method arm (`checkBuiltinOwnedFnArg`).
+    //
+    // `src` is the function VALUE's type (the source of the conversion);
+    // `targetReturnOwned` says whether the TARGET's return slot carries the
+    // `owned` marker; `srcExpr` is the source EXPRESSION (a fresh lambda
+    // literal is the callee-side-checked spelling — #9040/#1820: its body
+    // must supply a fresh or owned value — and is skipped); `what` names the
+    // position in the diagnostic.
+    //
+    // The rule: §27.1.1's fourth bullet ("Modifier slots (`owned`/`ref`/`out`/
+    // `out owned`/`scoped`) must match exactly"). §28.3.5 row 4's
+    // function-value-invocation cell reads the plain concrete class/interface
+    // slot — a call through `() -> K` is a "Borrow … The result is never
+    // owned"; row 1's is "Function-value invocation: Owned", so the CALLER
+    // disposes each result. A value whose return slot is the plain `K`,
+    // passed where the target declares `owned`, would hand the caller's
+    // disposal obligation a borrow of storage someone else owns — a
+    // heap-use-after-free.
+    //
+    // Returns true when the diagnostic was REPORTED (the caller stops).
+    bool checkPlainFunctionValueAtOwnedSlot(const TypeRef* src,
+                                             bool targetReturnOwned,
+                                             const ast::Expr* srcExpr,
+                                             const std::string& what,
+                                             SourceLocation loc);
+
+    // fix #9146 (stdlib §4.9, §4.14, §27.1.1 fourth bullet, §28.3.5 rows 1
+    // and 4, v0.359): the BUILT-IN constructor/method argument check at a
+    // parameter whose DECLARED type is a function type whose RETURN slot
+    // carries the `owned` marker — `(…) -> owned K`.
+    //
+    // `head` is the built-in type head, `member` the member (EMPTY for a
+    // CONSTRUCTOR); `args` the call's arguments; `instTy` the INSTANTIATION
+    // the declared parameter type is read out of (the construction's target
+    // type, or the receiver's type); `what` names the position.
+    //
+    // The declared RETURN slot is read out of the instantiation (the buffer's
+    // element type, the dictionary's value type), and the `owned` marker
+    // applies to the CLASS-typed presentation only (stdlib §4.14's two
+    // presentations: the class-typed one declares `init: (int) -> owned T`,
+    // the value-typed one declares `init: (int) -> T`).
+    //
+    // Returns true when the diagnostic was REPORTED (the caller stops).
+    bool checkBuiltinOwnedFnArg(
+        std::string_view head, std::string_view member,
+        const std::vector<ast::CallArgument>& args, const TypeRef* instTy,
+        const std::string& what);
+
     // fix #1820 (§28.3, v0.223 ruling): is `e` a fresh owned-producing
     // expression — `new T()` over a class/interface, or a call whose callee
     // returns `owned` (per `common::calleeReturnsOwned`, which covers

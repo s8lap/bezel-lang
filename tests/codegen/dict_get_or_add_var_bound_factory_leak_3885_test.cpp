@@ -65,6 +65,29 @@
 // 200-500x band): a one-shot LSan run can pass on BOTH sides of this exact
 // fix because a leaked few-byte allocation is a prime candidate to still be
 // stack-reachable at process exit on a single invocation.
+//
+// BEHAVIOUR FLIP (fix #9146, stdlib §4.9 / §27.1.1 fourth bullet / §28.3.5
+// rows 1 and 4, v0.359). The factory's DECLARED TYPE is now spelled out:
+// `var factory: (string) -> owned R := lambda(...)`. stdlib §4.9 declares
+// `OwningDictionary<K, V>.GetOrAdd(key: K, factory: (K) -> owned V): V`, and
+// §27.1.1's fourth bullet ("Modifier slots (`owned`/`ref`/`out`/`out owned`/
+// `scoped`) must match exactly") makes the factory's return slot part of the
+// parameter's identity: the UNANNOTATED `var factory := lambda(k: string)
+// => move (new R(captured));` has the INFERRED type `(string) -> R` -- a PLAIN
+// return slot (the compiler's inference does not see through the `move` to
+// the fresh production) -- and is therefore NOT admissible at that slot
+// (fix #9146 refuses it, with the same diagnostic a user-declared `() ->
+// owned K` parameter now gets). The annotation declares the `owned` return
+// slot the stdlib's §4.9 signature requires.
+//
+// The test's SUBJECT is unchanged: the factory is still a `var`-BOUND
+// reference (an `ast::IdentifierExpr`) rather than a lambda LITERAL at the
+// call site, still a CAPTURING closure over `captured`, and still read at two
+// call sites in the third row -- the closure-escape classification this file
+// pins is keyed on that AST shape, not on the type. MEASURED with the
+// annotation: the 300-iteration program is clean under ASan/LSan
+// (`detect_leaks=1`), exit 0, `R._n == 300` -- the same measurement the
+// unannotated spelling gave before fix #9146.
 
 #include <string>
 
@@ -114,7 +137,7 @@ BEZEL_TEST(dict_get_or_add_var_bound_factory_leak_3885,
         "var i := 0; "
         "while i < 300 do "
         "  var captured := i; "
-        "  var factory := lambda(k: string) => move (new R(captured)); "
+        "  var factory: (string) -> owned R := lambda(k: string) => move (new R(captured)); "
         "  using var d := new OwningDictionary<string, R>(); "
         "  var v := d.GetOrAdd(\"k\", factory); "
         "  if v.Tag <> captured then return 1; end; "
@@ -142,7 +165,7 @@ BEZEL_TEST(dict_get_or_add_var_bound_factory_leak_3885,
         "var i := 0; "
         "while i < 300 do "
         "  var captured := i; "
-        "  var factory := lambda(k: string) => move (new R(captured)); "
+        "  var factory: (string) -> owned R := lambda(k: string) => move (new R(captured)); "
         "  using var d := new OwningDictionary<string, R>(); "
         "  d.Add(\"k\", move (new R(-1))); "
         "  var v := d.GetOrAdd(\"k\", factory); "
@@ -185,7 +208,7 @@ BEZEL_TEST(dict_get_or_add_var_bound_factory_leak_3885,
         "var i := 0; "
         "while i < 300 do "
         "  var captured := i; "
-        "  var factory := lambda(k: string) => move (new R(captured)); "
+        "  var factory: (string) -> owned R := lambda(k: string) => move (new R(captured)); "
         "  using var d1 := new OwningDictionary<string, R>(); "
         "  var v1 := d1.GetOrAdd(\"k\", factory); "
         "  using var d2 := new OwningDictionary<string, R>(); "
