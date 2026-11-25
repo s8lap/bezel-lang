@@ -42304,18 +42304,24 @@ namespace {
 // THE ONE THING THE DECLARATION MUST ALSO RULE OUT is §28.14's own exception —
 // a callee that "mints a deferred-activation frame" keeps the callback "for
 // that frame's life". The frame is announced by the RETURN SLOT, so this arm
-// declines a Task-family / iterable-family return, a function-typed return and
-// a return whose origin is unknown — a CLASS type parameter the importer's
-// subclass may instantiate at such a head (§12.1: return types must match
-// exactly, so the base's declaration decides what an override may return).
+// reads it there: a Task-family / iterable-family return is the FRAME-RESIDENT
+// arm, which fix #9309 ADMITS (the frame holds a reference of its own on the
+// closure cell and drops it at the frame's end, so the caller's reference is
+// the caller's to release at its scope end — §28.9: every function-value holder
+// releases exactly one reference); a function-typed return and a return whose
+// origin is unknown — a CLASS type parameter the importer's subclass may
+// instantiate at such a head (§12.1: return types must match exactly, so the
+// base's declaration decides what an override may return) — are still DECLINED.
 //
 // The proof itself is the ONE copy in LlvmBackend_CallBoundedDecl.hpp, shared
 // with the LOCAL no-body callee (LlvmBackend_Calls2.cpp) so the two cannot
-// drift.
+// drift. The `viaDeferredFrame` out-param carries the arm's verdict back to
+// the escape walk.
 static bool importedCalleeFormalIsCallBounded(const sema::SemaContext& ctx,
                                                const sema::MethodSymbol& ms,
                                                const ast::CallExpr& call,
-                                               std::size_t ai) {
+                                               std::size_t ai,
+                                               bool* viaDeferredFrame = nullptr) {
     if (ai >= call.args.size() || !call.args[ai].value) return false;
     const ast::CallArgument& a = call.args[ai];
     if (!a.modifier.empty()) return false;
@@ -42378,12 +42384,13 @@ static bool importedCalleeFormalIsCallBounded(const sema::SemaContext& ctx,
     } else {
         d.returnOrigin = CallBoundedDeclaration::ReturnOrigin::Concrete;
     }
-    return declaredFormalIsCallBounded(d);
+    return declaredFormalIsCallBounded(d, viaDeferredFrame);
 }
 
 inline bool closureArgBindsMethodOwnTypeParamBorrow(
         const sema::SemaContext& ctx, const ast::CallExpr& call,
-        std::size_t ai, bool* viaFnvalFieldStore = nullptr) {
+        std::size_t ai, bool* viaFnvalFieldStore = nullptr,
+        bool* viaDeferredFrame = nullptr) {
     if (ai >= call.args.size() || !call.args[ai].value) return false;
     if (!call.args[ai].modifier.empty()) return false;
     auto* ms = dynamic_cast<sema::MethodSymbol*>(
@@ -42404,7 +42411,7 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
     // the imported arms, not the last. Everything else fails closed (ESCAPE →
     // leak, never an early release).
     if (ctx.isImported(ms) &&
-        importedCalleeFormalIsCallBounded(ctx, *ms, call, ai))
+        importedCalleeFormalIsCallBounded(ctx, *ms, call, ai, viaDeferredFrame))
         return true;
     if (ctx.isImported(ms) && !dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
         // fix #9056 (§28.14 / §28.9 / §2.5, v0.359): arm (d) below, for an
@@ -42538,7 +42545,7 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
         const sema::TypeRef* at0 = ctx.exprType(*a.value);
         if (at0 && at0->kind == sema::TypeRef::Kind::Function &&
             calleeBodyUsesFormalOnlyByInvocationInspectionOrForwarding(
-                ctx, *md, p.name))
+                ctx, *md, p.name, viaDeferredFrame))
             return true;
         return false;
     }
@@ -44179,14 +44186,28 @@ struct ClosureEscapeWalker {
                 // fix #8717: each relief below also admits target reached
                 // through `??` / `as` (argIsTarget).
                 bool viaFnvalFieldStore = false;  // fix-forward #9061
+                // fix #9309 (§28.14 *Call-bounded × deferred activation* /
+                // §28.9, v0.359): the FRAME-RESIDENT arm's report — the
+                // callee's declared return slot announces a deferred-activation
+                // frame, so the callee holds the callback for the FRAME'S life
+                // and the frame takes a reference of its own (the frame's
+                // construction retain). The caller's reference is therefore
+                // the caller's to release at its scope end — but the closure
+                // may OUTLIVE this scope (the frame holds it past the call),
+                // so its capture cells must not be freed with this scope. That
+                // is exactly `mayOutliveScope_`'s meaning (see its
+                // declaration), and it is what keeps the capture cells with
+                // the closure's env destructor.
+                bool viaDeferredFrame = false;  // fix #9309
                 if (!safeArg && argIsTarget(c->args[ai].value.get()) &&
                     closureArgBindsMethodOwnTypeParamBorrow(
-                        ctx, *c, ai, &viaFnvalFieldStore)) {
+                        ctx, *c, ai, &viaFnvalFieldStore, &viaDeferredFrame)) {
                     safeArg = true;
                     if (viaFnvalFieldStore) {
                         mayOutliveScope_ = true;
                         storedIntoFnvalField_ = true;
                     }
+                    if (viaDeferredFrame) mayOutliveScope_ = true;  // fix #9309
                 }
                 // fix #8872 (§28.14 / §28.9 / §27.5, v0.359): the
                 // FUNCTION-VALUE callee twin of the arm above. A call through

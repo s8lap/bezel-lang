@@ -67,19 +67,21 @@
 //           end by the lowering (`isCallBoundedClosureArgPosition`), so a fix
 //           that also armed a release for it would turn this row red with a
 //           bad free / use-after-free under ASan.
-//   Row 4 — GREEN CONTROL: the DEFERRED-ACTIVATION guard — an abstract member
-//           whose return slot announces an iterator's frame, overridden by an
-//           iterator that invokes the callback from its frame, with the caller
-//           RETURNING the enumerable. §28.14 (v0.359), *Call-bounded ×
-//           deferred activation*: the callee "receives the callback ... for
-//           that frame's life", so the caller's closure local must NOT be
-//           released at its scope end — a fix that admitted this shape would
-//           free the closure under the frame and turn this row red with a
-//           heap-use-after-free. The row stays LEAK-ONLY (the base's verdict),
-//           so it asserts the exact output, a leak floor and NO
-//           AddressSanitizer error — never a clean run.
+//   Row 4 — BEHAVIOUR FLIPPED by fix #9309: was the DEFERRED-ACTIVATION guard
+//           — an abstract member whose return slot announces an iterator's
+//           frame, overridden by an iterator that invokes the callback from
+//           its frame, with the caller RETURNING the enumerable. §28.14
+//           (v0.359), *Call-bounded × deferred activation*: the callee
+//           "receives the callback ... for that frame's life", and the frame
+//           holds a reference of its OWN on the closure cell (#1864), so the
+//           caller's closure local releases ITS reference at its scope end
+//           (§28.9). The row was LEAK-ONLY on the base (it asserted a
+//           200 × 64 B leak floor) and now asserts a CLEAN run — while still
+//           reading the closure after the caller's scope end, so an early
+//           release fails it with a heap-use-after-free.
 //
 // per §28.14, §28.9, §12.1, §12.5, §11.2, §11.8 (issue #9150)
+// Row 4 flipped by issue #9309 (§28.14, §28.9, v0.359)
 
 #include <iostream>
 #include <string>
@@ -139,22 +141,13 @@ void expectClean(const JitResult& r, int exitCode, const std::string& out) {
 // its exact output, LeakSanitizer reported at least `minBytes` leaked, and
 // AddressSanitizer reported NO error — a use-after-free aborts the run before
 // the leak summary, so it fails both of the last two checks.
-void expectLeakFloorNoUseAfterFree(const JitResult& r, const std::string& out,
-                                   unsigned long long minBytes) {
-    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    const std::string text = diagnosticText(r);
-    BEZEL_EXPECT_TRUE(text.find("ERROR: AddressSanitizer") == std::string::npos);
-    BEZEL_EXPECT_TRUE(text.find("heap-use-after-free") == std::string::npos);
-    BEZEL_EXPECT_EQ(r.stdoutText, out);
-    unsigned long long leakedBytes = 0, leakedAllocs = 0;
-    const bool sawSummary =
-        bezel::test::aot_detail::parseLeakSummary(text, leakedBytes, leakedAllocs);
-    std::cout << "    [ LEAK COUNT ] " << leakedAllocs << " allocation(s) / "
-              << leakedBytes << " byte(s) leaked (floor " << minBytes
-              << " byte(s))\n";
-    BEZEL_EXPECT_TRUE(sawSummary);
-    BEZEL_EXPECT_TRUE(leakedBytes >= minBytes);
-}
+//
+// fix #9309: this helper is GONE. The row that used it — the DEFERRED-
+// ACTIVATION guard below — no longer leaks: the frame takes a reference of its
+// own on the closure cell and drops it at the frame's end, so the caller's
+// local releases its own reference at its scope end (§28.9: every function-
+// value holder releases exactly one reference) and the row now asserts a CLEAN
+// run. The helper had no other caller.
 
 // ── Row 1 (§28.14 / §28.9 / §12.1 / §12.5): the ISSUE'S OWN REPRO — an
 // ABSTRACT member whose plain function-typed parameter receives the
@@ -284,22 +277,29 @@ BEZEL_TEST(abstract_callee_caller_owned_closure_local_9150,
     expectClean(r, 0, "8400\n");
 }
 
-// ── Row 4 (GREEN CONTROL — the DEFERRED-ACTIVATION guard): the abstract
-// member's return slot announces an ITERATOR's frame, the subclass overrides
-// it as an iterator that invokes the callback from its frame, and the caller
-// RETURNS the enumerable — so the frame outlives the caller's closure local.
+// ── Row 4 (BEHAVIOUR FLIPPED by fix #9309 — was the DEFERRED-ACTIVATION
+// guard): the abstract member's return slot announces an ITERATOR's frame, the
+// subclass overrides it as an iterator that invokes the callback from its
+// frame, and the caller RETURNS the enumerable — so the frame outlives the
+// caller's closure local.
 //
 // §28.14 (v0.359), *Call-bounded × deferred activation*: "the callee receives
 // the callback for the duration of the call only — or, when the call mints a
-// deferred-activation frame, for that frame's life". The frame is announced by
-// the RETURN slot, so the declaration-only proof must decline this callee: a
-// fix that admitted it would free the closure at the caller's scope end while
-// the frame still holds it, and the frame's `q()` would read the freed closure
-// ("AddressSanitizer: heap-use-after-free in lam$0").
+// deferred-activation frame, for that frame's life". The frame therefore HOLDS
+// the callback — and it holds a reference of ITS OWN: the iterator's frame
+// takes its own +1 on the closure cell at construction and drops it at the
+// frame's end (#1864's machinery). §28.9 (v0.359): "every function-value holder
+// releases exactly one reference" — the frame is a holder and the caller's
+// local is a holder, and each drops its own.
 //
-// The row stays LEAK-ONLY (the base's verdict, and the non-deferred twins'),
-// so it asserts the exact output, a leak floor and NO AddressSanitizer error
-// — never a clean run.
+// The row was LEAK-ONLY on the base (it asserted a leak floor of 200 × 64 B,
+// because #9150's declaration-only proof declined a frame-announcing return,
+// so the caller's local never released its reference). fix #9309 admits the
+// frame-resident arm, so the caller's local now releases its reference at its
+// scope end and the row asserts a CLEAN run instead — while STILL reading the
+// closure AFTER the caller's scope end (the frame invokes `q()` from its
+// MoveNext), so a fix that released the closure too early would fail this row
+// with a heap-use-after-free rather than pass it.
 BEZEL_TEST(abstract_callee_caller_owned_closure_local_9150,
            abstract_member_with_an_iterator_override_never_reads_a_freed_closure) {
     const std::string src =
@@ -333,7 +333,7 @@ BEZEL_TEST(abstract_callee_caller_owned_closure_local_9150,
         "  end Main; "
         "end Program;";
     auto r = runAotChecked(src);
-    expectLeakFloorNoUseAfterFree(r, "16800\n", 200ull * 64ull);
+    expectClean(r, 0, "16800\n");
 }
 
 }  // namespace

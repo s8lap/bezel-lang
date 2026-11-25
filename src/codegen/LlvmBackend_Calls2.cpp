@@ -22567,9 +22567,15 @@ static bool forwardedArgPositionIsRefFormal(const sema::SemaContext& ctx,
                                             std::size_t i, int depth);
 // fix #8933: the walk driver, with the forwarding chain depth (the public
 // entry point below starts it at 0).
+//
+// fix #9309 (§28.14 *Call-bounded × deferred activation* / §28.9, v0.359):
+// `viaDeferredFrame` reports that the verdict came from the FRAME-RESIDENT
+// arm (the callee's declared return slot announces a deferred-activation
+// frame) — see the definition's own note.
 static bool bodyWalkAllowsForwarding(const sema::SemaContext& ctx,
                                      const ast::MethodDecl& md,
-                                     std::string_view name, int depth);
+                                     std::string_view name, int depth,
+                                     bool* viaDeferredFrame);
 // fix #8953 (§27.5 / §28.14 / §28.9, v0.359): does the closure held by the
 // local `decl` ESCAPE the callee? (declared here and defined after the walk
 // below, which the scan reuses.)
@@ -23628,8 +23634,9 @@ bool calleeBodyUsesFormalOnlyByInvocationInspectionOrTakingFieldStore(
 //     leak, never an early release.
 bool calleeBodyUsesFormalOnlyByInvocationInspectionOrForwarding(
         const sema::SemaContext& ctx, const ast::MethodDecl& md,
-        std::string_view name) {
-    return bodyWalkAllowsForwarding(ctx, md, name, /*depth=*/0);
+        std::string_view name, bool* viaDeferredFrame) {
+    return bodyWalkAllowsForwarding(ctx, md, name, /*depth=*/0,
+                                    viaDeferredFrame);
 }
 
 // fix #9150 (§28.14 / §28.9 / §12.1 / §12.5 / §11.2 / §11.8, v0.359): the
@@ -23667,18 +23674,26 @@ bool calleeBodyUsesFormalOnlyByInvocationInspectionOrForwarding(
 // THE ONE THING THE DECLARATION MUST ALSO RULE OUT is §28.14's own exception —
 // a callee that "mints a deferred-activation frame" keeps the callback "for
 // that frame's life". The frame is announced by the RETURN SLOT, so the
-// declaration-only proof declines a Task-family / iterable-family return, a
+// declaration-only proof reads it there: a Task-family / iterable-family
+// return is the FRAME-RESIDENT arm, which fix #9309 ADMITS (the frame holds
+// a reference of its own on the closure cell and drops it at the frame's end,
+// so the caller's reference is the caller's to release at its scope end —
+// §28.9: every function-value holder releases exactly one reference); a
 // function-typed return (it could carry the callback out of the call) and a
 // return whose origin is unknown (a CLASS type parameter a subclass may
-// instantiate at such a head). Every clause fails closed → ESCAPE → a leak,
-// never an early release and never a double free.
+// instantiate at such a head) are still DECLINED. Every remaining clause fails
+// closed → ESCAPE → a leak, never an early release and never a double free.
 //
 // The proof itself is the ONE copy in LlvmBackend_CallBoundedDecl.hpp, shared
 // with the IMPORTED arm of the escape walk (LlvmBackend_Setup.cpp) so the two
-// cannot drift.
+// cannot drift. The `viaDeferredFrame` out-param carries the arm's verdict
+// back to the escape walk, so the caller learns that the closure may OUTLIVE
+// its scope (the frame holds it past the call) and that its capture cells must
+// not be freed with that scope.
 static bool noBodyCalleeFormalIsCallBounded(const sema::SemaContext& ctx,
                                              const ast::MethodDecl& md,
-                                             std::string_view name) {
+                                             std::string_view name,
+                                             bool* viaDeferredFrame = nullptr) {
     // The FORMAL, as the callee declares it. §12.6 forbids `async abstract`, so
     // an `async` modifier cannot appear here — but a callee that mints a
     // deferred-activation frame is declined on its RETURN slot below, and an
@@ -23720,13 +23735,23 @@ static bool noBodyCalleeFormalIsCallBounded(const sema::SemaContext& ctx,
     } else {
         d.returnOrigin = CallBoundedDeclaration::ReturnOrigin::Concrete;
     }
-    return declaredFormalIsCallBounded(d);
+    return declaredFormalIsCallBounded(d, viaDeferredFrame);
 }
 
 // fix #8933: the walk driver with the forwarding chain depth.
+//
+// fix #9309 (§28.14 *Call-bounded × deferred activation* / §28.9, v0.359): the
+// `viaDeferredFrame` out-param reports that the walk's verdict came from the
+// FRAME-RESIDENT arm — the callee's declared return slot announces a
+// deferred-activation frame, so the callee holds the callback for the FRAME'S
+// life and the frame takes a reference of its own. The caller needs the
+// distinction: the closure may then OUTLIVE the caller's scope (the frame
+// holds it past the call), so its capture cells must not be freed with that
+// scope.
 static bool bodyWalkAllowsForwarding(const sema::SemaContext& ctx,
                                      const ast::MethodDecl& md,
-                                     std::string_view name, int depth) {
+                                     std::string_view name, int depth,
+                                     bool* viaDeferredFrame) {
     if (name.empty()) return false;
     // fix #9150 (§28.14 / §28.9 / §12.1 / §12.5 / §11.2 / §11.8, v0.359): a
     // callee with NO BODY — an ABSTRACT member or an INTERFACE member — is
@@ -23735,7 +23760,7 @@ static bool bodyWalkAllowsForwarding(const sema::SemaContext& ctx,
     // there cost a LEAK (the issue's own repro: 16000 B / 600 allocations over
     // 200 iterations).
     if (md.bodyKind == ast::MethodBodyKind::Abstract)
-        return noBodyCalleeFormalIsCallBounded(ctx, md, name);
+        return noBodyCalleeFormalIsCallBounded(ctx, md, name, viaDeferredFrame);
     for (auto mod : md.modifiers)
         if (mod == "virtual" || mod == "abstract" || mod == "override")
             return false;
@@ -23851,7 +23876,15 @@ static bool forwardedArgPositionIsCallBounded(
             }
         }
         // RECURSE: the target's own body must keep nothing past ITS call.
-        return bodyWalkAllowsForwarding(ctx, *md, p.name, depth + 1);
+        // fix #9309: the forwarded callee's return slot was checked just
+        // above to be FRAME-FREE (a Task-family / iterable head DECLINES
+        // there) and a virtual / abstract / override callee DECLINES a few
+        // lines above, so this recursion reaches neither the frame-resident
+        // declaration arm nor the abstract declaration proof — it cannot
+        // report the frame-resident arm, and the flag stays as the caller
+        // set it.
+        return bodyWalkAllowsForwarding(ctx, *md, p.name, depth + 1,
+                                        /*viaDeferredFrame=*/nullptr);
     }
     // The FUNCTION-VALUE branch.
     const sema::TypeRef* ft = ctx.exprType(*c.callee);

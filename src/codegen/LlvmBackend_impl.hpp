@@ -1119,9 +1119,18 @@ bool calleeBodyUsesFormalOnlyByInvocationInspectionOrFnvalFieldStore(
 //
 // Used by ClosureEscapeWalker's method-callee argument relief
 // (closureArgBindsMethodOwnTypeParamBorrow arm (b), LlvmBackend_Setup.cpp).
+//
+// fix #9309 (§28.14 *Call-bounded × deferred activation* / §28.9, v0.359):
+// `viaDeferredFrame` is set when the verdict came from the FRAME-RESIDENT arm
+// — the callee's declared return slot announces a deferred-activation frame,
+// so the callee holds the callback for the frame's life and the frame takes a
+// reference of its own (the caller may then release the caller's own
+// reference at its scope end). The out-param keeps the caller and the proof
+// from drifting: the caller's capture-cell discipline follows the arm that
+// actually admitted the formal.
 bool calleeBodyUsesFormalOnlyByInvocationInspectionOrForwarding(
         const sema::SemaContext& ctx, const ast::MethodDecl& md,
-        std::string_view name);
+        std::string_view name, bool* viaDeferredFrame = nullptr);
 
 // fix #5611 (§28.14 / §28.9 / §8.6, v0.334): true when a PLAIN (no-modifier)
 // parameter's DECLARED type is a function type, however it is SPELLED.
