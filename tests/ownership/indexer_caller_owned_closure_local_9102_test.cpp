@@ -67,15 +67,15 @@
 //           that released the local's +1 at the call's end as well as at
 //           scope end would turn this row red with a bad free /
 //           use-after-free under ASan.
-//   Row 4 — GREEN CONTROL: the RETURN sink — an indexer whose ELEMENT type
-//           is itself a function type, so the accessor hands the callback
-//           BACK OUT of the call (`property [q: () -> int]: () -> int => q;`).
-//           The premise must decline it, so the local keeps its +1 and the
-//           callback stays alive for the caller that received it: the row
-//           asserts the program runs and prints the right value and that NO
-//           memory error fired. (The accessor's body is never §28.14-verified
-//           — that is #9084's gap — so the conservative ESCAPE is the sound
-//           answer for this shape, and the row pins it.)
+//   Row 4 — the RETURN sink — an indexer whose ELEMENT type is itself a
+//           function type, so the accessor hands the callback BACK OUT of the
+//           call (`property [q: () -> int]: () -> int => q;`). Until #9084 the
+//           accessor's body was never §28.14-verified, so the codegen
+//           premise's conservative ESCAPE was the only guard and the row
+//           pinned it as a run. #9084 closes that gap: §28.14 forbids the
+//           body ("It may not be ... returned"), so the program is now a
+//           compile error and the row pins the REJECTION — the use-after-free
+//           the premise guarded against is unreachable.
 //
 // The `scoped` index-parameter twin (an indexer whose parameter is declared
 // `scoped`, which §28.14 makes STORAGE-bounded — the callee MAY keep the
@@ -138,23 +138,6 @@ void expectClean(const JitResult& r, int exitCode, const std::string& out) {
     BEZEL_EXPECT_EQ(r.exitCode, exitCode);
     BEZEL_EXPECT_EQ(r.stdoutText, out);
     assertNoLeak(r);
-}
-
-// The program produced its own output and NO memory error fired — the oracle
-// for a shape whose residual LEAK is documented (the premise declines it, so
-// the local keeps its +1 and the callback stays alive). The exit code is NOT
-// asserted here: LeakSanitizer's exit code supersedes the program's own when
-// it fires (the #4532 lesson the harness documents), so the row pins the
-// program's OUTPUT and the ABSENCE of a memory error, and nothing that the
-// sanitizer's exit status would decide.
-void expectNoMemoryError(const JitResult& r, const std::string& out) {
-    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_EQ(r.stdoutText, out);
-    const std::string text = diagnosticText(r);
-    BEZEL_EXPECT_TRUE(text.find("heap-use-after-free") == std::string::npos);
-    BEZEL_EXPECT_TRUE(text.find("double-free") == std::string::npos);
-    BEZEL_EXPECT_TRUE(text.find("SEGV") == std::string::npos);
-    BEZEL_EXPECT_TRUE(text.find("ERROR: AddressSanitizer") == std::string::npos);
 }
 
 // The imported module's indexer, spelled by each row so the row's twin is
@@ -269,18 +252,16 @@ BEZEL_TEST(indexer_caller_owned_closure_local_9102,
     expectClean(r, 0, "1400\n");
 }
 
-// ── Row 4 (GREEN CONTROL — the RETURN sink): an indexer whose ELEMENT type
-// is itself a function type, so the accessor hands the callback BACK OUT of
-// the call (`property [q: () -> int]: () -> int => q;`). The premise declines
-// that shape — the element type is a function type, so the call may carry the
-// callback out — so the local keeps its +1, the callback stays alive for the
-// caller that received it, and the program prints the right value.
-//
-// The row pins the DECLINE: a premise that admitted the return sink would
-// release the local's +1 at scope end while the returned callback is still
-// live, and the row would go red with a use-after-free under ASan.
+// ── Row 4 (the RETURN sink, a behavior flip of #9084): an indexer whose
+// ELEMENT type is itself a function type, so the accessor hands the callback
+// BACK OUT of the call (`property [q: () -> int]: () -> int => q;`). Before
+// #9084 the accessor body was never §28.14-verified and this row pinned the
+// codegen premise's DECLINE as a clean run. §28.14 (v0.359), *The call-bounded
+// default*: a call-bounded parameter "may not be ... returned" — so the body
+// is now rejected at compile time, with the METHOD twin's own diagnostic, and
+// the use-after-free the decline guarded against cannot be written.
 BEZEL_TEST(indexer_caller_owned_closure_local_9102,
-           function_typed_element_indexer_keeps_the_callback_alive) {
+           function_typed_element_indexer_returning_its_index_param_rejected_spec_28_14) {
     const std::string src =
         "module Ret9102; "
         "public class FlRet9102 "
@@ -300,7 +281,10 @@ BEZEL_TEST(indexer_caller_owned_closure_local_9102,
         "  end Main; "
         "end ProgramRet9102;";
     auto r = runAotChecked(src);
-    expectNoMemoryError(r, "7\n");
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "parameter `q` is call-bounded; declare it `scoped` to store it"));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, "returned"));
 }
 
 }  // namespace

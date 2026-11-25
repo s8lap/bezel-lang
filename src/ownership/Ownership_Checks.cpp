@@ -33174,13 +33174,7 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
                 if (ait != callBoundedAlias_.end()) cb = ait->second;
             }
             if (cb) {
-                report(Severity::Error, arg.span.begin,
-                       std::string("parameter `") + std::string(cb->name) +
-                           "` is call-bounded and may not be forwarded into "
-                           "a `scoped` parameter position — the callee "
-                           "cannot vouch for captures it cannot see; declare "
-                           "`" + std::string(cb->name) +
-                           "` itself `scoped` to store it (§28.14, v0.177)");
+                reportCallBoundedScopedForward(arg.span.begin, cb->name);
                 return;
             }
         }
@@ -34193,6 +34187,17 @@ void MethodOwnership::reportCallBounded(SourceLocation loc,
                std::string(sink));
 }
 
+void MethodOwnership::reportCallBoundedScopedForward(
+    SourceLocation loc, std::string_view paramName) {
+    report(Severity::Error, loc,
+           std::string("parameter `") + std::string(paramName) +
+               "` is call-bounded and may not be forwarded into "
+               "a `scoped` parameter position — the callee "
+               "cannot vouch for captures it cannot see; declare "
+               "`" + std::string(paramName) +
+               "` itself `scoped` to store it (§28.14, v0.177)");
+}
+
 void MethodOwnership::seedLambdaCallBoundedParams(const ast::LambdaExpr& lam) {
     // §A.7 / §21.7: sema records each lambda's own parameter symbol list
     // (position-for-position with lam.params) via ctx_.setLambdaParams during
@@ -34234,6 +34239,69 @@ void MethodOwnership::callBoundedScan(
     // always run so that descent reaches the lambda. // per §28.14, v0.177
     for (const auto& s : body)
         if (s) callBoundedWalkStmt(*s);
+}
+
+// fix #9084 (§28.14 *The call-bounded default*, v0.359): "A function-typed
+// parameter declared *without* `scoped` is **call-bounded** … Within the
+// callee the callback may be invoked, bound to locals, and passed on as an
+// argument to another call-bounded parameter … It may not be stored in a field
+// of any object …, stored into any collection …, returned, captured by a
+// closure that itself escapes the callee …, or forwarded into a `scoped`
+// parameter position … These obligations are compiler-verified for
+// user-authored callees". An indexer accessor is such a callee and its index
+// parameters are its own formals, but only a METHOD body was ever seeded:
+// `run` seeds them and runs `callBoundedScan`, and a block getter reaches
+// `run` only when proved confined, with its diagnostics suppressed (#8767),
+// while an expression getter / setter reaches it not at all. See the
+// declaration for the contract. // per §28.14, v0.359
+void MethodOwnership::seedCallBoundedFormals(
+    const std::vector<sema::Symbol*>& paramSyms) {
+    // The seed `run` applies to a method's formals, verbatim. A `scoped`
+    // parameter carries a modifier and stays storage-bounded; a setter's
+    // `value` is a LocalSymbol, not a ParameterSymbol, and is never seeded.
+    for (sema::Symbol* sym : paramSyms) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+        if (!ps || !ps->modifier.empty()) continue;
+        const sema::TypeRef* rt = ps->declType
+                                      ? ctx_.resolvedType(*ps->declType)
+                                      : ps->resolvedDeclType;
+        const bool fnTyped =
+            (rt && rt->kind == sema::TypeRef::Kind::Function) ||
+            (ps->declType && ps->declType->kind == ast::TypeKind::Function);
+        if (fnTyped) callBoundedParams_.insert(sym);
+    }
+}
+
+void MethodOwnership::checkAccessorCallBounded(
+    const std::vector<sema::Symbol*>* paramSyms,
+    const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
+    const ast::Expr* exprBody, bool exprIsReturn,
+    const ast::Type* returnType) {
+    if (!paramSyms) return;
+    seedCallBoundedFormals(*paramSyms);
+    if (callBoundedParams_.empty()) return;
+    for (sema::Symbol* sym : *paramSyms) methodParamSet_.insert(sym);
+    returnType_ = returnType;
+    callBoundedReportsScopedForward_ = true;
+    if (stmts) callBoundedScan(*stmts);
+    if (exprBody) {
+        // A getter's `=> E` IS its returned value, so a call-bounded source
+        // there is the return sink — the twin of the expression-bodied
+        // method's (`runExprBodyOwningReturnCheck`) and of a lambda's `=> E`
+        // (`callBoundedWalkExpr`), frame residence under a deferred-activation
+        // declared type included.
+        sema::ParameterSymbol* src =
+            exprIsReturn ? callBoundedSourceOf(*exprBody) : nullptr;
+        if (src) {
+            if (!(isDeferredActivationCallResult(*exprBody) &&
+                  returnTypeIsDeferredActivation()))
+                reportCallBounded(exprBody->span.begin, src->name,
+                                  "returned");
+        } else {
+            callBoundedWalkExpr(*exprBody);
+        }
+    }
+    callBoundedReportsScopedForward_ = false;
 }
 
 void MethodOwnership::callBoundedWalkStmt(const ast::Stmt& s) {
@@ -34485,6 +34553,17 @@ void MethodOwnership::callBoundedWalkExpr(const ast::Expr& e) {
                 // — skip the duplicate here.
                 if (scopedFormalAt(callee, ne, args, i)) {
                     // (admission owns the diagnostic)
+                    // fix #9084 (§28.14, v0.359): "It may not be … forwarded
+                    // into a `scoped` parameter position". An accessor body
+                    // runs no admission pass, so the scan reports the
+                    // admission's own identifier-form verdict here: the bare
+                    // parameter or a carrier local, exactly the shape
+                    // `checkScopedAdmission` reports with this diagnostic.
+                    if (callBoundedReportsScopedForward_ &&
+                        dynamic_cast<const ast::IdentifierExpr*>(
+                            a.value.get()))
+                        reportCallBoundedScopedForward(a.value->span.begin,
+                                                       src->name);
                 } else if (collStore) {
                     // Sink: builtin-collection mutator on a receiver
                     // reachable beyond the call.

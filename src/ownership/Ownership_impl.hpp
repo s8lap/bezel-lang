@@ -1034,6 +1034,30 @@ public:
     void checkSetErasingPositionsInAccessorBody(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
+    // fix #9084 (§28.14 *The call-bounded default*, v0.359): the §28.14
+    // callee-side verification at an INDEXER ACCESSOR body that no full
+    // ownership pass reaches (a block getter, whose pass runs only when the
+    // body is proved confined and then with its diagnostics suppressed; an
+    // expression getter / the indexer's own `=> E` body; an expression
+    // setter). Seeds the accessor's own plain function-typed formals
+    // (`paramSyms`, the indexer's index parameters) exactly as `run` seeds a
+    // method's, then runs ONLY the existing call-bounded scan
+    // (`callBoundedScan` / `callBoundedWalkExpr`) over the body — no dataflow,
+    // no scope-end free, no other rule. Because no `scopedPreScan` follows,
+    // the scan reports the forward-into-a-`scoped`-parameter sink itself
+    // (`callBoundedReportsScopedForward_`), with the admission's own
+    // diagnostic. `exprBody` is the accessor's `=> E` body; `exprIsReturn`
+    // marks a GETTER's, which IS the returned value (§23.3), so a call-bounded
+    // source there is the return sink. `returnType` is the getter's declared
+    // type (the property's), for the §28.14 frame-residence carve-out.
+    // A no-op when the accessor has no plain function-typed formal.
+    // // per §28.14, v0.359
+    void checkAccessorCallBounded(
+        const std::vector<sema::Symbol*>* paramSyms,
+        const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
+        const ast::Expr* exprBody, bool exprIsReturn,
+        const ast::Type* returnType);
+
     // fix #3564: seed `states_` with the owned scope-bound locals declared in
     // ONE lambda body, so `checkClosureEscapesOnReturn`'s §28.3 leg (and
     // `checkBorrowStoreEscape`'s owned-source legs) can answer about that
@@ -8200,6 +8224,22 @@ private:
     // call result — a collection reached through one is reachable beyond the
     // call. (Only consulted for collection receivers.)
     std::unordered_set<sema::Symbol*> beyondCallRooted_;
+    // fix #9084 (§28.14, v0.359): set by `checkAccessorCallBounded` only. A
+    // method body's forward of a call-bounded parameter into a `scoped`
+    // position is reported by the §28.14 admission (`checkScopedAdmission`,
+    // driven by `scopedPreScan`), so the call-bounded scan skips it; an
+    // accessor body that runs ONLY the call-bounded scan has no admission
+    // pass, so the scan reports that sink itself, with the same diagnostic
+    // (`reportCallBoundedScopedForward`).
+    bool callBoundedReportsScopedForward_ = false;
+    // fix #9084 (§28.14, v0.359): `run`'s seed of a body's own plain
+    // function-typed formals into `callBoundedParams_`, for the accessor
+    // drivers (`checkAccessorCallBounded`).
+    void seedCallBoundedFormals(const std::vector<sema::Symbol*>& paramSyms);
+    // The §28.14 forward-into-a-`scoped`-position diagnostic, shared by
+    // `checkScopedAdmission` and the accessor scan so the two cannot drift.
+    void reportCallBoundedScopedForward(SourceLocation loc,
+                                        std::string_view paramName);
 
     // The pre-pass driver + walkers (statement coverage mirrors
     // scopedCalleeWalkStmt).

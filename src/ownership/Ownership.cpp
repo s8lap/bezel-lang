@@ -22034,6 +22034,15 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
             // LEAKED (MEASURED: 224 bytes in 3 allocations). Mark the K8
             // boundary for it. // per §28.3 K8
             mo.markCaseExprOwnedScrutineeInExpr(*pd->exprBody);
+            // fix #9084 (§28.14 *The call-bounded default*, v0.359): the
+            // indexer's `=> E` body is a getter body whose index parameters
+            // are its own formals; a plain function-typed one is call-bounded
+            // there exactly as a method's is. See `checkAccessorCallBounded`.
+            MethodOwnership cbMo(ctx);
+            cbMo.checkAccessorCallBounded(paramSymsOf(m, ctx), nullptr,
+                                          pd->exprBody.get(),
+                                          /*exprIsReturn=*/true,
+                                          pd->type.get());
         } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
             for (const auto& acc : pd->accessors) {
                 MethodOwnership mo(ctx);
@@ -22165,6 +22174,35 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
                     MethodOwnership setErasingMo(ctx);
                     setErasingMo.checkSetErasingPositionsInAccessorBody(
                         acc.stmts);
+                }
+                // fix #9084 (§28.14 *The call-bounded default*, v0.359): the
+                // §28.14 callee-side verification of the indexer's own plain
+                // function-typed formals, in every accessor body no full
+                // ownership pass reaches — a block GETTER (its own pass runs
+                // only when the body is proved confined, with its diagnostics
+                // suppressed) and an EXPRESSION getter or setter. A setter's
+                // BLOCK body (both `set` spellings) runs the full pass, which
+                // seeds and scans the formals already, so it is EXCLUDED: a
+                // second scan would report every sink twice. A setter's
+                // `value` is not seeded (§28.14: "a setter's `value` …
+                // excepted"; it is no ParameterSymbol). See
+                // `checkAccessorCallBounded`. // per §28.14, v0.359
+                if (!(acc.isSet &&
+                      acc.bodyKind == ast::PropertyAccessorBodyKind::Block)) {
+                    const bool isExpr =
+                        acc.bodyKind ==
+                            ast::PropertyAccessorBodyKind::Expression &&
+                        acc.exprBody;
+                    const bool isBlock =
+                        acc.bodyKind == ast::PropertyAccessorBodyKind::Block;
+                    if (isExpr || isBlock) {
+                        MethodOwnership cbMo(ctx);
+                        cbMo.checkAccessorCallBounded(
+                            paramSymsOf(m, ctx), isBlock ? &acc.stmts : nullptr,
+                            isExpr ? acc.exprBody.get() : nullptr,
+                            /*exprIsReturn=*/!acc.isSet,
+                            acc.isSet ? nullptr : pd->type.get());
+                    }
                 }
                 if (acc.isSet) continue;  // §28.6 getter-fresh-owned: getters only
                 if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression &&
