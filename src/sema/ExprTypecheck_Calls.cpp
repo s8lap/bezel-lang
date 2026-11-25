@@ -19285,6 +19285,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // comment's own words) — so it does not, and by design does
                     // not, catch this. This block is exactly that follow-up,
                     // scoped to `OwningDictionary`.
+                    //
+                    // fix #9262 (stdlib §4.9 / §5, v0.359): the SAME reasoning
+                    // covers §5's `*OrNull` TIER — `FirstOrNull` / `LastOrNull`
+                    // / `SingleOrNull` are the `T?`-returning SIBLINGS of
+                    // `First` / `Last` / `Single` on the SAME `public extension
+                    // IEnumerable<T>` block (stdlib §5), so §4.9's
+                    // `IDisposable`-only conformance leaves them with no
+                    // applicable stdlib member on an `OwningDictionary<K, V>`
+                    // either, exactly as it leaves their non-nullable twins
+                    // with none. The list was hand-spelled by NAME and carried
+                    // only the non-nullable tier (plus `ElementAt`/
+                    // `ElementAtOrNull`), so these three calls were NOT
+                    // rejected here at all: sema typed them and the call
+                    // reached codegen, which refused it THERE with a
+                    // codegen-internal wording ("internal: `FirstOrNull`
+                    // (stdlib §5, returns `T?`) was not typed `T?` on this
+                    // receiver, so its result cannot be lowered soundly",
+                    // #9234) instead of the §4.9 rule that decides the case.
+                    // The verdict is unchanged (rejected either way) — only
+                    // the wording a user reads was wrong, and it named an
+                    // internal condition rather than the stdlib rule.
                     if (colName == "OwningDictionary" &&
                         (m == "First" || m == "Last" || m == "Single" ||
                          m == "ElementAt" ||
@@ -19294,7 +19315,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                          // member, and §4.9's conformance is `IDisposable`
                          // only, so it has no applicable stdlib member on an
                          // `OwningDictionary<K, V>` either.
-                         m == "ElementAtOrNull")) {
+                         m == "ElementAtOrNull" ||
+                         // fix #9262 (stdlib §4.9 / §5, v0.359): §5's `*OrNull`
+                         // TIER — the `T?` siblings of `First` / `Last` /
+                         // `Single` on the same `extension IEnumerable<T>`
+                         // block, with no applicable stdlib member here for
+                         // the same reason as their non-nullable twins.
+                         m == "FirstOrNull" || m == "LastOrNull" ||
+                         m == "SingleOrNull")) {
                         ctx_.diagnostics().report(
                             Severity::Error, ce.span.begin,
                             std::string("`OwningDictionary<K, V>` does not "
