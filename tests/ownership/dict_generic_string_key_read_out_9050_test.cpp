@@ -290,6 +290,85 @@ const char* kEntryToArrayKeepsTheKeys =
     "  end Main;\n"
     "end Program;\n";
 
+// FIX-FORWARD F1, Stmts site. The plain `for var e in _d.Drain()` loop releases
+// the drained entry's owned string Key at the end of each iteration; the
+// release is classified on the key type, which must be the RESOLVED one at
+// K = string. The body reads nothing from the entry, so only the iteration-scope
+// release discharges the minted Key (stdlib §4.9, spec §28.9, §14.1).
+const char* kForVarIterScopeReleasesTheKey =
+    "module P; import System;\n"
+    "public class Conn\n"
+    "  public Name: string;\n"
+    "  public constructor(n: string) Name := n; end;\n"
+    "  destructor end destructor;\n"
+    "end Conn;\n"
+    "public class Repo<K> where K: hashable\n"
+    "  private owned _d: OwningDictionary<K, Conn> := new OwningDictionary<K, Conn>();\n"
+    "  public method Put(k: K, owned c: Conn) => _d[k] := c;\n"
+    "  public method Go(): string\n"
+    "    var n := 0;\n"
+    "    for var e in _d.Drain() do\n"
+    "      n := n + 1;\n"
+    "    end;\n"
+    "    return $\"{n}\";\n"
+    "  end Go;\n"
+    "end Repo;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var last := \"\";\n"
+    "    var i := 0;\n"
+    "    while i < 200 do\n"
+    "      using var r := new Repo<string>();\n"
+    "      r.Put($\"a{i}\", new Conn(\"x\"));\n"
+    "      r.Put($\"b{i}\", new Conn(\"y\"));\n"
+    "      last := r.Go();\n"
+    "      i := i + 1;\n"
+    "    end;\n"
+    "    Console.WriteLine(last);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+// FIX-FORWARD F1, Exprs2 site. An escaping closure over a moved drained entry
+// releases the entry's Key in its environment destructor; the classification
+// must read the resolved key type at K = string, or the minted Key leaks once
+// per escaping closure (stdlib §4.9, spec §28.9, §14.1). One entry per
+// repository, so the sum is independent of drain order:
+// sum over i in 0..199 of (len("ab" + i) + 9) = 120 + 1170 + 1400 = 2690.
+const char* kEscapingClosureReleasesTheKey =
+    "module P; import System;\n"
+    "public class Widget\n"
+    "  public property N: int;\n"
+    "  public constructor(n: int) N := n; end constructor;\n"
+    "  destructor end destructor;\n"
+    "end Widget;\n"
+    "public class Repo<K> where K: hashable\n"
+    "  private owned _d: OwningDictionary<K, Widget> := new OwningDictionary<K, Widget>();\n"
+    "  public method Put(k: K, owned w: Widget) => _d[k] := w;\n"
+    "  public method Make(): () -> int\n"
+    "    for var entry in _d.Drain() do\n"
+    "      var e := move entry;\n"
+    "      return lambda() => $\"{e.Key}\".Length + e.Value.N;\n"
+    "    end;\n"
+    "    return lambda() => 0;\n"
+    "  end Make;\n"
+    "end Repo;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var total := 0;\n"
+    "    var i := 0;\n"
+    "    while i < 200 do\n"
+    "      using var r := new Repo<string>();\n"
+    "      r.Put($\"ab{i}\", new Widget(9));\n"
+    "      var f := r.Make();\n"
+    "      total := total + f();\n"
+    "      i := i + 1;\n"
+    "    end;\n"
+    "    Console.WriteLine(total);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
 void expectOut(const char* src, const char* out) {
     JitResult r = runAot(src);
     BEZEL_EXPECT_TRUE(r.ran);
@@ -351,4 +430,20 @@ BEZEL_TEST(ownership_dict_generic_string_key_read_out_9050,
     BEZEL_EXPECT_TRUE(r.ran);          // no use-after-free, no leak
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("a=1;b199=2;\n"));
+}
+
+BEZEL_TEST(ownership_dict_generic_string_key_read_out_9050,
+           for_var_iteration_scope_releases_the_drained_key_spec_28_9) {
+    JitResult r = runAotChecked(kForVarIterScopeReleasesTheKey);
+    BEZEL_EXPECT_TRUE(r.ran);          // no leak, no double-free
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("2\n"));
+}
+
+BEZEL_TEST(ownership_dict_generic_string_key_read_out_9050,
+           escaping_closure_over_a_drained_entry_releases_the_key_spec_28_9) {
+    JitResult r = runAotChecked(kEscapingClosureReleasesTheKey);
+    BEZEL_EXPECT_TRUE(r.ran);          // no leak, no double-free
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("2690\n"));
 }
