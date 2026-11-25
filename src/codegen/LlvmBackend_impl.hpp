@@ -3754,6 +3754,26 @@ private:
     // that slot. Capture the slot BEFORE lowerExpr runs so the CG60 arm can use
     // it; cleared after the CG60 arm consumes it.
     llvm::AllocaInst* pendingChainCallLocalSlot_ = nullptr;
+    // fix #9082 (§28.3.11 *Unbound owned temporaries*, §28.3.10 *Owned-local
+    // discharge requirement*, v0.359): set by `lowerLocalDecl` for the duration
+    // of a local initializer that IS a chain call (`var w := C.Make()();`), so
+    // the CG60 chain-call arm can tell a BOUND chain-call result from an
+    // unbound one.
+    //
+    // §28.3.11 disposes an UNBOUND owned temporary at the end of its full
+    // expression, and says of a BOUND one that it "is governed by the
+    // corresponding transfer or discharge rule and is not disposed under this
+    // rule (it would otherwise be disposed twice)" — the bound local's own
+    // regime disposes it exactly once (§28.3.10's affine auto-drop, or an
+    // explicit discharge). So the CG60 arm registers NO scope-end disposal of
+    // its own for a bound result: two registrations for one value are the
+    // double free issue #9082 reports.
+    //
+    // The flag is CAPTURED at `lowerCallDispatch`'s entry and cleared there, so
+    // only the OUTERMOST call of the initializer sees it — a chain call NESTED
+    // in an argument position (`var x := Take(C.Make()());`) is not the
+    // initializer and keeps the §28.3.11 temporary disposal.
+    bool chainCallResultBoundToLocal_ = false;
     // fix #633 / §33.4: when Main(args: Array<string>) is emitted, the args
     // array is built in the function prolog (before any scope opens) and must be
     // disposed at the function-body root scope exit.  This optional Disposal is

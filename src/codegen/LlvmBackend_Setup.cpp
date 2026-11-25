@@ -19195,7 +19195,49 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // #4602: a local's initializer is a binding, not a retention — the
     // local's own later uses are marked where they retain the value.
     if (checkedDisposal_ && init) cdBenign_.insert(init);
+    // fix #9082 (§28.3.11 *Unbound owned temporaries*, §28.3.10 *Owned-local
+    // discharge requirement*, v0.359): arm `chainCallResultBoundToLocal_` for
+    // the duration of the init lowering when the initializer IS a chain call
+    // — `var w := C.Make()();` — so the CG60 chain-call arm knows the result
+    // is BOUND to this local and registers no scope-end disposal of its own.
+    //
+    // WHY. §28.3.11 disposes an unbound owned temporary at the end of its full
+    // expression, and says of a BOUND one that it "is governed by the
+    // corresponding transfer or discharge rule and is not disposed under this
+    // rule (it would otherwise be disposed twice)": the bound local's own
+    // regime disposes it exactly once — §28.3.10's affine auto-drop, or the
+    // program's explicit discharge. The CG60 arm registered a SECOND
+    // scope-end disposal (on its own temp slot), so the value was freed twice:
+    // an ASan heap-use-after-free in `main` (the second disposal READS the
+    // object the first one freed).
+    //
+    // The SHAPE. The initializer is a call whose CALLEE is a call — that is
+    // the chain-call shape the CG60 arm serves (`call.callee` is a CallExpr, so
+    // the callee is a temporary function value and the invocation goes through
+    // the closure-call path). A postfix null-forgiving `E!` is peeled, because
+    // the ownership pass classifies it exactly as it classifies `E`
+    // (§17.8: "`x!` is purely a type-system assertion … classifies nothing").
+    //
+    // The flag is captured and cleared at `lowerCallDispatch`'s entry, so only
+    // the OUTERMOST call of this initializer sees it: a chain call NESTED in an
+    // argument position (`var x := Take(C.Make()());`) is not the initializer
+    // and keeps §28.3.11's temporary disposal — that call's result is not
+    // bound to a local at all.
+    const bool savedChainCallResultBoundToLocal =
+        chainCallResultBoundToLocal_;
+    chainCallResultBoundToLocal_ = false;
+    if (init) {
+        const ast::Expr* initForChain = init;
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(initForChain))
+            if (pb->operand) initForChain = pb->operand.get();
+        if (auto* chainInit =
+                dynamic_cast<const ast::CallExpr*>(initForChain)) {
+            if (dynamic_cast<const ast::CallExpr*>(chainInit->callee.get()))
+                chainCallResultBoundToLocal_ = true;
+        }
+    }
     llvm::Value* v = init ? lowerExpr(*init) : nullptr;
+    chainCallResultBoundToLocal_ = savedChainCallResultBoundToLocal;
     expectedFunctionType_ = savedExpectedForLambdaDecl;
     // fix #4342: restore the flags (saved above) so a subsequent LocalDecl
     // in the same enclosing scope starts from the right state. The early-

@@ -11174,6 +11174,20 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     const bool wasRecordCallResultInitOutermost =
         recordCallResultInitOutermost_;
     recordCallResultInitOutermost_ = false;
+    // fix #9082 (§28.3.11 *Unbound owned temporaries*, v0.359): capture the
+    // `chainCallResultBoundToLocal_` flag at entry, for the same reason the
+    // #4342 flag above is captured — only the OUTERMOST call of a local's
+    // initializer is the one whose result the local binds. `lowerLocalDecl`
+    // arms the flag while it lowers the initializer of a local whose
+    // initializer IS a chain call (`var w := C.Make()();`); clearing it here
+    // means a chain call NESTED in an argument position (`var x :=
+    // Take(C.Make()());`) is NOT seen as the initializer and keeps the
+    // §28.3.11 unbound-temporary disposal. The CG60 arm below reads the
+    // CAPTURED value: the callee of the outermost call is lowered inside this
+    // call, and that nested dispatch clears the member.
+    const bool wasChainCallResultBoundToLocal =
+        chainCallResultBoundToLocal_;
+    chainCallResultBoundToLocal_ = false;
     // §22.16 (v0.250, #3038): `old(E)` inside an `ensures` clause. The
     // capture slot was allocated by `allocateOldCaptureSlots` and the
     // entry-time value was stored there by `captureOldOperands` (both
@@ -13675,7 +13689,24 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // scope-end disposal.  lowerLocalDecl wires the slot to us via
             // pendingChainCallLocalSlot_ so we use the same slot the disposal
             // will fire on.
+            //
+            // fix #9082 (§28.3.11 *Unbound owned temporaries*, §28.3.10
+            // *Owned-local discharge requirement*, v0.359): a BOUND result gets
+            // NO registration here. §28.3.11 disposes an UNBOUND owned
+            // temporary at the end of its full expression and says of a bound
+            // one that it "is governed by the corresponding transfer or
+            // discharge rule and is not disposed under this rule (it would
+            // otherwise be disposed twice)" — the local the result is bound to
+            // disposes it exactly once (§28.3.10's affine auto-drop, or the
+            // program's explicit discharge). Registering here as well freed
+            // the value TWICE: the local's scope-end disposal freed it, and
+            // this one then READ the freed object (the ASan
+            // heap-use-after-free of issue #9082) before double-freeing it.
+            //
+            // The UNBOUND case is untouched: the result is an owned temporary
+            // and this registration is its §28.3.11 disposal.
             if (chainResultOwned &&
+                !wasChainCallResultBoundToLocal &&
                 calleeTy->funcReturn &&
                 calleeTy->funcReturn->kind == sema::TypeRef::Kind::Named &&
                 calleeTy->funcReturn->declaration &&
