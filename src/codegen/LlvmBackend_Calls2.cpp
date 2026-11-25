@@ -19923,6 +19923,10 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs,
                                          call.span.begin, thisReceiver,
                                          argBoxCallIdx);
+    // fix #9249 (§22.3 / §28.9, v0.359): give a `ref`-aliased class field
+    // its own reference to what the callee stored, before any post-call
+    // discharge below.
+    finishClosureFieldRefArgs(accessorRefArgs);
     // fix #8624: restore the unwind target the closure cleanup replaced
     // (the `.` form's own `unwindTarget_ = savedClArgUnwind;`).
     unwindTarget_ = clRel.savedUnwindTarget;
@@ -30532,6 +30536,7 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     llvm::Value* r = emitMethodCall(ms, args, /*baseQualified=*/false, &argExprs,
                                     call.span.begin, /*thisReceiver=*/false,
                                     argBoxCallIdx);
+    finishClosureFieldRefArgs(accessorRefArgs);  // fix #9249, the `?.` twin
     // fix #8624: restore the unwind target the closure cleanup replaced
     // (the `.` form's own `unwindTarget_ = savedClArgUnwind;`).
     unwindTarget_ = clRel.savedUnwindTarget;

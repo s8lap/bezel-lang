@@ -27831,7 +27831,49 @@ private:
         // the write-back reuse those values instead of re-running a
         // side-effecting subexpression. Erased when the record is flushed.
         std::vector<const ast::Expr*> pins;
+        // fix #9249 (§22.3 / §28.3 / §28.9, v0.359): a `ref` argument naming
+        // a CLASS FIELD of function type is a true alias (`slot` stays null:
+        // there is no bracket), recorded here only so the caller can give the
+        // field its own reference to the value the callee stored. Set by
+        // `recordClosureFieldRefArg`; `closureFieldOld` is the field's value
+        // read immediately before the call (`stampClosureFieldRefArgOld`).
+        llvm::Value* closureFieldAddr = nullptr;
+        llvm::Value* closureFieldOld = nullptr;
     };
+
+    // fix #9249 (§22.3 / §28.3 / §28.9, v0.359): a `ref` argument naming a
+    // class field of function type (`Copy(ref a.F, b)`) aliases the field,
+    // and the callee's `x := src.F` is a PLAIN store through the alias — the
+    // callee cannot tell a field (whose holder releases what it holds on
+    // disposal) from a local or an accessor temporary (which do not, or which
+    // take their own reference at the write-back), so it takes no reference.
+    // A borrowed value stored there was therefore released twice: once by
+    // the field's holder and once by its real owner.
+    //
+    // The CALLER knows the slot is a field. When the callee is a locally
+    // compiled, statically dispatched method whose body consists ONLY of
+    // stores `x := p.G` into this parameter from a class field of a by-value
+    // class-typed parameter `p` (`refClosureParamStoresOnlyArgFieldBorrows`
+    // — such a callee takes and gives no reference of its own, so every
+    // reference transfer is the caller's to make), the caller records the
+    // field here, reads its value right before the call, and after a normal
+    // return gives the field the store discipline `lowerClosureFieldStore`
+    // gives a direct `a.F := b.F`: retain the new value, release the old
+    // one (`finishClosureFieldRefArgs`, right after the call instruction).
+    // Any other callee keeps the plain alias, and so does the exception edge
+    // of a summarised one: its body throws nothing, but a `throw` in a later
+    // argument never reaches the call.
+    void recordClosureFieldRefArg(const std::vector<ast::Param>& params,
+                                  size_t idx, const ast::Expr& target,
+                                  llvm::Value* fieldAddr,
+                                  std::vector<AccessorRefArg>& sink);
+    void stampClosureFieldRefArgOld(std::vector<AccessorRefArg>& sink);
+    void finishClosureFieldRefArgs(std::vector<AccessorRefArg>& recs);
+    bool refClosureParamStoresOnlyArgFieldBorrows(const ast::MethodDecl* md,
+                                                  size_t idx);
+    std::unordered_map<const ast::MethodDecl*, std::unordered_set<size_t>>
+        refClosureParamArgFieldBorrowOnly_;
+    std::unordered_set<const ast::MethodDecl*> refClosureParamSummarised_;
 
     // §22.4/§22.7: lower the call arguments into parameter order, honoring
     // named arguments and default values. Provided arguments are evaluated

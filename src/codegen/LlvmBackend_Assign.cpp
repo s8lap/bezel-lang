@@ -18632,9 +18632,148 @@ llvm::Value* Emitter::emitAccessorRefArgCopyIn(
 // receiver and index subexpressions stay pinned until here, so those helpers'
 // internal `lowerExpr` calls reuse the copy-in's values and address exactly the
 // slot the getter read (§22.3's evaluate-once).
+// fix #9249 (§22.3 / §28.3 / §28.9, v0.359): the callee summary. True only
+// when every statement of `md`'s block body is `x := p.G`, where `x` is the
+// `ref` function-typed parameter at `idx` and `p.G` reads a class field of
+// function type through a by-value class-typed parameter `p`. Such a callee
+// never reads `x`, never mints a closure, never mutates `p` or anything else,
+// and calls nothing, so the value in the caller's slot after a normal return
+// is either the slot's own value or a field value of an object the CALLER
+// passed in (§28.3.1 rule 5: "a field ... read is a borrow whose source is
+// the storage's holder"), still alive in the caller — and the callee took no
+// reference to it. A dispatched (`virtual`/`override`/`abstract`), generic,
+// imported, operator, extension or interface member is never summarised: the
+// body that runs might not be this one.
+bool Emitter::refClosureParamStoresOnlyArgFieldBorrows(
+        const ast::MethodDecl* md, size_t idx) {
+    if (!md) return false;
+    if (refClosureParamSummarised_.count(md))
+        return refClosureParamArgFieldBorrowOnly_[md].count(idx) != 0;
+    refClosureParamSummarised_.insert(md);
+    std::unordered_set<size_t>& ok = refClosureParamArgFieldBorrowOnly_[md];
+    if (md->bodyKind != ast::MethodBodyKind::Block || md->stmts.empty() ||
+        !md->genericParams.empty())
+        return false;
+    for (auto mod : md->modifiers)
+        if (mod == "virtual" || mod == "override" || mod == "abstract" ||
+            mod == "async" || mod == "extern")
+            return false;
+    // Exactly ONE by-reference parameter, so one call records at most one
+    // field: two `ref` arguments may name the same field at run time
+    // (`Two(ref a.F, ref c.F)` with `c` aliasing `a`), and two records would
+    // release the one old value twice.
+    size_t byRef = 0;
+    for (const auto& p : md->params)
+        if (isByRefMod(p.modifier)) ++byRef;
+    if (byRef != 1) return false;
+    // The parameter a plain identifier names, or npos.
+    auto paramIndexOf = [&](const ast::Expr* e) -> size_t {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id) return std::string::npos;
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(ctx_.exprSymbol(*id));
+        if (!ps || !ps->declType) return std::string::npos;
+        for (size_t j = 0; j < md->params.size(); ++j)
+            if (md->params[j].type.get() == ps->declType) return j;
+        return std::string::npos;
+    };
+    auto isFunctionTy = [](const sema::TypeRef* t) {
+        return t && t->kind == sema::TypeRef::Kind::Function;
+    };
+    std::unordered_set<size_t> stored;
+    for (const auto& st : md->stmts) {
+        auto* as = dynamic_cast<const ast::AssignmentStmt*>(st.get());
+        if (!as || as->op != ":=" || as->valueHasOwnedMarker || !as->target ||
+            !as->value)
+            return false;
+        const size_t tgt = paramIndexOf(as->target.get());
+        if (tgt == std::string::npos || md->params[tgt].modifier != "ref" ||
+            !md->params[tgt].type ||
+            !isFunctionTy(ctx_.resolvedType(*md->params[tgt].type)))
+            return false;
+        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(as->value.get());
+        if (!ma || !ma->target || !ma->typeArgs.empty()) return false;
+        auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*ma));
+        if (!fs || !fs->parent ||
+            fs->parent->kind != ast::TypeDeclKind::Class ||
+            !fs->parent->genericParams.empty() ||
+            !isFunctionTy(ctx_.exprType(*ma)))
+            return false;
+        for (auto mod : fs->modifiers)
+            if (mod == "static") return false;
+        const size_t src = paramIndexOf(ma->target.get());
+        if (src == std::string::npos || src == tgt ||
+            !md->params[src].modifier.empty() || !md->params[src].type)
+            return false;
+        const sema::TypeRef* srcTy = ctx_.resolvedType(*md->params[src].type);
+        if (!srcTy || srcTy->kind != sema::TypeRef::Kind::Named) return false;
+        stored.insert(tgt);
+    }
+    ok = std::move(stored);
+    return ok.count(idx) != 0;
+}
+
+void Emitter::recordClosureFieldRefArg(const std::vector<ast::Param>& params,
+                                       size_t idx, const ast::Expr& target,
+                                       llvm::Value* fieldAddr,
+                                       std::vector<AccessorRefArg>& sink) {
+    if (!fieldAddr || idx >= params.size() || params[idx].modifier != "ref")
+        return;
+    // The callee is the one whose parameter list is being lowered: its
+    // SEMANTIC symbol (restored around nested calls, #8950) must declare
+    // exactly these parameters.
+    sema::MethodSymbol* ms = currentCalleeSym_;
+    if (!ms || ms->isOperator || ms->extensionDecl || ctx_.isImported(ms))
+        return;
+    if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Interface)
+        return;
+    if (ms->parent && !ms->parent->genericParams.empty()) return;
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md || &md->params != &params) return;
+    // The slot must be a class field whose holder releases what it holds —
+    // the `lowerClosureFieldStore` arm, not the type-parameter one.
+    if (!isClosureFieldLvalue(target) || isTypeParamFunctionFieldLvalue(target))
+        return;
+    if (!refClosureParamStoresOnlyArgFieldBorrows(md, idx)) return;
+    AccessorRefArg rec;
+    rec.closureFieldAddr = fieldAddr;
+    sink.push_back(std::move(rec));
+}
+
+// Read each recorded field's value right before the call, after EVERY
+// argument has been evaluated, so a later argument that itself replaces the
+// field cannot leave a stale (already released) value to release again.
+void Emitter::stampClosureFieldRefArgOld(std::vector<AccessorRefArg>& sink) {
+    for (auto& r : sink)
+        if (r.closureFieldAddr && !r.closureFieldOld)
+            r.closureFieldOld = builder_.CreateLoad(
+                ptrTy(), r.closureFieldAddr, "refclf.old");
+}
+
+// fix #9249: the normal-return half, emitted IMMEDIATELY after the call
+// instruction — before any post-call discharge of the call's own argument
+// temporaries could drop the last other reference to the stored value. The
+// field now holds either its own old value or a borrow the callee took no
+// reference to. Retain-before-release, as every closure slot store does, so
+// an unchanged value keeps its one reference. The exception edge emits
+// nothing (the base behaviour; see the declaration).
+void Emitter::finishClosureFieldRefArgs(std::vector<AccessorRefArg>& recs) {
+    if (diverged_) return;
+    for (auto& r : recs) {
+        if (!r.closureFieldAddr || !r.closureFieldOld) continue;
+        llvm::Value* nv =
+            builder_.CreateLoad(ptrTy(), r.closureFieldAddr, "refclf.new");
+        emitClosureRetain(nv);
+        emitClosureRelease(r.closureFieldOld);
+        r.closureFieldOld = nullptr;  // exactly once
+    }
+}
+
 void Emitter::emitAccessorRefArgWriteBacks(std::vector<AccessorRefArg>& recs,
                                            bool emit) {
     for (auto& r : recs) {
+        // fix #9249: a class-field alias has no bracket to write back; its
+        // reference transfer was made by `finishClosureFieldRefArgs`.
+        if (r.closureFieldAddr) continue;
         if (emit && r.slot && r.valueTy && r.target) {
             llvm::Value* v = builder_.CreateLoad(r.valueTy, r.slot, "refacc.wb");
             bool done = false;
@@ -19528,6 +19667,11 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         if (isByRefMod(params[idx].modifier)) {
             llvm::Type* et = nullptr;
             v = lvalueAddr(*a.value, et);
+            // fix #9249 (§22.3 / §28.9, v0.359): a `ref` alias of a class
+            // field of function type, for a callee that only stores borrows.
+            if (v && accessorRefArgs)
+                recordClosureFieldRefArg(params, idx, *a.value, v,
+                                         *accessorRefArgs);
             // fix #1302 / §22.3: `lvalueAddr` covers exactly the categories
             // that ALIAS — "a `ref` argument naming a mutable local or writable
             // field is a true alias" (plus §15.1's inline-array element, which
@@ -20501,6 +20645,9 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
     // caller (`if (!buildOrderedArgs(...))`) already handles — the divergent
     // edge has no caller to discharge into anyway (the call never runs).
     if (diverged_) return false;
+    // fix #9249: every argument is evaluated; read each recorded class
+    // field's pre-call value (`recordClosureFieldRefArg`).
+    if (accessorRefArgs) stampClosureFieldRefArgOld(*accessorRefArgs);
     // §28.3 (#993): all arguments (and any default-value expressions) evaluated
     // successfully — the call is about to run and will take ownership of any
     // transferred owned temporaries on the normal path. Discharge the transient
