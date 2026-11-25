@@ -51423,17 +51423,23 @@ bool Emitter::isFreshDictEntryKeyReleaseTerminalLocal(
     if (!recvTy || !isDictTypeName(recvTy)) return false;
     std::string_view mm = ma->member;
     if (mm == "First" || mm == "Last" || mm == "Single")
-        return call->args.empty();
+        return call->args.empty() ||
+               (call->args.size() == 1 && call->args[0].value != nullptr);
     // fix #9234 (stdlib §5 / §4.8, v0.359): the three `*OrNull` terminals
     // join the set — they are the `T?` siblings of First/Last/Single on the
     // SAME §5 block, and the isDict block lowers them through the SAME
-    // decode, so the rebuilt Key needs the same scope-end release. Only the
-    // NO-ARGUMENT shape is admitted here: the predicate forms
-    // (`FirstOrNull(pred)` / `LastOrNull(pred)` / `SingleOrNull(pred)`)
-    // take an argument, and the isDict block lowers no predicate form over a
-    // dictionary receiver, so they are not this arm's candidates.
+    // decode, so the rebuilt Key needs the same scope-end release.
+    //
+    // fix #9261 (stdlib §5 / §4.8, v0.359): the PREDICATE forms join the set
+    // too. The isDict block's predicate tier rebuilds the matched entry's Key
+    // through the SAME `decodeDictStringKeyAt` rebuild the no-argument tier
+    // uses, so the matched entry's Key is the same freshly-owned `bz_string*`
+    // and needs the same scope-end release. (The scan's NON-matched
+    // candidates' keys are the terminal's own transients and are released by
+    // the terminal itself.)
     if (mm == "FirstOrNull" || mm == "LastOrNull" || mm == "SingleOrNull")
-        return call->args.empty();
+        return call->args.empty() ||
+               (call->args.size() == 1 && call->args[0].value != nullptr);
     if (mm == "ElementAt" || mm == "ElementAtOrNull")
         return call->args.size() == 1 && call->args[0].value != nullptr;
     return false;
@@ -51497,16 +51503,20 @@ bool Emitter::isFreshDictEntryValueReleaseTerminalLocal(
     if (!recvTy || !isDictTypeName(recvTy)) return false;
     std::string_view mm = ma->member;
     if (mm == "First" || mm == "Last" || mm == "Single")
-        return call->args.empty();
+        return call->args.empty() ||
+               (call->args.size() == 1 && call->args[0].value != nullptr);
     // fix #9234 (stdlib §5 / §4.8, v0.359): the three `*OrNull` terminals
     // join the set, spelled identically to the KEY sibling above so the two
     // cannot drift — the isDict block lowers them through the SAME decode,
-    // so the minted Value needs the same scope-end release. Only the
-    // NO-ARGUMENT shape is admitted here (the predicate forms take an
-    // argument, and the isDict block lowers no predicate form over a
-    // dictionary receiver).
+    // so the minted Value needs the same scope-end release.
+    //
+    // fix #9261 (stdlib §5 / §4.8, v0.359): the PREDICATE forms join the set
+    // too, for the same reason as the KEY sibling: the predicate tier mints
+    // the matched entry's Value exactly as the no-argument tier does, so the
+    // mint and this discharge still land together.
     if (mm == "FirstOrNull" || mm == "LastOrNull" || mm == "SingleOrNull")
-        return call->args.empty();
+        return call->args.empty() ||
+               (call->args.size() == 1 && call->args[0].value != nullptr);
     if (mm == "ElementAt" || mm == "ElementAtOrNull")
         return call->args.size() == 1 && call->args[0].value != nullptr;
     return false;

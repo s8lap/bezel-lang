@@ -1691,9 +1691,11 @@ constexpr std::array<std::string_view, 39> kBuiltinCollectionLinqOperatorNames =
 };
 
 // fix #3670 (stdlib §5): see the header — the lambda-parameter-seeding gate.
-// 21 names; a DIFFERENT question from the two tables above (shape, not name
-// existence) — deliberately not merged with either. Extracted unchanged from
-// `linqLambdaElementType`'s `elemLambda` (no name added or removed).
+// 24 names (21 at #3670, `GroupBy` at #6627, the three `*OrNull` predicate
+// forms at #9261); a DIFFERENT question from the two tables above (shape, not
+// name existence) — deliberately not merged with either. Extracted unchanged
+// from `linqLambdaElementType`'s `elemLambda` (no name added or removed
+// except where a fix records the addition).
 //
 // fix #6627 (stdlib §5 / spec §27.4 / §14.5, v0.357): `GroupBy` joins the
 // table — the 21st name. Its key selector is declared
@@ -1714,7 +1716,38 @@ constexpr std::array<std::string_view, 39> kBuiltinCollectionLinqOperatorNames =
 // `isLinqElementLambdaOperatorName` (BuiltinRegistry.hpp) documented the
 // asymmetry as an open question; this is the answer — it is a genuine
 // pre-existing gap, and this table is where it is closed.
-constexpr std::array<std::string_view, 21> kLinqElementLambdaOperatorNames = {
+//
+// fix #9261 (stdlib §5 / spec §27.4, v0.359): the three `*OrNull` PREDICATE
+// forms join the table — the 22nd, 23rd and 24th names. stdlib §5 declares
+// them on the SAME `extension IEnumerable<T>` block as the three non-nullable
+// terminals already in the table:
+//     public method FirstOrNull(predicate: (T) -> bool): T?;
+//     public method LastOrNull(predicate: (T) -> bool): T?;
+//     public method SingleOrNull(predicate: (T) -> bool): T?;
+// so their predicate is a source-element lambda EXACTLY like `First(pred)`'s
+// — the parameter is the receiver's element type T. §27.4 admits the omitted
+// annotation "when the lambda's target type is known from context", and §5's
+// signature supplies that context.
+//
+// #9261 MEASURED at the base: the three names were ABSENT, so the
+// un-annotated predicate parameter stayed UNTYPED for EVERY receiver — the
+// array family's `arr.FirstOrNull(lambda(x) => x > 5)` survived only because
+// an untyped `x > 5` happens to infer `x` as `int` from the literal, while a
+// DICTIONARY receiver's `d.FirstOrNull(lambda(e) => e.Value > 5)` has no such
+// fallback: `e` is an ENTRY (stdlib §4.8's `DictionaryEntry<K, V>`), `e.Value`
+// is a member access that needs `e`'s type, and with it untyped the predicate
+// body could not be typed at all — codegen emitted the closure with a
+// constant `ret i1 false`, so the `*OrNull` predicate forms over a dictionary
+// read as EMPTY (a non-empty dictionary read as empty). The same gap made
+// the non-nullable `First`/`Last`/`Single` predicate forms type their
+// parameter only because THOSE names were in this table.
+//
+// The three names join the table; the seeding itself is `linqLambdaElementType`
+// → `linqSourceElementType`, which already answers the DICTIONARY receiver's
+// element type as the synthetic `DictionaryEntry<K, V>` (stdlib §4.8) — the
+// SAME synthetic TypeRef the for-in loop's entry and the dictionary LINQ
+// block build.
+constexpr std::array<std::string_view, 24> kLinqElementLambdaOperatorNames = {
     "Where",     "Select",     "Count",      "Any",
     "All",       "First",      "Last",       "Single",
     "OrderBy",   "OrderByDescending",        "Min",
@@ -1722,6 +1755,7 @@ constexpr std::array<std::string_view, 21> kLinqElementLambdaOperatorNames = {
     "SelectMany", "Average",   "ToDictionary",
     "ThenBy",    "ThenByDescending",
     "GroupBy",
+    "FirstOrNull", "LastOrNull", "SingleOrNull",
 };
 
 // fix #3670 (stdlib §5): see the header — the lazy-passthrough-typing gate.

@@ -1183,6 +1183,25 @@ bool interfaceCollectionHeadDeclares(std::string_view head,
 //     same source-element shape as `ToDictionary`'s key selector above — so
 //     §27.4's "parameter type annotations may be omitted" applies: an
 //     un-annotated selector parameter takes the receiver's element type T.
+//   * `FirstOrNull(predicate: (T) -> bool)`, `LastOrNull(predicate: (T) ->
+//     bool)` and `SingleOrNull(predicate: (T) -> bool)` also take a
+//     source-element-typed lambda — the `*OrNull` SIBLINGS of the three
+//     non-nullable terminals already in this table, declared on the SAME
+//     stdlib §5 `extension IEnumerable<T>` block with the SAME `(T) -> bool`
+//     predicate shape. They WERE absent here (the table listed `First` /
+//     `Last` / `Single` but not their `*OrNull` siblings), so their
+//     un-annotated predicate parameter stayed UNTYPED for EVERY receiver.
+//     MEASURED by fix #9261 (stdlib §5 / spec §27.4, v0.359): over a
+//     `Dictionary<K, V>` receiver the predicate's parameter is an ENTRY
+//     (stdlib §4.8's `DictionaryEntry<K, V>`), `e.Value` is a member access
+//     that needs `e`'s type, and with it untyped the predicate's BODY could
+//     not be typed at all — codegen emitted the closure with a constant
+//     `ret i1 false`, so the `*OrNull` predicate forms read as EMPTY. The
+//     three names now JOIN this table (24 names). The array family's
+//     `arr.FirstOrNull(lambda(x) => x > 5)` had survived the same gap only
+//     by ACCIDENT — an untyped `x > 5` infers `x` as `int` from the literal —
+//     so its answer is unchanged, but its parameter is now typed at the
+//     element type like every other member of this table.
 // Folding this table into either existing one would silently make every name
 // in the union answer BOTH questions, which is false for most of them —
 // declined per fix #3589's own precedent (its commit left this exact list,

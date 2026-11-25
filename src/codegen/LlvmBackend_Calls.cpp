@@ -13441,6 +13441,524 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return dtEntryVal;
         }
 
+        // fix #9261 / stdlib §4.8 / §5 (v0.359): the §5 PREDICATE-form
+        // element-access terminals over a Dictionary receiver — `First(pred)` /
+        // `Last(pred)` / `Single(pred)` and their `*OrNull` siblings — get
+        // their OWN lowering here, beside the no-argument tier above.
+        //
+        // THE DEFECT (issue #9261). stdlib §5's element-access block declares
+        // a PREDICATE overload of each of the six terminals:
+        //
+        //   public method First(predicate: (T) -> bool): T;
+        //   public method FirstOrNull(predicate: (T) -> bool): T?;
+        //   public method Last(predicate: (T) -> bool): T;
+        //   public method LastOrNull(predicate: (T) -> bool): T?;
+        //   public method Single(predicate: (T) -> bool): T;
+        //   public method SingleOrNull(predicate: (T) -> bool): T?;
+        //
+        // A `Dictionary<K, V>` IS an `ICollection<DictionaryEntry<K, V>>`
+        // (stdlib §4.8), hence an `IEnumerable<DictionaryEntry<K, V>>`, so all
+        // six apply to it with the synthetic `DictionaryEntry<K, V>` as the
+        // ELEMENT type — the predicate's parameter is an ENTRY (`e.Key` /
+        // `e.Value`), not the key.
+        //
+        // SEMA types all six CALLS (the dictionary LINQ arm types `First` /
+        // `Last` / `Single` at the synthetic entry and the `*OrNull` forms at
+        // its nullable form — `ExprTypecheck_Calls.cpp`'s dictionary LINQ
+        // block, the SAME arm the no-argument forms use), and — with #9261's
+        // `BuiltinRegistry.cpp` half — it types the PREDICATE's PARAMETER at
+        // that same synthetic entry (the three `*OrNull` names joined the
+        // lambda-parameter-seeding table, so an un-annotated `lambda(e) => …`
+        // gets `e : DictionaryEntry<K, V>`; before that the parameter stayed
+        // UNTYPED, the predicate's body could not be typed, and codegen
+        // emitted the closure with a constant `ret i1 false`).
+        //
+        // CODEGEN had no arm: the dictionary-terminal arm above covered only
+        // the NO-ARGUMENT terminals, and the generic LINQ path the six names
+        // fell through to does not lower a dictionary receiver either — so the
+        // call lowered to NOTHING and `lowerLocalDecl`'s `#2434` defense in
+        // depth zero-filled the local. The observable defect was a SEGFAULT in
+        // the three non-nullable forms (the zero-filled entry's `Key` is a
+        // null pointer) and a SILENT wrong value in the three `*OrNull` forms
+        // (a non-empty dictionary read as EMPTY).
+        //
+        // THE LOWERING. The same shape as the no-argument tier above, plus
+        // the scan the predicate form needs: snapshot the dictionary's keys
+        // and values (the SAME `bz_dict_keys_str` / `bz_dict_keys_gen` +
+        // `bz_dict_values_*` snapshot the tier above takes, and the SAME
+        // §4.17 sort for a `SortedDictionary`), walk the snapshot, rebuild
+        // each entry, and call the predicate on it.
+        //
+        // THE ANSWERS (stdlib §5): "`First(pred)` and `Last(pred)` yield the
+        // first and last matching element, and `Single(pred)` the sole
+        // matching element … `First(pred)`/`Last(pred)`/`Single(pred)` raise
+        // `InvalidOperationException` when no element matches (and
+        // `Single(pred)` also when more than one matches), while
+        // `FirstOrNull(pred)`/`LastOrNull(pred)`/`SingleOrNull(pred)` return
+        // `null` when none matches (`SingleOrNull(pred)` still raises when
+        // more than one matches)." So the scan COUNTS the matches (saturated
+        // at two) and that count decides every outcome: `First` / `Last`
+        // raise when the count is zero; `Single` raises unless the count is
+        // exactly one; the `*OrNull` forms answer null when the count is
+        // zero, and `SingleOrNull` ALSO raises when the count is two or more
+        // (stdlib §5's own sentence — "(`SingleOrNull(pred)` still raises
+        // when more than one matches)" — and the signature's own comment,
+        // "// null if none; raises if more than one").
+        //
+        // THE MATCHED ENTRY. Exactly ONE rebuilt key survives the scan: the
+        // key of the entry the terminal returns. Every other candidate's key
+        // is released as soon as its predicate call has answered — the
+        // scan's own transient, exactly as the for-in loop's per-iteration
+        // key is (the for-in path's own incBB release). The surviving key is
+        // the terminal's own +1 string: the caller's `dictEntryKeyRelease`
+        // Disposal discharges it at the entry local's scope end (the SAME
+        // registration the no-argument tier's result uses —
+        // `isFreshDictEntryKeyReleaseTerminalLocal`, extended to the
+        // predicate forms in LlvmBackend_Setup.cpp).
+        //
+        // THE `*OrNull` TIER. The `T?` is the SAME tagged
+        // `{i8 hasValue; {K, V}}` struct the no-argument tier builds (#8232),
+        // so the `*OrNull` predicate forms and their no-argument siblings
+        // agree on one layout and on one "no value" spelling.
+        if (call.args.size() == 1 && call.args[0].value &&
+            (m == "First" || m == "Last" || m == "Single" ||
+             m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull")) {
+            // ---- the ELEMENT type: the synthetic `DictionaryEntry<K, V>` ----
+            // Built the way sema builds it (ExprTypecheck_Calls.cpp's
+            // dictionary LINQ block), so the predicate's parameter type is
+            // the SAME type sema typed the lambda's parameter at.
+            if (!recvTy || recvTy->genericArgs.size() < 2 ||
+                !recvTy->genericArgs[0] || !recvTy->genericArgs[1])
+                return nullptr;
+            auto* dtEntryTypeRef = ctx_.makeTypeRef();
+            dtEntryTypeRef->kind = sema::TypeRef::Kind::Named;
+            dtEntryTypeRef->declaration = nullptr;
+            dtEntryTypeRef->astNode = nullptr;
+            dtEntryTypeRef->importedName = "DictionaryEntry";
+            dtEntryTypeRef->genericArgs.push_back(recvTy->genericArgs[0]);
+            dtEntryTypeRef->genericArgs.push_back(recvTy->genericArgs[1]);
+            // Its LLVM type: the 2-field `{K, V}` struct `lowerTypeRef`'s
+            // `DictionaryEntry` arm builds (LlvmBackend_Layout.cpp) — the
+            // SAME struct the for-in loop's entry and the LINQ materializer
+            // use. It is read from the TYPE (not rebuilt by hand) so the
+            // entry this arm passes to the predicate has EXACTLY the type
+            // the predicate's parameter lowers to.
+            llvm::Type* dtEntryLL = lowerTypeRef(dtEntryTypeRef);
+            llvm::StructType* dtEntryStTy =
+                dtEntryLL ? llvm::dyn_cast<llvm::StructType>(dtEntryLL)
+                          : nullptr;
+            if (!dtEntryStTy || dtEntryStTy->getNumElements() != 2) {
+                // Refuse LOUDLY rather than miscompile (the sibling arm's own
+                // discipline for the shapes it cannot build soundly).
+                if (!ctx_.diagnostics().hasErrors())
+                    ctx_.diagnostics().report(
+                        Severity::Error, call.span.begin,
+                        "internal: a `Dictionary<K, V>` receiver's element type "
+                        "(stdlib §4.8's `DictionaryEntry<K, V>`) did not lower "
+                        "to its 2-field struct, so the §5 predicate terminal "
+                        "cannot be lowered soundly; the call is refused rather "
+                        "than miscompiled (#9261)");
+                return nullptr;
+            }
+            llvm::Type* dtKeyLlvm = dtEntryStTy->getElementType(0);
+            llvm::Type* dtValLlvm = dtEntryStTy->getElementType(1);
+            // The string-key classification — the no-argument tier's OWN rule
+            // (`keyTy` is null exactly for a string key; `genericBackingType`
+            // resolves the key type at every instantiation, #9050).
+            const bool dtIsStringKey = !keyTy;
+            if (dtIsStringKey && !dtKeyLlvm->isPointerTy()) {
+                // A NULLABLE string key lowers to the tagged
+                // `{i8 hasValue; ptr}` struct (spec §7.2), which the key
+                // REBUILD (a bare `bz_string*`) does not produce. Refuse
+                // LOUDLY rather than miscompile.
+                if (!ctx_.diagnostics().hasErrors())
+                    ctx_.diagnostics().report(
+                        Severity::Error, call.span.begin,
+                        "internal: a `Dictionary<string?, V>` receiver's key "
+                        "lowers to a nullable `string` (spec §7.2), which the "
+                        "§5 predicate terminal's key rebuild does not "
+                        "produce; the call is refused rather than miscompiled "
+                        "(#9261)");
+                return nullptr;
+            }
+            // The `T?` shape of the `*OrNull` forms — the SAME tagged
+            // `{i8 hasValue; {K, V}}` struct the no-argument tier builds
+            // (#8232), recognised by `isNullableDictEntryTy`.
+            const bool dtIsOrNullForm =
+                (m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull");
+            llvm::StructType* dtNullableTy = nullptr;
+            if (dtIsOrNullForm) {
+                const sema::TypeRef* dtEaTy = ctx_.exprType(call);
+                if (!dtEaTy || !isNullableDictEntryTy(dtEaTy)) {
+                    if (!ctx_.diagnostics().hasErrors())
+                        ctx_.diagnostics().report(
+                            Severity::Error, call.span.begin,
+                            "internal: `" + std::string(m) + "` (stdlib §5, "
+                            "returns `T?`) was not typed `T?` on this "
+                            "receiver, so its result cannot be lowered "
+                            "soundly; the call is refused rather than "
+                            "miscompiled (#9261)");
+                    return nullptr;
+                }
+                // The `T?` struct — the SAME computation the no-argument tier
+                // performs above (`nullableValueStructTy(dtEaTy)`), so the
+                // two tiers agree on one layout and one "no value" spelling.
+                dtNullableTy = nullableValueStructTy(dtEaTy);
+            }
+            // ---- the PREDICATE closure ----
+            // The closure is lowered with `expectedFunctionType_` set to
+            // `(DictionaryEntry<K, V>) -> bool`, so an UN-ANNOTATED lambda
+            // parameter gets the entry type (and the entry's LLVM type) —
+            // the same discipline the array receiver's eager predicate arms
+            // and the stack receiver's own §5 predicate tier use.
+            auto* dtPredFuncRef = ctx_.makeTypeRef();
+            dtPredFuncRef->kind = sema::TypeRef::Kind::Function;
+            dtPredFuncRef->funcReturn =
+                ctx_.primitiveTypeRef(sema::PrimitiveType::Bool);
+            {
+                sema::TypeRef::FuncParam fp;
+                fp.type = dtEntryTypeRef;
+                dtPredFuncRef->funcParams.push_back(std::move(fp));
+            }
+            const sema::TypeRef* dtSavedExpected = expectedFunctionType_;
+            expectedFunctionType_ = dtPredFuncRef;
+            llvm::Value* dtClosure = lowerExpr(*call.args[0].value);
+            expectedFunctionType_ = dtSavedExpected;
+            if (!dtClosure) return nullptr;
+            // The closure call: the closure cell is `{ fnPtr, envPtr }` and
+            // the callback is invoked as `fn(env, entry)`.
+            auto dtCallPredicate = [&](llvm::Value* el) -> llvm::Value* {
+                llvm::Value* fnPtr =
+                    builder_.CreateLoad(ptrTy(), dtClosure, "cl.fn");
+                llvm::Value* envSlot = builder_.CreateGEP(
+                    ptrTy(), dtClosure, {builder_.getInt32(1)});
+                llvm::Value* envPtr =
+                    builder_.CreateLoad(ptrTy(), envSlot, "cl.env");
+                auto* fnTy = llvm::FunctionType::get(
+                    i1(), {ptrTy(), el->getType()}, false);
+                return builder_.CreateCall(fnTy, fnPtr, {envPtr, el}, "cl.ret");
+            };
+            // The closure is a +1 transient when the ARGUMENT mints one (a
+            // lambda literal, a primitive-intrinsic or ordinary method
+            // reference — #422 / #9012's shared `isPlusOneClosureProducer`
+            // question); the eager operator consumes it during the call, so
+            // the CALL SITE releases it at the scan's end.
+            bool dtRelCl = false;
+            {
+                const ast::Expr* dtArg = call.args[0].value.get();
+                dtRelCl = dynamic_cast<const ast::LambdaExpr*>(dtArg) != nullptr ||
+                          isPrimIntrinsicMethodRef(dtArg) ||
+                          isPlusOneClosureProducer(dtArg);
+            }
+            // ---- the snapshot (the no-argument tier's own snapshot) ----
+            auto* dtFreeFn =
+                declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            auto* dtKeysOutSlot = entryAlloca(ptrTy());
+            auto* dtCntSlot     = entryAlloca(i64());
+            auto* dtValsOutSlot = entryAlloca(ptrTy());
+            llvm::Value* dtLensArr = nullptr;
+            llvm::Value* dtWidthsArr = nullptr;
+            if (dtIsStringKey) {
+                auto* dtLensOutSlot = entryAlloca(ptrTy());
+                auto* dtWidthsOutSlot = entryAlloca(ptrTy());
+                auto* kfnStr = declareC("bz_dict_keys_str",
+                    llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(kfnStr,
+                    {recv, dtKeysOutSlot, dtLensOutSlot, dtWidthsOutSlot,
+                     dtCntSlot});
+                dtLensArr   = builder_.CreateLoad(ptrTy(), dtLensOutSlot);
+                dtWidthsArr = builder_.CreateLoad(ptrTy(), dtWidthsOutSlot);
+            } else {
+                auto* kfn = declareC("bz_dict_keys_gen",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(kfn, {recv, dtKeysOutSlot, dtCntSlot});
+            }
+            auto* vfn = declareC(dtIsStringKey ? "bz_dict_values_str"
+                                                : "bz_dict_values_gen",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+            builder_.CreateCall(vfn, {recv, dtValsOutSlot, entryAlloca(i64())});
+            llvm::Value* dtKeysArr = builder_.CreateLoad(ptrTy(), dtKeysOutSlot);
+            llvm::Value* dtValsArr = builder_.CreateLoad(ptrTy(), dtValsOutSlot);
+            llvm::Value* dtCnt     = builder_.CreateLoad(i64(), dtCntSlot);
+            // §4.17 (fix #3511 / #4499): a `SortedDictionary` visits its
+            // entries in ascending key order — the SAME sort the no-argument
+            // tier above takes, so the two tiers agree on "the first" and
+            // "the last" entry.
+            if (builtinTypeName(recvTy) == "SortedDictionary") {
+                if (dtIsStringKey) {
+                    auto* sortStrFn = declareC("bz_sort_kv_str",
+                        llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64()});
+                    builder_.CreateCall(sortStrFn,
+                        {dtKeysArr, dtLensArr, dtWidthsArr, dtValsArr, dtCnt});
+                } else if (llvm::Function* cmpFn =
+                               buildSortedKeyComparator(keyTy)) {
+                    auto* sortFn = declareC("bz_sort_kv_gen",
+                        llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy(), i64(), ptrTy()});
+                    builder_.CreateCall(sortFn,
+                        {dtKeysArr, dtValsArr, dtCnt, cmpFn});
+                }
+            }
+            // ---- the SCAN ----
+            // The matched entry (zero-initialized, so the `*OrNull` forms can
+            // answer "no match" with it), the key pointer it holds (so a
+            // LATER match can release the earlier one), the match count
+            // (saturated at two) and the scan index.
+            auto* dtEntrySlot = entryAlloca(dtEntryStTy);
+            builder_.CreateStore(llvm::Constant::getNullValue(dtEntryStTy),
+                                 dtEntrySlot);
+            auto* dtKeySlot = entryAlloca(ptrTy());
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 dtKeySlot);
+            auto* dtMatchCntSlot = entryAlloca(i32());
+            builder_.CreateStore(builder_.getInt32(0), dtMatchCntSlot);
+            auto* dtFoundSlot = entryAlloca(i1());
+            builder_.CreateStore(builder_.getFalse(), dtFoundSlot);
+            auto* dtIdxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), dtIdxSlot);
+            // The CANDIDATE's key and entry. The decode runs ONCE per
+            // candidate (a string key's rebuild allocates), so the candidate
+            // is handed to the two arms that follow the predicate call
+            // through these slots rather than through a second decode.
+            auto* dtCandKeySlot = entryAlloca(ptrTy());
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 dtCandKeySlot);
+            auto* dtCandEntrySlot = entryAlloca(dtEntryStTy);
+            builder_.CreateStore(llvm::Constant::getNullValue(dtEntryStTy),
+                                 dtCandEntrySlot);
+            auto* dtCondBB   = llvm::BasicBlock::Create(llvm_, "dictpred.c", currentFn_);
+            auto* dtBodyBB   = llvm::BasicBlock::Create(llvm_, "dictpred.b", currentFn_);
+            auto* dtNoMatchBB = llvm::BasicBlock::Create(llvm_, "dictpred.nm", currentFn_);
+            auto* dtMatchBB  = llvm::BasicBlock::Create(llvm_, "dictpred.m", currentFn_);
+            auto* dtNextBB   = llvm::BasicBlock::Create(llvm_, "dictpred.n", currentFn_);
+            auto* dtEndBB    = llvm::BasicBlock::Create(llvm_, "dictpred.e", currentFn_);
+            builder_.CreateBr(dtCondBB);
+            builder_.SetInsertPoint(dtCondBB);
+            {
+                llvm::Value* idx = builder_.CreateLoad(i64(), dtIdxSlot);
+                builder_.CreateCondBr(
+                    builder_.CreateICmpSLT(idx, dtCnt), dtBodyBB, dtEndBB);
+            }
+            builder_.SetInsertPoint(dtBodyBB);
+            {
+                llvm::Value* idxB = builder_.CreateLoad(i64(), dtIdxSlot);
+                // The candidate's key: a string key is REBUILT (a fresh,
+                // independently-owned `bz_string*` — `decodeDictStringKeyAt`,
+                // the SAME rebuild the no-argument tier and the for-in loop
+                // use); a generic key is loaded BY VALUE (no separate heap
+                // ownership — `decodeDictGenericKeyAt`).
+                llvm::Value* dtKeyRebuilt = nullptr;
+                llvm::Value* dtKeyVal;
+                if (dtIsStringKey) {
+                    dtKeyRebuilt = decodeDictStringKeyAt(
+                        dtKeysArr, dtLensArr, dtWidthsArr, idxB).first;
+                    dtKeyVal = dtKeyRebuilt;
+                } else {
+                    dtKeyVal = decodeDictGenericKeyAt(
+                        dtKeyLlvm, dtKeysArr, idxB, "dictpred.kgen").first;
+                }
+                // The candidate's value — the SAME decode the no-argument
+                // tier uses (`decodeDictValueAt`).
+                llvm::Value* dtValVal = decodeDictValueAt(
+                    dtValLlvm, dtValsArr, idxB, "dictpred.vrec");
+                llvm::Value* dtEntryVal = llvm::UndefValue::get(dtEntryStTy);
+                dtEntryVal =
+                    builder_.CreateInsertValue(dtEntryVal, dtKeyVal, {0u});
+                dtEntryVal =
+                    builder_.CreateInsertValue(dtEntryVal, dtValVal, {1u});
+                // Hand the candidate to the arms that follow the predicate
+                // call (the decode runs ONCE per candidate — a string key's
+                // rebuild allocates).
+                builder_.CreateStore(dtEntryVal, dtCandEntrySlot);
+                if (dtIsStringKey)
+                    builder_.CreateStore(dtKeyRebuilt, dtCandKeySlot);
+                llvm::Value* dtOk = dtCallPredicate(dtEntryVal);
+                builder_.CreateCondBr(dtOk, dtMatchBB, dtNoMatchBB);
+            }
+            // The NO-MATCH arm: the candidate's rebuilt key is the scan's own
+            // transient — the predicate has answered and the entry is
+            // discarded — so it is released here (the for-in loop's own
+            // per-iteration key release). A generic key has no separate heap
+            // ownership, so nothing is released for it.
+            builder_.SetInsertPoint(dtNoMatchBB);
+            if (dtIsStringKey) {
+                llvm::Value* dtCandKey =
+                    builder_.CreateLoad(ptrTy(), dtCandKeySlot);
+                emitStringRelease(dtCandKey);
+            }
+            builder_.CreateBr(dtNextBB);
+            // The MATCH arm: the match REPLACES the entry held so far, so the
+            // previous match's key is released (there is none on the first
+            // match) and the new entry is stored. `First` / `FirstOrNull` stop
+            // at the first match; `Last` / `LastOrNull` / `Single` /
+            // `SingleOrNull` keep scanning (the last match wins for `Last`;
+            // `Single` throws unless there is exactly one match, so the entry
+            // it keeps is the sole match).
+            builder_.SetInsertPoint(dtMatchBB);
+            {
+                llvm::Value* dtEntryVal =
+                    builder_.CreateLoad(dtEntryStTy, dtCandEntrySlot);
+                if (dtIsStringKey) {
+                    // Release the PREVIOUS match's key (none on the first
+                    // match), so exactly one rebuilt key is alive at a time.
+                    llvm::Value* dtOldKey = builder_.CreateLoad(ptrTy(), dtKeySlot);
+                    llvm::Value* dtKeyToRelease = builder_.CreateSelect(
+                        builder_.CreateLoad(i1(), dtFoundSlot), dtOldKey,
+                        llvm::ConstantPointerNull::get(ptrTy()));
+                    emitStringRelease(dtKeyToRelease);
+                }
+                builder_.CreateStore(dtEntryVal, dtEntrySlot);
+                if (dtIsStringKey)
+                    builder_.CreateStore(
+                        builder_.CreateLoad(ptrTy(), dtCandKeySlot), dtKeySlot);
+                builder_.CreateStore(builder_.getTrue(), dtFoundSlot);
+                // The match count, saturated at two (the count only has to
+                // distinguish none / exactly one / more than one).
+                llvm::Value* dtCnt0 = builder_.CreateLoad(i32(), dtMatchCntSlot);
+                llvm::Value* dtCnt1 = builder_.CreateAdd(dtCnt0, builder_.getInt32(1));
+                llvm::Value* dtCntSat = builder_.CreateSelect(
+                    builder_.CreateICmpSGT(dtCnt1, builder_.getInt32(2)),
+                    builder_.getInt32(2), dtCnt1);
+                builder_.CreateStore(dtCntSat, dtMatchCntSlot);
+                if (m == "First" || m == "FirstOrNull")
+                    builder_.CreateBr(dtEndBB);
+                else
+                    builder_.CreateBr(dtNextBB);
+            }
+            builder_.SetInsertPoint(dtNextBB);
+            {
+                llvm::Value* idx = builder_.CreateLoad(i64(), dtIdxSlot);
+                builder_.CreateStore(
+                    builder_.CreateAdd(idx, builder_.getInt64(1)), dtIdxSlot);
+            }
+            builder_.CreateBr(dtCondBB);
+            // ---- the scan's end ----
+            builder_.SetInsertPoint(dtEndBB);
+            if (dtRelCl) emitClosureRelease(dtClosure);
+            // Free every per-key blob and the three snapshot spines — the
+            // SAME free the no-argument tier performs. It DOMINATES the throw
+            // below, so the reject path leaks nothing (the predicate tier's
+            // reject is not decidable from the count alone — a non-empty
+            // dictionary may still have no match — so the snapshot IS taken
+            // before the reject, and this free is what makes that safe).
+            {
+                auto* fiSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), fiSlot);
+                auto* fCond = llvm::BasicBlock::Create(
+                    llvm_, "dictpred.fcond", currentFn_);
+                auto* fBody = llvm::BasicBlock::Create(
+                    llvm_, "dictpred.fbody", currentFn_);
+                auto* fEnd  = llvm::BasicBlock::Create(
+                    llvm_, "dictpred.fend", currentFn_);
+                builder_.CreateBr(fCond);
+                builder_.SetInsertPoint(fCond);
+                llvm::Value* fi = builder_.CreateLoad(i64(), fiSlot);
+                builder_.CreateCondBr(
+                    builder_.CreateICmpSLT(fi, dtCnt), fBody, fEnd);
+                builder_.SetInsertPoint(fBody);
+                llvm::Value* fp = builder_.CreateGEP(ptrTy(), dtKeysArr, fi);
+                llvm::Value* fkp = builder_.CreateLoad(ptrTy(), fp);
+                builder_.CreateCall(dtFreeFn, {fkp});
+                builder_.CreateStore(
+                    builder_.CreateAdd(fi, builder_.getInt64(1)), fiSlot);
+                builder_.CreateBr(fCond);
+                builder_.SetInsertPoint(fEnd);
+            }
+            builder_.CreateCall(dtFreeFn, {dtKeysArr});
+            if (dtIsStringKey) {
+                builder_.CreateCall(dtFreeFn, {dtLensArr});
+                builder_.CreateCall(dtFreeFn, {dtWidthsArr});
+            }
+            builder_.CreateCall(dtFreeFn, {dtValsArr});
+            // ---- the OUTCOME ----
+            llvm::Value* dtMatchCnt = builder_.CreateLoad(i32(), dtMatchCntSlot);
+            llvm::Value* dtNoMatch =
+                builder_.CreateICmpEQ(dtMatchCnt, builder_.getInt32(0));
+            llvm::Value* dtThrowCond = nullptr;
+            if (m == "First" || m == "Last") {
+                // stdlib §5: `First(pred)` / `Last(pred)` raise
+                // `InvalidOperationException` when no element matches.
+                dtThrowCond = dtNoMatch;
+            } else if (m == "Single") {
+                // stdlib §5: `Single(pred)` raises unless exactly one element
+                // matches (zero AND more than one).
+                dtThrowCond = builder_.CreateNot(builder_.CreateICmpEQ(
+                    dtMatchCnt, builder_.getInt32(1)));
+            } else if (m == "SingleOrNull") {
+                // stdlib §5: `SingleOrNull(pred)` returns null when none
+                // matches and "still raises when more than one matches".
+                dtThrowCond = builder_.CreateICmpSGT(
+                    dtMatchCnt, builder_.getInt32(1));
+            }
+            if (dtThrowCond) {
+                // The matched key is the TERMINAL's own +1: on the reject path
+                // no caller receives the entry, so the terminal releases it
+                // (on the accept path the select yields null and
+                // `bz_string_release(null)` is a no-op).
+                if (dtIsStringKey) {
+                    llvm::Value* dtOldKey = builder_.CreateLoad(ptrTy(), dtKeySlot);
+                    llvm::Value* dtKeyToRelease = builder_.CreateSelect(
+                        dtThrowCond, dtOldKey,
+                        llvm::ConstantPointerNull::get(ptrTy()));
+                    emitStringRelease(dtKeyToRelease);
+                }
+                emitGuardThrow(dtThrowCond, "InvalidOperationException");
+            }
+            // ---- the VALUE's +1 (a non-nullable `string` V) ----
+            // The SAME mint the no-argument tier performs (fix #6470,
+            // §28.11 *Collection element ownership*, stdlib §4.8): the value
+            // the entry carries is the receiver's own reference, and §28.11's
+            // operations table reads a shared-reference slot as "reference
+            // out" — so the CALLER owns it and discharges it at the entry
+            // local's scope end (`dictEntryValueRelease`). It is minted AFTER
+            // the reject above, so the reject path mints nothing.
+            const sema::TypeRef* dtRecvVEl =
+                (recvTy && recvTy->genericArgs.size() > 1)
+                    ? recvTy->genericArgs[1] : nullptr;
+            const bool dtValueIsString = dtRecvVEl &&
+                !dtRecvVEl->nullable &&
+                dtRecvVEl->kind == sema::TypeRef::Kind::Primitive &&
+                dtRecvVEl->primitive == sema::PrimitiveType::String;
+            if (dtValueIsString) {
+                llvm::Value* dtStored = builder_.CreateLoad(dtEntryStTy, dtEntrySlot);
+                llvm::Value* dtStoredVal =
+                    builder_.CreateExtractValue(dtStored, {1u});
+                emitStringRetain(dtStoredVal);
+            }
+            // The receiver's own temporary reclaim (a fresh unbound
+            // Dictionary/SortedDictionary materializer receiver — e.g.
+            // `arr.ToDictionary(sel).First(pred)` — is freed here; a no-op
+            // for the common named-local receiver). The SAME call the
+            // no-argument tier makes, with the same `dictValueColumnEscapes`
+            // argument: the mint above is the caller's +1, so the table free
+            // discharges the value column in full.
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy,
+                                               /*dictValueColumnEscapes=*/false);
+            // ---- the RESULT ----
+            llvm::Value* dtEntryResult =
+                builder_.CreateLoad(dtEntryStTy, dtEntrySlot);
+            if (dtIsOrNullForm) {
+                // The tagged `{i8 hasValue; {K, V}}` struct (#8232): the tag
+                // distinguishes "no match" from "the entry".
+                llvm::Value* dtHasVal =
+                    builder_.CreateICmpNE(dtMatchCnt, builder_.getInt32(0));
+                llvm::Value* dtTag =
+                    builder_.CreateZExt(dtHasVal, nullablePrimHasValTy());
+                llvm::Value* dtEntryOrZero = builder_.CreateSelect(
+                    dtHasVal, dtEntryResult,
+                    llvm::Constant::getNullValue(dtEntryStTy));
+                llvm::Value* dtWrapped = llvm::UndefValue::get(dtNullableTy);
+                dtWrapped =
+                    builder_.CreateInsertValue(dtWrapped, dtTag, {0u});
+                dtWrapped =
+                    builder_.CreateInsertValue(dtWrapped, dtEntryOrZero, {1u});
+                return dtWrapped;
+            }
+            return dtEntryResult;
+        }
+
         // .Count: int
         if (m == "Count" && call.args.empty()) {
             auto* fn = declareC("bz_dict_count", i64(), {ptrTy()});
