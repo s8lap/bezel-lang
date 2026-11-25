@@ -38669,10 +38669,44 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     //      has rejected programs that would be unsound; this predicate's
     //      recursion still recurses through both arms and answers false, in
     //      lockstep with the rule itself.
+    // fix #9170 (§27.6 / §28.9 / §20 / §28.3, v0.359): the RESULT-TYPE gate
+    // below was too strong for a conditional whose arms are BARE method
+    // references. §27.6 forms a method reference as a FUNCTION VALUE, but
+    // sema DEFERS a bare method reference's Function type to the
+    // call-resolution slice (`ExprTC::resolveOverload` leaves exprType unset
+    // for a bare reference — see the MethodSymbol arm below), and §20's
+    // `typeConditional` takes each arm's type: both arms' types are unset, so
+    // `(if c then P else Q)` has NO expression type AT ALL. The gate therefore
+    // declined the whole shape, and the consumer that owns the merged cell —
+    // the eager §5 operator's call-site release, the local's scope-end
+    // release, a call-bounded function-typed formal's post-call release — never
+    // discharged it. MEASURED on r30-c1 @ 026db0dab (`bezelc
+    // --sanitize=address`, the issue's own repro over 200 iterations):
+    // "AddressSanitizer: 12800 byte(s) leaked in 200 allocation(s)" — one
+    // 64 B cell per call, with the program's OUTPUT correct (4400).
+    //
+    // WHY THE ARMS DECIDE WHEN THERE IS NO TYPE. A conditional of two +1
+    // producers MINTS EXACTLY ONE CELL: only the runtime-selected arm runs,
+    // so only its cell is allocated, and lowerConditional merges the two arms'
+    // closure pointers into that one value (the #4040 note above). The merged
+    // value is therefore a closure pointer whatever the conditional's STATIC
+    // type says — and for two bare method references the static type says
+    // NOTHING (§20's "no branch-level target-typing" plus §27.6's deferral).
+    // The TYPE-PRESENT branches of the gate are kept unchanged: a nullable
+    // result is not a uniform +1, and a non-Function result is not a closure
+    // at all.
+    //
+    // WHY IT CANNOT OVER-RELEASE. Both arms must be producers, so exactly one
+    // cell is live at the join and the consumer that owns it discharges it
+    // once. A conditional that mixes a producer with a borrow (a
+    // function-typed local, a `null` literal, a `throw` arm) answers false
+    // here, exactly as it did before — the arms' recursion is unchanged.
     if (auto* cond = dynamic_cast<const ast::ConditionalExpr*>(init)) {
         const sema::TypeRef* rt = ctx_.exprType(*cond);
-        if (!rt || rt->nullable) return false;          // non-nullable only
-        if (rt->kind != sema::TypeRef::Kind::Function) return false;
+        if (rt) {
+            if (rt->nullable) return false;              // non-nullable only
+            if (rt->kind != sema::TypeRef::Kind::Function) return false;
+        }
         return isPlusOneClosureProducer(cond->thenValue.get()) &&
                isPlusOneClosureProducer(cond->elseValue.get());
     }
