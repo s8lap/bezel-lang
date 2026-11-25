@@ -39407,6 +39407,32 @@ bool Emitter::isClosureFieldLvalue(const ast::Expr& target) {
 }
 
 
+// fix #9096 / #9123 / #9124 (§28.9 / §27.5 / §28.3 / §28.3.11, v0.359): is
+// the CALLEE of this call a READ of a class field's / auto-property's function
+// value? The declaration's comment carries the rationale; this is the ONE
+// copy, asked by every call-through-a-holder arm.
+//
+// It was a LOCAL LAMBDA inside `lowerCallDispatch` (LlvmBackend_Calls2.cpp)
+// until #9123: the null-conditional arm that lowers `f?(args)` lives in
+// LlvmBackend_Exprs.cpp, a DIFFERENT translation unit, which cannot see a
+// local lambda — so the predicate became a member, and the two arms now ask
+// the SAME question instead of two copies of it.
+//
+// The transparent wrappers are stripped first: §17.12's null-forgiving `!`
+// (`x!` is `x`'s own read) and §17.4's `as` cast (`x as T` is "a borrow of
+// `x`", the SAME value) both name the SAME holder the operand names.
+bool Emitter::calleeReadsClosureField(const ast::Expr* callee) {
+    if (!callee) return false;
+    const ast::Expr* e = callee;
+    while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
+        e = pb->operand.get();
+    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e))
+        if (te->op == "as" && te->operand)
+            e = te->operand.get();
+    return e && isClosureFieldLvalue(*e);
+}
+
+
 // #429 (closure FIELD-STORE) / §28.9: see the declaration in
 // LlvmBackend_impl.hpp. Store `newVal` into the class closure field at
 // `fieldAddr` with retain-new / release-old, giving the field an INDEPENDENT

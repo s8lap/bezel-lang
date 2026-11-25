@@ -5290,6 +5290,34 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         builder_.CreateCondBr(isNull, endBB, callBB);
 
         builder_.SetInsertPoint(callBB);
+        // fix #9123 (§28.9 / §27.5 / §28.3 / §28.3.11, v0.359): the callee is
+        // the HOLDER's function value, read as a borrow. The holder keeps the
+        // reference, and the callee may DISPLACE the holder while it runs —
+        // `x.Drop()` sets `_f := null` — which releases that reference and, if
+        // it was the last one, frees the closure object (with the captured
+        // variables §27.5 heap-allocates in it) while the body still reads
+        // them. MEASURED (issue #9123): a heap-use-after-free in `lam$0`,
+        // freed by `bz$lam$0$envdtor`. So the call takes a reference of its
+        // OWN for the duration of the call and gives it back after it
+        // (§28.3.11's discharge at the end of the full expression — here the
+        // end of the call expression).
+        //
+        // The retain is taken on the CALL edge (the block the null test fell
+        // INTO), and BEFORE the arguments are lowered — an argument may
+        // displace the holder too (`_f?(x.Drop())`), and the callee must
+        // still run in a live closure. A LOCAL callee is not this shape and
+        // is not touched: its slot keeps the reference for the whole scope.
+        //
+        // The predicate is `calleeReadsClosureField` — the SAME one the
+        // field arm and the null-forgiving arm ask (LlvmBackend_Calls2.cpp):
+        // one question, one answer, so the `?.` spelling cannot drift from
+        // the `.` spelling. §28.3's *Function-typed holders*: "A function
+        // value **read** from any holder — a field, a property or indexer … —
+        // carries the empty set"; §28.9: "Runtime management governs the
+        // *function value itself* — the heap-allocated closure object that
+        // backs it".
+        const bool calleeIsField = calleeReadsClosureField(nc->callee.get());
+        if (calleeIsField) emitClosureRetain(closurePtr);
         // Closure ABI { ptr fn, ptr env }: call fn(env, user args...).
         llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closurePtr);
         llvm::Value* envSlot =
@@ -5316,6 +5344,15 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             voidResult ? nullptr
             : (refResult ? callRes
                          : wrapNullableValue(fnRt->funcReturn, callRes));
+        // fix #9123 (§28.9 / §27.5 / §28.3.11, v0.359): give the reference the
+        // call took back, on the NORMAL edge only. `!diverged_` mirrors
+        // #4078's release discipline in `emitClosureCall` and #9096's field
+        // arm: a closure that raised leaves the release to the unwind edge (a
+        // leak on the throw path is the safe direction — the reference is
+        // never released TWICE).
+        if (calleeIsField && !diverged_ && closurePtr &&
+            closurePtr->getType()->isPointerTy())
+            emitClosureRelease(closurePtr);
         auto* callEndBB = builder_.GetInsertBlock();
         builder_.CreateBr(endBB);
 

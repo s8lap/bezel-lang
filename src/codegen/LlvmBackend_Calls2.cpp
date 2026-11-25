@@ -12162,54 +12162,14 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         }
         return result;
     }
-    // fix #9096 (§28.9 / §27.5 / §28.3.11, v0.359): is the CALLEE of this
-    // call a READ of a class field's function value?
+    // fix #9096 (§28.9 / §27.5 / §28.3.11, v0.359): the call-through-a-holder
+    // arms below ask ONE question — is the CALLEE a READ of a class field's /
+    // auto-property's function value? — and the answer is
+    // `calleeReadsClosureField`, a MEMBER (LlvmBackend_Setup.cpp) since #9123:
+    // the null-conditional arm that lowers `f?(args)` lives in another
+    // translation unit and must ask the SAME question, so the predicate is no
+    // longer a local lambda. Its declaration carries the rationale.
     //
-    // The callee of a closure call is a BORROW of the holder it was read from
-    // (§28.3's *Function-typed holders*: "A function value **read** from any
-    // holder — a field, a property or indexer … — carries the empty set"; a
-    // read takes no ownership, the holder keeps the reference). A LOCAL's or
-    // PARAMETER's slot keeps its reference for the whole scope, so a local
-    // callee is safe. A FIELD's reference is the field's own, and the callee
-    // may DISPLACE the field while it runs — `_f := null` (or a fresh
-    // closure) releases the field's reference, and if the field held the only
-    // one, the closure object is freed while its body still reads its
-    // captured environment.
-    //
-    // §28.9: "Runtime management governs the *function value itself* — the
-    // heap-allocated closure object that backs it", and §27.5: "Captured
-    // variables are heap-allocated in a closure object" — so freeing the
-    // closure object while the body runs is a use-after-free of the captures.
-    // The call must therefore take a reference of its OWN for the duration of
-    // the call (the same discipline #8763's property twin follows: "the
-    // reader's reference is what keeps the closure alive across the
-    // invocation (the field it was read from may be replaced while the call
-    // runs), so it may only be given back once the call has returned").
-    //
-    // §17.12: the null-forgiving `!` is TRANSPARENT — `x!` is `x`'s own read —
-    // so the holder is the operand's (`_f!(this)` reads the field `_f`).
-    // §17.4: `x as T` is "a borrow of `x`" — the SAME value, so a cast of a
-    // field read names the same holder (`(_f as F)!(this)`).
-    //
-    // The predicate is `isClosureFieldLvalue` — the SAME one the STORE side
-    // uses (`lowerClosureFieldStore`, #429): a class instance field /
-    // auto-property whose declared type is a function type. That set is
-    // exactly the holders that keep an INDEPENDENT +1 on the closure cell
-    // (retained at store, released on the owner's disposal), so a read of
-    // one borrows a reference that EXISTS and can be taken over for the
-    // call. A record's function-typed component is a BORROW (§9) and holds no
-    // such reference, and a static field's store has its own path — both are
-    // excluded, so neither is touched here.
-    auto calleeReadsClosureField = [this](const ast::Expr* callee) -> bool {
-        if (!callee) return false;
-        const ast::Expr* e = callee;
-        while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
-            e = pb->operand.get();
-        if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e))
-            if (te->op == "as" && te->operand)
-                e = te->operand.get();
-        return e && isClosureFieldLvalue(*e);
-    };
     // CG60: call through a function-typed parameter or local (lambda
     // value). Lambda values are heap-allocated closure structs
     // { ptr fn, ptr env }. The function's actual type includes an env_ptr
