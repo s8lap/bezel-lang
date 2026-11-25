@@ -2,7 +2,7 @@
 
 Compiler: r40, `bezelc-0.0.0-a30bb11d` (origin/main a30bb11df), `--checked-disposal`, default `--link`. Spec v0.355, stdlib v0.355.
 
-Each entry gives the spec sentence the program relies on, what r40 did, a minimal repro (checked on r40 as written here), the workaround the study used and the tasks it hit. **No issues were filed** (study constraint). Nine of the 24 are *silent* — the program compiles and prints a wrong answer or nothing: B1, B4, B5, B6, B7, B13, B16, B24, and B11 at run time. B8 and B17 are contested by open spec questions. Each entry names an existing issue where one was found (coordinator-supplied table, REST search for B23/B24); "new" means none was found.
+Each entry gives the spec sentence the program relies on, what r40 did, a minimal repro (checked on r40 as written here), the workaround the study used and the tasks it hit. **No issues were filed** (study constraint). Nine of the 24 are *silent* — the program compiles and prints a wrong answer or nothing: B1, B4, B5, B6, B7, B13, B16, B24, and B11 at run time. B8 and B17 rest on spec questions ruled in October (#6698; #7170/#7215); both rulings make them compiler bugs. Each entry names an existing issue where one was found (coordinator-supplied table, REST search for B23/B24); "new" means none was found.
 
 Documented not-yet-implemented items the study also hit (not numbered here; in `frictions.tsv` they are classified COMPILER-BUG, cluster `C-documented-nyi`, because the spec already answers the design question and the fix is implementation): `GroupBy` results stored in a variable (#755), `Counter<K>` (#3848), the `Json`/`Binary` facades (#2349), `Locked<T>`/`RwLocked<T>` (#1721), `typeof(E).EnumNames`/`EnumValues` (#3819, #487).
 
@@ -211,9 +211,9 @@ public class Program
 end Program;
 ```
 
-## B8. A narrowed local used as an `if`-expression branch makes the result nullable (contested: #6698)
+## B8. A narrowed local used as an `if`-expression branch makes the result nullable (ruled 2026-10-21, a compiler bug: #6698)
 
-- **Existing issue:** #6698 (open spec question: contested)
+- **Existing issue:** #6698 (ruled 2026-10-21: reading 1, the program is well-typed; still open as the sema tracker)
 - **Spec:** spec §7.4 (v0.355): inside a narrowing region the variable is "narrowed to User here"; §20's common type of `string` and `string` is `string`.
 - **r40:** `var hay := (if c then line.ToLower() else line);` inside `while line <> null do` gives `hay: string?`; the error appears at the later use (`member access .Length on a nullable value`).
 - **Workaround:** Ascribe the local and add `!`: `var hay: string := (if c then line.ToLower() else line!);`.
@@ -391,9 +391,9 @@ public class Program
 end Program;
 ```
 
-## B17. `Select` with an interpolated-string projection is rejected as a leak (contested: #7170, #7215)
+## B17. `Select` with an interpolated-string projection is rejected as a leak (ruled 2026-10-27, a compiler bug: #7170, #7215)
 
-- **Existing issue:** #7170, #7215 (open spec questions: contested)
+- **Existing issue:** #7170, #7215 (ruled 2026-10-27: admitted; the rejection is an over-rejection and the leak is the runtime's to fix)
 - **Spec:** spec §28.1/§28.9: `string` is runtime-managed — no ownership, nothing to leak.
 - **r40:** `a lazy Select selector that mints a fresh owned value per element (... a fresh string such as a + concatenation or an interpolation) launders that value ...`. `x.ToString()` is accepted.
 - **Workaround:** Project with `ToString()` instead of an interpolation.

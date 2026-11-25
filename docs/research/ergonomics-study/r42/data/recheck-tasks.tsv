@@ -2,7 +2,7 @@ task	drafts	final_r40	final_r42	v1_r40	v1_r42	drafts_ok_r40	drafts_ok_r42	per_dr
 t01-wc	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	no change
 t02-wordfreq	6	ok	ok	reject	reject	1	5	v1:reject v2:wrong v3:wrong v4:wrong v5:wrong v6:ok final:ok	v1:reject v2:ok v3:ok v4:ok v5:ok v6:ok final:ok	v2-v5 now correct (B4/B5/B6/B7 fixed). v1 still rejected: `Console.In.ReadToEnd().ToLower()` lowers to nothing with an internal warning, then "codegen for this for statement" (B1 changed, NB16).
 t03-csv	4	ok	ok	reject	reject	1	2	v1:reject v2:reject v3:wrong v4:ok final:ok	v1:reject v2:reject v3:ok v4:ok final:ok	v3 now correct (B4/B6). v1/v2 now fail on an untyped lambda inside a group (`g.Sum(lambda(e) => e.Salary)`: "string member .Salary") — B3 changed; v1 still hits stored GroupBy (open tracker #4694; the message cites closed #755).
-t04-grep	3	ok	ok	reject	reject	1	1	v1:reject v2:reject v3:ok final:ok	v1:reject v2:reject v3:ok final:ok	unchanged: B8 (contested #6698).
+t04-grep	3	ok	ok	reject	reject	1	1	v1:reject v2:reject v3:ok final:ok	v1:reject v2:reject v3:ok final:ok	unchanged: B8 (ruled #6698).
 t05-ini	2	ok	ok	reject	reject	1	1	v1:reject v2:ok final:ok	v1:reject v2:ok final:ok	v1 loses the ParseOrNull error (B9 fixed); the owned-field / fresh-store errors (LANG-RULE) remain.
 t06-logsummary	2	ok	ok	wrong	ok	1	2	v1:wrong v2:ok final:ok	v1:ok v2:ok final:ok	v1 now correct (B6 fixed).
 t07-money	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	no change
@@ -27,7 +27,7 @@ t25-json-read	5	ok	ok	wrong	wrong	1	1	v1:wrong v2:wrong v3:wrong v4:wrong v5:ok 
 t26-plugins	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	unchanged unused-result warning.
 t27-lru	2	ok	ok	reject	reject	1	1	v1:reject v2:ok final:ok	v1:reject v2:ok final:ok	unchanged: ?? across types; unused-result warnings.
 t28-comparer	3	ok	ok	reject	reject	1	1	v1:reject v2:reject v3:ok final:ok	v1:reject v2:reject v3:ok final:ok	unchanged (closures; generic comma in hole). B24 repro now correct.
-t29-partition	2	ok	ok	reject	reject	1	1	v1:reject v2:ok final:ok	v1:reject v2:ok final:ok	v1: B22 error gone; B17 (contested) remains. B18 internal warning gone in v2/final.
+t29-partition	2	ok	ok	reject	reject	1	1	v1:reject v2:ok final:ok	v1:reject v2:ok final:ok	v1: B22 error gone; B17 (ruled #7170/#7215) remains. B18 internal warning gone in v2/final.
 t30-workers	3	ok	ok	reject	reject	2	2	v1:reject v2:ok v3:ok final:ok	v1:reject v2:ok v3:ok final:ok	unchanged: fresh tasks into an Array.
 t31-pipeline	3	ok	ok	reject	reject	1	1	v1:reject v2:reject v3:ok final:ok	v1:reject v2:reject v3:ok final:ok	unchanged: `out` keyword; captured sender in a closure; owned-parameter warnings at teardown.
 t32-timeout	1	ok	ok	ok	ok	1	1	v1:ok final:ok	v1:ok final:ok	no change

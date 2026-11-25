@@ -15,7 +15,7 @@
 
 Of the 96 friction rows, **33 are resolved, 6 changed, 57 still present** (`data/recheck-frictions.tsv`). Every resolved row was resolved by a compiler fix. No design theme of the first study was resolved by a document change: the v0.356–v0.359 revisions (the error-handling story, `ParseOrNull` as doctrine, the `??` rule) touch only F021/F043 (now working) and F063 (the `??` rule is now stated and enforced).
 
-**What is still broken from the first study.** B8 and B17 (both contested spec questions). Two bugs changed rather than went away:
+**What is still broken from the first study.** B8 and B17, both compiler bugs. Their spec questions were already ruled in October (#6698; #7170/#7215), and the rulings stand at v0.360. Two bugs changed rather than went away:
 
 - **B1:** `ReadToEnd()` works, but a string member on a local inferred from it (`raw.ToLower()`, `.Trim()`, or the chained `Console.In.ReadToEnd().ToLower()`) still lowers to nothing, with only an internal warning (NB16).
 - **B3:** the key lambda works, but an untyped lambda over a group's elements is typed as the key (`g.Sum(lambda(e) => e.Salary)`), so t03 v1/v2 and t11 v1 still fail (NB17, open #8542).
