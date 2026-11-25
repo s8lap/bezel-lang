@@ -3889,14 +3889,21 @@ void Emitter::releaseIndexArgStringProducers(
 // (or its function-value equivalent) rejects every sink, so the producer's +1
 // is provably the sole remaining reference once the getter returns.
 //
-// WHY IT CANNOT OVER-RELEASE. The predicate is `isPlusOneClosureProducer`, the
-// same predicate #429 / #1073 / #3498 use. It admits ONLY a LambdaExpr literal
-// or a bare/qualified method reference (the codegen-internal +1 producers); a
-// CALLER-OWNED LOCAL passed as an index (`var g := lambda() => …; t[g];`) is
-// NOT matched — its +1 belongs to the local's own scope, and an extra release
-// here would be a double-free (the local's scope-end release runs and frees
-// again). Mirrors `releaseIndexArgStringProducers`'s identifier-exclusion
-// exactly.
+// WHY IT CANNOT OVER-RELEASE. The predicate is the UNION of the closure
+// producers an index argument can be:
+//
+//   * `isPlusOneClosureProducer` — a LambdaExpr literal or a bare/qualified
+//     method reference (the codegen-internal +1 producers), the same
+//     predicate #429 / #1073 / #3498 use;
+//   * `isUserMethodClosureReturnCall` and `isLambdaClosureReturnCall` —
+//     fix #9115 (§28.14 / §28.9, v0.359): a CALL whose result is a +1
+//     closure. See the block comment on the predicate union below.
+//
+// A CALLER-OWNED LOCAL passed as an index (`var g := lambda() => …; t[g];`) is
+// matched by NONE of them — its +1 belongs to the local's own scope, and an
+// extra release here would be a double-free (the local's scope-end release
+// runs and frees again). Mirrors `releaseIndexArgStringProducers`'s
+// identifier-exclusion exactly.
 //
 // GATED ON `!diverged_` (already enforced by every call site that names this
 // helper): on a path the getter body diverged from (a `throw`), the release
@@ -3922,7 +3929,40 @@ void Emitter::releaseIndexArgClosureProducers(
         // double-free it. The indexer parameter list itself forbids `ref`/`out`
         // per §23.5, so exprValueOverride_ is the only way this arm fires.
         if (exprValueOverride_.count(ie)) continue;
-        if (!isPlusOneClosureProducer(ie)) continue;
+        // fix #9115 (§28.14 / §28.9 / §23.5, v0.359): the predicate is the
+        // UNION of the closure producers an index argument can be.
+        //
+        // `isPlusOneClosureProducer` admits a LAMBDA LITERAL and a method
+        // reference — the producers whose cell is allocated IN the caller's
+        // frame. It DELIBERATELY declines a closure-returning CALL ("the
+        // callee may hand back a function value WITHOUT a fresh +1 ... so
+        // caller-side release of a call result could free a value the callee
+        // still references (UAF)"), because it cannot see the callee's body.
+        //
+        // The index argument is not that case. §23.5 (v0.359) forbids
+        // `ref`/`out`/`owned` on an indexer parameter list, so an indexer's
+        // function-typed parameter is plain and therefore CALL-BOUNDED
+        // (§28.14, v0.359: "the callee receives the callback for the
+        // duration of the call only"). The accessor never consumes the
+        // callback and keeps no reference to it, so the caller's +1 is the
+        // caller's to drop once the accessor has returned — whatever minted
+        // it. The two NARROW recognizers that DO know the callee mints exactly
+        // +1 (`isUserMethodClosureReturnCall`: a call to a user method whose
+        // DECLARED return type is a function type; `isLambdaClosureReturnCall`:
+        // a call through a lambda-typed local or parameter, whose body shape
+        // is statically known to mint +1) are the SAME pair the console
+        // discharge uses for an unbound closure temporary
+        // (LlvmBackend_Calls.cpp ~920) and the closure-local binding path uses
+        // to decide that the slot owns the producer's +1.
+        //
+        // MEASURED on r30-c1 @ 4e5dbd3fe, the issue's own 200-iteration repro
+        // `fl[g.MkClosure()]`: "SUMMARY: AddressSanitizer: 17600 byte(s)
+        // leaked in 600 allocation(s)" — the closure, its capture cell and the
+        // cell's payload, three allocations per call, all attributed to the
+        // caller's `MkClosure`.
+        if (!isPlusOneClosureProducer(ie) && !isUserMethodClosureReturnCall(ie) &&
+            !isLambdaClosureReturnCall(ie))
+            continue;
         emitClosureRelease(argVals[k]);  // null-safe; atomic rc dec
     }
 }
