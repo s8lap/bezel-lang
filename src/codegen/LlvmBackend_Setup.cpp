@@ -29536,6 +29536,15 @@ struct MoveOnlyArrayTransferWalker {
     // LocalDecl whose initializer is a fresh `new`.
     std::unordered_set<const void*>* cdReassigned = nullptr;
     std::vector<const ast::LocalDecl*>* cdCandidates = nullptr;
+    // fix #9156 (§28.2 / §28.3, v0.359): true in the #4602 checked-disposal
+    // FREE-ELIGIBILITY walk (collectCdFreeEligible), false in the #747
+    // move-only-array walk. The two walks fill the SAME `out` set but answer
+    // DIFFERENT questions, and the LENS-2 index-receiver marking below (see
+    // the AssignmentStmt arm) means a different thing in each: inert for the
+    // #747 walk (whose consumer is type-filtered to move-only owning inline
+    // arrays) and a DISQUALIFICATION for the #4602 walk (whose consumer is
+    // not type-filtered). See that arm for the full argument.
+    bool cdFreeEligibilityWalk = false;
 
     // #747 verify (LENS 2): a store into an owned slot `a[i] := rhs` whose rhs is
     // NOT a fresh-owned value (`new`), a `move`, or `null` may ALIAS another owner
@@ -29734,8 +29743,33 @@ struct MoveOnlyArrayTransferWalker {
             // alias another owner into the slot (`a[i] := a[j]`), which the
             // scope-end disposal would then double-free — mark the array (the index
             // receiver) ineligible so it is skipped (leak, never a double-free).
+            //
+            // fix #9156 (§28.2 / §28.3, v0.359): this marking is about a MOVE-ONLY
+            // OWNING INLINE ARRAY's slots — the #747 consumer
+            // (`registerInlineOwnedArrayDisposal`, this file) is type-filtered to
+            // `TypeRef::Kind::InlineArray && arrayOwned`, so for every other
+            // receiver the marking is INERT here. It was not inert in the #4602
+            // walk (`collectCdFreeEligible`), whose consumer is NOT type-filtered:
+            // any local in the transferred set loses its checked-mode free. So a
+            // CLASS receiver of a plain indexer assignment was read as
+            // "transferred", and §28.2's checked-mode QUARANTINE (never reclaim
+            // the block) was applied to it at the scope end — the 16 B per
+            // receiver the issue measured.
+            //
+            // WHY THE INDEX RECEIVER IS NOT A TRANSFER. §28.2 (v0.359) gives
+            // checked mode the LATITUDE to defer a disposed instance's
+            // reclamation "so that the flag remains readable after disposal" —
+            // that is, for a SURVIVING BORROW that may still read the disposed
+            // flag. An index receiver is a BORROW position (§6.6: the lvalue
+            // chain's receiver is borrowed, not consumed), and the
+            // free-eligibility walk's own rule says so ("receiver of a member
+            // access, method call or INDEX"). The inline-array slot aliasing
+            // has no bearing on it: a setter writes THROUGH its receiver, so it
+            // cannot alias an owner into the receiver's own block, and the
+            // receiver's own disposal cascade (§28.4) still runs. The #747 walk
+            // keeps the marking verbatim — the array case is unchanged.
             if (auto* ixt = dynamic_cast<const ast::IndexExpr*>(as->target.get())) {
-                if (!isSafeOwnedSlotRhs(as->value.get()))
+                if (!isSafeOwnedSlotRhs(as->value.get()) && !cdFreeEligibilityWalk)
                     markIdent(ixt->target.get());
             }
             // #4602: a reassigned local may hold a slot-derived value.
@@ -29849,6 +29883,11 @@ void Emitter::collectCdFreeEligible(
     MoveOnlyArrayTransferWalker w{ctx_, transferred};
     w.cdReassigned = &reassigned;
     w.cdCandidates = &candidates;
+    // fix #9156 (§28.2 / §28.3, v0.359): this walk asks "may this local's
+    // block be FREED at its scope end (rather than quarantined)?" — the
+    // index receiver of an assignment is a BORROW position in it, so the
+    // inline-array LENS-2 marking must not count as a transfer here.
+    w.cdFreeEligibilityWalk = true;
     for (auto& s : body) w.stmt(s.get());
     for (const ast::LocalDecl* ld : candidates) {
         const void* key = static_cast<const void*>(ld);

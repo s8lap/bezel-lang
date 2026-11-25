@@ -48,29 +48,48 @@
 // output — and once checked (`runAotChecked` / `runAotModulesChecked`) for
 // the MEMORY oracle.
 //
-// THE MEMORY ORACLE IS A FLOOR, and the reason is a SEPARATE, PRE-EXISTING
-// defect: an indexer SETTER leaks a COPY of the receiver (16 bytes per call
-// — the receiver object's size), on the base and on every arm, imported and
-// single-module alike. That leak is NOT this issue's and is NOT touched by
-// this fix, but it is in the same program, so the row cannot assert "no leak
-// at all". It asserts instead that what remains does not EXCEED the
-// receiver's own residual: the closure's 64 bytes per call must be GONE.
-// On the base the same programs leak 16000 byte(s) in 400 allocation(s) —
-// the receiver's 3200 B / 200 plus the closure's 12800 B / 200 — so the rows
-// are RED on the base.
+// THE MEMORY ORACLE WAS A FLOOR, and the reason was a SEPARATE, PRE-EXISTING
+// defect: an indexer SETTER leaked what this file's header called "a COPY of
+// the receiver" (16 bytes per call — the receiver object's size), on the base
+// and on every arm, imported and single-module alike. That leak was NOT this
+// issue's and was NOT touched by this fix, but it was in the same program, so
+// the rows could not assert "no leak at all". They asserted instead that what
+// remained did not EXCEED the receiver's own residual: the closure's 64 bytes
+// per call must be GONE. On the base the same programs leaked 16000 byte(s)
+// in 400 allocation(s) — the receiver's 3200 B / 200 plus the closure's
+// 12800 B / 200 — so the rows were RED on the base.
+//
+// fix #9156 (§28.2 / §28.3, v0.359): THE FLOOR IS GONE. The "receiver copy"
+// this floor tolerated was never a copy: it was the RECEIVER'S OWN BLOCK,
+// quarantined instead of reclaimed (§28.2's checked-mode latency), because
+// the index receiver of an indexer ASSIGNMENT was wrongly read as
+// "transferred" by the checked-disposal free-eligibility walk. Fix #9156
+// reclaims it, so the three floors below are TIGHTENED to "no leak at all"
+// (a strengthening). The row NAMES are kept as they are — issue #9156 and
+// its lane brief refer to row 3 by name.
+//
+// ⇒ The rows are now GREEN on the current base for the memory leg as well:
+// the programs leak NOTHING (the closure's 64 B per call was released by
+// #9110, and the receiver's 16 B per call by #9156). They stay RED on the
+// pre-#9110 base (16000 B / 400 allocations) and RED on the pre-#9156 base
+// for the receiver's residual (3200 B / 200 allocations, in
+// CHECKED-DISPOSAL mode).
 //
 // ROWS.
 //   Row 1 — the issue's own shape: an IMPORTED indexer, a compound
 //           assignment, 200 iterations. RED on the base (16000 B / 400
 //           allocations), GREEN with the fix (3200 B / 200 — the receiver's
-//           residual only).
+//           residual only), and — after fix #9156 — leak-free.
 //   Row 2 — the SINGLE-MODULE twin (the compound path's inline-setter arm).
-//           RED on the base, GREEN with the fix.
+//           RED on the base, GREEN with the fix, leak-free after #9156.
 //   Row 3 — GREEN CONTROL: the imported PLAIN setter (`fl[lambda() => 7]
 //           := 3;`), whose closure producer #4078's setter twin already
 //           discharged. Green on the base and green with the fix; it is the
 //           DOUBLE-RELEASE guard — a fix that released the producer twice
 //           turns this row red with a bad free / use-after-free under ASan.
+//           fix #9156 TIGHTENED this row from "at most the receiver's
+//           residual (3200 B / 200)" to "no leak at all"; the row NAME is
+//           kept (issue #9156 refers to it by name).
 //   Row 4 — GREEN CONTROL: the imported PLAIN getter (`fl[lambda() => 1];`),
 //           the path #9083 fixed. CLEAN on both arms (no leak at all): it is
 //           the guard that the compound fix does not release the getter's
@@ -114,34 +133,11 @@ void expectValue(const JitResult& r, int exitCode, const std::string& out) {
     BEZEL_EXPECT_EQ(r.stdoutText, out);
 }
 
-// The MEMORY oracle: the checked run leaked NO MORE than the receiver-copy
-// residual this issue does not own (3200 bytes in 200 allocations — see the
-// file header), and no memory error fired at all.
-//
-// The residual is asserted as a FLOOR, not as an equality: if the separate
-// receiver-copy defect is fixed later, the leak drops to zero and this row
-// stays green. On the base the same program leaks 16000 bytes in 400
-// allocations (the receiver's 3200 / 200 plus the closure's 12800 / 200), so
-// the rows are RED there.
-void expectLeakAtMost(const JitResult& r, unsigned long long maxBytes,
-                      unsigned long long maxAllocs) {
-    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    const std::string text = diagnosticText(r);
-    unsigned long long leakedBytes = 0, leakedAllocs = 0;
-    const bool sawSummary =
-        bezel::test::aot_detail::parseLeakSummary(text, leakedBytes, leakedAllocs);
-    std::cout << "    [ LEAK COUNT ] " << leakedAllocs
-              << " allocation(s) / " << leakedBytes
-              << " byte(s) leaked (floor " << maxAllocs << " / " << maxBytes
-              << ")\n";
-    BEZEL_EXPECT_TRUE(leakedBytes <= maxBytes);
-    BEZEL_EXPECT_TRUE(leakedAllocs <= maxAllocs);
-    // A memory error is never acceptable, at any leak level.
-    BEZEL_EXPECT_TRUE(text.find("heap-use-after-free") == std::string::npos);
-    BEZEL_EXPECT_TRUE(text.find("double-free") == std::string::npos);
-    BEZEL_EXPECT_TRUE(text.find("SEGV") == std::string::npos);
-    BEZEL_EXPECT_TRUE(text.find("ERROR: AddressSanitizer") == std::string::npos);
-}
+// fix #9156 (§28.2 / §28.3, v0.359): the receiver-copy residual this issue
+// did not own is GONE (the receiver's own block is reclaimed now, not
+// quarantined), so the three rows that used the floor (`expectLeakAtMost`,
+// removed) are TIGHTENED to `expectNoLeak` — a strengthening, named in the
+// commit body.
 
 // The MEMORY oracle for a program that must leak NOTHING at all.
 void expectNoLeak(const JitResult& r) {
@@ -232,7 +228,7 @@ std::string singleModule(const std::string& className,
 //
 // RED on the base (16000 B / 400 allocations: the receiver's 3200 / 200 plus
 // the closure's 12800 / 200), GREEN with the fix (3200 B / 200 — the
-// receiver's residual only).
+// receiver's residual only), and — after fix #9156 — leak-free.
 BEZEL_TEST(indexer_compound_lambda_arg_closure_release_9110,
            imported_compound_assignment_releases_the_index_argument_closure) {
     const std::string cls = "Lib9110C";
@@ -242,14 +238,14 @@ BEZEL_TEST(indexer_compound_lambda_arg_closure_release_9110,
     auto v = runAotModules(mods, "App9110C");
     expectValue(v, 0, "3600\n");
     auto r = runAotModulesChecked(mods, "App9110C");
-    expectLeakAtMost(r, 3200, 200);
+    expectNoLeak(r);
 }
 
 // ── Row 2 (§28.14 / §28.9): the SINGLE-MODULE twin — the compound path's
 // inline-setter arm, which leaked identically (the issue's own probe is
 // cross-module; this row shows the defect is not an import defect).
 //
-// RED on the base, GREEN with the fix.
+// RED on the base, GREEN with the fix, leak-free after fix #9156.
 BEZEL_TEST(indexer_compound_lambda_arg_closure_release_9110,
            single_module_compound_assignment_releases_the_index_argument_closure) {
     const std::string src =
@@ -257,7 +253,7 @@ BEZEL_TEST(indexer_compound_lambda_arg_closure_release_9110,
     auto v = runAot(src);
     expectValue(v, 0, "3600\n");
     auto r = runAotChecked(src);
-    expectLeakAtMost(r, 3200, 200);
+    expectNoLeak(r);
 }
 
 // ── Row 3 (GREEN CONTROL — the imported PLAIN setter): #4078's setter twin
@@ -268,6 +264,11 @@ BEZEL_TEST(indexer_compound_lambda_arg_closure_release_9110,
 // It is the DOUBLE-RELEASE guard: a fix that released the producer twice (for
 // example one that also released inside the compound's getter half) turns
 // this row red with a bad free / use-after-free under ASan.
+//
+// fix #9156 (§28.2 / §28.3, v0.359): TIGHTENED. This row used to accept the
+// receiver's residual as a FLOOR (3200 B / 200 allocations); the residual is
+// gone, so the row now asserts NO leak at all. The row NAME is kept — issue
+// #9156 and its lane brief refer to it by name.
 BEZEL_TEST(indexer_compound_lambda_arg_closure_release_9110,
            imported_plain_setter_stays_at_the_receiver_floor) {
     const std::string cls = "Lib9110S";
@@ -277,13 +278,15 @@ BEZEL_TEST(indexer_compound_lambda_arg_closure_release_9110,
     auto v = runAotModules(mods, "App9110S");
     expectValue(v, 0, "2200\n");
     auto r = runAotModulesChecked(mods, "App9110S");
-    expectLeakAtMost(r, 3200, 200);
+    expectNoLeak(r);
 }
 
 // ── Row 4 (GREEN CONTROL — the imported PLAIN getter): the path #9083 fixed
 // (`releaseIndexArgClosureProducers` in `lowerIndexerGet`'s imported arm).
-// CLEAN on both arms — no leak at all, not even the receiver's residual (the
-// getter path does not copy the receiver).
+// CLEAN on both arms — no leak at all, not even the receiver's residual: the
+// getter path's receiver is a BORROW position, so it was never quarantined
+// and its block is reclaimed at the scope end (fix #9156 makes the setter
+// path behave the same way).
 //
 // It is the guard that the compound fix does not release the getter's
 // producer a second time: a double release would free the closure while the

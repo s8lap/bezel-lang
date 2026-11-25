@@ -58,9 +58,15 @@
 // THE ORACLE. Every row runs the program TWICE: once plain (`runAot`) for the
 // VALUE oracle — the program's own exit code and output — and once checked
 // (`runAotChecked`) for the MEMORY oracle. These programs must leak NOTHING
-// at all: MEASURED, the `??=` path leaks no receiver copy (the plain SETTER
-// path does — a separate, pre-existing 16-byte receiver-copy defect this
-// issue does not own), so the closure's 64 bytes per call is the WHOLE leak.
+// at all: MEASURED, the `??=` path leaks no receiver copy, so the closure's
+// 64 bytes per call is the WHOLE leak.
+//
+// fix #9156 (§28.2 / §28.3, v0.359): the plain SETTER path's 16-byte
+// "receiver copy" this file used to name — the RECEIVER'S OWN BLOCK,
+// quarantined instead of reclaimed in §28.2's checked-disposal mode — is
+// GONE (the index receiver of an indexer assignment is a BORROW position, so
+// its block is reclaimed at the scope end). The rows' ASSERTIONS are
+// unchanged: they already required no leak at all.
 //
 // ROWS.
 //   Row 1 — the issue's own program, VERBATIM: `fl[lambda() => 7] ??= 3;` over
@@ -123,11 +129,10 @@ void expectValue(const JitResult& r, int exitCode, const std::string& out) {
 // The MEMORY oracle: the checked run leaked NOTHING at all, and no memory
 // error fired.
 //
-// MEASURED, the `??=` path leaks no receiver copy (the plain SETTER path
-// does — a separate, pre-existing 16-byte receiver-copy defect this issue
-// does not own), so a `??=`-only program has no residual: the closure's
-// 12736 B / 199 allocations over the issue's own 200-iteration repro is the
-// WHOLE leak.
+// MEASURED, the `??=` path leaks no receiver copy, so a `??=`-only program has
+// no residual: the closure's 12736 B / 199 allocations over the issue's own
+// 200-iteration repro is the WHOLE leak. (fix #9156: the plain SETTER path's
+// receiver residual this file used to name is GONE too.)
 void expectNoLeak(const JitResult& r) {
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     const std::string text = diagnosticText(r);
