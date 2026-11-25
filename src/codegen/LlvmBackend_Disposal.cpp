@@ -1764,9 +1764,17 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // (astNode-less, head in `importedName`) must match the same arm.
             if (!elemDisp && !isDict &&
                     fieldCollPol.cat == ElementPolicy::Category::RuntimeManaged &&
-                    collElem && collElem->kind == sema::TypeRef::Kind::Primitive &&
-                    collElem->primitive == sema::PrimitiveType::String &&
-                    !collElem->nullable &&
+                    // fix #9064 / fix #9107 / §3.6 / §28.9 / §28.11 (v0.359):
+                    // the `!nullable` gate is GONE — a `string?` element is the
+                    // same §28.11 *runtime-managed reference* row as a `string`
+                    // one (§3.6's *Nullable forms* rule reads the element
+                    // category of `V?` as `V`, nullability stripped), so the
+                    // field's collection co-owns a +1 per element (taken at
+                    // insert) and the field's free gives it back. The ARRAY-
+                    // backed family's +1 is #9064's; the LINKED LIST's is
+                    // #9107's (`llIsStrElem` / `llitIsStrElem` /
+                    // `ctorRetainStr`).
+                    isStringElementTypeRef(collElem) &&
                     [](std::string_view n){
                         // #2603 / issue #401: IList<T>/IReadOnlyList<T> are
                         // array-backed + borrowing (same bz_array_t* + per-
@@ -7590,33 +7598,35 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
         if (elemPol.disposerThunk) {
             elemDisposer = elemPol.disposerThunk;
         } else if (elemPol.cat == ElementPolicy::Category::RuntimeManaged &&
-                   isStringElementTypeRef(elemForDisposer) &&
-                   // fix-forward #9064 / §28.9 / §28.11 (v0.359): the nullable
-                   // string release is GATED BY COLLECTION KIND, because the
-                   // matching per-element RETAIN is per kind (§28.11's slot
-                   // policy is a pair: the store takes the reference, the
-                   // collection's free gives it back).
-                   //
+                   // fix #9064 / fix #9107 / §3.6 / §28.9 / §28.11 (v0.359):
+                   // the nullable string release is NOT gated by COLLECTION
+                   // KIND any more — §28.11's slot policy is a PAIR (the store
+                   // takes the reference, the collection's free gives it back),
+                   // and every kind that STORES a `string?` element now takes
+                   // that +1:
                    //   * the ARRAY-backed family (Array / Stack / Queue, and the
                    //     owning forms, which §14.4 rejects for a runtime-managed
-                   //     element) and the BORROWING Dictionary's VALUE take that
-                   //     +1 — `arrIsStringElem` (LlvmBackend_Calls.cpp),
-                   //     `litIsStrArr` (materializeHeapCollectionLiteral) and
-                   //     `dictIsStringValue` (#8207) — so their free gives one
-                   //     back per slot, `string?` included.
-                   //   * the LINKED LIST does NOT: `llIsStrElem` (LlvmBackend_
-                   //     Calls3.cpp) and `llitIsStrElem` (materializeHeapColl-
-                   //     ectionLiteral) are still `!nullable`-gated, so a
-                   //     `LinkedList<string?>` element was never retained.
-                   //     Releasing it here would be an UNPAIRED release — the
-                   //     double-free direction: MEASURED, an async method
-                   //     returning `Task<LinkedList<string?>>` that holds a
-                   //     borrowed element aborted with "bezel: fatal: refcount
-                   //     over-release (string)" (rc 134) — twice released for
-                   //     one reference. The LINKED-LIST arm therefore keeps the
-                   //     `!nullable` gate, exactly as `buildCollectionTempDisposal`
-                   //     (LlvmBackend_Setup.cpp) does for the same kind.
-                   (!isLL || !elemForDisposer->nullable)) {
+                   //     element) — `arrIsStringElem` (LlvmBackend_Calls.cpp),
+                   //     `litIsStrArr` (materializeHeapCollectionLiteral);
+                   //   * the BORROWING Dictionary's VALUE — `dictIsStringValue`
+                   //     (#8207);
+                   //   * the LINKED LIST — `llIsStrElem`
+                   //     (LlvmBackend_Calls3.cpp), `llitIsStrElem`
+                   //     (materializeHeapCollectionLiteral) and the source
+                   //     constructor's `ctorRetainStr` (LlvmBackend_Exprs2.cpp).
+                   //     #9107 added the linked list's +1 (§3.6's *Nullable
+                   //     forms* rule: a `string?` element is the same §28.11
+                   //     *runtime-managed reference* row as a `string` one), so
+                   //     the kind gate that #9064's fix-forward kept HERE (it
+                   //     existed only because that retain was missing) would now
+                   //     ORPHAN the +1 — the leak direction. Keeping it would
+                   //     also have been the DOUBLE-FREE direction in reverse:
+                   //     the rejected commit feb164d20 for #9064 removed the
+                   //     gate for every kind while the linked list's retain
+                   //     was still missing, and a `Task<LinkedList<string?>>`
+                   //     holding a borrowed element then aborted with "bezel:
+                   //     fatal: refcount over-release (string)" (rc 134).
+                   isStringElementTypeRef(elemForDisposer)) {
             // Borrowing Array<string> / Dictionary<string, int> / etc. —
             // release each string element. Mirrors the
             // collectionElemDisposer wiring in LlvmBackend_Setup.cpp
@@ -8443,6 +8453,21 @@ llvm::Function* Emitter::collectionNodeFreeThunk(const sema::TypeRef* nodeTy) {
                el->kind == sema::TypeRef::Kind::Primitive &&
                el->primitive == sema::PrimitiveType::String;
     };
+    // fix #9107 / §3.6 / §28.9 / §28.11 (v0.359): the same test with the
+    // `!nullable` gate GONE — a `string?` element is the same §28.11
+    // *runtime-managed reference* row as a `string` one (§3.6's *Nullable forms*
+    // rule reads the element category of `V?` as `V`, nullability stripped), so
+    // the CHILD collection co-owns a +1 per element (the linked list's since
+    // #9107) and its free gives it back. Used ONLY for the child disposer
+    // below; the dict-backed-SET arm keeps the `!nullable`-gated `isStrElem`
+    // above (its per-element retain is still `!nullable`-gated, so releasing a
+    // `string?` there would be an unpaired release).
+    auto isStrElemCoOwned = [&](const sema::TypeRef* el) {
+        if (!el) return false;
+        ElementPolicy p = elementPolicyFor(el, /*owning=*/false);
+        return p.cat == ElementPolicy::Category::RuntimeManaged &&
+               isStringElementTypeRef(el);
+    };
 
     // Which runtime free, and what this node owes for each of its own slots.
     const char* freeName = nullptr;
@@ -8571,7 +8596,8 @@ llvm::Function* Emitter::collectionNodeFreeThunk(const sema::TypeRef* nodeTy) {
                    // borrowed-source retain was a no-op), so the matching
                    // release here is a balanced thunk, not a double-free.
                    head == "FrozenArray");
-        if (!childDisposer && isStrElem(childTy) && strChildRetainedAtConstruction)
+        if (!childDisposer && isStrElemCoOwned(childTy) &&
+            strChildRetainedAtConstruction)
             childDisposer = stringElementReleaseThunk();
         // fix #5106 follow-up: the aggregate-node recursion
         // (`collectionNodeFreeThunk(childTy)`) now runs FIRST, above — see

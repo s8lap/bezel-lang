@@ -9329,10 +9329,18 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // path on the materialized/owned array it drained.
                 const ElementPolicy ctorPol =
                     elementPolicyFor(rt->genericArgs[0], /*owningFamily=*/false);
+                // fix #9107 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable`
+                // gate is GONE — §3.6's *Nullable forms* rule reads the element
+                // category of a `V?` as `V` (nullability stripped), so a
+                // `string?` element is the same §28.11 *runtime-managed
+                // reference* row as a `string` one: the source constructor takes
+                // the list's +1 per element exactly like `LinkedList<string>`
+                // does, and the snapshot's own retain/release pair below (both
+                // gated on this same predicate) stays balanced. `null` is the
+                // null-safe no-op on both sides.
                 const bool ctorRetainStr =
                     rt->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
                     rt->genericArgs[0]->primitive == sema::PrimitiveType::String &&
-                    !rt->genericArgs[0]->nullable &&
                     ctorPol.cat == ElementPolicy::Category::RuntimeManaged;
                 if (ctorRetainStr) {
                     auto* retainFn = declareC("bz_array_retain_strings",

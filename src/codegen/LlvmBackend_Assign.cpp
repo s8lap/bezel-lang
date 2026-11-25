@@ -13026,10 +13026,16 @@ void Emitter::freeLinkedListSourceNow(llvm::Value* v,
         const sema::TypeRef* elTy = srcTy->genericArgs[0];
         ElementPolicy elPol = elementPolicyFor(elTy, /*owning=*/false);
         elemDisp = elPol.disposerThunk;
+        // fix #9107 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate is
+        // GONE — a `string?` element is the same §28.11 *runtime-managed
+        // reference* row as a `string` one (§3.6's *Nullable forms`), so the
+        // list co-owns a +1 per element (taken at insert by `llIsStrElem` /
+        // `llitIsStrElem` / `ctorRetainStr`) and the source's free gives it
+        // back.
         bool llIsStringElem =
             elPol.cat == ElementPolicy::Category::RuntimeManaged &&
             elTy && elTy->kind == sema::TypeRef::Kind::Primitive &&
-            elTy->primitive == sema::PrimitiveType::String && !elTy->nullable;
+            elTy->primitive == sema::PrimitiveType::String;
         if (!elemDisp && llIsStringElem)
             elemDisp = stringElementReleaseThunk();
     }

@@ -8794,12 +8794,18 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
         // +1 per element (bounded leak, not unsoundness). The same
         // one-liner `.RemoveFirst`/`.RemoveLast`/`.Clear`/`.Remove`/
         // `.RemoveNode` already carry at LlvmBackend_Calls3.cpp and
-        // `#2692` family-wide. The `!nullable` guard mirrors Site 3
-        // (`patternAResultCollectionDisposer`'s asymmetry, recorded
-        // in #2710) and the `litIsStrArr`/`llitIsStrElem`
-        // siblings in materializeHeapCollectionLiteral — a nullable
-        // string element is never retained at construction so
-        // releasing here would be a stray double-free direction.
+        // `#2692` family-wide.
+        // fix #9107 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` guard
+        // this arm used to carry is GONE. It mirrored Site 3
+        // (`patternAResultCollectionDisposer`'s asymmetry, recorded in #2710)
+        // and the `litIsStrArr`/`llitIsStrElem` siblings in
+        // materializeHeapCollectionLiteral — a nullable string element was
+        // never retained at construction, so releasing here would have been a
+        // stray double-free direction. #9107 gives the linked list that
+        // retain (§3.6's *Nullable forms*: a `string?` element is the same
+        // §28.11 *runtime-managed reference* row as a `string` one), so the
+        // release is paired again and this arm must NOT skip the nullable
+        // element.
         {
             const sema::TypeRef* llElem =
                 (!recvTy->genericArgs.empty())
@@ -8811,13 +8817,18 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             ElementPolicy llElemPol =
                 elementPolicyFor(llElem, llIsOwning);
             llvm::Function* elemDisp = llElemPol.disposerThunk;
-            // RuntimeManaged + non-nullable string primitive —
+            // RuntimeManaged + string primitive —
             // verbatim mirror of `llIsStrElem` in
             // LlvmBackend_Calls3.cpp. The retain path that
             // paired this release (#2686) uses the same predicate,
             // so the release is provably paired.
+            // fix #9107 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate
+            // is GONE — a `string?` element is the same §28.11 *runtime-managed
+            // reference* row as a `string` one (§3.6's *Nullable forms`), so the
+            // list co-owns a +1 per element (taken at insert by `llIsStrElem` /
+            // `llitIsStrElem` / `ctorRetainStr`) and the Dispose gives it back.
             bool llIsStringElem =
-                !llIsOwning && llElem && !llElem->nullable &&
+                !llIsOwning && llElem &&
                 llElemPol.cat == ElementPolicy::Category::RuntimeManaged &&
                 llElem->kind == sema::TypeRef::Kind::Primitive &&
                 llElem->primitive == sema::PrimitiveType::String;

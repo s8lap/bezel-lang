@@ -23819,8 +23819,11 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                     elementPolicyFor(llEl, llIsOwning).disposerThunk;
                 // #2686: borrowing LinkedList<string> releases the +1 each
                 // element took on insert (mirrors the sync sibling arm).
+                // fix #9107 / §3.6 / §28.9 / §28.11 (v0.359): the
+                // `!nullable` gate is GONE — a `string?` element is the same
+                // §28.11 *runtime-managed reference* row as a `string` one, so
+                // the list co-owns it exactly like `LinkedList<string>` does.
                 if (!d.collectionElemDisposer && !llIsOwning && llEl &&
-                    !llEl->nullable &&
                     llEl->kind == sema::TypeRef::Kind::Primitive &&
                     llEl->primitive == sema::PrimitiveType::String &&
                     elementPolicyFor(llEl, /*owning=*/false).cat ==
@@ -24844,8 +24847,11 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             // OwningLinkedList is excluded by construction: elementPolicyFor puts
             // an owning-family string in the Value row (no retain at insert —
             // the element is `owned`, a transfer), so `llIsOwning` must be false.
+            // fix #9107 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate
+            // is GONE — a `string?` element is the same §28.11 *runtime-managed
+            // reference* row as a `string` one (§3.6's *Nullable forms*), so the
+            // list co-owns it exactly like `LinkedList<string>` does.
             if (!d.collectionElemDisposer && !llIsOwning && llEl &&
-                !llEl->nullable &&
                 llEl->kind == sema::TypeRef::Kind::Primitive &&
                 llEl->primitive == sema::PrimitiveType::String &&
                 elementPolicyFor(llEl, /*owning=*/false).cat ==
@@ -60298,10 +60304,16 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
         // literal arm was one of the five insert paths that never took it, so a
         // literal in call-argument position (which becomes an owned temp)
         // double-freed the string. OwningLinkedList is excluded (owned element =
-        // transfer, Value row in elementPolicyFor); `string?` is excluded; a
-        // fresh +1 producer TRANSFERS rather than double-retaining.
+        // transfer, Value row in elementPolicyFor); a fresh +1 producer
+        // TRANSFERS rather than double-retaining.
+        //
+        // fix #9107 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate is
+        // GONE — §3.6's *Nullable forms* rule reads the element category of a
+        // `V?` as `V` (nullability stripped), so a `string?` element is the
+        // same §28.11 *runtime-managed reference* row as a `string` one and
+        // the list co-owns it exactly like `LinkedList<string>` does.
         bool llitIsStrElem =
-            er && !er->nullable &&
+            er &&
             er->kind == sema::TypeRef::Kind::Primitive &&
             er->primitive == sema::PrimitiveType::String &&
             !common::isOwningPrefixedName(collTy->headName()) &&
@@ -61357,9 +61369,12 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
     // (`null` is the null-safe retain/release no-op). Used ONLY where the
     // matching per-element RETAIN is also in place: the array-backed family
     // (`arrIsStringElem` in LlvmBackend_Calls.cpp, `litIsStrArr` in
-    // materializeHeapCollectionLiteral) and the borrowing dictionary's value
-    // (`dictIsStringValue`, #8207). The LINKED-LIST and dict-backed-SET arms
-    // keep the `!nullable` gate above — their per-element retain is still
+    // materializeHeapCollectionLiteral), the borrowing dictionary's value
+    // (`dictIsStringValue`, #8207) and — since #9107 — the LINKED LIST
+    // (`llIsStrElem` in LlvmBackend_Calls3.cpp, `llitIsStrElem` in
+    // materializeHeapCollectionLiteral, the source constructor's
+    // `ctorRetainStr` in LlvmBackend_Exprs2.cpp). The dict-backed-SET arm
+    // keeps the `!nullable` gate above — its per-element retain is still
     // `!nullable`-gated, so releasing a `string?` there would be an unpaired
     // release (the double-free direction).
     auto isStrElemCoOwned = [&](const sema::TypeRef* el, bool owning) {
@@ -61376,7 +61391,15 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
         const sema::TypeRef* el =
             (!collTy->genericArgs.empty()) ? collTy->genericArgs[0] : nullptr;
         d.collectionElemDisposer = elementPolicyFor(el, isOwning).disposerThunk;
-        if (!d.collectionElemDisposer && isStrElem(el, /*owning=*/false))
+        // fix #9107 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate is
+        // GONE — `isStrElemCoOwned` is the same test #9064 uses for the
+        // array-backed family: a `string?` element is the same §28.11
+        // *runtime-managed reference* row as a `string` one (§3.6's *Nullable
+        // forms* rule reads the element category of `V?` as `V`, nullability
+        // stripped), so the linked list co-owns a +1 per element — taken at
+        // insert by `llIsStrElem` / `llitIsStrElem` / the source constructor's
+        // `ctorRetainStr` — and gives it back here.
+        if (!d.collectionElemDisposer && isStrElemCoOwned(el, /*owning=*/false))
             d.collectionElemDisposer = stringElementReleaseThunk();
         return d;
     }

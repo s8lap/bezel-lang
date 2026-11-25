@@ -5383,11 +5383,24 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     // mirror of the Array/Stack/Queue element arm of
     // materializeHeapCollectionLiteral (`litIsStrArr`): OwningLinkedList is
     // excluded (its element parameter is `owned` — a transfer, and
-    // elementPolicyFor puts an owning-family string in the Value row), `string?`
-    // is excluded, and a fresh +1 producer TRANSFERS via isPlusOneStringProducer
-    // instead of double-retaining.
+    // elementPolicyFor puts an owning-family string in the Value row), and a
+    // fresh +1 producer TRANSFERS via isPlusOneStringProducer instead of
+    // double-retaining.
+    //
+    // fix #9107 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate is
+    // GONE. §3.6's *Nullable forms* rule reads the element CATEGORY of a `V?`
+    // as `V` (nullability stripped), and §28.11's element-slot table puts that
+    // category (runtime-managed reference) in a BORROWING family's slot as a
+    // SHARED reference — so a `string?` element is the same co-owned slot a
+    // `string` element is, and the list takes a +1 of its own (the release
+    // half — `llElemDisposer` below and the collection's free — gives it
+    // back). `null` is the null-safe no-op: bz_string_retain / bz_string_release
+    // are no-ops on null. MEASURED, issue #9107: with the gate in place a
+    // BORROWED `string?` element was stored WITHOUT a reference, died with its
+    // source, and every later read of the slot was an ASan heap-use-after-free
+    // (and a +1 producer's +1 was orphaned — a leak).
     bool llIsStrElem =
-        !isOwning && llElemRef && !llElemRef->nullable &&
+        !isOwning && llElemRef &&
         llElemRef->kind == sema::TypeRef::Kind::Primitive &&
         llElemRef->primitive == sema::PrimitiveType::String &&
         llElemPol.cat == ElementPolicy::Category::RuntimeManaged;
