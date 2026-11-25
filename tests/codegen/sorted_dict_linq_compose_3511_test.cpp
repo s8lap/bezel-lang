@@ -168,28 +168,6 @@ BEZEL_TEST(sorted_dict_linq_compose_3511, select_over_entries_ascending_4_17) {
 // filed by #3716 — it affects plain `Dictionary` too, independent of
 // `SortedDictionary`).
 
-namespace {
-
-// `Single()` is typed as the bare value type by the sorted block's
-// catch-all (the ONE remaining exclusion after #3716), so consuming the
-// result as an entry — the only way an entry is ever used — is a "no member
-// on primitive type" reject.
-void expectEntryAccessStaysLoud(const std::string& call) {
-    auto r = runAot(prog(std::string(kOutOfOrderMap) +
-        "var f := " + call + "; "
-        "return f.Key + f.Value; "));
-    bool found = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("no member `Key` on primitive type") !=
-            std::string::npos)
-            found = true;
-    BEZEL_EXPECT_TRUE(found);
-    // And it must be a REJECTION, not a note beside a produced binary.
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-}
-
-}  // namespace
-
 // fix #3716 / stdlib §4.17, §5: `First()` over a sorted source now yields the
 // LEAST key (ascending order), not the first-stored one (key 3). Pre-fix
 // this was a loud reject ("no member `Key` on primitive type `int`");
@@ -221,12 +199,16 @@ BEZEL_TEST(sorted_dict_linq_compose_3511, element_at_one_is_second_ascending_371
         "return ea.Key * 100 + ea.Value; ")), 220);
 }
 
-// `Single()` stays a loud reject (issue 3576 / #3716) — the codegen arm
-// #3576 added covers only First/Last/ElementAt, so typing `Single` here
-// would silently degrade instead of rejecting. See #3761 (the codegen-side
-// gap, which also affects plain `Dictionary<K, V>.Single()`).
-BEZEL_TEST(sorted_dict_linq_compose_3511, single_stays_a_loud_reject_3716) {
-    expectEntryAccessStaysLoud("sd.Single()");
+// fix #9290 (stdlib §4.17 / §5, v0.359): `Single()` yields the ENTRY too —
+// the carve-out that kept it a loud reject (no codegen arm, #3761) is gone.
+BEZEL_TEST(sorted_dict_linq_compose_3511, single_yields_the_entry_9290) {
+    BEZEL_EXPECT_EQ(runAotOut(prog(
+        "var sd := new SortedDictionary<int, int>(); "
+        "sd.Add(3, 30); "
+        "var se := sd.Single(); "
+        "Console.WriteLine($\"{se.Key * 100 + se.Value}\"); "
+        "return 0; ")),
+        "330");
 }
 
 // stdlib §5 Quantifiers: `Count()` over the sorted source. A cheap row, but it

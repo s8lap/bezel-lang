@@ -19195,42 +19195,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // needs to clobber them back to `V` for `SortedDictionary`
                         // specifically; #3716 lifts the exclusion for those three.
                         //
-                        // `Single` STAYS carved out. Measured directly against
-                        // #3576's own codegen arm (LlvmBackend_Calls.cpp, the
-                        // `isDict` block): its condition is `(call.args.empty() &&
-                        // (m == "First" || m == "Last")) || (m == "ElementAt" &&
-                        // …)` — there is no `m == "Single"` arm anywhere in that
-                        // block, nor anywhere else in the `isDict` codegen
-                        // surface. Typing `sd.Single()` as `entryTy` here would
-                        // hand codegen a call it cannot lower — `lowerLocalDecl`'s
-                        // #2434 defense-in-depth would degrade it SILENTLY to a
-                        // zero-filled entry rather than reject it, exactly the
-                        // loud→quiet trade LANE_RULES §6c forbids (the shape
-                        // #3444 names "a typed call with no lowering arm is a
-                        // silent miscompile"). The SAME gap already exists today
-                        // for `Dictionary<K, V>.Single()` — that block's arm above
-                        // types it unconditionally and `Dictionary` has no
-                        // catch-all here to stop it — measured: `new
-                        // Dictionary<int,int>(){{1,1}}.Single()` bound to a local
-                        // compiles clean and prints `dictSingle=0`. That is a
-                        // pre-existing defect outside #3716's stated scope
-                        // (SortedDictionary + OwningDictionary) and outside this
-                        // lane's file ownership (the fix is in
-                        // `LlvmBackend_Calls.cpp`, not owned here) — filed
-                        // separately as #3761 rather than fixed here. Keeping
-                        // `Single` on the `V`-catch-all path below preserves its
-                        // current loud rejection for `SortedDictionary` (it does
-                        // NOT preserve today's silent bug for plain `Dictionary`,
-                        // which this arm cannot reach — see #3761).
-                        //
-                        // The carve-out is deliberately spelled by NAME rather
-                        // than by "did the element-access arm fire", because the
-                        // name IS the arm's whole condition; there is no separate
-                        // fact to consult.
-                        const bool isEntryAccessWithoutCodegenArm = m == "Single";
+                        // fix #9290 (stdlib §4.8 / §4.17 / §5, v0.359): `Single`
+                        // is no longer carved out. Its codegen arm exists now
+                        // (#3761 for the no-argument form, #9261 for the
+                        // predicate form, both over any `isDictTypeName`
+                        // receiver), so the carve-out's own premise — "a typed
+                        // call with no lowering arm is a silent miscompile" —
+                        // is gone, and keeping it typed the call at `V` for a
+                        // `SortedDictionary` (rejecting `.Key` / `.Value` on
+                        // the result) while `Dictionary<K, V>.Single()`,
+                        // `First()` and `Last()` all answer the entry
+                        // `DictionaryEntry<K, V>` that §5's `Single(): T` over
+                        // §4.8's `ICollection<DictionaryEntry<K, V>>` means.
                         dictEntryElemTyped =
-                            !hadTypeBefore && (ctx_.exprType(ce) != nullptr) &&
-                            !isEntryAccessWithoutCodegenArm;
+                            !hadTypeBefore && (ctx_.exprType(ce) != nullptr);
                     }
                     // fix #3716 / stdlib §4.9 (v0.286): `OwningDictionary<K,
                     // V>`'s §5 element-access terminals `First`/`Last`/`Single`/
@@ -20038,12 +20016,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // an arm for all three over any `isDictTypeName`
                         // receiver), so they keep the `entryTy` typed above and
                         // `sd.First().Key` type-checks instead of rejecting.
-                        // `Single` is still FALSE by construction (no codegen
-                        // arm exists for it — see the flag's assignment site
-                        // above), so it still reaches the catch-all below and
-                        // is still typed as `V` — which is what makes
-                        // `sd.Single().Key` a loud reject instead of a silent
-                        // zero-filled entry.
+                        // fix #9290: `Single` too — every §5 element-access
+                        // terminal over a dictionary now has a codegen arm.
                         else if (dictEntryElemTyped) { /* typed above; keep it */ }
                         // Indexer / Value return: V (second generic arg).
                         else if (recvTy && recvTy->genericArgs.size() > 1 &&

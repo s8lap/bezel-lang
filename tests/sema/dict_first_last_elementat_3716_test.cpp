@@ -101,19 +101,17 @@ BEZEL_TEST(sema_dict_first_last_elementat_3716,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// `Single()` STAYS a loud reject: no codegen arm exists for it (#3761), so
-// this fix deliberately does NOT lift its exclusion. The catch-all types the
-// call as `V` (here `int`), so `.Key` rejects as "no member on primitive
-// type" — the exact same diagnostic shape the pre-fix containment produced
-// for all four names.
+// fix #9290 (stdlib §4.17 / §5, v0.359): `Single()` types as the ENTRY too —
+// its codegen arm exists now (#3761), so the exclusion is lifted and `.Key`
+// type-checks (it was a "no member on primitive type" reject).
 BEZEL_TEST(sema_dict_first_last_elementat_3716,
-           sorted_dictionary_single_still_rejects_no_codegen_arm_3761) {
+           sorted_dictionary_single_type_checks_clean_9290) {
     auto r = parseSemaAll(sema(
         "    var sd := new SortedDictionary<int, int>(); "
         "    sd.Add(1, 10); "
         "    var se := sd.Single(); "
         "    return se.Key + se.Value; "));
-    BEZEL_EXPECT_TRUE(hasError(r, "no member `Key` on primitive type"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // ---------------------------------------------------------------------------
