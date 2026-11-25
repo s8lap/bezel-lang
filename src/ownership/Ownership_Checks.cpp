@@ -34122,6 +34122,27 @@ void MethodOwnership::scopedCalleeWalkStmt(const ast::Stmt& s) {
                    "v0.175/v0.180)");
             return;
         }
+        // fix #9274 (§17.2 event-subscription forms, §28.14 form 4, v0.359):
+        // `lhs += h` on an event source "rewrites to `lhs.Add(h)`" and
+        // "evaluates `lhs` only as the receiver of the desugared call", and
+        // `Add` is a `scoped` position — so a `scoped` handler on the right
+        // is a FORWARD, not a value read. It is the admitted forward when the
+        // desugared call's bounding object is `this`: form 4, a receiver chain
+        // rooted at `this` through `owned` field hops (spec: "the bare
+        // `_clicked += h` spelling — the stdlib §6.5 event pattern"). Same
+        // receiver test as `builtinScopedCallbackFormal`'s `Add` arm (an event
+        // member, or an `EventSource`/`AsyncEventSource` value; a
+        // `SharedEventSource` admits capture-free handlers only and is not a
+        // `scoped` position). Any other `+=` keeps the value-read rejection.
+        if (as->op == "+=" && as->target && as->value &&
+            scopedUseKind(*as->value) == 1 &&
+            (dynamic_cast<sema::EventSymbol*>(ctx_.exprSymbol(*as->target)) ||
+             typeRefIsEventSourceLike(ctx_.exprType(*as->target))) &&
+            resolveChainHead(as->target.get()).kind ==
+                ScopedBound::Kind::This) {
+            scopedCalleeWalkExpr(*as->target);
+            return;
+        }
         if (as->target) scopedCalleeWalkExpr(*as->target);
         if (as->value) scopedCalleeWalkExpr(*as->value);
         return;
@@ -34279,6 +34300,28 @@ void MethodOwnership::scopedCalleeWalkExpr(const ast::Expr& e) {
                         onThis = true;
                     }
                 }
+                // fix #9274 (§28.14 forms 3/4, v0.359): the forward's
+                // "same object" is the bounding object the INNER call
+                // resolves by §28.14's own forms at its own site — the
+                // literal `this.M` / bare `M` receiver above (form 5 on
+                // `this`) is only one of them. Since v0.180:
+                //   form 3 — an owned-return call directly assigned to an
+                //     `owned` field of `this` (`_sub := _changed.Subscribe(h)`)
+                //     resolves `this`;
+                //   form 4 — a receiver chain rooted at `this` (explicit or
+                //     implicit) in which every hop is an `owned` field
+                //     (`_changed.Add(h)`, `this._changed.Add(h)`,
+                //     `_child.Reg(h)`) resolves the chain head `this`.
+                // The caller-side resolver `scopedBoundingLocal` decides both,
+                // in the spec's order, so a getter hop (`this.Changed.…`), a
+                // borrow-field hop, an indexer, a call result, and a
+                // parameter / local root resolve no `this` and stay rejected,
+                // as does a form-2 `using var` local in the callee (a
+                // different, tighter object).
+                if (formalScoped && !onThis &&
+                    scopedBoundingLocal(*ce, ce->callee.get(), nullptr).kind ==
+                        ScopedBound::Kind::This)
+                    onThis = true;
                 if (formalScoped && onThis) continue;  // admitted forward
                 if (kind == 3) {
                     report(Severity::Error, a.value->span.begin,

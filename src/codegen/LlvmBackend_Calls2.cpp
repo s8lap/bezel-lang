@@ -21185,9 +21185,10 @@ bool Emitter::scopedCallResultAdmitsRelease(const sema::SemaContext& ctx,
 // `EventSource<T>.Subscribe` / `.Add`, `IEvent<T>.Subscribe`,
 // `CancellationToken.Register` — keeps the handler past the call and releases
 // it exactly once when the registration ends (`bz_subscription_dispose`, the
-// source's free). The event `+=` and `TaskScope.Spawn` need no retain: sema
-// rejects a `scoped` formal there (§28.14), and `scopedFormalCallerReleases-
-// Producer` excludes async methods, the only home of a `TaskScope`. The
+// source's free). The event `+=` takes the same retain since fix #9274
+// (`tryLowerEventCompound`, which sema now admits on an owned-field chain of
+// `this`, §28.14 form 4). `TaskScope.Spawn` needs none: `scopedFormalCaller-
+// ReleasesProducer` excludes async methods, the only home of a `TaskScope`. The
 // runtime calls that reference a TRANSFERRED +1 (#841: "codegen hands the
 // event source the SOLE reference with no separate retain"), which is what a
 // lambda literal or a method reference produces at the sink's own call.

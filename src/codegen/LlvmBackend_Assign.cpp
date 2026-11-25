@@ -12019,6 +12019,13 @@ bool Emitter::tryLowerEventCompound(const ast::AssignmentStmt& as) {
     if (dynamic_cast<const ast::LambdaExpr*>(as.value.get()))
         consumeLastLambdaCapturedCells();
     if (as.op == "+=") {
+        // fix #9274 (§17.2 / §28.14 form 4, v0.359): `_changed += handler`
+        // with `handler` a `scoped` formal of this method is now the admitted
+        // forward (the desugared `Add` on an owned-field chain of `this`), so
+        // the storing sink takes its own +1 on the borrowed formal exactly as
+        // the `.Add(h)` call arm does (fix #9056, retainForwardedScopedHandler;
+        // a no-op for any other handler shape).
+        retainForwardedScopedHandler(as.value.get(), closure);
         auto* addFn = declareC("bz_event_add", i64(), {ptrTy(), ptrTy()});
         builder_.CreateCall(addFn, {src, closure});
     } else {
