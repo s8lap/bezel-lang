@@ -20257,6 +20257,49 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
         // call-site release is the `rel.syncIter` arm above — arming both
         // would double-release.
         const bool isPlainAsyncCallee = isPlainAsyncCalleeMethod(ms);
+        // fix #9174 (§28.14 / §28.9 / §27.5, v0.359): the callee's DECLARED
+        // return type RESOLVES to a function type — the source-written
+        // spelling `(): () -> int` and the ALIAS spelling `type F :=
+        // () -> int; … : F` alike (`resolvedType` is alias-transparent, the
+        // same re-alignment with sema `resolvedFormalIsFunction` makes).
+        //
+        // WHY THIS IS ITS OWN FACT. The two result-side gates below
+        // (`declaredReturnOk` and `callResultOk`) exclude a callee whose
+        // result is a function VALUE, on the ground that "the callee may
+        // `return f;` directly" — the callee could hand the CALLER'S OWN
+        // closure back, and the caller's release would then free a live cell
+        // (the #1921 / #2248 UAF). §28.14 (v0.359) forecloses that for a
+        // plain function-typed formal: the call-bounded default makes it
+        // CALL-BOUNDED — "the callee receives the callback for the duration
+        // of the call only … It may not be stored in a field of any object
+        // …, stored into any collection …, **returned**, captured by a closure
+        // that itself escapes the callee …, or forwarded into a `scoped`
+        // parameter position … These obligations are compiler-verified for
+        // user-authored callees." MEASURED on this tree: `return q;` in such a
+        // callee is REJECTED — "parameter `q` is call-bounded; declare it
+        // `scoped` to store it (§28.14, v0.177) — a plain function-typed
+        // parameter may be invoked, bound to locals, and passed to another
+        // plain function-typed parameter, but may not be returned". So a
+        // callee whose declared return is a function type CANNOT return the
+        // argument: its function-typed RESULT is a DIFFERENT function value,
+        // and the caller's +1 on the argument is the caller's to drop when
+        // the call returns (§28.9's runtime-managed lifetime).
+        //
+        // THE EXCLUSION STAYS for the shape it was written for — a bare type
+        // parameter (`Id<T>(x: T): T`, §28.3's set-erasing positions), where
+        // the callee MAY forward its argument and §28.14's verification never
+        // ran on the formal. A bare type parameter resolves to `Kind::Named`
+        // at every instantiation, so this fact is false for it.
+        bool declaredReturnIsFunctionType = false;
+        if (mdCb->returnType) {
+            if (mdCb->returnType->kind == ast::TypeKind::Function) {
+                declaredReturnIsFunctionType = true;
+            } else if (const sema::TypeRef* drt =
+                           ctx_.resolvedType(*mdCb->returnType)) {
+                declaredReturnIsFunctionType =
+                    drt->kind == sema::TypeRef::Kind::Function;
+            }
+        }
         // (1) The DECLARED return type: `void` (nothing can carry the callback
         // out at all), or a single-part Named head that is neither a
         // deferred-activation frame nor a generic parameter of the method or
@@ -20314,6 +20357,20 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
                     isMethodOwnTypeParamReturn = true;
                 }
             }
+        } else if (declaredReturnIsFunctionType) {
+            // fix #9174 (§28.14 / §28.9 / §27.5, v0.359): a SOURCE-WRITTEN
+            // function-typed declared return. The Named branch above reaches
+            // the same verdict for the ALIAS spelling; this arm is the
+            // inline spelling, which the branch above never saw (its guard
+            // tests `ast::TypeKind::Named`).
+            //
+            // The declared return announces NO deferred-activation frame (a
+            // function value is not a Task/Enumerable head), so the
+            // frame-residence exclusion does not apply; and §28.14's
+            // compiler-verified obligations forbid the callee to RETURN its
+            // call-bounded formal, so the "closure-returning" exclusion does
+            // not apply either (see `declaredReturnIsFunctionType` above).
+            declaredReturnOk = true;
         }
         // (2) The SUBSTITUTED result type at THIS call site — the belt to (1)'s
         // braces, closing the `: T`-through-an-interface corner where the
@@ -20337,8 +20394,25 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
                     it != genericSubstSemaTy_.end() && it->second)
                     rt = it->second;
             }
-            if (!rt || rt->kind == sema::TypeRef::Kind::Function) {
+            if (!rt) {
                 callResultOk = false;
+            } else if (rt->kind == sema::TypeRef::Kind::Function) {
+                // fix #9174 (§28.14 / §28.9 / §27.5, v0.359): a function-valued
+                // RESULT blocks the call-bounded release only where the callee
+                // COULD be handing the caller's own argument back — the
+                // bare-type-parameter shapes (§28.3's set-erasing positions),
+                // where the callee may forward its argument (`return x;`) and
+                // §28.14's verification never ran on the formal.
+                //
+                // A callee whose DECLARED return is a function type cannot
+                // return its call-bounded formal: §28.14's compiler-verified
+                // obligations forbid it (MEASURED: `return q;` is rejected —
+                // "parameter `q` is call-bounded; … it may not be returned",
+                // §28.14, v0.177). Its result is therefore a DIFFERENT
+                // function value, and the caller's +1 on the argument is the
+                // caller's to drop when the call returns — the leak #9174
+                // measured (12800 B in 200 allocations on its own repro).
+                callResultOk = declaredReturnIsFunctionType;
             } else if (rt->kind == sema::TypeRef::Kind::Named) {
                 // The §29.11 lazy-query sentinel: a synthesized Named TypeRef
                 // with no declaration, no astNode and generic args (mirrors

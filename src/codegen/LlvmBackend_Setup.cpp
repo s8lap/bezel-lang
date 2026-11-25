@@ -39246,8 +39246,43 @@ bool Emitter::isCallBoundedClosureArgPosition(const ast::CallExpr& call,
     // for an arg passed to a non-`using var` receiver (declining the call
     // at sema) and `buildOrderedArgs` keeps an `out` arg's TRANSFERRED
     // bookkeeping on its own slot.
-    if (md->returnType &&
-        md->returnType->kind == ast::TypeKind::Function) return false;
+    //
+    // fix #9174 (v0.359) WITHDRAWS the function-typed-RETURN decline this
+    // comment describes; see the paragraph below.
+    // fix #9174 (§28.14 / §28.9 / §27.5, v0.359): the #3778 decline — "a
+    // function-TYPED return CAN carry the callback out of the call (the
+    // callee may `return f;` directly), so we decline that" — is WITHDRAWN.
+    //
+    // WHY. §28.14's call-bounded default (v0.359): "A function-typed
+    // parameter declared *without* `scoped` is **call-bounded** … the callee
+    // receives the callback for the duration of the call only … It may not be
+    // stored in a field of any object …, stored into any collection …,
+    // **returned**, captured by a closure that itself escapes the callee …,
+    // or forwarded into a `scoped` parameter position … These obligations are
+    // compiler-verified for user-authored callees." The verification
+    // (`MethodOwnership::callBoundedScan` → `reportCallBounded`, the
+    // "returned" sink) REJECTS `return f;` in such a callee — MEASURED on
+    // this tree: "parameter `q` is call-bounded; declare it `scoped` to store
+    // it (§28.14, v0.177) — a plain function-typed parameter may be invoked,
+    // bound to locals, and passed to another plain function-typed parameter,
+    // but may not be returned". So a callee whose declared return is a
+    // function type CANNOT return the argument: its function-typed RESULT is
+    // a DIFFERENT function value, the caller's +1 on the argument is the
+    // caller's to drop when the call returns (§28.9), and the capture cells
+    // the closure points at are non-escaping too — freed at the call's end.
+    //
+    // The withdrawal is bounded by this predicate's own domain: it admits
+    // ONLY a formal whose DECLARED type is a function type (the last check
+    // below, `resolvedFormalIsFunction`) — the very shape §28.14's
+    // verification runs on. A bare type parameter (`Id<T>(x: T): T`,
+    // §28.3's set-erasing positions) is `Kind::Named` at every instantiation
+    // and never reaches here.
+    //
+    // THE TWO SITES MOVE TOGETHER (this pre-scan and
+    // `prepareCallClosureArgRelease`'s call-bounded arm are the SAME
+    // decision — #5611: "the reason a two-site fix would have shipped a
+    // half-closed leak"). The arm's `declaredReturnOk` / `callResultOk`
+    // clauses were relaxed to match in fix #9174.
     // POSITIONAL, exact arity — the only shape in which the SYNTACTIC index is
     // the PARAMETER index. A named (`Identifier :=`) or defaulted call is not
     // reordered here the way `buildOrderedArgs` reorders it at lowering time, so
