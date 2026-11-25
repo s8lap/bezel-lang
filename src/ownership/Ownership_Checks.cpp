@@ -34328,6 +34328,80 @@ void MethodOwnership::scopedCarrierReportCollectionStore(
                "(§28.14; §28.3 *Function-typed holders*; v0.359)");
 }
 
+// fix #9352 (§28.3 *Function-typed holders*, §28.14, v0.359): a carrier
+// stored into a CHOICE CASE's FUNCTION-TYPED payload field.
+//
+// §28.3's *Function-typed holders* bullet: "A **function-typed holder** is a
+// field (a `scoped` field excepted), a record component, **a choice case's
+// payload field**, an inline-array slot, … At every function-typed holder the
+// closure bullet's sink rule holds: a store of a function value admits a
+// capture-free value and rejects one whose source set is non-empty (a
+// capture-bearing closure, a plain function-typed parameter, a local carrying
+// either), judged at the site, whatever form the member is declared in. The
+// stores are … **a payload argument at a case construction** (§35.3, the
+// declared-result form included)". §28.14: the callback "may not … store it
+// in any other object".
+void MethodOwnership::scopedCarrierReportChoicePayloadStore(
+    const ast::Expr& value, std::string_view formalName) {
+    report(Severity::Error, value.span.begin,
+           std::string("this closure captures `") + std::string(formalName) +
+               "`, a `scoped` parameter — a closure that captures it carries "
+               "it (§28.3), so it may not be stored in a function-typed "
+               "choice payload, which reads it back with the empty source "
+               "set: the callback may be stored only in a `scoped` field of "
+               "the bounding object itself (§28.14; §28.3 *Function-typed "
+               "holders*; v0.359)");
+}
+
+// fix #9352 (§28.3 *Function-typed holders*, §28.14, v0.359): is the argument
+// at source position `argPos` a store into a CHOICE CASE's FUNCTION-TYPED
+// payload field? Both the `scoped` walk and the §28.14 call-bounded walk ask
+// the same question of the same site (§28.3's rule is tier-agnostic: it
+// rejects a value "whose source set is non-empty (a capture-bearing closure, a
+// plain function-typed parameter, a local carrying either)").
+//
+// §35.3's construction binds a POSITIONAL argument to the case's payload
+// fields in declaration order, and a NAMED one to the field of that name
+// (§22.5's binder). The payload's DECLARED type is read off the case
+// declaration (`ChoiceCaseSymbol::caseDecl->payload`), so a generic case's
+// payload declared at a TYPE PARAMETER is not a function-typed holder — at a
+// function-type substitution it is a set-erasing position (§28.3), which this
+// check does not decide.
+// per §28.3, §35.3, v0.359
+bool MethodOwnership::choicePayloadHolderIsFunctionTyped(
+    const ast::Expr* callee, const std::vector<ast::CallArgument>* args,
+    std::size_t argPos) const {
+    if (!callee || !args || argPos >= args->size()) return false;
+    auto* cc =
+        dynamic_cast<const sema::ChoiceCaseSymbol*>(ctx_.exprSymbol(*callee));
+    if (!cc || !cc->caseDecl) return false;
+    const std::vector<ast::Param>& payload = cc->caseDecl->payload;
+    if (payload.empty()) return false;
+    // The BOUND field: a named argument binds the field of that name, a
+    // positional one the next field in declaration order (§22.5).
+    std::size_t bound = 0;
+    const std::string_view argName = args->at(argPos).name;
+    if (!argName.empty()) {
+        bool found = false;
+        for (std::size_t i = 0; i < payload.size(); ++i) {
+            if (payload[i].name == argName) {
+                bound = i;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    } else {
+        for (std::size_t i = 0; i < argPos; ++i)
+            if (args->at(i).name.empty()) ++bound;
+    }
+    if (bound >= payload.size()) return false;
+    const ast::Type* pt = payload[bound].type.get();
+    if (!pt) return false;
+    const sema::TypeRef* ft = ctx_.resolvedType(*pt);
+    return ft && ft->kind == sema::TypeRef::Kind::Function;
+}
+
 // fix-forward #9310: §28.3 *Function-typed holders* names "a `with`
 // assignment to it" (§9.5) beside the construction argument as a record
 // component's store, so a `with` override with a carrier at a function-typed
@@ -34402,8 +34476,23 @@ void MethodOwnership::scopedCarrierAtCallArg(
         std::vector<const sema::TypeRef*> comp =
             recordCtorArgComponentTypes(*ne);
         if (argPos < comp.size() && comp[argPos] &&
-            comp[argPos]->kind == sema::TypeRef::Kind::Function)
+            comp[argPos]->kind == sema::TypeRef::Kind::Function) {
             scopedCarrierReportRecordStore(arg, formalName);
+            return;
+        }
+        return;
+    }
+    // fix #9352 (§28.3 *Function-typed holders*, §28.14, v0.359): an argument
+    // for a FUNCTION-TYPED CHOICE PAYLOAD at a case construction is a store
+    // into that payload field — "a choice case's payload field … At every
+    // function-typed holder … a store of a function value … rejects one whose
+    // source set is non-empty", and their stores include "a payload argument
+    // at a case construction (§35.3, the declared-result form included)".
+    // The payload reads the value back with the empty source set (§28.3
+    // *Provenance* clause 5), so a carrier stored there would outlive its
+    // bound (§28.14: the callback "may not … store it in any other object").
+    if (choicePayloadHolderIsFunctionTyped(callee, args, argPos)) {
+        scopedCarrierReportChoicePayloadStore(arg, formalName);
         return;
     }
     // A built-in collection mutator on a receiver reachable beyond the call
@@ -35170,6 +35259,40 @@ void MethodOwnership::reportCallBounded(SourceLocation loc,
                std::string(sink));
 }
 
+// fix #9352 (§28.3 *Function-typed holders*, §28.14, v0.359): a
+// CALL-BOUNDED callback stored into a FUNCTION-TYPED HOLDER — a choice case's
+// payload field.
+//
+// §28.14's call-bounded tier: a plain function-typed parameter "may not be
+// stored in a field of any object (a property or indexer assignment is such a
+// store, and so is a store into a function-typed record component, **choice
+// payload** or inline-array slot, a local array's included, §28.3's
+// *function-typed holders*)". §28.3's *Function-typed holders*: "At every
+// function-typed holder the closure bullet's sink rule holds: a store of a
+// function value admits a capture-free value and rejects one whose source set
+// is non-empty (a capture-bearing closure, **a plain function-typed
+// parameter**, a local carrying either), judged at the site".
+//
+// The remedy is NOT to declare the parameter `scoped` — a `scoped` parameter
+// is storage-bounded and may not be stored in a holder either (§28.14): the
+// remedy is a closure that captures no source (copy the data it needs into a
+// value it can capture).
+// per §28.3, §28.14, v0.359
+void MethodOwnership::reportCallBoundedHolderStore(
+    const ast::Expr& value, std::string_view paramName,
+    std::string_view sink) {
+    report(Severity::Error, value.span.begin,
+           std::string("parameter `") + std::string(paramName) +
+               "` is call-bounded; a plain function-typed parameter may be "
+               "invoked, bound to locals, and passed to another plain "
+               "function-typed parameter, but may not be " +
+               std::string(sink) +
+               " — a function-typed holder admits only a capture-free value "
+               "(§28.3 *Function-typed holders*), and a value read back from "
+               "the holder carries the empty source set, so the callback would "
+               "outlive the call it is bounded by (§28.14; v0.359)");
+}
+
 void MethodOwnership::reportCallBoundedScopedForward(
     SourceLocation loc, std::string_view paramName) {
     report(Severity::Error, loc,
@@ -35547,6 +35670,19 @@ void MethodOwnership::callBoundedWalkExpr(const ast::Expr& e) {
                             a.value.get()))
                         reportCallBoundedScopedForward(a.value->span.begin,
                                                        src->name);
+                } else if (choicePayloadHolderIsFunctionTyped(callee, args, i)) {
+                    // fix #9352 (§28.3 *Function-typed holders*, §28.14,
+                    // v0.359): a store into a CHOICE CASE's function-typed
+                    // payload field — the payload reads the value back with
+                    // the empty source set (§28.3 *Provenance* clause 5), so a
+                    // call-bounded callback stored there would outlive the
+                    // call it is bounded by (§28.14: "a store into a
+                    // function-typed record component, choice payload or
+                    // inline-array slot").
+                    reportCallBoundedHolderStore(
+                        *a.value, src->name,
+                        "stored into a function-typed choice payload");
+                    continue;
                 } else if (collStore) {
                     // Sink: builtin-collection mutator on a receiver
                     // reachable beyond the call.
