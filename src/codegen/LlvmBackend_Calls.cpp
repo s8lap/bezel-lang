@@ -2733,7 +2733,9 @@ bool Emitter::emitArrayBackedSetInsert(llvm::Value* setArr, llvm::Value* item,
     // (§17.5) is the tagged `{i8 hasValue, T value}` carrier. The scan loads
     // each element with that type, so the comparison is between two values of
     // the element's own type.
-    llvm::Type* elemLlTy = elemRef ? lowerTypeRef(elemRef) : nullptr;
+    llvm::Type* elemLlTy = !elemRef ? nullptr
+                           : elemRef->nullable ? lowerTypeRef(elemRef)
+                                               : (llvm::Type*)ptrTy();
     if (!elemLlTy) return false;
     // fix #4642 (§8.6/§4.10, v0.307): the array-backed set's slot is a POINTER
     // by construction — this function loads each element as `ptrTy()` and
@@ -2752,8 +2754,12 @@ bool Emitter::emitArrayBackedSetInsert(llvm::Value* setArr, llvm::Value* item,
     // fix #9277: a NULLABLE VALUE element is NOT a pointer — it is the §17.5
     // carrier — so the guard now admits the carrier as well, and only the
     // carrier (the element's own type): a bare value still cannot be stored.
-    if (item->getType() != elemLlTy &&
-        !(item->getType()->isPointerTy() && elemLlTy->isPointerTy()))
+    //
+    // The carrier is admitted for a NULLABLE element ONLY: a non-nullable value
+    // element (e.g. `Range<int>`) keeps the pre-#9277 pointer-only guard, so
+    // its rejection behaviour is unchanged.
+    if (!item->getType()->isPointerTy() &&
+        !(elemRef->nullable && item->getType() == elemLlTy))
         return false;
     auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
     llvm::Value* arrLen = builder_.CreateCall(lenFn, {setArr}, "sa.len");
