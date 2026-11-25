@@ -3324,6 +3324,149 @@ TypeRef* consoleStreamArgumentType(SemaContext& ctx, const ast::Expr& e) {
 
 }  // namespace
 
+// fix #9184 (stdlib §2.1 / §7.4, §26.5 rule 2, v0.359): the CLOSED member
+// surface of the built-in console stream property reads, and the refusal of a
+// name that is not on it.
+//
+// THE DEFECT. stdlib §2.1 (v0.359) declares
+//
+//     public static readonly property In: TextReader;
+//     public static readonly property Out: TextWriter;
+//     public static readonly property Error: TextWriter;
+//
+// and stdlib §7.4 (v0.359) declares each of those classes' member surface.
+// The property READ is left UNTYPED outside a call-argument position (§2.1's
+// rule — `consoleStreamArgumentType`, this file), so the member lookup has
+// NO receiver type to resolve against: `Console.In.Bogus()` found no member,
+// reported NOTHING, and codegen lowered the whole access to NOTHING. The
+// statement position carried no diagnostic of any severity — not even the
+// `internal:` degrade note the value-demanding position got.
+//
+// THE RULE. §26.5 rule 2 (v0.359): "Where neither rule 1 nor this search
+// supplies the name, nothing supplies it: the access names no member and is
+// a compile error at the name, the diagnostic naming the receiver's static
+// type." The receiver's static type is the stdlib-DECLARED one — `TextReader`
+// for `Console.In`, `TextWriter` for `Console.Out` / `Console.Error` — so the
+// refusal is the ORDINARY no-member diagnostic, the one sema's
+// `knownCompleteUserType` catch-all draws ("no member `M` on type `T`
+// (§11.3, §12.1)"). §26.5 rule 2 says the outcome is the same for every
+// member access on a value, not only a call — a property or field read or
+// write, and a method reference — so the check is on the ACCESS, not on the
+// call.
+//
+// SCOPE, and the neighbours this does NOT touch:
+//
+//   * the VALUE-typed receiver (`var w := Console.Out; w.Bogus();`) already
+//     has a diagnostic — codegen's #2457 one, which names the built-in type
+//     and says its surface "is exactly what the standard library documents
+//     for it". That shape is not this defect and is not touched here.
+//   * the `?.` spelling (`Console.In?.Bogus()`) is the null-conditional
+//     resolver's own site (`resolveNullCondMember`), and the house files each
+//     `?.` twin of this family as its own issue (#7446, #7670, #7775, #7789).
+//     Not touched here. The postfix-`!` spelling IS this site's access (A.7's
+//     `PostfixBangExpr` is "`x!` is `x`'s own type", and §26.5 rule 2 reads
+//     the member of a postfix-`!` receiver at its underlying non-nullable
+//     type), so it is covered.
+//   * a USER's own class named `TextReader` / `TextWriter` keeps its own
+//     surface: the receiver recognition is by the SYNTACTIC built-in property
+//     read, and a VALUE named `Console` is not the built-in class (#8126,
+//     §2.7 rule 1).
+namespace {
+
+// The stdlib type the built-in console stream property read denotes — the
+// DECLARED type, read from `common::builtinDeclaredProperty` (the registry
+// table that carries the stdlib's own declaration blocks verbatim), so this
+// helper cannot drift from the stdlib: it mints whatever the declaration
+// says. Empty when the receiver is not one of the three built-in stream
+// property reads.
+//
+// THE POSTFIX-`!` WRAPPER IS TRANSPARENT. A.7's `PostfixBangExpr` is "`x!`
+// is `x`'s own type" (§7.8: "The result is the non-nullable form of the
+// expression"), and §26.5 rule 2 reads the member of a postfix-`!` receiver
+// "at its underlying non-nullable type" — so `Console.In!.Bogus()` is the
+// SAME access as `Console.In.Bogus()`, and the wrapper is unwrapped to find
+// the property read under it.
+std::string consoleStreamDeclaredType(SemaContext& ctx,
+                                       const ast::Expr* target) {
+    while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(target))
+        target = pb->operand.get();
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(target);
+    if (!ma || !ma->target) return {};
+    auto* cid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!cid || cid->name != "Console") return {};
+    // fix #8126 (§2.7 rule 1, v0.355): a VALUE named `Console` is member
+    // access on the user's own object, not on the built-in class.
+    if (!receiverMayReachBuiltinStaticArm(ctx.exprSymbol(*cid))) return {};
+    const common::BuiltinPropertyDecl* d =
+        common::builtinDeclaredProperty("Console", ma->member);
+    if (!d || !d->isStatic) return {};
+    // stdlib §2.1 declares exactly three static properties on `Console`, and
+    // only the two STREAM ones are named `TextWriter` / `TextReader`.
+    if (d->type != "TextWriter" && d->type != "TextReader") return {};
+    return std::string(d->type);
+}
+
+// The §7.4 declared member surface of the two built-in console stream
+// classes, transcribed from stdlib §7.4's declaration blocks (v0.359).
+//
+// The two `destructor;` rows are the compiler-generated `Dispose()` (§8.7:
+// `Dispose()` is a member of a class type), and §8.1's universal members are
+// members of every type, so neither is ever "no member" here — the same
+// exemptions the #7661 closed-surface check gives its own built-ins.
+bool consoleStreamSurfaceDeclares(std::string_view typeName,
+                                  std::string_view member) {
+    if (member == "ToString" || member == "Equals" ||
+        member == "GetHashCode" || member == "GetType" ||
+        member == "ReferenceEquals" || member == "Dispose")
+        return true;
+    if (typeName == "TextReader")
+        // §7.4: `Read(): int`, `ReadLine(): string?`, `ReadToEnd(): string`.
+        return member == "Read" || member == "ReadLine" ||
+               member == "ReadToEnd";
+    if (typeName == "TextWriter")
+        // §7.4: `Write(value: string|char|Object)`, `WriteLine()` /
+        // `WriteLine(value: string|Object)`, `Flush()`. The per-type
+        // `Write`/`WriteLine` overloads for bool and the numeric primitives
+        // are the same NAMES, so they add nothing to this name set.
+        return member == "Write" || member == "WriteLine" ||
+               member == "Flush";
+    return false;
+}
+
+}  // namespace
+
+// fix #9184: the check itself. Asked for every member access, so it is
+// independent of which arm of `resolveMemberAccess` the access took (the
+// same discipline #7661 established for the by-name built-ins).
+void ExprTC::checkConsoleStreamMemberAccess(const ast::MemberAccessExpr& ma,
+                                            std::size_t errorsBefore) {
+    if (!ma.target) return;
+    // Something already reported about this access — do not add a second
+    // diagnostic for it (the same discipline `checkBuiltinClosedRecordMember`
+    // uses).
+    if (ctx_.diagnostics().errorCount() != errorsBefore) return;
+    const std::string typeName =
+        consoleStreamDeclaredType(ctx_, ma.target.get());
+    if (typeName.empty()) return;
+    if (consoleStreamSurfaceDeclares(typeName, ma.member)) return;
+    // §26.5 rule 2's extension search: a member an extension block whose
+    // head applies to the receiver's type declares IS a member of it, so the
+    // name is not "no member". The receiver has no TypeRef to offer the
+    // matcher (the property read is untyped), so the head's NAME is what the
+    // predicate is asked — the same escape the #7661 closed-surface check
+    // takes (`anyExtensionAppliesToBuiltin`).
+    if (anyExtensionAppliesToBuiltin(nullptr, typeName, ma.member, nullptr))
+        return;
+    // The MemberAccessExpr span is degenerate (line 0) when the access is a
+    // call callee (`x.M()`); fall back to the receiver's span.
+    auto loc = ma.span.begin;
+    if (loc.line == 0) loc = ma.target->span.begin;
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        "no member `" + std::string(ma.member) + "` on type `" + typeName +
+            "` (§11.3, §12.1)");
+}
+
 // fix #7756 (§26.5 rules 1-2, v0.355): see ExprTypecheck_impl.hpp. The two
 // tables are the ones `resolveMemberAccessWithRule1` commits a stub-typed
 // receiver by, so the matcher admits exactly the stubs that commitment covers.
@@ -7496,6 +7639,13 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         // fix #7661 (stdlib §2.5-§2.7, §3.1, v0.350): a member outside a
         // by-name built-in's closed surface, whatever arm resolved it.
         checkBuiltinClosedRecordMember(*ma, errorsBeforeMa);
+        // fix #9184 (stdlib §2.1 / §7.4, §26.5 rule 2, v0.359): a member
+        // outside the built-in console stream property read's closed surface
+        // (`Console.In` — a `TextReader`; `Console.Out` / `Console.Error` —
+        // `TextWriter`s). The property read is untyped outside a
+        // call-argument position, so the ordinary member lookup has no
+        // receiver type to resolve against and admitted the name unchecked.
+        checkConsoleStreamMemberAccess(*ma, errorsBeforeMa);
         // per §7.4 (v0.182, #1593): a named-property access whose accessor can
         // run user code (a user-defined getter/setter, or a virtual/abstract
         // dispatch) is an "accessor call" — the control transfer may reach a

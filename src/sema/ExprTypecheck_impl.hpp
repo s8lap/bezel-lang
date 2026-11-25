@@ -5919,6 +5919,13 @@ private:
                                                 std::string_view mbr);
     void checkBuiltinClosedRecordMember(const ast::MemberAccessExpr& ma,
                                         std::size_t errorsBefore);
+    // fix #9184 (stdlib §2.1 / §7.4, §26.5 rule 2, v0.359): the closed
+    // member surface of the built-in console stream property reads
+    // (`Console.In` — a `TextReader`; `Console.Out` / `Console.Error` —
+    // `TextWriter`s), asked for every receiver spelling. Defined in
+    // ExprTypecheck_Exprs.cpp, beside the expression visitor that calls it.
+    void checkConsoleStreamMemberAccess(const ast::MemberAccessExpr& ma,
+                                        std::size_t errorsBefore);
     // per §27.6 (v0.338; #5814): a method reference's explicit type-argument
     // list substituted into the formed function type.
     TypeRef* applyMethodRefTypeArgs(const ast::MemberAccessExpr& ma,
