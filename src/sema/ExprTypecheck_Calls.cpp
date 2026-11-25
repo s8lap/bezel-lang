@@ -42467,6 +42467,64 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 CollectionSurfaceHeadScope::DotCatchAll);
         }
     }
+    // fix #9185 (stdlib §4.19 / §27.3, v0.359): type the int-typed PROPERTY
+    // READ of the BUILTIN-CLASS-STUB receiver shape — the factory result
+    // `FrozenArray<int>.From(a)`, whose TypeRef's `declaration` is the
+    // synthetic `builtinClassSym("FrozenArray")`.
+    //
+    // WHY THE STUB SHAPE NEEDS ITS OWN ARM. The declaration-less shape's
+    // int-property arm (the `isBuiltinIntLengthPropertyHead` /
+    // `isBuiltinIntCountPropertyHead` read) lives INSIDE the `!targetType`
+    // block below — the block that serves a receiver carrying NO TypeSymbol.
+    // A stub-shaped receiver DOES carry one (the synthetic class symbol), so
+    // `targetType` is non-null, that block never runs, and stdlib §4.19's
+    // `public readonly property Length: int;` was typed for the ANNOTATION
+    // spelling (`var f: FrozenArray<int> := ...`) and NOT for the FACTORY
+    // spelling (`var f := FrozenArray<int>.From(s);`) — the same expression
+    // with a type in one spelling and none in the other.
+    //
+    // WHY THAT IS A SILENT MISCOMPILE, NOT A REJECTION. §27.3 (v0.359):
+    // "Expression-bodied lambdas need no inference rule: the body
+    // expression's type is the return type". With the body's type missing,
+    // `var fn := lambda() => f.Length;` got a function type with NO
+    // `funcReturn` — and codegen's closure call (`emitClosureCall`) builds
+    // the call's return type from `rt->funcReturn`, so the call was typed
+    // VOID, produced no value, and the consuming statement was DROPPED: the
+    // #3079 internal warning ("the argument of this `Console.WriteLine`
+    // failed to lower to a value, so the whole statement emits nothing — not
+    // even the line terminator"), the wrong output, and exit 0.
+    //
+    // THE HEAD SET. `isBuiltinIntLengthPropertyHead` names §3.1
+    // StringBuilder, §4.14 OwningBuffer<T> and §4.19 FrozenArray<T>, and of
+    // those ONLY FrozenArray has a stub shape (a factory result) — so this arm
+    // fires for `FrozenArray.Length` alone. `isBuiltinIntCountPropertyHead`
+    // names §4.17 SortedDictionary, §4.18 SortedSet and §6.9 Channel, none of
+    // which has a stub shape — and stdlib §4.19 declares NO `Count` on
+    // FrozenArray, so `f.Count` keeps the #8350 surface refusal above (it is
+    // not on the head's documented surface: GetEnumerator/Length/ToArray).
+    //
+    // A USER type that reuses a built-in name is excluded:
+    // `isUserDeclaredTypeSym` is true for it (a user declaration carries a
+    // non-null `decl`, or a module name), and its own declared surface
+    // answers.
+    if (ma.target && currentCallArity_ <= 0 && !ctx_.exprType(ma) &&
+        (ma.member == "Length" || ma.member == "Count")) {
+        if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+            if (tt->kind == TypeRef::Kind::Named && tt->declaration &&
+                !isUserDeclaredTypeSym(tt->declaration)) {
+                const std::string_view cn = tt->declaration->name;
+                const bool isIntProperty =
+                    ma.member == "Length"
+                        ? common::isBuiltinIntLengthPropertyHead(cn)
+                        : common::isBuiltinIntCountPropertyHead(cn);
+                if (isIntProperty) {
+                    ctx_.setExprType(
+                        &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    return;
+                }
+            }
+        }
+    }
     if (!targetType || builtinDateTimeRecv) {
         // §31 / #600 phase c: `e.Message` where `e` is typed as a PURE built-in
         // exception (declaration==nullptr, no user TypeSymbol — e.g. a caught
