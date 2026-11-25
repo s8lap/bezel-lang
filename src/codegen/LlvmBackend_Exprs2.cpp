@@ -5455,7 +5455,13 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 }
             }
         }
-        if (!v) v = lowerExpr(*lam.exprBody);
+        // fix #9138 (§28.3.11 *Unbound owned temporaries* *The return slot*,
+        // v0.359): an expression-bodied lambda's body IS its
+        // `return <exprBody>;` — the same return position as the block-bodied
+        // face (LlvmBackend_Stmts.cpp's ReturnStmt arm). A chain-call result
+        // the body RETURNS is transferred into the return slot, so the CG60
+        // arm registers no §28.3.11 disposal of its own for it.
+        if (!v) v = lowerChainCallHandedOff(lam.exprBody.get());
         if (!terminatorOrNull(builder_.GetInsertBlock())) {
             if (v && !retTy->isVoidTy()) {
                 // fix #541 / §7.1: when the lambda's expected return type is a

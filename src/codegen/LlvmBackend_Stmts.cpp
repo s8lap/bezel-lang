@@ -1467,7 +1467,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         }
                     }
                 }
-                rhs = lowerExpr(*as->value);
+                // fix #9138 (§28.3.11 *Unbound owned temporaries*, §28.8
+                // *Ownership transfer*, v0.359): a chain-call result this
+                // `:=` TRANSFERS into the target is governed by the target's
+                // own rule — the local is an OWNED local, so §28.3.10's affine
+                // auto-drop disposes it exactly once at the scope end — and
+                // §28.3.11 says a value "transferred into an owning location
+                // is not disposed under this rule (it would otherwise be
+                // disposed twice)". So the CG60 chain-call arm registers no
+                // §28.3.11 disposal of its own for it.
+                rhs = lowerChainCallHandedOff(as->value.get());
                 rhs = rescueUnitAssignRhs(rhs, *as);
                 // fix #2961 (§28.9/§28.3, v0.240): the `:=` arms of lowerStmt
                 // bailed silently on a null RHS — no diagnostic of any severity.
@@ -1578,7 +1587,18 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         }
                     }
                 }
-                rhs = lowerExpr(*as->value);
+                // fix #9138 (§28.3.11 *Unbound owned temporaries*, §28.8
+                // *Ownership transfer*, v0.359): the generic lvalue fallback
+                // covers the FIELD / property / indexer / imported targets, and
+                // a chain-call result stored into one of them is TRANSFERRED
+                // into that owning location (§28.8) — "the value … is not
+                // disposed under this rule (it would otherwise be disposed
+                // twice)", so the location's owner disposes it exactly once
+                // and the CG60 chain-call arm registers no §28.3.11 disposal
+                // of its own for it. (A non-`owned` field is rejected by the
+                // ownership pass before codegen runs, so the target here is
+                // always an owning location.)
+                rhs = lowerChainCallHandedOff(as->value.get());
                 rhs = rescueUnitAssignRhs(rhs, *as);
                 // fix #2961 — same Warning the localSlot arm emits above; the
                 // generic lvalueAddr fallback covers every non-local-slot
@@ -3549,7 +3569,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 recordLocalStringHolderSink_ = nullptr;
                 if (returnsRecordByValue)
                     collectReturnedRecordStringArgsToRetain(rs->value.get());
-                v = lowerExpr(*rs->value);
+                // fix #9138 (§28.3.11 *Unbound owned temporaries* *The return
+                // slot*, v0.359): a chain-call result this `return` TRANSFERS
+                // into the return slot is governed by the return slot's own
+                // rule — "A value transferred into a `return` — a fresh
+                // producer … — leaves the named-value regime above for a
+                // callee-local owned slot, established on the cleanup stack at
+                // the `return` statement" — and §28.3.11's last paragraph says
+                // a value "returned … is not disposed under this rule (it
+                // would otherwise be disposed twice)". So the CG60 chain-call
+                // arm registers no §28.3.11 disposal of its own for it: the
+                // callee hands the value to its caller (the plain-call twin
+                // `return Make();` over an `owned`-returning method does
+                // exactly this), and the caller's own regime disposes it once.
+                v = lowerChainCallHandedOff(rs->value.get());
                 returnedRecordStringArgsToRetain_ = std::move(savedArgs);
                 recordLocalStringHolderSink_ = savedSink;
                 // The two-statement spelling: `var e := new E(f[0], n); …
@@ -5804,7 +5837,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // and the same re-home exposure but do not currently surface a
                 // ctor-recipient interaction, so they are left unchanged to
                 // keep this commit minimal (#3294 candidates).
-                llvm::Value* v = lowerExpr(*ds->value);
+                //
+                // fix #9138 (§28.3.11 *Unbound owned temporaries*, §17.13
+                // *The discard `_`*, v0.359): the value this discard DISPOSES
+                // is disposed by the discard's own rule — "the discard form
+                // `_ := expr;` disposes the value at the end of the discard
+                // statement for any class or interface type" — so the CG60
+                // chain-call arm registers no §28.3.11 disposal of its own
+                // for it: two registrations for one value are the double free
+                // issue #9138 reports.
+                llvm::Value* v = lowerChainCallHandedOff(ds->value.get());
                 if (!diverged_ && v) {
                     disposeStack_.emplace_back();
                     llvm::AllocaInst* slot = entryAlloca(ptrTy());
@@ -5858,7 +5900,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // (ds->value) has already fully evaluated by the time this
                 // runs, so there is no LATER sub-expression in this
                 // statement whose throw could skip the free.
-                llvm::Value* v = lowerExpr(*ds->value);
+                //
+                // fix #9138 (§28.3.11 *Unbound owned temporaries*, §17.13
+                // *The discard `_`*, v0.359): the collection this discard
+                // FREES is freed by the discard's own rule, so the CG60
+                // chain-call arm registers no §28.3.11 disposal of its own
+                // for it (an owning collection head is one of the OWNED
+                // families the CG60 arm's `chainResultOwned` computation
+                // admits, so without this the value would be freed twice).
+                llvm::Value* v = lowerChainCallHandedOff(ds->value.get());
                 if (!diverged_ && v)
                     freeUnboundOwnedOwningCollectionTemp(
                         v, ctx_.exprType(*ds->value));

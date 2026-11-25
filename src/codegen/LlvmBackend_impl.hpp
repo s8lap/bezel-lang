@@ -3754,26 +3754,43 @@ private:
     // that slot. Capture the slot BEFORE lowerExpr runs so the CG60 arm can use
     // it; cleared after the CG60 arm consumes it.
     llvm::AllocaInst* pendingChainCallLocalSlot_ = nullptr;
-    // fix #9082 (§28.3.11 *Unbound owned temporaries*, §28.3.10 *Owned-local
-    // discharge requirement*, v0.359): set by `lowerLocalDecl` for the duration
-    // of a local initializer that IS a chain call (`var w := C.Make()();`), so
-    // the CG60 chain-call arm can tell a BOUND chain-call result from an
-    // unbound one.
+    // fix #9082 / #9138 (§28.3.11 *Unbound owned temporaries*, §28.3.10
+    // *Owned-local discharge requirement*, v0.359): the CHAIN CALL whose OWNED
+    // result is HANDED OFF to a destination that owns it — bound to a local
+    // (`var w := C.Make()();`, #9082), returned (`return C.Make()();`), a
+    // discard (`_ := C.Make()();`), or stored into an owning location
+    // (`h.F := C.Make()();`, `w := C.Make()();`) — or null when the chain-call
+    // result is left as an UNBOUND owned temporary.
     //
     // §28.3.11 disposes an UNBOUND owned temporary at the end of its full
-    // expression, and says of a BOUND one that it "is governed by the
+    // expression, and says of a handed-off one that it "is governed by the
     // corresponding transfer or discharge rule and is not disposed under this
-    // rule (it would otherwise be disposed twice)" — the bound local's own
-    // regime disposes it exactly once (§28.3.10's affine auto-drop, or an
-    // explicit discharge). So the CG60 arm registers NO scope-end disposal of
-    // its own for a bound result: two registrations for one value are the
-    // double free issue #9082 reports.
+    // rule (it would otherwise be disposed twice)" — the destination's own
+    // regime disposes it exactly once (§28.3.10's affine auto-drop, the
+    // return slot, §17.13's discard, the owning location's owner). So the CG60
+    // arm registers NO scope-end disposal of its own for a handed-off result:
+    // two registrations for one value are the double free issues #9082 and
+    // #9138 report.
     //
-    // The flag is CAPTURED at `lowerCallDispatch`'s entry and cleared there, so
-    // only the OUTERMOST call of the initializer sees it — a chain call NESTED
-    // in an argument position (`var x := Take(C.Make()());`) is not the
-    // initializer and keeps the §28.3.11 temporary disposal.
-    bool chainCallResultBoundToLocal_ = false;
+    // The member is the CALL NODE, not a boolean: the destination arms it with
+    // the chain call it hands off (`chainCallResultNode`), and the CG60 arm
+    // compares the node it is lowering against it. That is what keeps a chain
+    // call NESTED inside the handed-off expression (`var x := Take(C.Make()());`
+    // — the argument is an unbound temporary of its own) on the §28.3.11
+    // disposal: it is a different call node, so the comparison fails and the
+    // temporary keeps its own registration.
+    const ast::CallExpr* chainCallResultHandedOff_ = nullptr;
+    // fix #9138 (§28.3.11, v0.359): the chain call `e` produces, or null when
+    // `e` is not the chain-call shape — a call whose CALLEE is a call. A
+    // postfix `!` (§17.8: "purely a type-system assertion … classifies
+    // nothing") is peeled, exactly as #9082's local-binding test peeled it.
+    static const ast::CallExpr* chainCallResultNode(const ast::Expr* e);
+    // fix #9138 (§28.3.11, v0.359): lower `e` with its chain-call result
+    // HANDED OFF to the enclosing destination (the local binding, the return
+    // slot, the discard, the owning location), so the CG60 arm registers no
+    // §28.3.11 disposal of its own for it. `e` that is not a chain call is
+    // lowered unchanged.
+    llvm::Value* lowerChainCallHandedOff(const ast::Expr* e);
     // fix #633 / §33.4: when Main(args: Array<string>) is emitted, the args
     // array is built in the function prolog (before any scope opens) and must be
     // disposed at the function-body root scope exit.  This optional Disposal is

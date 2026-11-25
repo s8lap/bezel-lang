@@ -3104,7 +3104,14 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             // reads asyncChainedReturn_ during the await lowering below to
             // decide whether to suppress the source task's immediate free.
             detectAsyncPatternAKind(lam.exprBody.get());
-            llvm::Value* v = lowerExpr(*lam.exprBody);
+            // fix #9138 (§28.3.11 *Unbound owned temporaries* *The return
+            // slot*, §30.5, v0.359): an expression-bodied async lambda's value
+            // COMPLETES the outer task (§30.6) — the task owns the result, so
+            // the value is transferred out of the body, exactly as the
+            // block-bodied `return e;` transfers it into the return slot. The
+            // CG60 chain-call arm registers no §28.3.11 disposal of its own for
+            // it.
+            llvm::Value* v = lowerChainCallHandedOff(lam.exprBody.get());
             // fix #3960: read-and-reset, exactly like lowerReturnStmt's
             // block-body twin (LlvmBackend_Stmts.cpp) — lowerAwait has now
             // consumed the flag (if set) to suppress the source task's free;

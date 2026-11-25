@@ -11180,6 +11180,56 @@ llvm::Value* emitTextReaderReadToEnd(llvm::IRBuilder<>& builder,
 
 }  // namespace
 
+// fix #9138 (§28.3.11 *Unbound owned temporaries*, v0.359): the chain call
+// `e` produces, or null when `e` is not the chain-call shape.
+//
+// THE SHAPE. A chain call is a call whose CALLEE is a call — `C.Make()()` —
+// so the callee is a temporary function value and the invocation goes through
+// the closure-call path (the CG60 arm of `lowerCallDispatch`). That is the
+// only shape the CG60 arm serves, and the only shape whose result the arm
+// registers a §28.3.11 scope-end disposal for.
+//
+// THE `!` PEEL. A postfix `!` (§17.8) is "purely a type-system assertion …
+// classifies nothing", so `C.Make()()!` hands off exactly what `C.Make()()`
+// hands off. #9082's local-binding test peeled it for the same reason.
+const ast::CallExpr* Emitter::chainCallResultNode(const ast::Expr* e) {
+    if (!e) return nullptr;
+    const ast::Expr* core = e;
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(core))
+        if (pb->operand) core = pb->operand.get();
+    auto* call = dynamic_cast<const ast::CallExpr*>(core);
+    if (!call) return nullptr;
+    if (!dynamic_cast<const ast::CallExpr*>(call->callee.get()))
+        return nullptr;
+    return call;
+}
+
+// fix #9138 (§28.3.11 *Unbound owned temporaries*, v0.359): lower `e` with
+// its chain-call result HANDED OFF to the enclosing destination.
+//
+// WHY. §28.3.11's unbound-temporary rule ("Such a temporary is disposed at
+// the end of the full expression in which it is produced") governs a value
+// that is NOT bound, NOT moved, NOT returned and NOT transferred into an
+// owning location. A value in one of those positions "is governed by the
+// corresponding transfer or discharge rule and is not disposed under this rule
+// (it would otherwise be disposed twice)". So the destination — the local
+// binding (#9082), the return slot, the discard (§17.13), the owning location
+// (§28.8) — owns the value, and the CG60 arm must register no scope-end
+// disposal of its own for it.
+//
+// The member carries the CALL NODE, so only the chain call that IS the
+// handed-off expression is affected: a chain call nested inside it (an
+// argument position, a member read) is a different node and keeps its own
+// §28.3.11 temporary disposal.
+llvm::Value* Emitter::lowerChainCallHandedOff(const ast::Expr* e) {
+    if (!e) return nullptr;
+    const ast::CallExpr* saved = chainCallResultHandedOff_;
+    chainCallResultHandedOff_ = chainCallResultNode(e);
+    llvm::Value* v = lowerExpr(*e);
+    chainCallResultHandedOff_ = saved;
+    return v;
+}
+
 llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     // fix #7600 (§22.5, v0.350): the written-order pre-pass runs BEFORE every
@@ -11206,20 +11256,15 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     const bool wasRecordCallResultInitOutermost =
         recordCallResultInitOutermost_;
     recordCallResultInitOutermost_ = false;
-    // fix #9082 (§28.3.11 *Unbound owned temporaries*, v0.359): capture the
-    // `chainCallResultBoundToLocal_` flag at entry, for the same reason the
-    // #4342 flag above is captured — only the OUTERMOST call of a local's
-    // initializer is the one whose result the local binds. `lowerLocalDecl`
-    // arms the flag while it lowers the initializer of a local whose
-    // initializer IS a chain call (`var w := C.Make()();`); clearing it here
-    // means a chain call NESTED in an argument position (`var x :=
-    // Take(C.Make()());`) is NOT seen as the initializer and keeps the
-    // §28.3.11 unbound-temporary disposal. The CG60 arm below reads the
-    // CAPTURED value: the callee of the outermost call is lowered inside this
-    // call, and that nested dispatch clears the member.
-    const bool wasChainCallResultBoundToLocal =
-        chainCallResultBoundToLocal_;
-    chainCallResultBoundToLocal_ = false;
+    // fix #9082 / #9138 (§28.3.11 *Unbound owned temporaries*, v0.359): the
+    // `chainCallResultHandedOff_` member is READ by the CG60 arm below, which
+    // compares the call node it is lowering against the node the enclosing
+    // destination armed. It needs no capture-and-clear here (the #4342 flag
+    // above does, because it is a boolean): the NODE identity already tells
+    // the outermost call of a handed-off expression from a chain call NESTED
+    // inside it (`var x := Take(C.Make()());` — the argument is an unbound
+    // temporary of its own, and it is a different call node, so it keeps the
+    // §28.3.11 unbound-temporary disposal).
     // §22.16 (v0.250, #3038): `old(E)` inside an `ensures` clause. The
     // capture slot was allocated by `allocateOldCaptureSlots` and the
     // entry-time value was stored there by `captureOldOperands` (both
@@ -13759,23 +13804,32 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // pendingChainCallLocalSlot_ so we use the same slot the disposal
             // will fire on.
             //
-            // fix #9082 (§28.3.11 *Unbound owned temporaries*, §28.3.10
-            // *Owned-local discharge requirement*, v0.359): a BOUND result gets
-            // NO registration here. §28.3.11 disposes an UNBOUND owned
-            // temporary at the end of its full expression and says of a bound
-            // one that it "is governed by the corresponding transfer or
-            // discharge rule and is not disposed under this rule (it would
-            // otherwise be disposed twice)" — the local the result is bound to
-            // disposes it exactly once (§28.3.10's affine auto-drop, or the
-            // program's explicit discharge). Registering here as well freed
-            // the value TWICE: the local's scope-end disposal freed it, and
-            // this one then READ the freed object (the ASan
-            // heap-use-after-free of issue #9082) before double-freeing it.
+            // fix #9082 / #9138 (§28.3.11 *Unbound owned temporaries*, §28.3.10
+            // *Owned-local discharge requirement*, v0.359): a HANDED-OFF result
+            // gets NO registration here. §28.3.11 disposes an UNBOUND owned
+            // temporary at the end of its full expression and says of a
+            // handed-off one that it "is governed by the corresponding
+            // transfer or discharge rule and is not disposed under this rule
+            // (it would otherwise be disposed twice)" — the destination's own
+            // regime disposes it exactly once (§28.3.10's affine auto-drop for
+            // the bound local of #9082; the RETURN SLOT for `return
+            // C.Make()();`; §17.13's discard for `_ := C.Make()();`; the
+            // owning location's owner for `h.F := C.Make()();` and `w :=
+            // C.Make()();`). Registering here as well freed the value TWICE:
+            // the destination's disposal freed it, and this one then READ the
+            // freed object (the ASan heap-use-after-free of issues #9082 and
+            // #9138) before double-freeing it.
+            //
+            // `chainCallResultHandedOff_` is the CALL NODE the destination
+            // handed off (see `lowerChainCallHandedOff`), so the comparison
+            // below is the node identity: a chain call NESTED inside the
+            // handed-off expression is a different node and keeps its
+            // §28.3.11 temporary disposal.
             //
             // The UNBOUND case is untouched: the result is an owned temporary
             // and this registration is its §28.3.11 disposal.
             if (chainResultOwned &&
-                !wasChainCallResultBoundToLocal &&
+                chainCallResultHandedOff_ != &call &&
                 calleeTy->funcReturn &&
                 calleeTy->funcReturn->kind == sema::TypeRef::Kind::Named &&
                 calleeTy->funcReturn->declaration &&
