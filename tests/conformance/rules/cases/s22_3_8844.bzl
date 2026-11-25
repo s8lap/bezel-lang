@@ -10,6 +10,7 @@
 //!  `M<string?>(ref s, $"q{j}")` writes `p := q` from a lambda; the caller's `s` then holds "q{j}". Per j: 1 + (1 + digits(j)); the sum over 0..199 is 400 + 490 = 890.
 //!  On the parent compiler the value the lambda stored was not retained, so the caller's later read is a use-after-free
 //!  (ASan: heap-use-after-free in the caller; a plain run diverges or aborts).
+//!  The LeakSanitizer leak reported on the tip is the by-policy #4965 trade (a displaced value is not disposed); it must not be "fixed" by weakening this case.
 module Conf;
 public class Program
   public static readonly F: string := "fld";

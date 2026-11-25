@@ -2,7 +2,7 @@
 //! doc: spec
 //! section: 27.1.1
 //! title: a method reference returning `bool` is rejected at a `(Object?, Object?) -> int` target
-//! rule: **Value-typed, record-typed, and primitive slots are invariant.**
+//! rule: The reference's signature must be compatible with the target function type: its parameter and return types unify with the target's under the standard implicit-conversion rules
 //! cites: 8.4, 27.6
 //! expect: reject
 //! diagnostic: convertible
