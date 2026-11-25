@@ -12460,11 +12460,23 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         const ast::Expr* valueExpr =
             (call.args.size() >= 2 && call.args[1].value)
                 ? call.args[1].value.get() : nullptr;
+        // fix #9197 (§28.9 / §28.11 / §14.1, v0.359): inside a MONOMORPHIZED
+        // generic body the dictionary's V is still the PLACEHOLDER type
+        // parameter (`T`) — a Named TypeRef with NO `declaration` — so the
+        // #3974 gate below was null and the box took no `+1` on the record's
+        // string fields. `dictValueTyEff` resolves V through the ACTIVE
+        // substitution (the same resolution `elementPolicyFor` does — fix
+        // #4596 — and the release half in `dictValueBoxFreer` does), so the
+        // take half and the release half agree on the CONCRETE instantiation
+        // (§14.1). It returns its argument unchanged for anything that is
+        // not a bare type parameter and outside an active substitution, so
+        // every non-generic dictionary is byte-identical.
+        const sema::TypeRef* valTyR = dictValueTyEff(valTy);
         const sema::TypeSymbol* valRec3974 =
-            (valTy && valTy->kind == sema::TypeRef::Kind::Named &&
-             valTy->declaration &&
-             valTy->declaration->kind == ast::TypeDeclKind::Record)
-                ? valTy->declaration : nullptr;
+            (valTyR && valTyR->kind == sema::TypeRef::Kind::Named &&
+             valTyR->declaration &&
+             valTyR->declaration->kind == ast::TypeDeclKind::Record)
+                ? valTyR->declaration : nullptr;
         // Encode a value as the stored void*. Pointer values store directly;
         // integer/float values widen to i64 and inttoptr so each stored value is
         // self-contained (no shared-alloca aliasing across loop iterations);
@@ -12558,18 +12570,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         recAddr = builder_.CreateStructGEP(
                             wrapTy, box, 1, "dvbxre.nrec.payload");
                     }
-                    if (valRec3974 && recordHasStringFields(valTy) &&
-                        boxValueNeedsStringRetain(valueExpr, valTy)) {
-                        emitRecordStringFieldRetains_impl(recAddr, valTy);
-                    } else if (!valNullableVal && valTy->kind ==
+                    if (valRec3974 && recordHasStringFields(valTyR) &&
+                        boxValueNeedsStringRetain(valueExpr, valTyR)) {
+                        emitRecordStringFieldRetains_impl(recAddr, valTyR);
+                    } else if (!valNullableVal && valTyR &&
+                               valTyR->kind ==
                                    sema::TypeRef::Kind::Named &&
-                               valTy->declaration &&
-                               valTy->declaration->kind ==
+                               valTyR->declaration &&
+                               valTyR->declaration->kind ==
                                    ast::TypeDeclKind::Choice &&
-                               choiceHasStringFields(valTy->declaration) &&
-                               boxValueNeedsStringRetain(valueExpr, valTy)) {
+                               choiceHasStringFields(valTyR->declaration) &&
+                               boxValueNeedsStringRetain(valueExpr, valTyR)) {
                         emitChoiceStringFieldRetains_impl(
-                            recAddr, valTy->declaration);
+                            recAddr, valTyR->declaration);
                     }
                 }
                 return box;

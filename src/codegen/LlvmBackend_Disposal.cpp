@@ -8136,6 +8136,31 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
     const sema::TypeRef* valTy = dictTy->genericArgs[1];
     llvm::Type* valLlvm = valTy ? lowerTypeRef(valTy) : nullptr;
     if (!dictValueIsBoxedStruct(valLlvm)) return nullptr;
+    // fix #9197 (§28.9 / §28.11 / §14.1, v0.359): inside a MONOMORPHIZED
+    // generic body the dictionary's V is still the PLACEHOLDER type parameter
+    // (`T`) — a Named TypeRef with NO `declaration` — so the per-V
+    // string-walking box freer below never fired for a generic V and the box
+    // was reclaimed with the plain `valueBoxFreeThunk` (a bare `free(box)`),
+    // which leaves the box's record string fields' +1s unreleased. MEASURED
+    // (issue #9197): a generic `Dictionary<string, T>` whose T is a record
+    // with a `string` field leaked that string per stored value, while the
+    // non-generic twin reached `bz$recValBoxFree$Entry` and was clean.
+    //
+    // `dictValueTyEff` resolves V through the ACTIVE substitution — the SAME
+    // resolution `elementPolicyFor` does for the element slot (fix #4596,
+    // §28.11 / §14.1) and the owned-FIELD path does for its element (fix
+    // #816) — so the per-V decision is made on the CONCRETE instantiation
+    // (§14.1: a generic body is monomorphized per instantiation; the
+    // element's shape is fixed at the instantiation, not at the generic
+    // declaration). It is the ONE effective type the take half
+    // (`boxValueNeedsStringRetain`) also reads, so the two halves agree.
+    //
+    // The NULLABLE V keeps the DECLARED shape: the substitution's concrete
+    // type carries the ARGUMENT's nullability, while the box's `{i8, T}`
+    // wrapper is decided on the declared `T?` — so a nullable generic V
+    // stays on the plain thunk (UNCHANGED), which keeps this fix's release
+    // half paired with the take half's nullable gate.
+    const sema::TypeRef* valTyEff = dictValueTyEff(valTy);
     // fix #3798 (stdlib §4.8 / §28.9, v0.286): when V is a non-nullable record
     // or choice that owns a string (directly or transitively through a
     // non-nullable nested record/choice), the plain valueBoxFreeThunk's
@@ -8164,19 +8189,23 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
     // one module — one box is the bare T, the other is `{i8, T}`. A nullable
     // V without string fields still keeps the plain valueBoxFreeThunk —
     // UNCHANGED for that V.
-    if (valTy &&
-        valTy->kind == sema::TypeRef::Kind::Named && valTy->declaration) {
+    if (valTyEff &&
+        valTyEff->kind == sema::TypeRef::Kind::Named && valTyEff->declaration) {
         // fix #3945 (§9.7 / §28.9 / §14.1, v0.294): `valTy`, not
         // `valTy->declaration` — a `Dictionary<K, Box<string>>` boxed-value
         // freer needs the substitution installed for `Box`'s own
         // bare-type-parameter fields.
-        if (valTy->declaration->kind == ast::TypeDeclKind::Record &&
-            recordHasStringFields(valTy)) {
-            return boxedRecordValueFreer(valTy, valTy->nullable);
+        //
+        // fix #9197 (§28.9 / §28.11 / §14.1, v0.359): `valTyEff` — the
+        // RESOLVED value type — so a generic V reaches the same per-V
+        // string-walking freer its non-generic twin reaches (above).
+        if (valTyEff->declaration->kind == ast::TypeDeclKind::Record &&
+            recordHasStringFields(valTyEff)) {
+            return boxedRecordValueFreer(valTyEff, valTyEff->nullable);
         }
-        if (valTy->declaration->kind == ast::TypeDeclKind::Choice &&
-            choiceHasStringFields(valTy->declaration)) {
-            return boxedChoiceValueFreer(valTy, valTy->nullable);
+        if (valTyEff->declaration->kind == ast::TypeDeclKind::Choice &&
+            choiceHasStringFields(valTyEff->declaration)) {
+            return boxedChoiceValueFreer(valTyEff, valTyEff->nullable);
         }
     }
     return valueBoxFreeThunk();
@@ -8227,9 +8256,34 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
 // separately.
 bool Emitter::boxValueNeedsStringRetain(const ast::Expr* valueExpr,
                                           const sema::TypeRef* valTy) const {
-    if (!valTy || !valTy->declaration) return false;  // nothing to retain
+    if (!valTy) return false;  // nothing to retain
+    // fix #9197 (§28.9 / §28.11 / §14.1, v0.359): the NULLABLE gate reads the
+    // DECLARED value type — a declared `T?` is the `{i8, T}` wrapper shape,
+    // and the wrapper's own release is decided on the declared nullability
+    // (the `dictValueBoxFreer` arm above keeps a nullable generic V on the
+    // plain thunk for the same reason), so a nullable V stays unchanged here.
     if (valTy->nullable) return false;  // nullable handled separately
-    if (valTy->declaration->kind == ast::TypeDeclKind::Record) {
+    // fix #9197 (§28.9 / §28.11 / §14.1, v0.359): resolve a BARE type
+    // parameter through the ACTIVE substitution — the twin of the release
+    // half's resolution in `dictValueBoxFreer`. Inside a MONOMORPHIZED
+    // generic body the dictionary's V is still the placeholder `T` (a Named
+    // TypeRef with no `declaration`), so this predicate's `!valTy->declaration`
+    // early-out returned false and the box took NO `+1` on the record's
+    // string fields — while the release half (before its own fix) freed the
+    // box with a plain `free(box)`. NEITHER half fired, so the constructing
+    // site's `+1` was never balanced (issue #9197). Resolving here makes the
+    // take half agree with the release half: the box takes its own `+1` on a
+    // BORROW source and the per-V freer gives it back at the disposal.
+    //
+    // `dictValueTyEff` is the SAME effective type the release half reads, so
+    // the two halves cannot disagree — a retain without its matching release
+    // (a leak) or a release without its matching retain (a heap-use-after-
+    // free) is not reachable through this pair. It returns its argument
+    // unchanged for anything that is not a bare type parameter and outside an
+    // active substitution, so every non-generic dictionary is byte-identical.
+    const sema::TypeRef* vt = dictValueTyEff(valTy);
+    if (!vt || !vt->declaration) return false;  // nothing to retain
+    if (vt->declaration->kind == ast::TypeDeclKind::Record) {
         // Empty valueExpr (defensive): retain.
         if (!valueExpr) return true;
         // NewExpr: the construction's string field is a +1 transfer ONLY
@@ -8257,7 +8311,7 @@ bool Emitter::boxValueNeedsStringRetain(const ast::Expr* valueExpr,
         //     arg, the box must retain; otherwise the field has its own +1
         //     and the box does not need to retain.
         if (auto* ne = dynamic_cast<const ast::NewExpr*>(valueExpr)) {
-            const auto* recTs = valTy->declaration;
+            const auto* recTs = vt->declaration;
             if (recTs->hasPositionalFields) {
                 return !isFreshRecordConstructionOfExactType(
                     ne, recTs);
@@ -8297,20 +8351,20 @@ bool Emitter::boxValueNeedsStringRetain(const ast::Expr* valueExpr,
         // CallExpr: either a synthesized Deserialize (always fresh) or
         // a provably-fresh factory method. Anything else → retain.
         if (auto* call = dynamic_cast<const ast::CallExpr*>(valueExpr)) {
-            if (isSynthesizedRecordDeserializeCall(call, valTy->declaration))
+            if (isSynthesizedRecordDeserializeCall(call, vt->declaration))
                 return false;
             if (const sema::MethodSymbol* ms = dynamic_cast<
                     const sema::MethodSymbol*>(
                         ctx_.exprSymbol(*call->callee))) {
                 return !isProvablyFreshRecordFactoryMethod(
-                    ms, valTy->declaration);
+                    ms, vt->declaration);
             }
             return true;
         }
         // Any other shape: retain (conservative).
         return true;
     }
-    if (valTy->declaration->kind == ast::TypeDeclKind::Choice) {
+    if (vt->declaration->kind == ast::TypeDeclKind::Choice) {
         // fix #3974 follow-up (v0.295): the case-factory CALL shape
         // (`Shape.Circle($"...")`) routes its string payload through the
         // case-ctor's `lowerStringFieldStore`-equivalent retain-on-non-

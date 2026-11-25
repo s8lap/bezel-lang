@@ -18259,6 +18259,48 @@ private:
     bool boxValueNeedsStringRetain(const ast::Expr* valueExpr,
                                     const sema::TypeRef* valTy) const;
 
+    // fix #9197 (§28.9 / §28.11 / §14.1, v0.359): the dictionary's VALUE
+    // type as the INSTANTIATION sees it — the ONE effective type the box's
+    // TAKE half (`boxValueNeedsStringRetain`) and its RELEASE half
+    // (`dictValueBoxFreer`) must AGREE on.
+    //
+    // Inside a MONOMORPHIZED generic body the dictionary's V is still the
+    // PLACEHOLDER type parameter (`T`) — a Named TypeRef with NO
+    // `declaration` — so both halves used to see "no per-V shape" and
+    // NEITHER fired: the box took no `+1` on the value's string fields, and
+    // the box went back with a plain `free(box)` that releases no string at
+    // all (issue #9197). Resolving V through the ACTIVE substitution fixes
+    // the PAIR: the same resolution `elementPolicyFor` does for the element
+    // slot (fix #4596, §28.11 / §14.1) and the owned-FIELD path does for its
+    // element (fix #816).
+    //
+    // The NULLABLE shapes keep the DECLARED type on purpose, so the two
+    // halves stay PAIRED:
+    //   * a DECLARED nullable V (`T?`) is the `{i8, T}` wrapper shape, and
+    //     the wrapper's release is decided on the DECLARED nullability;
+    //   * a DECLARED non-nullable V whose SUBSTITUTION is nullable is that
+    //     same wrapper shape at the instantiation.
+    // In both cases the box's release half stays on the plain thunk, so the
+    // take half must stay on "no retain" too: resolving the nullable
+    // substitution would give the generic path a release without its
+    // matching retain (a heap-use-after-free, MEASURED in this lane) or a
+    // retain without its matching release (a leak). Both are worse than the
+    // status quo, so the nullable V stays UNCHANGED.
+    //
+    // The non-generic path is byte-identical: a concrete V is returned
+    // unchanged here, and `resolveTypeParamRef` returns its argument
+    // unchanged for anything that is not a bare type parameter and outside an
+    // active substitution (fail-closed).
+    const sema::TypeRef* dictValueTyEff(const sema::TypeRef* valTy) const {
+        if (!valTy) return nullptr;
+        if (valTy->nullable) return valTy;  // declared nullable: keep the declared shape
+        if (valTy->kind != sema::TypeRef::Kind::Named || valTy->declaration)
+            return valTy;  // not a bare type parameter: unchanged
+        const sema::TypeRef* r = resolveTypeParamRef(valTy);
+        if (!r || !r->declaration || r->nullable) return valTy;
+        return r;
+    }
+
     // fix #2428 / §9.8 / §28.9 / §35.4: the set of plain `var` VALUE-LIKE
     // CHOICE LocalDecl nodes whose initializer is a call recognized by
     // isSynthesizedValueLikeChoiceDeserializeCall, whose resolved type
