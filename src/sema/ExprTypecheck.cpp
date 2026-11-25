@@ -4,6 +4,7 @@
 #include "sema/EnumValues.hpp"  // enumDeclaredValues — §10.2/§17.11 (#3044)
 #include "sema/Formattability.hpp"  // fix #8059: namedTypeName / isIntrinsicTemporalOrGuid — the shared stdlib-value-builtin name reader
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
+#include "sema/GroupingElem.hpp"  // fix #8542: the ONE IGrouping element-type recognizer (stdlib §5) — shared with `ExprTypecheck_Calls.cpp`'s LINQ sites
 #include "sema/LinqStdlibOverloads.hpp"  // fix #3726: shared stdlib §5 LINQ overload table (name + arity + where) — exported from this TU so `ExprTypecheck_Calls.cpp`'s arity gate (#3726) can consult the SAME source of truth
 
 #include <algorithm>
@@ -27870,29 +27871,11 @@ void ExprTC::checkEventHandlerArgument(const ast::Expr* value,
 // `isGroupingLinqRecv` arm, and `builtinNullableOrNullTypeArgIndex`'s
 // `IGrouping` row); the for-in path did not.
 //
-// The three shapes an `IGrouping` TypeRef reaches sema in mirror codegen's
-// `Emitter::iGroupingElemTypeRef` (LlvmBackend_Calls3.cpp): a declaration-less
-// astNode (the synthetic node the GroupBy typing arms build), a builtin
-// TypeSymbol whose `decl` is null (a user-written `IGrouping<K, V>`
-// annotation), or an `importedName` set by ModuleLoader.
-static TypeRef* iGroupingElemTypeRef(TypeRef* rt) {
-    if (!rt || rt->kind != TypeRef::Kind::Named) return nullptr;
-    std::string_view hn;
-    if (rt->declaration) {
-        if (rt->declaration->decl) return nullptr;  // a real user type
-        hn = rt->declaration->name;
-    } else if (rt->astNode && rt->astNode->name &&
-               !rt->astNode->name->parts.empty()) {
-        hn = rt->headName();
-    } else if (!rt->importedName.empty()) {
-        hn = rt->importedName;
-    } else {
-        return nullptr;
-    }
-    if (hn != "IGrouping") return nullptr;
-    if (rt->genericArgs.size() < 2 || !rt->genericArgs[1]) return nullptr;
-    return rt->genericArgs[1];
-}
+// fix #8542 (v0.359): the RECOGNIZER moved to `sema/GroupingElem.hpp` — the
+// two sites in `ExprTypecheck_Calls.cpp` that ask the same question (the
+// LINQ lambda-parameter seeding and the `SelectMany` inner element) read it
+// there, so the three sema sites cannot drift apart again. The helper is
+// `sema::iGroupingElemTypeRef`; this file's call sites are unchanged.
 
 void ExprTC::visitStmt(const ast::Stmt& s) {
     factUseLoc_ = s.span.begin;   // #6114

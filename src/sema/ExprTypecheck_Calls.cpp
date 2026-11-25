@@ -23,6 +23,9 @@
 #include "sema/SubstArgs.hpp"       // sema::substituteGenericArgs — generic class IComparable check
 #include "sema/GenericParams.hpp"   // sema::hasVariantGenericParam — §12.9 variance read from BOTH
                                    // sources (#3143; an AST-only read answers invariant for an import)
+#include "sema/GroupingElem.hpp"    // fix #8542: sema::iGroupingElemTypeRef — the ONE IGrouping
+                                   // element-type recognizer (stdlib §5), shared with
+                                   // `ExprTypecheck.cpp`'s for-in inference
 
 // fix #4724 / #4801 (§4.4, §5.2, §6.4, v0.307): the compile-time float and
 // decimal folds reuse the runtime's decimal entry points — the SAME ops codegen
@@ -15121,12 +15124,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // issue #775 / §16.3: the selector may return a `Range<T>`
                         // (a range as the inner sequence) — its element type is
                         // genericArgs[0], exactly like a collection/lazy inner.
+                        //
+                        // fix #8542 (stdlib §5 / spec §27.4, v0.359): the inner
+                        // sequence may be an `IGrouping<TKey, T>` — the shape
+                        // `GroupBy(k).SelectMany(lambda(g) => g)` has — and §5
+                        // declares `IGrouping<TKey, T> : IEnumerable<T>`, so the
+                        // flattened element is T, the grouping's SECOND generic
+                        // argument. Reading genericArgs[0] took the KEY instead,
+                        // so the flattened element was typed as the key's type
+                        // and the `for` variable over the result failed to
+                        // resolve its members (issue #8542, shape (a)).
+                        //
+                        // The recognizer is the shared one
+                        // (`sema/GroupingElem.hpp`), so this read and the
+                        // lambda-parameter seeding in `linqSourceElementType`
+                        // cannot drift apart.
                         if (auto* lamTy = ctx_.exprType(*ce.args[0].value))
                             if (lamTy->kind == TypeRef::Kind::Function &&
-                                lamTy->funcReturn &&
-                                !lamTy->funcReturn->genericArgs.empty() &&
-                                lamTy->funcReturn->genericArgs[0])
-                                outElem = lamTy->funcReturn->genericArgs[0];
+                                lamTy->funcReturn) {
+                                if (TypeRef* grpElem =
+                                        iGroupingElemTypeRef(lamTy->funcReturn))
+                                    outElem = grpElem;
+                                else if (!lamTy->funcReturn->genericArgs.empty() &&
+                                         lamTy->funcReturn->genericArgs[0])
+                                    outElem = lamTy->funcReturn->genericArgs[0];
+                            }
                         ctx_.setExprType(&ce, makeLazyEnumerable(outElem));
                         return true;
                     }
@@ -35571,6 +35593,25 @@ TypeRef* ExprTC::linqSourceElementType(TypeRef* recvTy) {
     if (recvTy->kind != TypeRef::Kind::Named ||
         recvTy->genericArgs.empty() || !recvTy->genericArgs[0])
         return nullptr;
+    // fix #8542 (stdlib §5 / spec §27.4, v0.359): an `IGrouping<TKey, T>`
+    // receiver's LINQ element type is T — the SECOND generic argument. §5
+    // declares `IGrouping<TKey, T> : IEnumerable<T>`, so the §5 operators
+    // apply to a grouping with the ELEMENT type T; genericArgs[0] is the
+    // KEY. Reading genericArgs[0] here typed the selector's parameter as the
+    // KEY: `g.Where(lambda(x) => x.age > 35)` seeded `x` as the key's
+    // `string` and the body failed with "string member `.age` is not yet
+    // supported in codegen" (issue #8542, shapes (b)/(c)).
+    //
+    // The recognizer is the shared one (`sema/GroupingElem.hpp`), so this
+    // site, the `SelectMany` inner-element read in `typeLinqOperator` below,
+    // and `ExprTypecheck.cpp`'s for-in loop-variable inference cannot drift.
+    //
+    // It is read BEFORE the "a user class/interface is not a LINQ source"
+    // exclusion below, because a builtin `IGrouping` TypeRef carries a
+    // TypeSymbol whose `decl` is null — the same shape the `Range<T>`
+    // exception below already had to admit.
+    if (TypeRef* grpElem = iGroupingElemTypeRef(recvTy))
+        return grpElem;
     // A collection (Array/Set/… — Named with astNode, no declaration) or a lazy
     // IEnumerable sentinel (Named with neither). Either carries the element
     // type as genericArgs[0]. A user class/interface (has declaration) is not
