@@ -111,7 +111,8 @@ std::string slurp(const std::string& path) {
 }
 
 RunOutcome runWithStdin(const std::string& source,
-                        const std::string& stdinText) {
+                        const std::string& stdinText,
+                        bool detectLeaks = true) {
     auto dir = rteScratchDir();
     std::string stem = unique_stem("bezel_tr8383");
     std::string src = (dir / (stem + ".bzl")).string();
@@ -132,16 +133,24 @@ RunOutcome runWithStdin(const std::string& source,
     bezel::codegen::CodegenOptions opts;
     // The ASan sweep's one bit (support/force_sanitize.hpp) — the generated
     // code is instrumented and the run reports a fired sanitizer as a
-    // non-zero exit, exactly as `runAot` does.
+    // non-zero exit, exactly as `runAot` does. `detectLeaks` is the LEAK
+    // half of the same oracle: it is ON for every row of this file since
+    // fix #9199 (the §7.4 `ReadToEnd()` result is discharged, so the read
+    // text is no longer leaked) and OFF for the ONE row whose program calls
+    // `Console.ReadLine()` — a SEPARATE, separately filed defect.
     opts.sanitizeAddress = bezel::test::forceSanitizeAddress();
     bezel::CompileResult r = driver.compileFile(src, exe, /*deps=*/{}, opts);
     o.compiled = r.success;
     if (r.success) {
         pid_t pid = ::fork();
         if (pid == 0) {
-            if (opts.sanitizeAddress)
-                ::setenv("ASAN_OPTIONS",
-                         "detect_leaks=0:abort_on_error=0:exitcode=97", 1);
+            if (opts.sanitizeAddress) {
+                const std::string asanOptions =
+                    std::string(detectLeaks ? "detect_leaks=1:abort_on_error=0"
+                                            : "detect_leaks=0:abort_on_error=0") +
+                    ":exitcode=97";
+                ::setenv("ASAN_OPTIONS", asanOptions.c_str(), 1);
+            }
             int fd0 = ::open(inf.c_str(), O_RDONLY);
             int fd1 = ::open(outf.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
             int fd2 = ::open(errf.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -374,6 +383,19 @@ BEZEL_TEST(textreader_readtoend_8383, no_internal_degrade_note_21_1) {
 // stdlib §2.1's `Console.ReadLine()` — the workaround the issue names —
 // still reads a line and still strips its terminator ('hello', not
 // 'hello\n').
+//
+// THE LEAK ORACLE IS OFF FOR THIS ROW ONLY. `Console.ReadLine()` (stdlib
+// §2.1) is NOT the §7.4 `TextReader.ReadToEnd()`: it is its OWN member, and
+// its OWN result is still never discharged (`Emitter::isPlusOneStringProducer`
+// has no `Console.ReadLine` arm), so this row's program leaks the line it
+// read — 38 bytes in 2 allocations, MEASURED with the generated code's
+// LeakSanitizer on the tip of fix #9199. That is a SEPARATE defect from the
+// one this file covers, and it is filed as its own issue; this lane does not
+// fix it (scope discipline) and must not import its failure into this file.
+// Every OTHER row of this file runs with `detect_leaks=1`: since fix #9199
+// the §7.4 `ReadToEnd()` result IS discharged, so the read text is no longer
+// leaked, and the leak oracle now watches these rows (which is the net that
+// would have caught #9199).
 BEZEL_TEST(textreader_readtoend_8383, console_read_line_still_strips_the_newline_2_1) {
     const char* src =
         "module P;\n"
@@ -383,7 +405,7 @@ BEZEL_TEST(textreader_readtoend_8383, console_read_line_still_strips_the_newline
         "    if l <> null then Console.WriteLine($\"[{l}]\"); end if;\n"
         "  end Main;\n"
         "end Program;\n";
-    auto o = runWithStdin(src, "hello\nworld\n");
+    auto o = runWithStdin(src, "hello\nworld\n", /*detectLeaks=*/false);
     BEZEL_EXPECT_TRUE(o.compiled);
     BEZEL_EXPECT_EQ(o.exitCode, 0);
     BEZEL_EXPECT_EQ(o.stdoutText, std::string("[hello]\n"));

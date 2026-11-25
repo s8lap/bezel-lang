@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "codegen/LlvmBackend_TextReader.hpp"  // fix #9199: the ONE built-in `TextReader.ReadToEnd()` classifier (lowering + consumer-side classification)
 #include "llvm/ADT/STLFunctionalExtras.h"  // llvm::function_ref (fix #4901 shared-event gate)
 #include "sema/BuiltinInterfaceAncestors.hpp"  // fix #6828: the §26.5 built-in interface table — the ONE copy, shared with sema's §14.5 phase-1 unification
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
@@ -10978,12 +10979,14 @@ namespace {
 //
 // printed nothing and exited 0.
 //
-// WHY FILE-LOCAL HELPERS AND NOT `Emitter` MEMBERS. The arm needs two new
-// emitter entry points (the classifier and the reader). An `Emitter` member
-// would have to be DECLARED in `src/codegen/LlvmBackend_impl.hpp`, which is
-// outside this lane's file set, so the arm is written as two FILE-LOCAL
-// functions that take the emitter's state explicitly. They sit next to their
-// only call site (`lowerCallDispatch`), so the arm reads as one unit.
+// WHY THE CLASSIFIER IS NOT FILE-LOCAL. The arm needs two new emitter entry
+// points (the classifier and the reader). The READER stays a file-local
+// function here (it takes the emitter's state explicitly); the CLASSIFIER is
+// shared with the consumer-side classification
+// (`Emitter::isPlusOneStringProducer`, LlvmBackend_Setup.cpp), which must
+// recognise the SAME call as a fresh `string` production, so it lives in
+// `src/codegen/LlvmBackend_TextReader.hpp` — the one place both read, so the
+// two cannot drift (fix #9199).
 //
 // THE RECEIVER. stdlib §7.4 declares `ReadToEnd` on the abstract
 // `TextReader`, and §2.1 declares `Console.In` as its one instance. Two
@@ -11008,49 +11011,6 @@ namespace {
 // ⇒ `Console.In` is the only `TextReader` instance stdlib §7.4 admits, so
 // BOTH receivers denote the same reader — standard input.
 // ===========================================================================
-
-// Which receiver the built-in `TextReader.ReadToEnd()` call has.
-enum class TextReaderReceiverKind {
-    None,       // not the built-in member — the ordinary dispatch owns it
-    ConsoleIn,  // `Console.In.ReadToEnd()` — the syntactic receiver
-    TypedValue, // `r.ReadToEnd()` on a value of the built-in `TextReader` type
-};
-
-// Is `call` the built-in `TextReader.ReadToEnd()` member call? (§7.4)
-TextReaderReceiverKind classifyTextReaderReadToEnd(
-    const ast::CallExpr& call, const sema::SemaContext& ctx) {
-    if (!call.callee) return TextReaderReceiverKind::None;
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
-    if (!ma || !ma->target) return TextReaderReceiverKind::None;
-    // §7.4: `ReadToEnd()` takes no argument.
-    if (ma->member != "ReadToEnd" || !call.args.empty())
-        return TextReaderReceiverKind::None;
-    // A USER-declared `ReadToEnd` on a user receiver is the user's own
-    // member: the ordinary dispatch owns it, and this arm must not claim it.
-    if (dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*call.callee)))
-        return TextReaderReceiverKind::None;
-    // (1) `Console.In.ReadToEnd()` — the syntactic receiver.
-    if (auto* inner =
-            dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get())) {
-        if (inner->member == "In" && inner->target) {
-            if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
-                    inner->target.get())) {
-                // fix #8126 (§2.7 rule 1, v0.355): a VALUE named `Console` is
-                // member access, not the built-in class.
-                if (cid->name == "Console" &&
-                    sema::receiverMayReachBuiltinStaticArm(
-                        ctx.exprSymbol(*cid)))
-                    return TextReaderReceiverKind::ConsoleIn;
-            }
-        }
-    }
-    // (2) a value of the built-in `TextReader` type.
-    const sema::TypeRef* rt = ctx.exprType(*ma->target);
-    if (rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
-        rt->headName() == "TextReader")
-        return TextReaderReceiverKind::TypedValue;
-    return TextReaderReceiverKind::None;
-}
 
 // THE READ. A `fgets` loop on `stdin` — the same `stdin` / `fgets` / `strlen`
 // setup `emitConsoleReadLine` makes — accumulating the bytes INCLUDING their

@@ -87,15 +87,33 @@
 // `tests/codegen/textwriter_value_7792_test.cpp`, with fd 0 carrying INPUT
 // instead of catching OUTPUT.
 //
-// THE LEAK. Every row's program leaks the CONSOLE-READ STRING itself (45
-// bytes for a 12-byte input: a 32-byte header and a 13-byte buffer). That is
-// a PRE-EXISTING property of the console-read string's LIFETIME, not of this
-// lane: it is the gap the #8383 lane measured and reported ("`Emitter::
+// THE LEAK — RE-ENABLED by fix #9199 (stdlib §7.4 / §4.6 / §28.3 / §28.9,
+// v0.359). This runner used to set `detect_leaks=0`, because EVERY row's
+// program leaked the CONSOLE-READ STRING itself (45 bytes for a 12-byte input:
+// a 32-byte header and a 13-byte buffer). That was NOT this lane's property:
+// it was the gap the #8383 lane measured and reported ("`Emitter::
 // isPlusOneStringProducer` has no `ReadToEnd` arm, so a `ReadToEnd()` result
-// is never discharged — NOT the stored form and NOT the unstored one"), and
-// it is measured on the CONTROL rows too, which this lane does not change.
-// The runner therefore sets `detect_leaks=0`, exactly as the #8383 test
-// does; the ASan leg still catches a use-after-free or an overflow.
+// is never discharged — NOT the stored form and NOT the unstored one"), and it
+// was measured on the CONTROL rows too.
+//
+// fix #9199 added that arm: the §7.4 `TextReader.ReadToEnd(): string` result
+// is a +1 string PRODUCER, so the caller owns exactly ONE reference and
+// discharges it — the bound local is released at scope end, a call argument
+// at the end of the full expression. The read text is therefore no longer
+// leaked, and this runner now runs with `detect_leaks=1`: the ASan leg
+// catches a use-after-free or an overflow AND LeakSanitizer catches a
+// residual leak (the runner's `exitcode=97` keeps a leak distinguishable
+// from the program's own exit status).
+//
+// THE ROWS THAT CHANGED. The rows that READ standard input — the four
+// `local_to_lower_on_a_readtoend_local_9_6`,
+// `local_trim_on_a_readtoend_local_9_6`,
+// `chained_to_lower_on_a_readtoend_call_9_6` and
+// `chained_trim_on_a_readtoend_call_9_6` rows, and the two CONTROL rows
+// `the_length_twin_of_the_readtoend_local_still_works_9_6` and
+// `the_ascribed_local_twin_of_the_readtoend_local_still_works_9_6` — are the
+// ones the leak oracle now watches. The rows that only COMPILE
+// (`no_internal_degrade_note_for_the_string_members_21_1`) are unaffected.
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -180,7 +198,7 @@ RunOutcome runWithStdin(const std::string& source,
         if (pid == 0) {
             if (opts.sanitizeAddress)
                 ::setenv("ASAN_OPTIONS",
-                         "detect_leaks=0:abort_on_error=0:exitcode=97", 1);
+                         "detect_leaks=1:abort_on_error=0:exitcode=97", 1);
             int fd0 = ::open(inf.c_str(), O_RDONLY);
             int fd1 = ::open(outf.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
             int fd2 = ::open(errf.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);

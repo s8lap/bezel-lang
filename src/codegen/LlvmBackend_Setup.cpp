@@ -1,6 +1,7 @@
 #include "codegen/LlvmBackend_impl.hpp"
 #include "codegen/LlvmBackend_EnumMembers.hpp"  // fix #3862 (§10.4, v0.357): the ONE enum-member gate (lowering + ownership walk)
 #include "codegen/LlvmBackend_IndexerParams.hpp"  // fix #9102: the ONE indexer index-parameter shape (lowering + escape walk)
+#include "codegen/LlvmBackend_TextReader.hpp"  // fix #9199: the ONE built-in `TextReader.ReadToEnd()` classifier (lowering + consumer-side classification)
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 #include "common/DisposalKind.hpp"   // §28.9/§28.12: the shared disposal anchor
@@ -31134,6 +31135,52 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                 }
             }
         }
+    }
+    // fix #9199 (stdlib §7.4 / §2.1 / §4.6 / §28.3 / §28.9, v0.359): the
+    // built-in `TextReader.ReadToEnd(): string` is a +1 string PRODUCER — the
+    // §7.4 sibling of the `Path` arm above.
+    //
+    // WHY IT IS A PRODUCER. stdlib §7.4 declares, on the abstract `TextReader`,
+    //
+    //   public method ReadToEnd(): string;
+    //
+    // and stdlib §2.1 declares `Console.In` as that class's ONE instance
+    // ("`TextReader` has no concrete subclass in this library: its one
+    // instance is `Console.In`"). The `ReadToEnd` lowering
+    // (`emitTextReaderReadToEnd`, LlvmBackend_Calls2.cpp) reads standard input
+    // into a heap buffer and mints the result the way every fresh string
+    // production is minted: a `malloc`'d `bz.string` header whose rc is set to
+    // 1 (`initStringRc`) — the producer's reference, §28.3's "Fresh productions
+    // are owned" and §28.9's "the implementation reclaims the production"
+    // (§4.6: "`string` is runtime-managed: its memory is reclaimed
+    // automatically"). So the CALLER owns exactly ONE reference to it.
+    //
+    // WITHOUT THIS ARM every consumer treated the result as a BORROW and never
+    // discharged the producer's +1: the bound local was not a release
+    // candidate at all, so nothing released it and the read text leaked once
+    // per run. MEASURED (issue #9199; generated-code LeakSanitizer): the
+    // issue's own program — `var s: string := Console.In.ReadToEnd();` over
+    // the input "hello\n" — leaked 39 bytes in 2 allocations (the 32-byte
+    // header + the 7-byte data buffer), and a 200-iteration loop of the same
+    // shape leaked 6606 bytes in 400 allocations.
+    //
+    // A bound local TRANSFERS the single reference (no extra retain) and the
+    // scope-end release drops rc 1->0 exactly once; a call argument and the
+    // `Console.Write` #1031 arm discharge it at the end of the full
+    // expression. No double free: an ESCAPING local is excluded from the
+    // scope-end release by the escape walk (its +1 then leaks — the safe
+    // direction).
+    //
+    // THE DISCRIMINATOR IS THE LOWERING'S OWN (`classifyTextReaderReadToEnd`,
+    // `src/codegen/LlvmBackend_TextReader.hpp`), so the two halves agree on
+    // WHICH call is the built-in member: the SYNTACTIC receiver `Console.In`,
+    // or a VALUE of the built-in `TextReader` type. A USER's own `ReadToEnd`
+    // (its callee resolves to a MethodSymbol) and a USER class named
+    // `TextReader` are both excluded, exactly as the lowering excludes them.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (classifyTextReaderReadToEnd(*call, ctx_) !=
+            TextReaderReceiverKind::None)
+            return true;  // emitTextReaderReadToEnd → initStringRc → rc=1
     }
     // fix #8016 (stdlib §7.3 / §4.6 / §28.9, v0.350): `File.ReadAllText(path)`
     // is a +1 string PRODUCER — the §7.3 sibling of #7865's §7.4 `Path` arm
