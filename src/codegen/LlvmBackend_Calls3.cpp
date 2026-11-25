@@ -4034,7 +4034,12 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         if (elemRef && elemRef->kind == sema::TypeRef::Kind::Named &&
             builtinTypeName(elemRef) == "DictionaryEntry" &&
             elemRef->genericArgs.size() >= 2 && elemRef->genericArgs[0]) {
-            const sema::TypeRef* keyTy = elemRef->genericArgs[0];
+            // fix #9050 (F2): the RESOLVED key (§14.1), the one
+            // `lowerToLazyEnumerator`'s Dictionary arm now classifies; the
+            // two must agree or the lazy source releases Keys this copy
+            // never retained (a use-after-free at `K = string`).
+            const sema::TypeRef* keyTy =
+                resolveTypeParamRef(elemRef->genericArgs[0]);
             entryWithStringKey =
                 keyTy->kind == sema::TypeRef::Kind::Primitive &&
                 keyTy->primitive == sema::PrimitiveType::String;

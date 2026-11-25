@@ -257,6 +257,39 @@ const char* kDrainReleasesTheMintedKey =
     "  end Main;\n"
     "end Program;\n";
 
+// FIX-FORWARD F2 (probe p14). The entry `ToArray()` materializer's string-Key
+// retain is keyed on the same predicate `lowerToLazyEnumerator`'s Dictionary
+// arm uses for the lazy source's Key release ("the two can never disagree").
+// Resolving only the source half made the lazy source release the string Keys
+// while the array never retained them: reading `e.Key` after the lazy source
+// was disposed was a use-after-free at `K = string`.
+const char* kEntryToArrayKeepsTheKeys =
+    "module M; import System;\n"
+    "public class Bag<K> where K: hashable\n"
+    "  private owned _d: Dictionary<K, int> := new Dictionary<K, int>();\n"
+    "  public method Put(k: K, v: int) => _d[k] := v;\n"
+    "  public method Snap(): string\n"
+    "    using var es := _d.Where(lambda(kv) => kv.Value > 0).ToArray();\n"
+    "    var s := \"\";\n"
+    "    for var e in es do s := s + $\"{e.Key}={e.Value};\"; end;\n"
+    "    return s;\n"
+    "  end Snap;\n"
+    "end Bag;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var last := \"\";\n"
+    "    var i := 0;\n"
+    "    while i < 200 do\n"
+    "      using var b := new Bag<string>();\n"
+    "      b.Put(\"a\", 1); b.Put($\"b{i}\", 2);\n"
+    "      last := b.Snap();\n"
+    "      i := i + 1;\n"
+    "    end;\n"
+    "    Console.WriteLine(last);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
 void expectOut(const char* src, const char* out) {
     JitResult r = runAot(src);
     BEZEL_EXPECT_TRUE(r.ran);
@@ -310,4 +343,12 @@ BEZEL_TEST(ownership_dict_generic_string_key_read_out_9050,
     BEZEL_EXPECT_TRUE(r.ran);          // no leak, no double-free
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("400\n"));
+}
+
+BEZEL_TEST(ownership_dict_generic_string_key_read_out_9050,
+           entry_toarray_keeps_the_string_keys_after_the_source_is_disposed_spec_28_11) {
+    JitResult r = runAotChecked(kEntryToArrayKeepsTheKeys);
+    BEZEL_EXPECT_TRUE(r.ran);          // no use-after-free, no leak
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("a=1;b199=2;\n"));
 }
