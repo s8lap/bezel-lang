@@ -3642,4 +3642,4 @@ OPEN ON GITHUB AFTER THE PUSH.**
 **THE R41 GATE HAS NOT RUN.** THE `gate` ROW READS `pid: none | done: 0` AND THE NEWEST CYCLE LOG IS
 `a30bb11d_cycle.log` — **R40's TIP, NOT R41's**. **⇒ THE GATE IS THE RUN's LAST ACT AND ITS VERDICT
 IS NOT YET MEASURED.**
-- R43 coordinator (Claude Code). The run ends **2026-11-27 02:00 NZDT**, with one gate on Thursday evening 2026-11-26.
+- R43 coordinator (Claude Code). The run ends **2026-11-30 02:00 NZDT (MONDAY)** (owner extension 2026-11-26; originally 2026-11-27 02:00), with two gates: one on 2026-11-26 and one near the end.

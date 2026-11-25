@@ -866,7 +866,7 @@ inference at `Sort`) and should share a lane.
 
 ---
 
-**R43 (2026-11-24, owner directive): THE RUN'S END IS 2026-11-27 02:00 NZDT (FRIDAY).** Campaigns 2 (builtin-call-admission) and 6 (closures-cells) stay ACTIVE. Pool: 6 Claude agents in total (producers, reviewers and harvest) plus 8 OpenCode MiniMax producers. No Fable unless a true blocker; an issue that needs one gets the `hard` label. One gate near the end (Thursday evening). The box was upgraded to Fedora 45 (LLVM 23) first.
+**R43 (2026-11-24, owner directive): THE RUN'S END IS 2026-11-30 02:00 NZDT (MONDAY)** (owner directive 2026-11-26 ~10:30: *"Let's extend the run to 2 am Monday. This means we can do the gate several times, perhaps we can do a gate soon, then another gate toward the end of the extended run"*; it supersedes the original 2026-11-27 02:00 end and the one-gate rule for THIS run: gate 1 soon after the directive, gate 2 near the end). Campaigns 2 (builtin-call-admission) and 6 (closures-cells) stay ACTIVE. Pool: 6 Claude agents in total (producers, reviewers and harvest) plus 8 OpenCode MiniMax producers. No Fable unless a true blocker; an issue that needs one gets the `hard` label. Originally one gate near the end (Thursday evening); since the 2026-11-26 extension, two gates (one on 2026-11-26, one near 2026-11-30 02:00). The box was upgraded to Fedora 45 (LLVM 23) first.
 
 ## Appendix A — the mechanical commands
 

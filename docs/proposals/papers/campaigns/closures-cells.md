@@ -14,4 +14,4 @@
 ## Coordinator block
 - R42 coordinator. The run ends **2026-11-20 02:00 NZDT**, with one gate on Thursday evening 2026-11-19 and then the
   static pre-release.
-- R43 coordinator (Claude Code). The run ends **2026-11-27 02:00 NZDT**, with one gate on Thursday evening 2026-11-26.
+- R43 coordinator (Claude Code). The run ends **2026-11-30 02:00 NZDT (MONDAY)** (owner extension 2026-11-26; originally 2026-11-27 02:00), with two gates: one on 2026-11-26 and one near the end.
