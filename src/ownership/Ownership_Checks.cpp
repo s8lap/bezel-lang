@@ -5676,7 +5676,20 @@ bool MethodOwnership::returnedExprMayBorrow(const ast::Expr& e) const {
     // possibly-untyped `exprType(e)` branch.
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
         if (call->callee) {
-            const sema::TypeRef* ct = ctx_.exprType(*call->callee);
+            // fix-forward #9155 (§28.3, §27.6, v0.359): a BARE method-name
+            // callee (`OnceItem(t)`) now carries its §27.6 formed function
+            // type (#9155), but it is a DIRECT call of a declared method,
+            // not an invocation of a function VALUE (§27.7). Reading the
+            // formed type's return here would short-circuit the
+            // deferred-activation arm below (#5624), which classifies the
+            // CALL RESULT (`IEnumerable<Item>`) and not the callee. Only a
+            // callee that is not a bare method name is a function value.
+            const bool bareMethodCallee =
+                dynamic_cast<const ast::IdentifierExpr*>(call->callee.get()) &&
+                dynamic_cast<const sema::MethodSymbol*>(
+                    ctx_.exprSymbol(*call->callee));
+            const sema::TypeRef* ct =
+                bareMethodCallee ? nullptr : ctx_.exprType(*call->callee);
             if (ct && ct->kind == sema::TypeRef::Kind::Function && ct->funcReturn)
                 return isBorrowableType(ct->funcReturn);
         }
