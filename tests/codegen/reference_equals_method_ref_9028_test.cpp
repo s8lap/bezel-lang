@@ -15,7 +15,11 @@
 // is a member of every class derived from it ... and may be named through a
 // derived type". So `K.ReferenceEquals` names the INHERITED static — and
 // §27.6 turns a static named in a VALUE position into a function value, the
-// `(Object, Object) -> bool` pair the root spelling forms:
+// pair the root spelling forms. (The pair is the callee's own signature,
+// `(Object?, Object?) -> bool` — §8.1's `ReferenceEquals(a: Object?, b:
+// Object?): bool` — since #9108; before it, sema formed `(Object, Object) ->
+// bool`, which is NOT that signature and made the reference unusable at a
+// `(Object?, Object?) -> bool` target):
 //
 //     var f := K.ReferenceEquals;   // §27.6 method-group reference
 //     f(k, k2);                      // the root's identity compare (§8.4)

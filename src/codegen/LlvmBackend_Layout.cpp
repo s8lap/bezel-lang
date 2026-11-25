@@ -9602,8 +9602,9 @@ bool Emitter::isPrimIntrinsicMethodRef(const ast::Expr* e) const {
     // `var f := K.ReferenceEquals;` — is the ROOT's static, so it lowers
     // through the SAME thunk as the root `Object.ReferenceEquals` reference
     // (makePrimIntrinsicThunk → the one identity compare). Sema already
-    // types this shape as a `(Object, Object) -> bool` function value and
-    // binds NO MethodSymbol to it (the #8795 arm), so without this arm the
+    // types this shape as a `(Object?, Object?) -> bool` function value (the
+    // callee's own signature — fix #9108, §8.1 / §8.4 / §27.6) and binds NO
+    // MethodSymbol to it (the #8795 arm), so without this arm the
     // CG60 gate fell through to `ret nullptr`: the local's slot degraded to
     // zero behind #2434's warning and the call of it was a null-function
     // SEGV.

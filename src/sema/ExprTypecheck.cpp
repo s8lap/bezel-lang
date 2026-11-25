@@ -5761,9 +5761,12 @@ bool functionSlotTypeRefEqual(const TypeRef* a, const TypeRef* b) {
 // identity/subtype plus nullable-widening, mirroring the Named-Named branch
 // of checkAssignable below); every other slot shape — value-typed, record-
 // typed, primitive, generic, nested-function, or array — is INVARIANT (exact
-// structural match, functionSlotTypeRefEqual above). Callers apply this with
-// the operands swapped for a CONTRAVARIANT parameter slot and in-order for a
-// COVARIANT return slot (§27.1.1 first/second bullets).
+// structural match, functionSlotTypeRefEqual above). The ROOT CLASS `Object`
+// is the one exception: it is a class in the spec (§8.1) even though the
+// compiler models it as a primitive, so its slot relates as a class slot
+// does (fix #9108, below). Callers apply this with the operands swapped for a
+// CONTRAVARIANT parameter slot and in-order for a COVARIANT return slot
+// (§27.1.1 first/second bullets).
 static bool functionSlotConvertible(
         const TypeRef* from, const TypeRef* to,
         bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*)) {
@@ -5778,6 +5781,42 @@ static bool functionSlotConvertible(
         if (from->nullable && !to->nullable) return false;
         return from->declaration == to->declaration ||
                isSubtypeFn(from->declaration, to->declaration);
+    }
+    // fix #9108 (§8.1 / §27.1.1, v0.359): the ROOT CLASS `Object` is a CLASS
+    // in the spec — §8.1 declares `public class Object` — so a slot of type
+    // `Object`/`Object?` is a CLASS slot, and §27.1.1's first bullet governs
+    // it: "**Parameter slots** of class or interface type, nullable or not,
+    // are **contravariant**: the target's parameter type must reach the
+    // value's by a reference conversion, its nullable lift or the nullable
+    // view of a reference type, never the view's reverse".
+    //
+    // The compiler models the root type as the PRIMITIVE
+    // `PrimitiveType::Object` (there is no `Object` TypeDecl to name), and
+    // the branch above — which needs a Named declaration — therefore never
+    // reached it: the root class's slots fell through to the invariant
+    // "every other slot shape ... is INVARIANT" rule, and the root class's
+    // own nullability was frozen into the slot. §3.1's type kinds list the
+    // primitive value types as `bool`, the integer types, `float`, `double`,
+    // `decimal` and `char` — `Object` is none of them, so "primitive slots
+    // are invariant" does not reach it.
+    //
+    // The relation added here is exactly the class-slot one: the nullable
+    // lift in the widening direction only (target `Object` reaches value
+    // `Object?`), never its reverse (target `Object?` does NOT reach value
+    // `Object` — a call through the target would hand a `null` to a
+    // non-nullable parameter, §7.1). With it, a function value whose
+    // parameter slot is `Object?` is usable where an `Object` slot is
+    // expected, and the built-in static `Object.ReferenceEquals` — whose
+    // own signature is `(a: Object?, b: Object?): bool` (§8.1 / §8.4) — is
+    // usable at a `(Object?, Object?) -> bool` target and at a
+    // `(Object, Object) -> bool` one, exactly as a USER static with the
+    // same signature is (§27.6).
+    if (from->kind == TypeRef::Kind::Primitive &&
+        to->kind == TypeRef::Kind::Primitive &&
+        from->primitive == PrimitiveType::Object &&
+        to->primitive == PrimitiveType::Object) {
+        if (from->nullable && !to->nullable) return false;
+        return true;
     }
     return functionSlotTypeRefEqual(from, to);
 }

@@ -40978,10 +40978,31 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // arguments always returns false — each boxing creates a fresh
                 // object — which the pointer compare yields naturally.)
                 if (pt == PrimitiveType::Object && mbr == "ReferenceEquals") {
-                    // §27.6: `Object.ReferenceEquals` as a reference is
-                    // `(object, object) -> bool`.
-                    methodRef({ctx_.primitiveTypeRef(PrimitiveType::Object),
-                               ctx_.primitiveTypeRef(PrimitiveType::Object)},
+                    // fix #9108 (§8.1 / §8.4 / §27.6, v0.359): the
+                    // reference's FORMED TYPE is the CALLEE'S OWN SIGNATURE
+                    // — §27.6: "A reference's **formed type** (§12.7
+                    // *Function-typed targets*) is the callee's own
+                    // signature read as a function type" — and §8.1 declares
+                    // the static as `public static method ReferenceEquals(a:
+                    // Object?, b: Object?): bool;` (§8.4: "It is an ordinary
+                    // static method with `Object?` parameters").
+                    //
+                    // The prior `(Object, Object) -> bool` was NOT that
+                    // signature: its NON-NULLABLE parameter slots made the
+                    // reference unusable at a `(Object?, Object?) -> bool`
+                    // target, because §27.1.1's parameter bullet is
+                    // CONTRAVARIANT — the TARGET's `Object?` must reach the
+                    // VALUE's `Object`, and it does not (§5.1 admits no
+                    // nullable → non-nullable conversion). So the reference
+                    // was rejected ("not implicitly convertible (§5.1)") where
+                    // a USER static with the very same signature was
+                    // admitted — §27.6 admits a method reference for a
+                    // static method, and this static's own signature is the
+                    // nullable one.
+                    methodRef({ctx_.primitiveTypeRef(PrimitiveType::Object,
+                                                     /*nullable=*/true),
+                               ctx_.primitiveTypeRef(PrimitiveType::Object,
+                                                     /*nullable=*/true)},
                               ctx_.primitiveTypeRef(PrimitiveType::Bool));
                     return;
                 }
@@ -48196,17 +48217,28 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // §8.1's DECLARED FORM: `public static method ReferenceEquals(a:
             // Object?, b: Object?): bool;`. The CALL form's result is `bool`;
             // the READ form is a §27.6 method reference over the static, whose
-            // type is the `(Object, Object) -> bool` pair the root spelling
-            // forms (the primitive-keyword block above).
+            // FORMED TYPE is the callee's own signature read as a function
+            // type (§27.6) — the `(Object?, Object?) -> bool` pair the root
+            // spelling forms (the primitive-keyword block above).
+            //
+            // fix #9108 (§8.1 / §8.4 / §27.6, v0.359): the pair was
+            // `(Object, Object) -> bool` — NOT the declared signature — and
+            // §27.1.1's contravariant parameter bullet then refused the
+            // reference at a `(Object?, Object?) -> bool` target (the
+            // TARGET's `Object?` does not reach the VALUE's `Object` under
+            // §5.1), where a USER static with the same signature was
+            // admitted.
             if (&ma == calleeOfCallCtx_) {
                 ctx_.setExprType(&ma,
                                  ctx_.primitiveTypeRef(PrimitiveType::Bool));
             } else {
                 auto* ft = ctx_.makeTypeRef();
                 ft->kind = TypeRef::Kind::Function;
-                for (TypeRef* p : {ctx_.primitiveTypeRef(PrimitiveType::Object),
-                                   ctx_.primitiveTypeRef(
-                                       PrimitiveType::Object)}) {
+                for (TypeRef* p :
+                     {ctx_.primitiveTypeRef(PrimitiveType::Object,
+                                            /*nullable=*/true),
+                      ctx_.primitiveTypeRef(PrimitiveType::Object,
+                                            /*nullable=*/true)}) {
                     TypeRef::FuncParam fp;
                     fp.type = p;
                     ft->funcParams.push_back(fp);
