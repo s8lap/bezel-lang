@@ -21820,6 +21820,126 @@ bool Emitter::boxArgToUserCallNonEscaping(
 }
 
 
+// fix-forward #9206 (§28.3.8 / §28.11 / §28.9 / §8.6, v0.359): does the
+// FUNCTION VALUE that `callee` evaluates to provably keep nothing of its
+// parameter at `i` past the call, so a §8.6 box the caller passes there may be
+// released at the caller's scope end? A plain function-type slot is a borrow
+// (§28.1), but the callee may STORE that borrow (§28.11's store rule, §28.3.8
+// clause 2) under §28.3.8 clause 3's trust clause, and for a runtime-managed
+// box (§28.9) that clause's checked-disposal backstop does not exist (#9219):
+// releasing a box a callee stored is a heap-use-after-free. So this answers
+// true only where the BODY that runs is known and the #2952 walk
+// (`ParamEscapeWalker`, the one `isCalleeParamNonEscaping` runs over a user
+// method) finds no store, return, capture or onward escape of the parameter:
+//
+//   * a LAMBDA LITERAL called in place, `(lambda(x: Object) => ...)(b)`;
+//   * a LOCAL whose initializer is a lambda literal or a METHOD GROUP, when
+//     the local is a `const` (§21.1: single-assignment) or a `var` that
+//     `body` declares and provably never writes (`localProvablyUnwrittenIn`:
+//     no assignment, increment or `ref`/`out` pass, lambda bodies included),
+//     so the value at every call is the initializer's.
+//
+// A lambda's parameter must carry a written type (`ParamEscapeWalker` keys
+// the tracked parameter on its declared-type node, which an inferred
+// parameter lacks) at `Object`/interface, with no modifier; an `async` lambda
+// or one containing `yield` runs past the call and is refused, as a state-
+// machine method is in `isCalleeParamNonEscaping`. A method group is gated as
+// `plainLocalUserCallee` gates a direct call (not an operator, an extension,
+// an imported or an interface member; non-generic; a plain formal), and
+// `isCalleeParamNonEscaping` refuses a dispatched or state-machine body.
+// EVERY OTHER function value is OPAQUE — a parameter, a field, a property
+// read, a call's result, a reassigned or outer local — and answers false: the
+// spec does not decide what protects a box an unreadable callee stores
+// (#9219), so the pre-fix leak is kept there (a leak, never a UAF).
+bool Emitter::functionValueCalleeParamNonEscaping(
+        const ast::Expr* callee, std::size_t i,
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    if (!callee) return false;
+    auto lambdaParamNonEscaping = [this](const ast::LambdaExpr& lam,
+                                         std::size_t pi) -> bool {
+        if (lam.isAsync || containsYield(lam.stmts)) return false;
+        if (pi >= lam.params.size()) return false;
+        const ast::Param& p = lam.params[pi];
+        if (p.destructure || !p.type || !p.modifier.empty()) return false;
+        if (!isObjectOrInterfaceTarget(ctx_.resolvedType(*p.type)))
+            return false;
+        auto captures = [this](const ast::LambdaExpr& l,
+                               std::unordered_set<const sema::Symbol*>& out) {
+            collectCapturedSyms(l, out);
+        };
+        // The same onward handoff `isCalleeParamNonEscaping` installs: the
+        // parameter passed on, bare, to a locally compiled, statically
+        // dispatched user method whose own formal provably does not escape.
+        auto argNonEscaping = [this](const ast::CallExpr& c,
+                                     std::size_t ai) -> bool {
+            if (!c.callee) return false;
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                ctx_.exprSymbol(*c.callee));
+            if (!ms || ms->isOperator || ms->extensionDecl ||
+                ctx_.isImported(ms))
+                return false;
+            if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Interface)
+                return false;
+            for (const ast::CallArgument& a : c.args)
+                if (!a.name.empty() || a.isDiscard) return false;
+            if (ai >= ms->params.size()) return false;
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[ai]);
+            if (!ps || !ps->modifier.empty()) return false;
+            return isCalleeParamNonEscaping(
+                dynamic_cast<const ast::Member*>(ms->decl), ai);
+        };
+        auto unboxes = [this](const sema::TypeRef* t) -> bool {
+            return t && (isBoxableValueType(t) || isNullableValueTy(t));
+        };
+        ParamEscapeWalker w{ctx_, p.type.get(), captures};
+        w.argNonEscaping = argNonEscaping;
+        w.unboxes = unboxes;
+        if (lam.isBlockBody) {
+            for (auto& s : lam.stmts) w.stmt(s.get());
+        } else {
+            if (!lam.exprBody) return false;
+            w.expr(lam.exprBody.get(), false);
+        }
+        return !w.escaped;
+    };
+    auto methodGroupParamNonEscaping = [this](const ast::Expr* mg,
+                                              std::size_t pi) -> bool {
+        if (!dynamic_cast<const ast::IdentifierExpr*>(mg) &&
+            !dynamic_cast<const ast::MemberAccessExpr*>(mg))
+            return false;
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*mg));
+        if (!ms || ms->isOperator || ms->extensionDecl || ctx_.isImported(ms) ||
+            !ms->decl || !ms->genericParams.empty())
+            return false;
+        if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Interface)
+            return false;
+        if (pi >= ms->params.size()) return false;
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[pi]);
+        if (!ps || !ps->modifier.empty()) return false;
+        return isCalleeParamNonEscaping(
+            dynamic_cast<const ast::Member*>(ms->decl), pi);
+    };
+    auto initializerParamNonEscaping = [&](const ast::Expr* init) -> bool {
+        if (!init) return false;
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(init))
+            return lambdaParamNonEscaping(*lam, i);
+        return methodGroupParamNonEscaping(init, i);
+    };
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(callee))
+        return lambdaParamNonEscaping(*lam, i);
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(callee);
+    if (!id) return false;
+    auto* loc = dynamic_cast<const sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!loc || !loc->decl) return false;
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(loc->decl))
+        return initializerParamNonEscaping(lc->value.get());
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+    if (!ld || !ld->initializer) return false;
+    if (!localProvablyUnwrittenIn(ld, body)) return false;
+    return initializerParamNonEscaping(ld->initializer.get());
+}
+
+
 // fix #8307 (§28.9 / §8.6 / §28.3, v0.357): is the `Object`/interface-typed
 // formal at `pos` of `callee` (a MethodSymbol or a ConstructorSymbol) one a
 // `string` argument may be handed to as a CALL-BOUNDED BORROW? A string

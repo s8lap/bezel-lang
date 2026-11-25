@@ -53347,6 +53347,14 @@ struct BoxEscapeWalker {
     std::function<bool(const ast::Expr*, const std::vector<ast::CallArgument>&,
                        std::size_t)>
         userCallArgNonEscaping;
+    // fix-forward #9206 (§28.3.8 / §28.11 / §28.9, v0.359): "does the
+    // FUNCTION VALUE this callee expression evaluates to provably not let its
+    // parameter at this position outlive the call?" — the Emitter's
+    // `functionValueCalleeParamNonEscaping` over the body being analysed.
+    // Empty for every other reuse of this walker (the answer is then
+    // "escapes", the leak direction).
+    std::function<bool(const ast::Expr*, std::size_t)>
+        functionValueParamNonEscaping;
     // fix #6057 (§27.6 / §28.9, v0.338): "does this method reference take
     // its own reference on its receiver's box?" — the Emitter's
     // `methodRefRetainsBoxReceiver`. Left empty in phase 1.
@@ -53609,64 +53617,59 @@ struct BoxEscapeWalker {
                 slotWritten = true;
     }
 
-    // fix #9206 (§28.3.8 clause 3 / §28.1 / §28.9 / §8.6, v0.359): is the
-    // argument at `i` a CALL-BOUNDED BORROW because the CALLEE at this call
-    // site is a FUNCTION VALUE whose parameter slot at that position is PLAIN?
+    // fix #9206 + fix-forward #9206 (§28.3.8 / §28.11 / §28.1 / §28.9 / §8.6,
+    // v0.359): is the argument at `i` a CALL-BOUNDED BORROW because the
+    // CALLEE at this call site is a FUNCTION VALUE that provably does not let
+    // its parameter at that position outlive the call?
     //
-    // THE DEFECT (issue #9206). A RECORD implementing an interface, boxed
-    // into an interface-typed local (`var ih: IHx := r;`), whose FUNCTION-
-    // typed property is read through the interface and CALLED with the
-    // interface itself as the argument (`ih.P(ih)`), leaked the 24-byte §8.6
-    // interface box — one per boxing, unbounded. MEASURED on r30-c1 @
-    // 7fe91b2b7 (`bezelc --sanitize=address`, 200 iterations):
-    // "Direct leak of 4800 byte(s) in 200 object(s) allocated from: #1 in
-    // main" — the box the §8.6 conversion minted.
+    // THE DEFECT (issue #9206). A box minted into an `Object`/interface local
+    // (`var b: Object := i;`, `var ih: IHx := r;`) and passed as a plain
+    // positional argument to a FUNCTION VALUE (`f(b)`) leaked: this walker's
+    // `walkArgs` marks every argument an ESCAPE unless an admitted predicate
+    // says otherwise, an escape keeps the local out of `boxReleaseEligible_`,
+    // and no predicate read a function-value callee (`userCallArgNonEscaping`
+    // needs a `sema::MethodSymbol`). MEASURED: 4800 B / 200 allocations over
+    // 200 iterations, one 24-byte §8.6 box per boxing.
     //
-    // THE CAUSE. This walker's `walkArgs` marks a call argument as an ESCAPE
-    // unless one of its admitted predicates says otherwise, and an escape
-    // keeps the tracked local out of `boxReleaseEligible_` — so the local's
-    // scope-end `bz_box_release` is never emitted and NOBODY ever releases
-    // the box. The admitted predicates were: two stdlib callees, a §12.7-
-    // narrowed read, the `Equals` twin, and `userCallArgNonEscaping` — the
-    // last of which reads a USER METHOD's body (§6149). A FUNCTION-VALUE
-    // callee had no predicate at all: `plainLocalUserCallee` needs a
-    // `sema::MethodSymbol`, and a property read (or a local of function type)
-    // is not one. So the gap was not a decision but a hole.
+    // WHY THE CALLEE MUST BE READ (the fix-forward). A plain function-type
+    // parameter slot is a borrow (§28.1), and a borrow of a plain parameter
+    // may be STORED by the callee — into a borrowing collection (§28.11's
+    // store rule) or a field (§28.3.8 clause 2) — under §28.3.8 clause 3's
+    // trust clause, whose named safety net is K4.1's checked-disposal
+    // backstop. A runtime-managed box (§28.9) has no disposed flag, so that
+    // backstop does not exist for it (issue #9219, open): releasing the box
+    // at the local's scope end while a stored slot still names it is a
+    // heap-use-after-free, not a `DisposedAccessException`. MEASURED on the
+    // first version of this fix, which admitted EVERY plain argument to
+    // EVERY function-value callee: `lambda(x: Object) => do a.Add(x); ...`
+    // into a captured `Array<Object>`, and the same store into a captured
+    // object's field, each read after the loop, SEGV in `bz_string_release`
+    // where the base only leaked. So, like the method arm (#2952 / #6149,
+    // which reads the callee's body), the box is admitted only when the
+    // function value's BODY is known and does not let the parameter escape.
     //
-    // THE RULE. §28.1 (v0.359): a function-type parameter slot may carry
-    // `owned`, and "the modifier is part of the function type's identity" —
-    // so a PLAIN slot is a BORROW and an `owned` slot TAKES the value. §28.3.8
-    // (v0.359) clause 3, *The residual*: "The caller's check reads only the
-    // callee's signature ... a borrow of a scope-bound local, passed to a
-    // plain parameter that the callee stores ... is admitted at the call, for
-    // a local, virtual, interface or imported callee alike. Neither source is
-    // lifetime-extended: the temporary is disposed at its K8 boundary and the
-    // local at its scope's end." A function value's plain parameter slot IS
-    // that signature, and nothing in §28.3.8 turns on whether the callee's
-    // body is in this module — the callee may STORE the borrow (the K4.3
-    // trust clause, §28.11's borrowing-collection store rule admits a
-    // parameter-sourced borrow the same way), but the CALLER's local is
-    // released at its scope's end all the same. §28.9 (v0.359): the box is
-    // runtime-managed, so its reference must be dropped exactly once; §8.6
-    // (v0.359): the box the conversion minted is the local's to reclaim.
-    //
-    // THE GATES (it fails CLOSED — an unreadable shape stays an ESCAPE, a
-    // leak, never an early release and never a double free):
-    //   * the callee must not be a METHOD: a method callee is the
-    //     `userCallArgNonEscaping` arm's business (it reads the callee's
-    //     body, §6149), and this rule is about the callee whose body the
-    //     compiler CANNOT read;
-    //   * the callee's resolved type must be a FUNCTION type, and the slot at
-    //     that position must carry NO modifier — a plain slot is a borrow, an
-    //     `owned` slot takes the value (§28.1), and a `ref`/`out` slot is an
-    //     alias, not a pass (§22.3);
+    // THE GATES (it fails CLOSED — an unproven shape stays an ESCAPE, a leak,
+    // never an early release and never a double free):
+    //   * the callee must not be a METHOD: the `userCallArgNonEscaping` arm
+    //     owns that one;
+    //   * the callee's resolved type must be a FUNCTION type whose slot at
+    //     that position carries NO modifier — an `owned` slot takes the value
+    //     (§28.1), a `ref`/`out` slot is an alias, not a pass (§22.3);
     //   * the argument must be a POSITIONAL, unmodified pass: a named or
     //     discarded argument is not a parameter pass, and a `move`d argument
-    //     TRANSFERS the value (§28.8.1), so the caller owns nothing after.
+    //     TRANSFERS the value (§28.8.1);
+    //   * `functionValueParamNonEscaping` must PROVE the function value's
+    //     body non-escaping for that parameter (a lambda literal, or a local
+    //     bound once to a lambda literal or a method group — see
+    //     `Emitter::functionValueCalleeParamNonEscaping`). Every OPAQUE
+    //     function value — a parameter, a field, a property read, a call's
+    //     result, a reassigned local — answers "escapes": the spec does not
+    //     decide the box's fate when an unreadable callee stores it (#9219),
+    //     so the pre-fix leak is kept there.
     bool functionValueArgNonEscaping(const ast::Expr* callee,
                                      const std::vector<ast::CallArgument>& args,
                                      std::size_t i) {
-        if (!callee) return false;
+        if (!callee || !functionValueParamNonEscaping) return false;
         if (dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*callee)))
             return false;
         const sema::TypeRef* ft = ctx.exprType(*callee);
@@ -53677,7 +53680,7 @@ struct BoxEscapeWalker {
         if (!args[i].name.empty() || args[i].isDiscard ||
             !args[i].modifier.empty())
             return false;
-        return true;
+        return functionValueParamNonEscaping(callee, i);
     }
 
     void walkArgs(const ast::Expr* callee,
@@ -54488,6 +54491,14 @@ void Emitter::collectBoxReleaseEligible(
                const std::vector<ast::CallArgument>& args, std::size_t i) {
             return boxArgToUserCallNonEscaping(callee, args, i);
         };
+    // fix-forward #9206 (§28.3.8 / §28.11, v0.359): the function-value
+    // callee's body proof, read over THIS body (a local bound to a lambda
+    // literal is admitted only when this body declares it and never writes
+    // it). Both passes read it, so pass 2 stays a superset of pass 1.
+    const auto boxFnValueArg =
+        [this, &body](const ast::Expr* callee, std::size_t i) {
+            return functionValueCalleeParamNonEscaping(callee, i, body);
+        };
     const std::size_t aliasRounds =
         std::min<std::size_t>(candidates.size(), 8u);
     for (std::size_t round = 0; round < aliasRounds; ++round) {
@@ -54513,6 +54524,7 @@ void Emitter::collectBoxReleaseEligible(
                            isSynthesizedIEquatableEquals(ms, rt->declaration);
                 };
             w.userCallArgNonEscaping = boxUserArg;   // fix #6149
+            w.functionValueParamNonEscaping = boxFnValueArg;  // #9206
             // Round 0 reads an EMPTY map, which disables the relaxation
             // everywhere and reproduces the pre-#6309 verdicts exactly; later
             // rounds read the previous round's.
@@ -54552,6 +54564,7 @@ void Emitter::collectBoxReleaseEligible(
             };
         w.boxAliasBorrowTargets = &boxAliasBorrowTargets;   // fix #6309
         w.userCallArgNonEscaping = boxUserArg;               // fix #6149
+        w.functionValueParamNonEscaping = boxFnValueArg;     // #9206
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         bool hasManagedBox =
             isPlusOneBoxProducer(ld) || w.sawBoxAssignment;

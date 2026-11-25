@@ -14229,6 +14229,13 @@ private:
     bool boxArgToUserCallNonEscaping(
         const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
         std::size_t i);
+    // fix-forward #9206 (§28.3.8 / §28.11 / §28.9, v0.359): the FUNCTION
+    // VALUE `callee` evaluates to provably keeps nothing of its parameter at
+    // `i` past the call (a lambda literal, or a local of `body` bound once to
+    // a lambda literal or a method group); false for every opaque value.
+    bool functionValueCalleeParamNonEscaping(
+        const ast::Expr* callee, std::size_t i,
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
     // fix #5855 (v0.357): a record argument boxed into a non-generic callee's
     // non-escaping `Object`/interface parameter.
     bool boxedRecordArgNonEscaping(

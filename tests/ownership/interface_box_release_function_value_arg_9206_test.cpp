@@ -32,9 +32,23 @@
 //     a local, virtual, interface or imported callee alike. Neither source is
 //     lifetime-extended: the temporary is disposed at its K8 boundary and the
 //     local at its scope's end." The callee may STORE the borrow (the K4.3
-//     trust clause); the CALLER's local is released at its scope's end all the
-//     same, and nothing in that sentence turns on whether the callee's body is
-//     in this module.
+//     trust clause), and the clause names K4.1's checked-disposal backstop as
+//     the safety net for a later access through the stored borrow.
+//
+// THE FIX-FORWARD. A runtime-managed box has no disposed flag, so that
+// backstop does not exist for it (#9219, open): releasing a box a callee
+// STORED is a heap-use-after-free, not a `DisposedAccessException`. The first
+// version of this fix released the box for EVERY function-value callee and
+// crashed the two store rows at the end of this file (ASan SEGV). The box is
+// now released only when the function value's BODY is known and keeps nothing
+// of the parameter: a lambda literal, or a local bound once to a lambda
+// literal or a method group. Every OPAQUE function value (a parameter, a
+// field, a property read, a call result, a reassigned local) keeps the
+// pre-fix leak, because the spec does not decide what protects a box an
+// unreadable callee stores — including the issue's own `ih.P(ih)` shape,
+// whose callee is an interface property read. That shape has NO row here: it
+// stays a memory-safe leak until #9219 is ruled, and its program is parked as
+// corpus candidate 9206-opaque-callee.bzl (expected after #9219: no leak).
 //
 // THE ORACLES. `runAotChecked` compiles the program with the generated-code
 // ASan pass and runs it, so a leak (the bug) and a double free / use-after-
@@ -44,15 +58,15 @@
 // THE FUNCTION VALUE'S SOURCE. The issue's own property creates a FRESH
 // lambda per read, and a slot-dispatched read of a function-typed property
 // leaks that closure too (issue #9175, a separate defect in the same
-// program family, fixed on a separate branch). The rows below therefore take
+// program family, fixed on a separate branch). The controls below therefore take
 // the function value from a `static readonly` field — the same interface, the
-// same function-typed property, the same `ih.P(ih)` call — so this file pins
+// same function-typed property, the same property read — so this file pins
 // the BOX leak alone. The static field draws one §22.12 rule 4 warning (a
 // function-typed static is reachable from every domain); it is not the
 // subject of any row here.
 //
-// The first row is the same mechanism without a static: the interface local is
-// passed as an argument to a LOCAL function value.
+// The first row is the issue's mechanism with a callee whose body IS known:
+// the interface local is passed as an argument to a LOCAL function value.
 
 #include <string>
 
@@ -61,36 +75,11 @@
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
+using bezel::test::runAotCheckedLenient;
 
 namespace {
 
-// The issue's own program, with the property's function value taken from a
-// static field (see THE FUNCTION VALUE'S SOURCE above). 200 iterations, so
-// the box leak is 200 * 24 B.
-const char* kIssueShape =
-    "module M;\n"
-    "public interface IHx\n"
-    "  readonly property P: (IHx) -> int;\n"
-    "end IHx;\n"
-    "public record Rx: IHx\n"
-    "  public static readonly _f: (IHx) -> int := lambda(x: IHx) => 1;\n"
-    "  public property P: (IHx) -> int => _f;\n"
-    "  public constructor() end constructor;\n"
-    "end Rx;\n"
-    "public class Program\n"
-    "  public static method Main(): int\n"
-    "    var t := 0;\n"
-    "    for var i in 0 ..< 200 do\n"
-    "      var r := new Rx();\n"
-    "      var ih: IHx := r;\n"
-    "      t := t + ih.P(ih);\n"
-    "    end for;\n"
-    "    Console.WriteLine(t);\n"
-    "    return 0;\n"
-    "  end Main;\n"
-    "end Program;\n";
-
-// The same mechanism with a LOCAL function value as the callee: the
+// The issue's mechanism with a LOCAL function value as the callee: the
 // interface-typed local holding the box is passed as the argument.
 const char* kLocalFunctionValue =
     "module M;\n"
@@ -176,6 +165,89 @@ const char* kControlClassReceiver =
 
 // The strict oracle: no leak (the bug), no double free / use-after-free (an
 // over-release), the printed total, and a zero exit code.
+// fix-forward #9206: the provable callee arms beyond the local lambda.
+const char* kLambdaLiteralInPlace =
+    "module M;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var t := 0;\n"
+    "    for var i in 0 ..< 200 do\n"
+    "      var b: Object := i;\n"
+    "      t := t + (lambda(x: Object) => 1)(b);\n"
+    "    end for;\n"
+    "    Console.WriteLine(t);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+const char* kMethodGroupLocal =
+    "module M;\n"
+    "public class Program\n"
+    "  static method G(o: Object): int => 1;\n"
+    "  public static method Main(): int\n"
+    "    var t := 0;\n"
+    "    var f: (Object) -> int := G;\n"
+    "    for var i in 0 ..< 200 do\n"
+    "      var b: Object := i;\n"
+    "      t := t + f(b);\n"
+    "    end for;\n"
+    "    Console.WriteLine(t);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+// fix-forward #9206: a function value that STORES its argument. The first
+// version of this fix released the box at the caller's scope end here too,
+// and the later read of the stored slot was a heap-use-after-free (ASan SEGV
+// in `bz_string_release`); the base only leaked.
+const char* kLambdaStoresIntoCapturedArray =
+    "module M;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var a := new Array<Object>();\n"
+    "    var f: (Object) -> int := lambda(x: Object) => do a.Add(x); return 1; end;\n"
+    "    for var i in 0 ..< 200 do\n"
+    "      var b: Object := i;\n"
+    "      var u := f(b);\n"
+    "    end for;\n"
+    "    Console.WriteLine(a.Count);\n"
+    "    Console.WriteLine(a[0].ToString());\n"
+    "    Console.WriteLine(a[199].ToString());\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+const char* kLambdaStoresIntoCapturedField =
+    "module M;\n"
+    "public class Slot\n"
+    "  public _o: Object? := null;\n"
+    "  public constructor() end constructor;\n"
+    "end Slot;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var s := new Slot();\n"
+    "    var f: (Object) -> int := lambda(x: Object) => do s._o := x; return 1; end;\n"
+    "    for var i in 0 ..< 200 do\n"
+    "      var b: Object := i;\n"
+    "      var u := f(b);\n"
+    "    end for;\n"
+    "    var o2 := s._o;\n"
+    "    if o2 <> null then Console.WriteLine(o2.ToString()); end if;\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+// A STORED box must stay alive and read back its own value: ASan on (a
+// use-after-free or a double free flips `r.ran`), LeakSanitizer off — what
+// protects a box an unreadable or storing callee keeps is #9219's open spec
+// question, so the box a store keeps is allowed to leak here.
+void expectMemorySafe(const char* src, const char* out) {
+    JitResult r = runAotCheckedLenient(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string(out));
+}
+
 void expectClean(const char* src, const char* out) {
     JitResult r = runAotChecked(src);
     BEZEL_EXPECT_TRUE(r.ran);
@@ -185,16 +257,8 @@ void expectClean(const char* src, const char* out) {
 
 }  // namespace
 
-// The issue's own shape: a record boxed into an interface-typed local, whose
-// FUNCTION-typed property is read through that interface and called with the
-// interface itself as the argument. The 24-byte box must be released at the
-// local's scope end.
-BEZEL_TEST(interface_box_release_function_value_arg_9206,
-           spec_28_3_8_interface_box_passed_to_a_function_value_is_released) {
-    expectClean(kIssueShape, "200\n");
-}
-
-// The same mechanism with a local function value as the callee.
+// The issue's mechanism with a local function value as the callee: the
+// 24-byte box must be released at the local's scope end.
 BEZEL_TEST(interface_box_release_function_value_arg_9206,
            spec_28_3_8_interface_box_passed_to_a_local_function_value_is_released) {
     expectClean(kLocalFunctionValue, "200\n");
@@ -211,4 +275,33 @@ BEZEL_TEST(interface_box_release_function_value_arg_9206,
 BEZEL_TEST(interface_box_release_function_value_arg_9206,
            spec_28_9_control_the_class_receiver_twin_has_no_box) {
     expectClean(kControlClassReceiver, "200\n");
+}
+
+// fix-forward #9206 — a lambda literal called in place: its body is read, it
+// keeps nothing of `x`, so the box is released at the local's scope end.
+BEZEL_TEST(interface_box_release_function_value_arg_9206,
+           spec_28_3_8_box_passed_to_a_lambda_literal_in_place_is_released) {
+    expectClean(kLambdaLiteralInPlace, "200\n");
+}
+
+// fix-forward #9206 — a local bound once to a METHOD GROUP: the method's body
+// is read (the #2952 summary), so the box is released.
+BEZEL_TEST(interface_box_release_function_value_arg_9206,
+           spec_28_3_8_box_passed_to_a_method_group_local_is_released) {
+    expectClean(kMethodGroupLocal, "200\n");
+}
+
+// fix-forward #9206 — the lambda STORES `x` into a captured `Array<Object>`
+// (§28.11's store rule admits it under §28.3.8 clause 3's trust clause), and
+// the array is read after the loop. The box must not be released under it.
+BEZEL_TEST(interface_box_release_function_value_arg_9206,
+           spec_28_11_box_a_function_value_stores_in_a_collection_stays_alive) {
+    expectMemorySafe(kLambdaStoresIntoCapturedArray, "200\n0\n199\n");
+}
+
+// fix-forward #9206 — the lambda STORES `x` into a field of a captured object
+// (§28.3.8 clause 2), read after the loop.
+BEZEL_TEST(interface_box_release_function_value_arg_9206,
+           spec_28_3_8_box_a_function_value_stores_in_a_field_stays_alive) {
+    expectMemorySafe(kLambdaStoresIntoCapturedField, "199\n");
 }
