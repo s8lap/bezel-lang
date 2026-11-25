@@ -22008,6 +22008,13 @@ void Emitter::collectClosureArgBodyIdentifiers(
 static bool forwardedArgPositionIsCallBounded(
         const sema::SemaContext& ctx, const ast::CallExpr& c, std::size_t i,
         int depth);
+// fix #9222 (§22.3 / §28.3.8 / §28.9 / §28.14, v0.359): the by-ref FORWARD
+// test — may the formal be handed on to another `ref`/`out` function-typed
+// formal? (declared here and defined after the walk below, which calls it,
+// and which the definition calls back for the recursion.)
+static bool forwardedArgPositionIsRefFormal(const sema::SemaContext& ctx,
+                                            const ast::CallExpr& c,
+                                            std::size_t i, int depth);
 // fix #8933: the walk driver, with the forwarding chain depth (the public
 // entry point below starts it at 0).
 static bool bodyWalkAllowsForwarding(const sema::SemaContext& ctx,
@@ -22064,6 +22071,19 @@ struct FormalInvocationOnlyWalk {
     // dynamic function-value storage field (needs `ctx`). See
     // calleeBodyUsesFormalOnlyByInvocationInspectionOrFnvalFieldStore.
     bool allowFnvalFieldStore = false;
+    // fix #9222 (§22.3 / §28.3.8 / §28.9, v0.359): the REF-FORMAL mode. The
+    // walk then judges a `ref`/`out` FUNCTION-TYPED formal, whose position is
+    // CALLER STORAGE (§28.3.8, *A `ref` or plain `out` location outlives the
+    // call*) rather than a plain call-bounded parameter: the callee may WRITE
+    // the location, so the formal's VALUE is not the caller's any more, and
+    // the two admissions this mode adds are the ones §28.3.8 allows — a
+    // FORWARD to another `ref`/`out` function-typed formal (the forwarded
+    // callee writes the same caller storage) and nothing else. A WRITE of the
+    // formal stays DECLINED (the displacing store is #9111's subject), and
+    // every retention shape (a field / collection / `Object`-typed holder
+    // store, a return, an escaping capture, a read into a callee-local)
+    // stays declined, exactly as the plain walk declines it.
+    bool refFormalMode = false;
     // fix #8933: the depth of the forwarding chain already walked (a cycle
     // in the call graph must not recurse forever; the limit fails closed).
     int forwardDepth = 0;
@@ -22194,7 +22214,17 @@ struct FormalInvocationOnlyWalk {
                 (lambdaDepth == 0 || captureRelaxed) &&
                 (isFormalArg ||
                  (lambdaDepth == 0 && isAliasIdentifier(a.value.get()))) &&
-                forwardedArgPositionIsCallBounded(*ctx, c, i, forwardDepth)) {
+                (forwardedArgPositionIsCallBounded(*ctx, c, i, forwardDepth) ||
+                 // fix #9222 (§22.3 / §28.3.8, v0.359): the by-ref forward —
+                 // a `ref`/`out` function-typed formal handed to another
+                 // `ref`/`out` function-typed formal. §28.3.8: the location
+                 // is CALLER STORAGE, so the forwarded callee writes the same
+                 // location and the value stays in the caller's scope. The
+                 // forwarded callee is held to the SAME discipline
+                 // (recursively), so a chain of by-ref forwards keeps nothing
+                 // past the call.
+                 (refFormalMode &&
+                  forwardedArgPositionIsRefFormal(*ctx, c, i, forwardDepth)))) {
                 // fix #8953: the reference is a CAPTURE the closure holds.
                 if (isFormalArg && captureRelaxed) ++formalAdmitCount;
                 continue;  // #8933: the formal is forwarded to a
@@ -22906,6 +22936,198 @@ static bool forwardedArgPositionIsCallBounded(
         }
     }
     return true;
+}
+
+
+// fix #9222 (§22.3 / §28.3.8 / §28.9 / §28.14, v0.359): the by-ref BODY WALK
+// (defined below) — does the callee's body keep nothing of its `ref`/`out`
+// function-typed formal past the call?
+static bool refFormalBodyKeepsNothing(const sema::SemaContext& ctx,
+                                      const ast::MethodDecl& md,
+                                      std::string_view name, int depth);
+
+// fix #9222 (§22.3 / §28.3.8 / §28.9 / §28.14, v0.359): the by-ref FORWARD
+// — is argument `i` of `c` a hand-off of the caller's `ref`/`out`
+// FUNCTION-TYPED location to another `ref`/`out` function-typed formal?
+//
+// §28.3.8 (v0.359), *A `ref` or plain `out` location outlives the call*: the
+// location "is caller storage" — the callee may store into it, and the value
+// it holds is the CALLER's to release. A hand-off to a second by-ref formal
+// is therefore not a RETENTION: the second callee writes the SAME caller
+// storage, and the value never leaves the caller's scope.
+//
+// The forwarded callee is held to the SAME discipline (the by-ref body walk,
+// recursively), so a chain of by-ref forwards keeps nothing past the call. The
+// return slot is NOT constrained here (the value cannot travel back through a
+// by-ref location: §28.3.8's `ref` location carries "the set it carried
+// before the call" on the call's normal return).
+//
+// Every clause fails closed: a non-method callee (a call through a FUNCTION
+// VALUE has no body to walk and no by-ref formal to name), an imported,
+// virtual, abstract, override or async callee, a named / defaulted /
+// discarded argument, a formal that is not `ref`/`out`, a formal whose
+// declared type is not a function type, and a call-graph cycle all answer
+// false — a declined forward leaves the argument an escape (a leak, never an
+// early release).
+static bool forwardedArgPositionIsRefFormal(const sema::SemaContext& ctx,
+                                            const ast::CallExpr& c,
+                                            std::size_t i, int depth) {
+    if (depth > 8) return false;
+    if (i >= c.args.size() || !c.args[i].value) return false;
+    // The forwarded ARGUMENT itself: it carries the by-ref MARKER at the call
+    // site (`Peek2(ref x)`), and it is neither named nor discarded.
+    const ast::CallArgument& a = c.args[i];
+    if (a.modifier != "ref" && a.modifier != "out") return false;
+    if (!a.name.empty() || a.isDiscard) return false;
+    if (!c.callee) return false;
+    // The METHOD branch — a function-value callee has no body to walk, and a
+    // function type's own parameter list cannot name a `ref`/`out` formal
+    // (§28.3.8's by-ref positions are a DECLARATION-site discipline), so a
+    // call through a function value declines.
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*c.callee));
+    if (!ms || ms->isOperator || ctx.isImported(ms)) return false;
+    // SEAM-ACCESSOR: the imported case is declined on the line above; this
+    // AST read is reached only for a locally compiled callee.
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md) return false;
+    // A virtual / abstract / override callee may be overridden at runtime
+    // with a body that stores the value; an `async` callee mints a
+    // deferred-activation frame that may hold it past the call
+    // (§28.14 *Call-bounded × deferred activation*).
+    for (auto mod : md->modifiers)
+        if (mod == "async" || mod == "virtual" || mod == "abstract" ||
+            mod == "override")
+            return false;
+    // POSITIONAL, exact arity — the only shape in which the syntactic index
+    // is the PARAMETER index.
+    if (c.args.size() != md->params.size() || i >= md->params.size())
+        return false;
+    for (const auto& arg : c.args)
+        if (!arg.name.empty() || arg.isDiscard) return false;
+    const ast::Param& p = md->params[i];
+    if (p.modifier != "ref" && p.modifier != "out") return false;
+    // The formal must be FUNCTION-TYPED — §28.3.8's by-ref location is
+    // "a function-typed holder" only for a function-typed declared type.
+    if (!p.type || !resolvedFormalIsFunction(*p.type, ctx)) return false;
+    // RECURSE: the forwarded callee's own body must keep nothing past ITS
+    // call (the by-ref body walk).
+    return refFormalBodyKeepsNothing(ctx, *md, p.name, depth + 1);
+}
+
+
+// fix #9222 (§22.3 / §28.3.8 / §28.9, v0.359): the by-ref BODY WALK — does the
+// callee's body keep nothing of its `ref`/`out` function-typed formal past the
+// call?
+//
+// It is the plain walk (FormalInvocationOnlyWalk) in its REF-FORMAL mode: the
+// admitted uses of the formal are an INVOCATION, a `null` / `is` INSPECTION,
+// and a FORWARD to another `ref`/`out` function-typed formal. A WRITE of the
+// formal is NOT admitted (§28.3.8 lets the callee write the location, but the
+// displacing store replaces the caller's value, and the reference the
+// displaced value carried is #9111's subject), and neither is a retention
+// (a field / collection / `Object`-typed holder store, a return, a capture by
+// an escaping closure, a read into a callee-local) — each of those DECLINES,
+// which leaves the argument an escape: a leak, never an early release.
+//
+// A capture by a closure that does NOT escape the callee IS admitted (the
+// same #8953 admission the plain walk uses): such a closure borrows the
+// caller's storage and is disposed at the callee's own scope end, before the
+// caller's scope-end release, so it holds nothing past the call.
+static bool refFormalBodyKeepsNothing(const sema::SemaContext& ctx,
+                                      const ast::MethodDecl& md,
+                                      std::string_view name, int depth) {
+    if (depth > 8) return false;
+    if (name.empty()) return false;
+    for (auto mod : md.modifiers)
+        if (mod == "virtual" || mod == "abstract" || mod == "override")
+            return false;
+    FormalInvocationOnlyWalk w{name};
+    w.allowInspection = true;
+    // The forwarding admission, with the sema context the proof needs to
+    // resolve the forwarded callee.
+    w.allowForwarding = true;
+    w.refFormalMode = true;
+    w.ctx = &ctx;
+    w.forwardDepth = depth;
+    // The CAPTURE admission — a closure that captures the formal and does not
+    // escape the callee (the #8953 admission).
+    w.allowCaptureClosure = true;
+    w.md = &md;
+    if (md.bodyKind == ast::MethodBodyKind::Expression) {
+        if (!md.exprBody) return false;
+        w.expr(md.exprBody.get());
+    } else if (md.bodyKind == ast::MethodBodyKind::Block) {
+        w.stmts(md.stmts);
+    } else {
+        return false;
+    }
+    return w.ok;
+}
+
+
+// fix #9222 (§22.3 / §28.3.8 / §28.9 / §28.14, v0.359): the caller's verdict
+// on a `ref`/`out` FUNCTION-TYPED argument position. See the declaration in
+// LlvmBackend_impl.hpp for the argument and for the shape of the proof.
+//
+// THE CALLER'S SIDE OF §22.3. A `ref` argument is an ALIAS: the location is
+// the caller's, and the value in it stays the caller's to release (§28.3.8).
+// The callee's use of the formal never takes the value's ownership out of the
+// caller's scope — provided the callee keeps nothing of it past the call,
+// which is what the body walk proves. The caller's local then holds exactly
+// the producer's one reference at its scope end, and the scope-end release
+// drops it — the same accounting the BY-VALUE twin already has (§28.14's
+// call-bounded default), which is why the two spellings must not differ.
+//
+// WITHOUT THIS, THE LOCAL'S SCOPE-END RELEASE IS NEVER ARMED: the closure
+// escape walk classifies every by-ref argument position as an ESCAPE (the
+// §28.14 call-bounded premise does not hold for a by-ref formal — the callee
+// may WRITE it), so the local's own +1 is never dropped and the closure
+// leaks, 64 B per call (MEASURED on r30-c1 @ 9ff2f909f: the issue's own
+// program, `Peek(ref f)` where `Peek` never calls `x`, leaks
+// "64 byte(s) in 1 allocation(s)" under `bezelc --sanitize=address`; the
+// BY-VALUE twin is clean).
+bool closureRefArgKeepsNothingPastCall(const sema::SemaContext& ctx,
+                                        const ast::CallExpr& call,
+                                        std::size_t ai) {
+    if (!call.callee) return false;
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*call.callee));
+    if (!ms || ms->isOperator || ctx.isImported(ms)) return false;
+    // SEAM-ACCESSOR: the imported case is declined on the line above; this
+    // AST read is reached only for a locally compiled callee.
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md) return false;
+    // A virtual / abstract / override callee may be overridden at runtime with
+    // a body that keeps the value; an `async` callee (or one whose body
+    // yields) mints a deferred-activation frame that may hold it past the
+    // call (§28.14 *Call-bounded × deferred activation*).
+    for (auto mod : md->modifiers)
+        if (mod == "async" || mod == "virtual" || mod == "abstract" ||
+            mod == "override")
+            return false;
+    // POSITIONAL, exact arity — the only shape in which the syntactic index
+    // is the PARAMETER index. A named (`Identifier :=`) or defaulted call is
+    // not reordered here the way buildOrderedArgs reorders it at lowering
+    // time, so it is declined rather than guessed at.
+    if (call.args.size() != md->params.size() || ai >= md->params.size())
+        return false;
+    for (std::size_t j = 0; j < call.args.size(); ++j) {
+        const ast::CallArgument& a = call.args[j];
+        if (!a.name.empty() || a.isDiscard) return false;
+        // The argument at `ai` carries the by-ref MARKER at the call site
+        // (`Peek(ref f)`); every OTHER argument must be unmarked, so that the
+        // positional mapping is the syntactic one.
+        if (j == ai) {
+            if (a.modifier != "ref" && a.modifier != "out") return false;
+        } else if (!a.modifier.empty()) {
+            return false;
+        }
+    }
+    const ast::Param& p = md->params[ai];
+    if (p.modifier != "ref" && p.modifier != "out") return false;
+    // The formal must be FUNCTION-TYPED — §28.3.8's by-ref location is "a
+    // function-typed holder" only for a function-typed declared type.
+    if (!p.type || !resolvedFormalIsFunction(*p.type, ctx)) return false;
+    return refFormalBodyKeepsNothing(ctx, *md, p.name, /*depth=*/0);
 }
 
 

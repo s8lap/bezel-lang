@@ -1098,6 +1098,62 @@ bool calleeBodyUsesFormalOnlyByInvocationInspectionOrForwarding(
 bool resolvedFormalIsFunction(const ast::Type& t,
                               const sema::SemaContext& ctx);
 
+// fix #9222 (§22.3 / §28.3.8 / §28.9 / §28.14, v0.359): true when argument
+// `ai` of `call` binds a `ref`/`out` formal whose DECLARED type is a function
+// type, and the callee provably keeps NOTHING of the value past the call.
+//
+// WHY A `ref`/`out` ARGUMENT IS A BORROW AND NOT AN ESCAPE. §22.3 (v0.359):
+// "A `ref` argument naming a mutable local or writable field is a true alias:
+// callee writes are visible through the caller's location immediately." §28.3.8
+// (v0.359), *A `ref` or plain `out` location outlives the call*: the location
+// "is caller storage" — "Where the location's declared type is a function type
+// it is also a function-typed holder, so a function value stored there is
+// admitted only capture-free." So the CALLEE's use of the formal never takes
+// the value's ownership out of the caller's scope: the location is the
+// caller's, and the value in it is released by the CALLER's own scope-end
+// release (§28.9: the closure object is runtime-managed, and the local's own
+// reference must be dropped exactly once). §28.14 (v0.359)'s call-bounded
+// default says the same for a plain function-typed formal — the callee holds
+// the callback "for the duration of the call only" — and this predicate is the
+// `ref`/`out` spelling of that same discipline.
+//
+// WHAT THE PREDICATE PROVES, AND HOW IT FAILS CLOSED. A `ref`/`out` formal is
+// NOT automatically call-bounded: the callee may WRITE it (§22.3), and §28.14's
+// obligations are not enforced for a by-ref formal (measured on r30-c1
+// @ 9ff2f909f: a `ref` function-typed formal may be stored into a field, a
+// collection, an `Object`-typed holder, returned, or captured by a closure —
+// every shape §28.14 rejects for a PLAIN function-typed formal). So the
+// predicate admits a position only when the callee's OWN BODY keeps nothing of
+// the formal past the call — the same fail-closed body walk the plain
+// function-typed formal's relief uses (calleeBodyUsesFormalOnly... in
+// LlvmBackend_Calls2.cpp), extended with the two by-ref admissions §28.3.8
+// admits and the others do not:
+//
+//   * an INVOCATION of the formal, and a `null` / `is` INSPECTION of it
+//     (§28.14's first two admitted uses; neither keeps a reference);
+//   * a FORWARD to another `ref`/`out` function-typed formal (§28.3.8: the
+//     forwarded callee writes the SAME caller storage, so the value stays in
+//     the caller's scope) — the forwarded callee is held to the same
+//     discipline, recursively.
+//
+// A WRITE of the formal is NOT admitted: the callee's displacing store
+// replaces the caller's value, and the reference the displaced value carried
+// is #9111's subject (the caller mints the reference a function-typed
+// `ref`/`out` slot lacks), not this predicate's. A store of the formal into a
+// field / collection / `Object`-typed holder, a RETURN of it, a CAPTURE of it
+// by a closure that escapes the callee, a read of it into a callee-local, and
+// every unrecognised shape DECLINE — a declined position leaves the argument
+// an escape, which leaks the closure (the safe direction) and never releases
+// it early.
+//
+// Every clause fails closed: an imported, virtual, abstract, override, async
+// or operator callee, a generic callee whose body is the unsubstituted
+// template, a named / defaulted / discarded argument, a callee with no
+// compilable body, and a call-graph cycle all answer false.
+bool closureRefArgKeepsNothingPastCall(const sema::SemaContext& ctx,
+                                        const ast::CallExpr& call,
+                                        std::size_t ai);
+
 // fix #6075 (§12.1 / §14.1 / §27.8, v0.338): the type arguments of a generic
 // BASE, bound to the base's type-parameter names. `class G<T>` with a virtual
 // member over `T` (or over a type CONTAINING `T`: `Array<T>`, `Stack<T?>`),

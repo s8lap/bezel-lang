@@ -43289,6 +43289,41 @@ struct ClosureEscapeWalker {
                 if (!safeArg && argIsTarget(c->args[ai].value.get()) &&
                     closureArgBindsFunctionValueCallBoundedParam(ctx, *c, ai))
                     safeArg = true;
+                // fix #9222 (§22.3 / §28.3.8 / §28.9 / §28.14, v0.359): the
+                // BY-REF twin of the arm above. A `ref`/`out` argument
+                // position is not an ESCAPE either: §22.3's `ref` argument is
+                // "a true alias" of the caller's location and §28.3.8's *A
+                // `ref` or plain `out` location outlives the call* makes that
+                // location CALLER STORAGE — the value in it is the caller's to
+                // release, so the local's scope-end release (the drop of the
+                // local's own +1 on the closure cell, §28.9) must stay
+                // armed, exactly as it is for the BY-VALUE twin.
+                //
+                // THE DEFECT THIS RELIEVES. The §28.14 call-bounded premise
+                // above does not hold for a by-ref formal — the callee may
+                // WRITE it — so the position stayed an ESCAPE, the local's
+                // scope-end release was never armed, and the closure leaked
+                // 64 B per call. MEASURED on r30-c1 @ 9ff2f909f, the issue's
+                // own program (`Peek(ref f)`, the callee never calling `x`):
+                // "64 byte(s) leaked in 1 allocation(s)" under
+                // `bezelc --sanitize=address`; the BY-VALUE twin
+                // (`G(f)`, `G(y: () -> int)`) is clean.
+                //
+                // THE PREMISE IS NOT THE MODIFIER. A `ref` formal is not
+                // automatically call-bounded: §28.14's obligations are not
+                // enforced for a by-ref formal (MEASURED on r30-c1: such a
+                // formal may be stored into a field, a collection, an
+                // `Object`-typed holder, returned, or captured by a closure —
+                // every shape §28.14 rejects for a PLAIN function-typed
+                // formal), and a callee that RETAINS the value would make the
+                // caller's scope-end release an EARLY release. So the relief
+                // is admitted only where the callee's OWN BODY keeps nothing
+                // of the value past the call — the fail-closed by-ref body
+                // walk (closureRefArgKeepsNothingPastCall). A declined
+                // position stays an escape: a leak, never an early release.
+                if (!safeArg && argIsTarget(c->args[ai].value.get()) &&
+                    closureRefArgKeepsNothingPastCall(ctx, *c, ai))
+                    safeArg = true;
                 // fix #7803 (stdlib §2.1 / §8.5 / §22.3 / §28.3 / §28.9,
                 // v0.355): a closure local read at the BUILT-IN console's
                 // `Write(Line)` argument position is a CALL-BOUNDED BORROW,
