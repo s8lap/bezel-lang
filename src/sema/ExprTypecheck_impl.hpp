@@ -5848,6 +5848,22 @@ private:
     TypeRef* declaredIndexerParamType(PropertySymbol* ps, std::size_t k,
                                       const ast::Expr* target);
 
+    // fix #9230 (§27.3 / §22.6 / §23.4 / §5.1, v0.359): the §27.3 ADMISSION
+    // check at an INDEX position — the indexer twin of the METHOD path's own
+    // check (the lambda arm's "lambda body's returned value" diagnostic).
+    //
+    // `declared` is the bound indexer's DECLARED index-parameter type at this
+    // position; `arityCandidates` is the number of ARITY-MATCHING indexer
+    // candidates on the receiver's frontier. The check is silent when the
+    // receiver declares an OVERLOAD SET of them (the resolution's pick then
+    // governs, §22.6) — the indexer twin of #6161's `isSoleNamedCandidate`.
+    //
+    // Called from `checkIndexArgTypes`, once per IndexExpr, after the receiver
+    // has been typed and the indexer resolved.
+    void checkIndexerLambdaArgAdmission(const ast::LambdaExpr& lam,
+                                        const TypeRef* declared,
+                                        std::size_t arityCandidates);
+
     // fix #2758 (§23.5, v0.241): "Index arguments are **positional-only**. The
     // named-argument form (`Identifier :=`, §22.5) is not admitted at an index
     // position — a compile error naming this rule." An IndexExpr's indices

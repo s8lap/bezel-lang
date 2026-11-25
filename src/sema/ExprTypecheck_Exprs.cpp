@@ -1066,6 +1066,23 @@ static bool sameIndexParamType(const TypeRef* p, const TypeRef* a) {
     return true;
 }
 
+// fix #9230 (§23.4, v0.359) — a candidate indexer's index-PARAMETER COUNT.
+//
+// The arity the overload selection compares (`allParamsMatch`'s loop and the
+// `arityOnly` fallback) and the arity the §27.3 admission check at an index
+// position counts the candidates by. ONE definition, so the two cannot
+// disagree about what "the same arity" means.
+//
+// A LOCAL indexer is read through its `ast::PropertyDecl`; an IMPORTED one
+// (no AST node — ModuleLoader reconstructs the PropertySymbol and its
+// ParameterSymbols, #2414) through the symbol's own `indexerParams`.
+static std::size_t indexerCandidateParamCount(const PropertySymbol* cand) {
+    if (!cand) return 0;
+    if (auto* cpd = dynamic_cast<const ast::PropertyDecl*>(cand->decl))
+        return cpd->indexerParams.size();
+    return cand->indexerParams.size();
+}
+
 // fix #7064 (§14.1 / §14.2, v0.343) — does this type still carry an
 // UNSUBSTITUTED type parameter?
 //
@@ -1366,6 +1383,17 @@ void ExprTC::checkIndexArgTypes(const ast::IndexExpr& ix, const ast::Expr& e,
         }
     }
 
+    // fix #9230 (§27.3 / §22.6 / §23.4, v0.359): the number of ARITY-MATCHING
+    // indexer candidates on the receiver's frontier — the INDEXER twin of
+    // `isSoleNamedCandidate` (#6161), the guard the METHOD path's own §27.3
+    // admission check carries: with an OVERLOAD SET the resolution's pick
+    // governs (§22.6's exact-match ranking) and the slot must not classify the
+    // lambda. Counted with the selection's own arity definition
+    // (`indexerCandidateParamCount`), so the two agree.
+    std::size_t arityCandidates = 0;
+    for (auto* cand : candidates)
+        if (indexerCandidateParamCount(cand) == nargs) ++arityCandidates;
+
     for (std::size_t k = 0; k < nargs; ++k) {
         const auto& arg = ix.indices[k];
         // The same modifiers the §7 check skips (§22.3 / #2758: a named /
@@ -1402,6 +1430,21 @@ void ExprTC::checkIndexArgTypes(const ast::IndexExpr& ix, const ast::Expr& e,
         // key slot.
         if (containsUnsubstitutedTypeParam(declared)) continue;
 
+        // fix #9230 (§27.3 / §22.6 / §23.4 / §5.1, v0.359): the §27.3
+        // ADMISSION check at an INDEX position — the indexer twin of the
+        // METHOD path's own check (the lambda arm's "lambda body's returned
+        // value" diagnostic). §27.3 *Admission at a target-typed non-call
+        // position*: "the body is typed, and its inferred return type must
+        // equal the target's return slot or implicitly converts to it
+        // (§5.1); otherwise the lambda is a compile error at the position" —
+        // and an indexer's parameter list is a parameter list (§23.4), so the
+        // index argument's slot is the target. The METHOD path supplied that
+        // target to the lambda's own visit; the INDEX path never did, so the
+        // mismatched lambda was ADMITTED and the accessor called it through
+        // the SLOT's ABI (the SEGV this issue reports).
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(arg.value.get()))
+            checkIndexerLambdaArgAdmission(*lam, declared, arityCandidates);
+
         // A NULLABLE argument is the §7 question, owned by
         // `checkIndexArgNullability` at this same position.
         if (idxTy->nullable) continue;
@@ -1421,6 +1464,107 @@ void ExprTC::checkIndexArgTypes(const ast::IndexExpr& ix, const ast::Expr& e,
                                  : e.span.begin;
         checkAssignable(idxTy, declared, loc, subject(k), arg.value.get());
     }
+}
+
+// fix #9230 (§27.3 / §22.6 / §23.4 / §5.1, v0.359) — the §27.3 ADMISSION
+// check at an INDEX position.
+//
+// THE DEFECT. An indexer whose index parameter is FUNCTION-TYPED, and whose
+// accessor CALLS that parameter, calls it through the SLOT's ABI. A lambda
+// argument whose inferred return type does not match the slot's return type
+// was ADMITTED at the index position — the index path never checked it — so
+// the program compiled, linked and then SEGFAULTed at run time.
+//
+//   ==2268033==ERROR: AddressSanitizer: SEGV on unknown address
+//   0x00000000000f (pc 0x0000003787b9 ...)
+//       #0 ... in bz$indexer$get
+//       #1 ... in main
+//
+// (MEASURED on r30-c1 @ fc77e935f, `scripts/agent_check.sh --probe --asan` —
+// byte-identical to the issue's own report.) The closure returns an `i32`
+// (the lambda's inferred return type, §27.3); the accessor calls it as a
+// `ptr`-returning function (the slot's declared type) and reads `.Length` of
+// the garbage.
+//
+// THE RULE. §27.3 (v0.359) *Admission at a target-typed non-call position*,
+// verbatim: "the body is typed, and its inferred return type must equal the
+// target's return slot or implicitly converts to it (§5.1); otherwise the
+// lambda is a compile error at the position". §23.4 (v0.359) makes an
+// indexer's parameter list a parameter list ("Indexers may be overloaded by
+// parameter type list"), so an index argument's slot is the function-typed
+// TARGET the rule judges. §22.6 (v0.359) *Lambda-literal arguments* grades
+// the position by the lambda's INFERRED RETURN TYPE: "the candidate is
+// applicable at the position when the lambda's inferred return type equals
+// the candidate's return slot, implicitly converts to it (§5.1), or binds it".
+//
+// THE METHOD PATH IS THE ORACLE, AND IT IS ALREADY CORRECT. The matched
+// formal's function-type return slot is threaded into the lambda's own visit
+// (`pendingLambdaTargetReturn_`), and the lambda arm then applies the check
+// with `checkAssignable(<the body's value type>, <the slot's return slot>,
+// <the body's span>, "lambda body's returned value", <the body>)` — so
+// `c.M(lambda() => 7)` at `M(f: () -> string)` is rejected with "the lambda
+// body's returned value has a type that is not implicitly convertible to the
+// target type (§5.1)" (MEASURED, the issue's own words).
+//
+// THE INDEX PATH NEVER SUPPLIED THAT TARGET: the index argument is visited
+// with NO target (the IndexExpr's overload selection runs LATER — after the
+// argument has been visited), so the §27.3 check never ran. And
+// `checkAssignable`'s function-to-function arm DELIBERATELY skips the shape
+// check for a fresh lambda ("a lambda literal's param/return shape is
+// target-typed — §27.4 — so there is no prior, independently-typed value to
+// compare; its body is separately checked against the target elsewhere",
+// ExprTypecheck.cpp's function-to-function arm) — and that "elsewhere" is the
+// §27.3 check the index path never reaches. Hence the admission.
+//
+// THE CHECK. The SAME predicate and the SAME diagnostic the METHOD path's
+// check uses, on the same values: the lambda's body value type against the
+// slot's return slot, reported at the body's own span with the word
+// "lambda body's returned value".
+//
+// THE GUARD — the indexer twin of #6161's `isSoleNamedCandidate`. The METHOD
+// path's check is SILENT when the callee is an OVERLOAD SET: the resolution's
+// pick then governs, and §22.6's exact-match ranking grades it. The indexer
+// twin is "the receiver declares exactly ONE arity-matching indexer" — so an
+// indexer OVERLOAD SET keeps its §22.6 pick (#9187's exact-match ranking) and
+// this check stays silent, exactly as the METHOD path's does. MEASURED on the
+// base: two methods `M(f: () -> string)` / `M(f: () -> int)` with
+// `c.M(lambda() => 7)` compiles and prints 2, and two indexers
+// `[f: () -> string]` / `[f: () -> int]` with `c[lambda() => 7]` compiles and
+// prints 2 — both unchanged by this check.
+//
+// The remaining guards are the METHOD path's own, one for one: an ASCRIBED
+// lambda's ascription is its written return type and is judged as a value's
+// return type (§27.1.1), so the ascription governs and not this check; an
+// `async` lambda's slot is its task-family wrapper (§30.1 / §30.6); and the
+// target slot must be a primitive (numeric, `bool`, `char`, `string`,
+// `Object`, nullable or not) or a Named slot with a resolved declaration — a
+// bare type-parameter slot is not judged here (it may still be an
+// unsubstituted callee type parameter).
+void ExprTC::checkIndexerLambdaArgAdmission(const ast::LambdaExpr& lam,
+                                            const TypeRef* declared,
+                                            std::size_t arityCandidates) {
+    if (!declared || declared->kind != TypeRef::Kind::Function) return;
+    // An OVERLOAD SET's pick governs (§22.6) — the METHOD path's own guard
+    // (#6161), in its indexer form.
+    if (arityCandidates != 1) return;
+    // An ascribed lambda's ascription governs (§27.1.1).
+    if (lam.retType) return;
+    // An `async` lambda's slot is its task-family wrapper (§30.1 / §30.6).
+    if (lam.isAsync) return;
+    TypeRef* targetRet = declared->funcReturn;
+    if (!targetRet) return;
+    // The METHOD path's own target gate — a primitive slot, or a Named slot
+    // with a resolved declaration.
+    if (!(targetRet->kind == TypeRef::Kind::Primitive ||
+          (targetRet->kind == TypeRef::Kind::Named &&
+           targetRet->declaration)))
+        return;
+    forEachLambdaReturnValue(lam, [&](const ast::Expr* retVal) {
+        if (!retVal || !ctx_.exprType(*retVal)) return;
+        checkAssignable(ctx_.exprType(*retVal), targetRet,
+                        retVal->span.begin,
+                        "lambda body's returned value", retVal);
+    });
 }
 
 // fix #2758 (§23.5, v0.241) — INDEX ARGUMENTS ARE POSITIONAL-ONLY.
@@ -7156,10 +7300,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     // argument (§23.4)` for the issue's own 1-arg repro).
                     auto candParamCount =
                         [](const PropertySymbol* cand) -> std::size_t {
-                        if (auto* cpd = dynamic_cast<const ast::PropertyDecl*>(
-                                cand->decl))
-                            return cpd->indexerParams.size();
-                        return cand->indexerParams.size();
+                        return indexerCandidateParamCount(cand);
                     };
                     auto candParamResolvedType =
                         [this](const PropertySymbol* cand,
