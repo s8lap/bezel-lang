@@ -12757,7 +12757,25 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // `src/sema/**` gap this arm cannot close. Both surviving halves
         // (the SortedDictionary exclusion and the missing OwningDictionary
         // typing rule) are filed as #3716.
-        if ((call.args.empty() && (m == "First" || m == "Last" || m == "Single")) ||
+        // fix #9234 / stdlib §5 / §4.8 (v0.359): the `*OrNull` element-access
+        // terminals over a Dictionary receiver — `FirstOrNull` / `LastOrNull` /
+        // `SingleOrNull` — join `First` / `Last` / `Single` here. They are the
+        // `T?` siblings of those three on the SAME `extension IEnumerable<T>`
+        // block (stdlib §5), and a `Dictionary<K, V>` IS an
+        // `ICollection<DictionaryEntry<K, V>>` (stdlib §4.8), so their element
+        // type is the synthetic `DictionaryEntry<K, V>` and their answer is
+        // that entry or null.
+        //
+        // BEFORE this fix these three names reached NO arm at all: the
+        // dictionary-terminal arm below covered only `First` / `Last` /
+        // `Single` / `ElementAt` / `ElementAtOrNull`, and the generic LINQ
+        // path they fell through to does not lower a dictionary receiver
+        // either — so the call lowered to nothing and `lowerLocalDecl`'s
+        // `#2434` defense-in-depth zero-filled the local. The observable
+        // defect was a NON-EMPTY dictionary reading as EMPTY (issue #9234).
+        if ((call.args.empty() && (m == "First" || m == "Last" || m == "Single" ||
+                                   m == "FirstOrNull" || m == "LastOrNull" ||
+                                   m == "SingleOrNull")) ||
             ((m == "ElementAt" || m == "ElementAtOrNull") &&
              call.args.size() == 1 && call.args[0].value)) {
             // fix #3720 / stdlib §5 / §4.8 / §4.17 (v0.294): lifts narrow
@@ -12884,7 +12902,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // `{i8 hasValue; {K, V}}` struct (spec §7.2). Computed ONCE, so
             // the null arm and the tail agree on it.
             llvm::StructType* dtNullableTy = nullptr;
-            if (m == "ElementAtOrNull") {
+            // fix #9234 (stdlib §5 / §4.8, v0.359): the `*OrNull` tier over a
+            // Dictionary receiver — `FirstOrNull` / `LastOrNull` /
+            // `SingleOrNull` — forms its `T?` at the dictionary's ELEMENT
+            // type, the synthetic `DictionaryEntry<K, V>` (stdlib §4.8:
+            // `Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>`), exactly
+            // as `ElementAtOrNull` does on the SAME §5 block. The nullable
+            // form of that synthetic type is the SAME tagged
+            // `{i8 hasValue; {K, V}}` struct `ElementAtOrNull` builds
+            // (#8232), so the type computation and the "refuse LOUDLY rather
+            // than miscompile" guard below apply unchanged.
+            const bool dtIsOrNullTerminal =
+                m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull";
+            if (m == "ElementAtOrNull" || dtIsOrNullTerminal) {
                 const sema::TypeRef* dtEaTy = ctx_.exprType(call);
                 if (!dtEaTy || !isNullableDictEntryTy(dtEaTy)) {
                     // Refuse LOUDLY rather than miscompile: this arm builds a
@@ -12895,10 +12925,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     if (!ctx_.diagnostics().hasErrors())
                         ctx_.diagnostics().report(
                             Severity::Error, call.span.begin,
-                            "internal: `ElementAtOrNull` (stdlib \xC2\xA7""5, "
-                            "returns `T?`) was not typed `T?` on this receiver, "
-                            "so its result cannot be lowered soundly; the call "
-                            "is refused rather than miscompiled (#8232)");
+                            m == "ElementAtOrNull"
+                                ? "internal: `ElementAtOrNull` (stdlib "
+                                  "\xC2\xA7""5, returns `T?`) was not typed `T?` "
+                                  "on this receiver, so its result cannot be "
+                                  "lowered soundly; the call is refused rather "
+                                  "than miscompiled (#8232)"
+                                : "internal: `" + std::string(m) + "` (stdlib "
+                                  "\xC2\xA7""5, returns `T?`) was not typed `T?` "
+                                  "on this receiver, so its result cannot be "
+                                  "lowered soundly; the call is refused rather "
+                                  "than miscompiled (#9234)");
                     return nullptr;
                 }
                 dtNullableTy = nullableValueStructTy(dtEaTy);
@@ -12924,6 +12961,63 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     builder_.CreateICmpNE(dtCnt0, builder_.getInt64(1)),
                     "InvalidOperationException");
                 dtIdx = builder_.getInt64(0);
+            } else if (dtIsOrNullTerminal) {
+                // fix #9234 / stdlib §5 / §4.8 (v0.359): the `*OrNull` tier
+                // over a Dictionary receiver — the NON-throwing companions of
+                // `First` / `Last` / `Single` on the SAME §5 block. stdlib §5
+                // ("`First`/`Last`/`Single` raise `InvalidOperationException`
+                // … the non-throwing form: the `*OrNull` variants, which
+                // return `null` instead") makes the answers:
+                //
+                //   * `FirstOrNull()` — the first entry, or null when EMPTY.
+                //   * `LastOrNull()`  — the last entry, or null when EMPTY.
+                //   * `SingleOrNull()` — the entry, or null unless the
+                //     dictionary holds EXACTLY ONE entry.
+                //
+                // The `SingleOrNull` answer is the one the array family's own
+                // arm gives (stdlib §5's `Single()` "raises if not exactly
+                // one", and its `*OrNull` sibling returns null instead) and
+                // the one the runtime's `bz_lazy_single_or_null` gives for a
+                // lazy source ("1 if exactly one … 0 if empty or more than
+                // one") — so the dictionary arm and its two siblings agree.
+                //
+                // NO snapshot is taken on the null path, so the "no
+                // allocation before reject" discipline this arm keeps holds
+                // there too — there is simply nothing to reject, and nothing
+                // to mint.
+                llvm::Value* dtPresent =
+                    (m == "SingleOrNull")
+                        ? builder_.CreateICmpEQ(dtCnt0, builder_.getInt64(1))
+                        : builder_.CreateICmpSGT(dtCnt0, builder_.getInt64(0));
+                dtNullBB = llvm::BasicBlock::Create(
+                    llvm_, "dictterm.null", currentFn_);
+                dtPresentBB = llvm::BasicBlock::Create(
+                    llvm_, "dictterm.present", currentFn_);
+                dtMergeBB = llvm::BasicBlock::Create(
+                    llvm_, "dictterm.merge", currentFn_);
+                builder_.CreateCondBr(dtPresent, dtPresentBB, dtNullBB);
+                // The null arm: NO snapshot is taken (nothing is decoded, so
+                // nothing is minted), and the receiver's own temporary is
+                // reclaimed exactly as the present arm reclaims it — an
+                // unbound `a.ToDictionary(...)` receiver must be freed on
+                // BOTH paths or it leaks on the null one (the same discipline
+                // the `ElementAtOrNull` null arm below uses).
+                builder_.SetInsertPoint(dtNullBB);
+                freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv,
+                                                   recvTy,
+                                                   /*dictValueColumnEscapes=*/
+                                                   false);
+                dtNullRes = llvm::Constant::getNullValue(dtNullableTy);
+                dtNullEndBB = builder_.GetInsertBlock();
+                builder_.CreateBr(dtMergeBB);
+                // The present arm continues with the snapshot + decode.
+                builder_.SetInsertPoint(dtPresentBB);
+                // The index is computed INSIDE the present arm, so the
+                // `LastOrNull` subtraction never runs on the null path (where
+                // the count is 0 and the difference would be -1).
+                dtIdx = (m == "LastOrNull")
+                    ? builder_.CreateSub(dtCnt0, builder_.getInt64(1))
+                    : builder_.getInt64(0);
             } else {
                 llvm::Value* rawIdx = lowerExpr(*call.args[0].value);
                 if (!rawIdx) return nullptr;
@@ -13226,7 +13320,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // recognised by `isNullableDictEntryTy`). The present
             // arm wraps the decoded entry with the tag set; the null arm
             // produced the all-zero struct; the merge PHI picks between them.
-            if (m == "ElementAtOrNull") {
+            //
+            // fix #9234 (stdlib §5 / §4.8, v0.359): the three `*OrNull`
+            // terminals join it — they return the SAME `T?` (the dictionary's
+            // element type, nullable), so the same tagged struct and the
+            // same present/null/merge shape carry them.
+            if (m == "ElementAtOrNull" || dtIsOrNullTerminal) {
                 llvm::Value* dtWrapped = llvm::UndefValue::get(dtNullableTy);
                 dtWrapped = builder_.CreateInsertValue(
                     dtWrapped,

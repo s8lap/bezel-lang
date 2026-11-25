@@ -50736,6 +50736,16 @@ bool Emitter::isFreshDictEntryKeyReleaseTerminalLocal(
     std::string_view mm = ma->member;
     if (mm == "First" || mm == "Last" || mm == "Single")
         return call->args.empty();
+    // fix #9234 (stdlib §5 / §4.8, v0.359): the three `*OrNull` terminals
+    // join the set — they are the `T?` siblings of First/Last/Single on the
+    // SAME §5 block, and the isDict block lowers them through the SAME
+    // decode, so the rebuilt Key needs the same scope-end release. Only the
+    // NO-ARGUMENT shape is admitted here: the predicate forms
+    // (`FirstOrNull(pred)` / `LastOrNull(pred)` / `SingleOrNull(pred)`)
+    // take an argument, and the isDict block lowers no predicate form over a
+    // dictionary receiver, so they are not this arm's candidates.
+    if (mm == "FirstOrNull" || mm == "LastOrNull" || mm == "SingleOrNull")
+        return call->args.empty();
     if (mm == "ElementAt" || mm == "ElementAtOrNull")
         return call->args.size() == 1 && call->args[0].value != nullptr;
     return false;
@@ -50799,6 +50809,15 @@ bool Emitter::isFreshDictEntryValueReleaseTerminalLocal(
     if (!recvTy || !isDictTypeName(recvTy)) return false;
     std::string_view mm = ma->member;
     if (mm == "First" || mm == "Last" || mm == "Single")
+        return call->args.empty();
+    // fix #9234 (stdlib §5 / §4.8, v0.359): the three `*OrNull` terminals
+    // join the set, spelled identically to the KEY sibling above so the two
+    // cannot drift — the isDict block lowers them through the SAME decode,
+    // so the minted Value needs the same scope-end release. Only the
+    // NO-ARGUMENT shape is admitted here (the predicate forms take an
+    // argument, and the isDict block lowers no predicate form over a
+    // dictionary receiver).
+    if (mm == "FirstOrNull" || mm == "LastOrNull" || mm == "SingleOrNull")
         return call->args.empty();
     if (mm == "ElementAt" || mm == "ElementAtOrNull")
         return call->args.size() == 1 && call->args[0].value != nullptr;
