@@ -2710,11 +2710,31 @@ llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
 // §15.4 collection-literal materializer, so a literal-built set is bit-for-bit
 // what `new` + `.Add` builds. Returns false only on an internal
 // emitRemoveElementEquality failure (malformed comparison IR).
+//
+// fix #9277 (§3.6 clause (c) / §8.4 / stdlib §4.10 / §15.4, v0.359): the
+// element may be NULLABLE (`Set<T?>`), whose identity is the UNDERLYING type's
+// value equality read through §8.4's null-safe wrapper (`null` equals `null`,
+// `null` differs from a present value, two present values compare by the
+// underlying type's contract). The element is then stored in the §17.5 form —
+// the tagged `{i8 hasValue, T value}` carrier for a nullable VALUE element, the
+// plain pointer for a nullable REFERENCE one — so the scan loads the element
+// with the ELEMENT's own type (the class family's `ptr` is unchanged) and the
+// equality dispatch reads `elemIsClass` from the caller's §28.11
+// classification.
 bool Emitter::emitArrayBackedSetInsert(llvm::Value* setArr, llvm::Value* item,
                                        const sema::TypeRef* elemRef,
                                        llvm::Function* dupDisposer,
-                                       int64_t esz) {
+                                       int64_t esz,
+                                       bool elemIsClass,
+                                       llvm::Function* appendRetain) {
     if (!setArr || !item) return false;
+    // fix #9277: the slot holds the ELEMENT's own lowered type — a class /
+    // interface / string element is a POINTER, a NULLABLE VALUE element
+    // (§17.5) is the tagged `{i8 hasValue, T value}` carrier. The scan loads
+    // each element with that type, so the comparison is between two values of
+    // the element's own type.
+    llvm::Type* elemLlTy = elemRef ? lowerTypeRef(elemRef) : nullptr;
+    if (!elemLlTy) return false;
     // fix #4642 (§8.6/§4.10, v0.307): the array-backed set's slot is a POINTER
     // by construction — this function loads each element as `ptrTy()` and
     // `collectionElemSize` gives 8 for every element type that reaches here —
@@ -2728,7 +2748,13 @@ bool Emitter::emitArrayBackedSetInsert(llvm::Value* setArr, llvm::Value* item,
     // internal-failure diagnostic and no unsafe IR is emitted. Every correct
     // caller boxes first (`boxForTarget`, the three `.Add`/`.TryAdd` arms
     // below), so this is an assertion of their precondition, not a live arm.
-    if (!item->getType()->isPointerTy()) return false;
+    //
+    // fix #9277: a NULLABLE VALUE element is NOT a pointer — it is the §17.5
+    // carrier — so the guard now admits the carrier as well, and only the
+    // carrier (the element's own type): a bare value still cannot be stored.
+    if (item->getType() != elemLlTy &&
+        !(item->getType()->isPointerTy() && elemLlTy->isPointerTy()))
+        return false;
     auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
     llvm::Value* arrLen = builder_.CreateCall(lenFn, {setArr}, "sa.len");
     auto* condBB = llvm::BasicBlock::Create(llvm_, "sa.c", currentFn_);
@@ -2749,9 +2775,14 @@ bool Emitter::emitArrayBackedSetInsert(llvm::Value* setArr, llvm::Value* item,
                            {ptrTy(), i64(), i64()});
     llvm::Value* ep = builder_.CreateCall(
         ptrFn, {setArr, curIdx, builder_.getInt64(esz)}, "sa.ep");
-    llvm::Value* existing = builder_.CreateLoad(ptrTy(), ep, "sa.ex");
+    llvm::Value* existing = builder_.CreateLoad(elemLlTy, ep, "sa.ex");
+    // fix #9277: the equality dispatch reads the §28.11 element
+    // classification, so a NULLABLE element compares by the UNDERLYING type's
+    // value equality through §8.4's null-safe wrapper (emitRemoveElement-
+    // Equality's nullable-value / string branches) instead of the class
+    // branch's reference identity.
     llvm::Value* same = emitRemoveElementEquality(
-        existing, item, elemRef, /*elemIsClass=*/true);
+        existing, item, elemRef, elemIsClass);
     if (!same) return false;
     builder_.CreateCondBr(same, dupBB, nextBB);
     builder_.SetInsertPoint(nextBB);
@@ -2765,6 +2796,11 @@ bool Emitter::emitArrayBackedSetInsert(llvm::Value* setArr, llvm::Value* item,
     // new: append.
     builder_.SetInsertPoint(newBB);
     {
+        // fix #9277 (§28.11 / §28.9): the runtime-managed row — the set
+        // co-owns a +1 per element, taken at insert and given back when the
+        // collection frees the slot. The retain belongs on the APPEND path
+        // only: a rejected duplicate is never stored, so it takes no +1.
+        if (appendRetain) builder_.CreateCall(appendRetain, {item});
         llvm::AllocaInst* slot = entryAlloca(item->getType());
         builder_.CreateStore(item, slot);
         auto* addFn = declareC("bz_array_add",
@@ -10128,6 +10164,24 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             arrElemPol.cat == ElementPolicy::Category::ClassOwned ||
             arrElemPol.cat == ElementPolicy::Category::ClassBorrow ||
             hasObjectHeaderEquality(arrElemRef);
+        // fix #9277 (§3.6 clause (c) / §8.4 / stdlib §4.10 / §15.4, v0.359):
+        // arrElemIsNullable — whether the ELEMENT type is a nullable form
+        // (`T?`). A nullable type is HASHABLE — §3.6's hashable row, clause
+        // (c): "a nullable type `T?` ... such a type's `Equals` and
+        // `GetHashCode` are `T`'s, through §8.4's null-safe wrapper — which
+        // hashes `null` to one fixed implementation-defined value" — so
+        // `Set<T?>` is a WELL-FORMED instantiation (stdlib §4.10's "T must be
+        // hashable", enforced at the instantiation site per §3.6 rule 2), and
+        // §4.10's set semantics (duplicates collapse, per `T`'s equality
+        // contract) are owed to it.
+        //
+        // The element's identity is therefore the UNDERLYING type's value
+        // equality read through §8.4's null-safe wrapper: `null` equals
+        // `null`, `null` differs from a present value, and two present values
+        // compare by the underlying type's own contract. `emitRemoveElement-
+        // Equality` already implements exactly that — its nullable-value
+        // branch, its string branch, and its null-guarded class branch.
+        bool arrElemIsNullable = arrElemRef && arrElemRef->nullable;
 
         // per §3/§25.2: .IndexOf(item): int — index of first match, -1 if not
         // found. Match semantics (issue #424 / §25.2): dispatched per element
@@ -10304,9 +10358,46 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // fix #1070: the body moved to the shared member helper
         // emitArrayBackedSetInsert so the §15.4 collection-literal materializer
         // builds a class-element set with the IDENTICAL dedup/dispose semantics.
-        auto emitSetDedupInsert = [&](llvm::Value* item) -> bool {
-            return emitArrayBackedSetInsert(recv, item, arrElemRef,
-                                            arrElemPol.disposerThunk, esz);
+        // fix #9277 (§3.6 clause (c) / §8.4 / stdlib §4.10, v0.359): the
+        // array-backed set's dedup arms used to be gated on a CLASS element,
+        // so a NULLABLE element (`Set<T?>` — hashable per §3.6's hashable
+        // row, clause (c)) fell through to the generic array append: `Add` of
+        // an equal element grew `Count` (two copies of one element), `Remove`
+        // then removed only one copy, and `TryAdd` of a fresh element
+        // returned false and added nothing (issue #9277). `setElemDedups` is
+        // the widened gate; the equality itself is the UNDERLYING type's
+        // value equality through §8.4's null-safe wrapper (the dispatch
+        // inside emitRemoveElementEquality, which reads `arrElemIsClass`).
+        bool setElemDedups = arrElemIsClass || arrElemIsNullable;
+        // fix #9277 (§28.11 v0.135 / §28.9): the RUNTIME-MANAGED row — a
+        // `string` / `string?` element is co-owned by the collection: the
+        // insert takes an INDEPENDENT +1 per element (given back when the
+        // collection frees the slot), while a +1 PRODUCER's single reference
+        // is TRANSFERRED to the collection instead. Which of the two applies
+        // is a property of the ARGUMENT expression, so the two thunks are
+        // chosen per call site and handed to the shared insert. A rejected
+        // duplicate is never stored, so it takes no +1 — the +1 producer's
+        // reference is given back instead (§28.9; the dict-backed Set's own
+        // spelling, #8648).
+        auto setStringSlotThunks = [&](const ast::Expr* arg,
+                                       llvm::Function** dupDisposerOut,
+                                       llvm::Function** appendRetainOut) {
+            *dupDisposerOut = arrElemPol.disposerThunk;
+            *appendRetainOut = nullptr;
+            if (!arrIsStringElem) return;
+            if (isPlusOneStringProducer(arg)) {
+                *dupDisposerOut = stringElementReleaseThunk();
+            } else {
+                *appendRetainOut =
+                    declareC("bz_string_retain", llvm::Type::getVoidTy(llvm_),
+                             {ptrTy()});
+            }
+        };
+        auto emitSetDedupInsert = [&](llvm::Value* item,
+                                      llvm::Function* dupDisposer,
+                                      llvm::Function* appendRetain) -> bool {
+            return emitArrayBackedSetInsert(recv, item, arrElemRef, dupDisposer,
+                                            esz, arrElemIsClass, appendRetain);
         };
         // isOwnedSetRecv: this call's receiver is exactly an OwningSet<T> (class
         // T). Gates the set-specific .Add/.UnionWith dedup handlers below —
@@ -10343,7 +10434,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // applies unchanged. Written for symmetry with the borrowing arms below
             // so the three set-insert sites cannot drift.
             item = boxForTarget(item, arrElemRef, call.args[0].value.get());
-            if (!emitSetDedupInsert(item)) return nullptr;
+            // fix #9277: the element is stored in its §17.5 form (the tagged
+            // `{i8 hasValue, T value}` carrier for a nullable VALUE element) —
+            // the same conversion the generic array Add path applies, so the
+            // two paths store the same bytes.
+            item = ensureNullableElem(item);
+            llvm::Function* dupDisposer = nullptr;
+            llvm::Function* appendRetain = nullptr;
+            setStringSlotThunks(call.args[0].value.get(), &dupDisposer,
+                                 &appendRetain);
+            if (!emitSetDedupInsert(item, dupDisposer, appendRetain))
+                return nullptr;
             // fix #1970 / §28.4 / §28.6: OwningSet<T>.Add takes `owned item`
             // (the dup branch disposes `item`, the non-dup branch transfers
             // ownership into the backing array). Either way ownership has
@@ -10380,8 +10481,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // C(...))`) — Set<T>.Add never takes ownership of `item`, dup or not,
         // so such a producer must still be disposed at the end of this full
         // expression.
+        // fix #9277 (§3.6 clause (c) / §8.4 / stdlib §4.10 / §15.4, v0.359):
+        // the gate widens from a CLASS element to a NULLABLE one as well — a
+        // `Set<T?>` is hashable (§3.6's hashable row, clause (c)) and owes
+        // §4.10's duplicate-collapsing semantics, with `T?`'s identity being
+        // `T`'s value equality through §8.4's null-safe wrapper.
         if (m == "Add" && call.args.size() == 1 && call.args[0].value &&
-            isBorrowingSetRecv && arrElemIsClass && !arrIsOwning) {
+            isBorrowingSetRecv && setElemDedups && !arrIsOwning) {
             llvm::Value* item = lowerExpr(*call.args[0].value);
             if (!item) return nullptr;
             // fix #4642 (§8.6/§4.10, v0.307): see the OwningSet.Add arm above.
@@ -10390,7 +10496,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // against a pointer and `bz_array_add` copies 8 bytes out of a
             // 4-byte slot.
             item = boxForTarget(item, arrElemRef, call.args[0].value.get());
-            if (!emitSetDedupInsert(item)) return nullptr;
+            // fix #9277: a NULLABLE element is stored in its §17.5 form (the
+            // tagged `{i8 hasValue, T value}` carrier for a nullable VALUE
+            // element) — the same conversion the generic array Add path
+            // applies, so the two paths store (and compare) the same bytes.
+            item = ensureNullableElem(item);
+            llvm::Function* dupDisposer = nullptr;
+            llvm::Function* appendRetain = nullptr;
+            setStringSlotThunks(call.args[0].value.get(), &dupDisposer,
+                                 &appendRetain);
+            if (!emitSetDedupInsert(item, dupDisposer, appendRetain))
+                return nullptr;
             if (isFreshOwnedClassProducer(call.args[0].value.get()))
                 emitDisposeAndReclaim(item);
             return llvm::ConstantInt::get(i32(), 0);  // unit
@@ -10433,7 +10549,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 llvm::Value* oep = builder_.CreateCall(
                     ptrFn, {other, oIdx, builder_.getInt64(esz)}, "uw.oep");
                 llvm::Value* item = builder_.CreateLoad(ptrTy(), oep, "uw.item");
-                if (!emitSetDedupInsert(item)) return nullptr;
+                // fix #9277: the drained element is already in the stored
+                // form, and the owning class family's slot is a borrow whose
+                // ownership TRANSFERS on insert (a rejected duplicate is
+                // disposed instead — the element disposer) — so the append
+                // path takes no +1.
+                if (!emitSetDedupInsert(item, arrElemPol.disposerThunk,
+                                        /*appendRetain=*/nullptr))
+                    return nullptr;
                 // emitSetDedupInsert leaves the builder positioned at its
                 // "sa.end" block; continue the outer loop from there.
                 builder_.CreateStore(
@@ -10846,8 +10969,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // already does the right thing unmodified: a borrowing Set<T> must
         // NOT dispose a rejected duplicate (§28.11 v0.135), only
         // OwningSet<T> does.
+        // fix #9277 (§3.6 clause (c) / §8.4 / stdlib §4.10, v0.359): the gate
+        // widens from a CLASS element to a NULLABLE one as well — `Set<T?>` is
+        // hashable (§3.6's hashable row, clause (c): a nullable type's `Equals`
+        // and `GetHashCode` are the underlying type's, through §8.4's
+        // null-safe wrapper), so it is a well-formed instantiation and §4.10's
+        // `TryAdd` — "returns whether added (false if duplicate)" — is owed to
+        // it. Before this, a nullable element fell through to no handler at
+        // all: the call lowered to nullptr and the `bool` result degraded to
+        // codegen's #2434 zero-init fallback, so `TryAdd` of a FRESH element
+        // answered `false` and added nothing (issue #9277).
         if (m == "TryAdd" && call.args.size() == 1 && call.args[0].value &&
-            arrElemIsClass && (arrIsOwning || isBorrowingSetRecv)) {
+            ((arrElemIsClass && (arrIsOwning || isBorrowingSetRecv)) ||
+             (arrElemIsNullable && isBorrowingSetRecv && !arrIsOwning))) {
             llvm::Value* item = lowerExpr(*call.args[0].value);
             if (!item) return nullptr;
             // fix #4642 (§8.6/§4.10, v0.307): §8.6-box a bare value into an
@@ -10857,7 +10991,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // THE arm the issue's repro reaches: `s.TryAdd(1)` on a
             // `Set<Object>`. A no-op for a class element or a reference source.
             item = boxForTarget(item, arrElemRef, call.args[0].value.get());
-            if (!item->getType()->isPointerTy()) return nullptr;
+            // fix #9277: a NULLABLE element is stored in its §17.5 form (the
+            // tagged `{i8 hasValue, T value}` carrier for a nullable VALUE
+            // element) — the same conversion the generic array Add path
+            // applies, so the two paths store (and compare) the same bytes.
+            item = ensureNullableElem(item);
+            // fix #9277: the element's own lowered type — a class / interface /
+            // string element is a POINTER, a nullable VALUE element is the
+            // §17.5 carrier — is the type the slot holds and the type the scan
+            // compares.
+            llvm::Type* elemLlTy = lowerTypeRef(arrElemRef);
+            if (!elemLlTy) return nullptr;
+            if (item->getType() != elemLlTy &&
+                !(item->getType()->isPointerTy() && elemLlTy->isPointerTy()))
+                return nullptr;
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* arrLen = builder_.CreateCall(lenFn, {recv}, "ta.len");
             // Create all BBs upfront to avoid CFG wiring errors.
@@ -10882,12 +11029,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                    {ptrTy(), i64(), i64()});
             llvm::Value* ep = builder_.CreateCall(
                 ptrFn, {recv, curIdx, builder_.getInt64(esz)}, "ta.ep");
-            llvm::Value* existing = builder_.CreateLoad(ptrTy(), ep, "ta.ex");
+            llvm::Value* existing = builder_.CreateLoad(elemLlTy, ep, "ta.ex");
             // §8.3 / §4.10 (#837): match by the element's equality contract — a
             // user `Equals` override is dispatched (so a content-equal element is
             // a duplicate), else reference identity (the §8.3 class default).
+            // fix #9277: for a NULLABLE element the contract is the UNDERLYING
+            // type's value equality through §8.4's null-safe wrapper, so the
+            // dispatch reads the caller's §28.11 classification
+            // (`arrElemIsClass`) rather than an unconditional `true`.
             llvm::Value* same = emitRemoveElementEquality(
-                existing, item, recvTy->genericArgs[0], /*elemIsClass=*/true);
+                existing, item, recvTy->genericArgs[0], arrElemIsClass);
             if (!same) return nullptr;
             builder_.CreateCondBr(same, foundBB, nextBB);
             // nextBB: advance index, loop back.
@@ -10897,12 +11048,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateBr(condBB);
             // foundBB: duplicate — dispose the passed item and return false.
             builder_.SetInsertPoint(foundBB);
-            if (arrElemPol.disposerThunk)
-                builder_.CreateCall(arrElemPol.disposerThunk, {item});
+            // fix #9277 (§28.11 / §28.9): a rejected duplicate is never
+            // stored, so it takes no +1 — a +1 string producer's reference is
+            // given back instead (the dict-backed Set's own rule, #8648).
+            llvm::Function* dupDisposer = nullptr;
+            llvm::Function* appendRetain = nullptr;
+            setStringSlotThunks(call.args[0].value.get(), &dupDisposer,
+                                 &appendRetain);
+            if (dupDisposer)
+                builder_.CreateCall(dupDisposer, {item});
             builder_.CreateBr(endBB);
             // newBB: not present — append and return true.
             builder_.SetInsertPoint(newBB);
             {
+                if (appendRetain) builder_.CreateCall(appendRetain, {item});
                 llvm::AllocaInst* slot = entryAlloca(item->getType());
                 builder_.CreateStore(item, slot);
                 auto* addFn = declareC("bz_array_add",

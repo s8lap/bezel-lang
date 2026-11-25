@@ -16755,9 +16755,24 @@ private:
     // otherwise `item` is appended via bz_array_add. Shared by the `.Add` /
     // `.UnionWith` call paths and the §15.4 literal materializer. Returns false
     // only on an internal emitRemoveElementEquality failure.
+    //
+    // fix #9277 (§3.6 clause (c) / §8.4 / stdlib §4.10 / §15.4, v0.359): the
+    // element may be NULLABLE (`Set<T?>`), whose identity is the UNDERLYING
+    // type's value equality read through §8.4's null-safe wrapper. Two
+    // parameters carry that:
+    //   * `elemIsClass` — the §28.11 element classification the equality
+    //     dispatch reads (a class/interface/Object element compares by §8.3's
+    //     Equals / reference identity, null-guarded; a string or a nullable
+    //     VALUE element compares by its own value contract).
+    //   * `appendRetain` — a `void(ptr)` thunk called on the APPEND path only
+    //     (the §28.11 runtime-managed row: the collection co-owns a +1 per
+    //     element, taken at insert and given back when the collection frees
+    //     the slot). Null for the class family, whose slots are borrows.
     bool emitArrayBackedSetInsert(llvm::Value* setArr, llvm::Value* item,
                                   const sema::TypeRef* elemRef,
-                                  llvm::Function* dupDisposer, int64_t esz);
+                                  llvm::Function* dupDisposer, int64_t esz,
+                                  bool elemIsClass,
+                                  llvm::Function* appendRetain);
 
     // §28.4 step 3: chain to the base class's Dispose. baseTypes[0] is
     // conventionally the base class when it resolves to one.

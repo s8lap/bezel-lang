@@ -62876,7 +62876,14 @@ llvm::Value* Emitter::materializeArrayBackedSetLiteral(
                 "literal element — #1386");
             continue;
         }
-        if (!emitArrayBackedSetInsert(arr, ev, elemRef, dupDisposer, esz)) {
+        // fix #9277 (§3.6 clause (c) / §8.4 / stdlib §4.10, v0.359): the
+        // element is a CLASS / INTERFACE one here (the literal materializer
+        // is reached only for that shape), so the equality dispatch keeps the
+        // class reading (`elemIsClass` true) and the slot takes no +1 (a
+        // class slot is a borrow whose ownership transfers on insert).
+        if (!emitArrayBackedSetInsert(arr, ev, elemRef, dupDisposer, esz,
+                                       /*elemIsClass=*/true,
+                                       /*appendRetain=*/nullptr)) {
             // emitRemoveElementEquality could not build the comparison — the
             // same internal-failure path the .Add handler propagates.
             ctx_.diagnostics().report(
