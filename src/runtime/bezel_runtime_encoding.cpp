@@ -517,6 +517,47 @@ extern "C" void* bz_string_from_utf8z(const void* p) {
                                 (int64_t)strlen((const char*)p));
 }
 
+// ---------------------------------------------------------------------------
+// The standard-input line reader (stdlib §2.1 / §7.4, v0.359; fix #9303).
+//
+// §2.1 `Console.ReadLine(): string?` and §7.4 `TextReader.ReadLine(): string?`
+// are ONE reader of standard input. A line is delimited by its '\n' terminator,
+// not by an implementation buffer (#9303): the line comes back whole whatever
+// its length. Only '\n' is the terminator here: CR handling is the spec
+// question #9305 and is NOT decided in this reader.
+
+// A width-1 string of the `n` bytes at `p`, one code point per byte. +1.
+static void* bz_console_raw_byte_string(const uint8_t* p, int64_t n) {
+    void* sdata = malloc((size_t)(n > 0 ? n : 1));
+    if (n > 0) memcpy(sdata, p, (size_t)n);
+    uint8_t* s = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+    memcpy(s, &sdata, sizeof(void*));
+    memcpy(s + 8, &n, sizeof(int64_t));
+    s[16] = 1;
+    bz_string_init_rc(s);
+    return s;
+}
+
+// The next line of standard input as a fresh +1 string, without its '\n'; NULL
+// when the input is exhausted before any byte (the §7.4 / §2.1 "null at EOF").
+// A last line with no terminator is a line.
+extern "C" void* bz_console_read_line() {
+    size_t cap = 256, n = 0;
+    uint8_t* buf = (uint8_t*)malloc(cap);
+    bool any = false;
+    int c;
+    while ((c = getc(stdin)) != EOF) {
+        any = true;
+        if (c == '\n') break;
+        if (n == cap) { cap *= 2; buf = (uint8_t*)realloc(buf, cap); }
+        buf[n++] = (uint8_t)c;
+    }
+    if (!any) { free(buf); return nullptr; }
+    void* s = bz_console_raw_byte_string(buf, (int64_t)n);
+    free(buf);
+    return s;
+}
+
 // string.From(w: WString) / string.FromWStringPointer(p): copy the UTF-16LE
 // code units up to (not including) the terminating 0x0000 unit into a fresh
 // Bezel string. bz_wstrlen counts UNITS (strlen would stop at the high zero

@@ -120,89 +120,17 @@ llvm::Value* Emitter::emitConsoleWrite(llvm::Value* strPtr, bool newline,
 }
 
 
+// stdlib §2.1 / §7.4 (v0.359; fix #9303): the ONE reader of a line of
+// standard input — §2.1's `Console.ReadLine()` and §7.4's
+// `TextReader.ReadLine()` both lower here, so the two agree. The runtime reads
+// up to the '\n' terminator whatever the line's length (an implementation
+// buffer is not a line delimiter) and returns it as the producer's +1
+// reference (#422 / #8592 — `bz_string_init_rc`), or NULL at EOF (§7.4 "null
+// at EOF").
 llvm::Value* Emitter::emitConsoleReadLine() {
-    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-    const unsigned BUFSZ = 4096;
-    llvm::Value* buf = entryAlloca(llvm::ArrayType::get(i8Ty, BUFSZ));
-    llvm::Value* bufPtr = builder_.CreateGEP(
-        llvm::ArrayType::get(i8Ty, BUFSZ), buf,
-        {builder_.getInt64(0), builder_.getInt64(0)});
-    // fgets(bufPtr, BUFSZ, stdin)
-    auto* fgetsFn = module_->getFunction("fgets");
-    if (!fgetsFn) {
-        auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy(), i32(), ptrTy()}, false);
-        fgetsFn = llvm::Function::Create(
-            ft, llvm::Function::ExternalLinkage, "fgets", module_.get());
-    }
-    // stdin global (FILE*)
-    auto* stdinGV = module_->getGlobalVariable("stdin");
-    if (!stdinGV) {
-        stdinGV = new llvm::GlobalVariable(
-            *module_, ptrTy(), false,
-            llvm::GlobalValue::ExternalLinkage, nullptr, "stdin");
-    }
-    llvm::Value* stdinVal = builder_.CreateLoad(ptrTy(), stdinGV, "stdin");
-    llvm::Value* fgRet = builder_.CreateCall(
-        fgetsFn, {bufPtr, builder_.getInt32(BUFSZ), stdinVal}, "fgets.ret");
-    auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy());
-    llvm::Value* isEOF = builder_.CreateICmpEQ(fgRet, nullPtr, "rl.eof");
-    auto* eofBB = llvm::BasicBlock::Create(llvm_, "rl.eof",  currentFn_);
-    auto* okBB  = llvm::BasicBlock::Create(llvm_, "rl.ok",   currentFn_);
-    auto* endBB = llvm::BasicBlock::Create(llvm_, "rl.end",  currentFn_);
-    builder_.CreateCondBr(isEOF, eofBB, okBB);
-    builder_.SetInsertPoint(eofBB);
-    builder_.CreateBr(endBB);
-    // OK: compute length, strip trailing '\n'.
-    builder_.SetInsertPoint(okBB);
-    auto* strlenFn = module_->getFunction("strlen");
-    if (!strlenFn) {
-        auto* ft2 = llvm::FunctionType::get(i64(), {ptrTy()}, false);
-        strlenFn = llvm::Function::Create(
-            ft2, llvm::Function::ExternalLinkage, "strlen", module_.get());
-    }
-    llvm::Value* rawLen = builder_.CreateCall(strlenFn, {bufPtr}, "rawlen");
-    llvm::Value* hasBytes = builder_.CreateICmpSGT(rawLen, builder_.getInt64(0));
-    auto* stripBB = llvm::BasicBlock::Create(llvm_, "rl.strip", currentFn_);
-    auto* afterBB = llvm::BasicBlock::Create(llvm_, "rl.after", currentFn_);
-    builder_.CreateCondBr(hasBytes, stripBB, afterBB);
-    builder_.SetInsertPoint(stripBB);
-    llvm::Value* lastIdx = builder_.CreateSub(rawLen, builder_.getInt64(1));
-    llvm::Value* lastPtr = builder_.CreateGEP(i8Ty, bufPtr, lastIdx);
-    llvm::Value* lastByte = builder_.CreateLoad(i8Ty, lastPtr);
-    llvm::Value* isNL = builder_.CreateICmpEQ(lastByte, llvm::ConstantInt::get(i8Ty, '\n'));
-    auto* nlBB = llvm::BasicBlock::Create(llvm_, "rl.nl", currentFn_);
-    builder_.CreateCondBr(isNL, nlBB, afterBB);
-    builder_.SetInsertPoint(nlBB);
-    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), lastPtr);
-    builder_.CreateBr(afterBB);
-    builder_.SetInsertPoint(afterBB);
-    // Final length after stripping.
-    llvm::Value* finalLen = builder_.CreateCall(strlenFn, {bufPtr}, "finalLen");
-    // Heap-copy the data.
-    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-    auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-    llvm::Value* dataSz = builder_.CreateAdd(finalLen, builder_.getInt64(1));
-    llvm::Value* dataCopy = builder_.CreateCall(mallocFn, {dataSz}, "rl.data");
-    builder_.CreateCall(memcpyFn, {dataCopy, bufPtr, finalLen});
-    llvm::Value* endData = builder_.CreateGEP(i8Ty, dataCopy, finalLen);
-    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), endData);
-    uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
-    llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "rl.obj");
-    builder_.CreateStore(dataCopy, builder_.CreateStructGEP(stringType(), strObj, 0));
-    builder_.CreateStore(finalLen, builder_.CreateStructGEP(stringType(), strObj, 1));
-    builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
-        builder_.CreateStructGEP(stringType(), strObj, 2));
-        initStringRc(strObj);  // #422: producer's reference, rc := 1
-    auto* okEnd = builder_.GetInsertBlock();
-    builder_.CreateBr(endBB);
-    // Merge.
-    builder_.SetInsertPoint(endBB);
-    auto* phi = builder_.CreatePHI(ptrTy(), 2, "rl.result");
-    phi->addIncoming(nullPtr, eofBB);
-    phi->addIncoming(strObj, okEnd);
-    return phi;
+    llvm::Function* fn = declareC("bz_console_read_line", ptrTy(), {});
+    return builder_.CreateCall(fn, {}, "rl.result");
 }
-
 
 // fix #7792 (stdlib §7.4, v0.355): is `ty` the built-in `TextWriter` (no user
 // declaration), nullable or not? A value of that type is the i32 descriptor of

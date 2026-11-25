@@ -1998,6 +1998,11 @@ int64_t bz_wstrlen(const void* wstr);
 void* bz_string_from_utf8z(const void* p);
 void* bz_string_from_utf16z(const void* p);
 
+// stdlib §2.1 / §7.4 (v0.359) / fix #9303: the standard-input line reader behind
+// `Console.ReadLine` / `TextReader.ReadLine`: the next line (no '\n', any
+// length) as a +1 string, or NULL at EOF.
+void* bz_console_read_line();
+
 // stdlib §10.3 / fix #977 / #985: RawBytes.From(buffer: Array<byte>) — copies
 // the byte array into a fresh malloc'd buffer and wraps it with its length in a
 // { ptr, len } heap struct so RawBytes is a backed pointer-and-length pair.

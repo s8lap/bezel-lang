@@ -11493,13 +11493,14 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             }
             if (receiverOk) {
                 // THE READ. §2.1's `Console.ReadLine()` reader — the same
-                // `fgets`-on-`stdin` shape, the same trailing-'\n' strip
-                // (§7.4's `ReadLine` returns the line WITHOUT its
-                // terminator, as §2.1's does), the same NULL at EOF — so the
-                // two members AGREE on what a line of standard input is, and
-                // the minted string has the same {data, len, width=1, rc=1}
-                // shape (the producer's reference, §4.6 / #422), which is what
-                // `Emitter::isPlusOneStringProducer`'s arm discharges.
+                // runtime line reader (`bz_console_read_line`: the whole line
+                // up to its '\n', which is not part of it (§7.4's `ReadLine`
+                // returns the line WITHOUT its terminator, as §2.1's does),
+                // and NULL at EOF) — so the two members AGREE on what a line
+                // of standard input is, and the minted string is the
+                // producer's +1 reference (§4.6 / #422), which is what
+                // `Emitter::isPlusOneStringProducer`'s arm discharges. A line
+                // is not cut at an implementation buffer (fix #9303).
                 llvm::Value* line = emitConsoleReadLine();
                 if (line) {
                     // fix #9260 (§7.4): the RESULT is a `string?` — stamp it
