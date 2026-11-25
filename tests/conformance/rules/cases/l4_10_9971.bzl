@@ -17,9 +17,8 @@ public class Program
   public static method Main()
     var s := new Set<string?>();
     var head := "a";
-    var built := head + "b";
     Console.WriteLine(s.TryAdd("ab"));
-    Console.WriteLine(s.TryAdd(built));
+    Console.WriteLine(s.TryAdd(head + "b"));
     Console.WriteLine(s.TryAdd("cd"));
     Console.WriteLine(s.TryAdd("cd"));
     Console.WriteLine(s.Count);
