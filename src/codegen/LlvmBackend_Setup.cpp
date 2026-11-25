@@ -25894,6 +25894,58 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
                     return reinterpret_cast<const sema::TypeSymbol*>(1);
                 }
             }
+            // (b1f) #9139 / §27.1 / §28.3 announcement-table row 1 / §28.7:
+            // the callee may be a FUNCTION-TYPED VALUE — a local, a field, or
+            // another call's result — whose declared return slot carries
+            // `owned` (`h: () -> owned W; var w := h();`). §28.3's
+            // announcement table row 1 ("`owned T` over a non-mint-announcing
+            // type") reads "Instance, extension, function-value invocation:
+            // Owned", so the invocation produces an OWNED value and `w` is an
+            // owned local — the same verdict the ownership pass reaches (its
+            // `producerState` reads the callee's function type's
+            // `funcReturnOwned` flag, #1290 / §27.1), so the ownership side
+            // already treats the local's reassignment as a COVERED
+            // drop-on-overwrite (`localDropOnOverwriteCovered`).
+            //
+            // Codegen missed it: (b) above keys on a MethodSymbol callee, so a
+            // function-value callee fell through to null — and (b) is the gate
+            // `disposeDisplacedOwnedClassLocal` reads for the §28.7
+            // drop-on-overwrite, so the displaced value was never disposed and
+            // leaked (the scope-end disposal covers the FINAL value only).
+            // MEASURED on r30-c1 @ e97a8efbc (`bezelc --sanitize=address`, 200
+            // iterations): `var w := h(); w := new W();` left 3200 B in 200
+            // allocations leaked and ran the destructor 200 times instead of
+            // 400, while the byte-identical DIRECT-CALL twin (`var w :=
+            // C.Get();`, a method returning `owned W`) was clean.
+            //
+            // The fact is the callee's function type's `funcReturnOwned` flag —
+            // the SAME flag the ownership pass's `producerState` reads (#1290)
+            // and the using-var classifier's (b1f) arm reads — so the three
+            // sides cannot drift. The `!ms` gate keeps the arm to the spelling
+            // this arm is about (a callee that is NOT a method): the method
+            // path (b) above already owns the method-call twin, and a builtin
+            // owned-transfer call is (b3) above. A value-typed owned return
+            // has no heap disposal obligation and stays unregistered (the
+            // class/interface test). // per §27.1, §28.3, §28.7, v0.359
+            if (!ms) {
+                if (const sema::TypeRef* cty = ctx_.exprType(*call->callee)) {
+                    if (cty->kind == sema::TypeRef::Kind::Function &&
+                        cty->funcReturnOwned) {
+                        const sema::TypeRef* initTy =
+                            ctx_.exprType(*ld->initializer);
+                        if (isClassOrInterfaceRef(initTy) ||
+                            isClassOrInterfaceRef(resolveTypeParamRef(initTy))) {
+                            if (initTy &&
+                                initTy->kind == sema::TypeRef::Kind::Named &&
+                                initTy->declaration &&
+                                initTy->declaration->kind ==
+                                    ast::TypeDeclKind::Class)
+                                return initTy->declaration;
+                            return reinterpret_cast<const sema::TypeSymbol*>(1);
+                        }
+                    }
+                }
+            }
         }
     }
     // §28.7 / §28.3 (#1625): a null-INITIALIZED plain local (`var x: T? := null;`)
