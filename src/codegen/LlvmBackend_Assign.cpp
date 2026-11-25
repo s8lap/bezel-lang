@@ -11443,6 +11443,64 @@ bool Emitter::lowerAccessorNullCoalescingAssign(const ast::AssignmentStmt& as) {
     if (!terminatorOrNull(builder_.GetInsertBlock()))
         builder_.CreateBr(endBB);
     builder_.SetInsertPoint(endBB);
+    // fix #9134 (§28.14 / §28.9 / §6.6, v0.359): the `??=` path's OWN
+    // discharge of the index argument's CLOSURE producer.
+    //
+    // `releaseIndexArgClosureProducers` DECLINES a PINNED index expression —
+    // §22.3's copy-in/copy-out bracket exclusion: a `ref`/`out` bracket owns
+    // the index's lifetime across the getter and the setter halves, so
+    // releasing it there would double-free it.
+    //
+    // §6.6 evaluates the LHS chain ONCE ("every constituent of the
+    // left-hand side's lvalue chain ... is evaluated exactly once, left to
+    // right: ... and every index expression in the chain"), so this path
+    // PINS the index expression (#2929's `exprValueOverride_` pin) and the
+    // getter and the setter share ONE lowered index value. The getter's
+    // discharge (#9083's) and the setter's (#4078's) therefore BOTH decline
+    // it, and the producer's +1 was stranded: a lambda written AT the index
+    // position of a `??=` minted its +1 and nobody dropped it.
+    //
+    // MEASURED on r30-c1 @ 4e5dbd3fe, `bezelc --sanitize=address --link=system
+    // --checked-disposal`, the issue's own 200-iteration repro
+    // `fl[lambda() => 7] ??= 3;`:
+    //
+    //     SUMMARY: AddressSanitizer: 12800 byte(s) leaked in 200 allocation(s).
+    //
+    // 64 bytes per call — the closure object alone (the probe's lambda
+    // captures nothing, so there is no capture cell and no cell payload).
+    //
+    // The pin here is this path's OWN (§6.6's once-only pin), not §22.3's
+    // bracket, so the discharge belongs to this path — ONCE, at the JOIN,
+    // after the getter (unconditional) and the setter (the assign branch) have
+    // both consumed the index. §23.5 (v0.359) forbids `ref`/`out`/`owned` on
+    // an indexer parameter list, so the accessor's function-typed parameter is
+    // plain and therefore CALL-BOUNDED (§28.14, v0.359): it keeps no
+    // reference to the callback, so the producer's +1 is the caller's to drop
+    // once the accessor has returned.
+    //
+    // The `!diverged_` gate is the discipline every sibling discharge uses
+    // (#429 / #9068 / #4078 / #9110): the release is not emitted into
+    // unreachable IR after an accessor that threw; the unwind edge's caller
+    // owns the throw path (a leak there is the safe direction — the indexer's
+    // THROW path is #9135, deferred).
+    if (ix && !diverged_) {
+        for (const auto& iv : ix->indices) {
+            const ast::Expr* ie = iv.value.get();
+            if (!ie) continue;
+            auto pit = exprValueOverride_.find(ie);
+            if (pit == exprValueOverride_.end() || !pit->second) continue;
+            llvm::Value* v = pit->second;
+            if (!v->getType()->isPointerTy()) continue;
+            // The SAME producer union `releaseIndexArgClosureProducers`
+            // discharges (fix #9115): a lambda literal, a method reference, a
+            // function-typed property read, or a CALL whose result is a +1
+            // closure.
+            if (!isPlusOneClosureProducer(ie) && !isUserMethodClosureReturnCall(ie) &&
+                !isLambdaClosureReturnCall(ie))
+                continue;
+            emitClosureRelease(v);  // null-safe; atomic rc dec
+        }
+    }
     // fix #2929: the getter (unconditional) and the setter (assign branch) are
     // both behind us, so the pins have no further readers — drop them at the
     // JOIN, where any later lowering of the same nodes is a genuinely new
