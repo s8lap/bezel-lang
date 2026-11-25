@@ -16060,10 +16060,11 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
         if (scrutChoiceSlot && patternBindsAnySlot(arm.pattern.get()))
             dischargeOwningMatchTransfers(scrutChoiceSlot, scrutChoiceRef,
                                           arm.pattern.get());
-        // fix #9094 (§35.5 *The owning match*, §19.3, §28.3.11, v0.359): the
-        // ARM-EXIT discharge of the payload the owning match TRANSFERRED into
-        // this arm's binding — the expression-position twin of the
-        // statement-position fix (LlvmBackend_Stmts.cpp's `lowerCaseStmt`).
+        // fix #9094 (§35.5 *The owning match*, §19.3, §28.3, §28.3.11,
+        // v0.359): the ARM-EXIT discharge of the payload the owning match
+        // TRANSFERRED into this arm's binding — the expression-position twin
+        // of the statement-position fix (LlvmBackend_Stmts.cpp's
+        // `lowerCaseStmt`).
         //
         // §35.5: the transferred binding "is an owned local of the arm body's
         // scope, and §28.3's standard rules apply to it on every arm-exit
@@ -16072,50 +16073,82 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
         // construct-completion reclaim — §35.5's "transfers … into its
         // bindings" — so the binding is its only owner, and an arm that
         // discharges nothing left the payload owned by NOBODY: the destructor
-        // never ran and the block leaked (MEASURED on r30-c1 @ 74b77d29d,
-        // ASan/LSan, over the issue's own program in EXPRESSION position:
-        // "N=0 S=700" and "Direct leak of 1600 byte(s) in 100 object(s)").
+        // never ran and the block leaked.
         //
-        // The ENCLOSING scope's entry covers the arm's abnormal exits (a
-        // `throw` out of the arm expression); the explicit pass below covers
-        // the NORMAL exit — the arm's expression is evaluated, and the
-        // binding's payload is dropped with it. Both are null-guarded on the
-        // BINDING's own slot, so this is exactly-once with `move r`
-        // (#4734's per-occurrence null), `r.Dispose()` (#4734's
-        // reclaim-and-null) and `_ := r;` (§17.13's discard) — all of which
-        // reclaim through that same slot.
+        // THE ARM'S EXIT EDGES, AND ONLY ITS OWN. The expression position has
+        // no block scope for the arm, so the arm's binding disposals are put
+        // on the innermost dispose scope for exactly as long as THIS ARM's
+        // expression is being lowered, and taken off again afterwards:
+        //   * an ABNORMAL exit out of the arm (a `throw`, a pending-exception
+        //     check after a call in the arm) is emitted INSIDE the arm's own
+        //     control flow and disposes the scopes live at that point
+        //     (`emitUnwindDisposals`), so it sees the entries — the arm's
+        //     binding is dropped on that edge;
+        //   * the NORMAL exit (the arm's value is computed) gets the explicit
+        //     pass below.
+        // Nothing of an arm outlives that arm's lowering. "Falling off the
+        // arm" is a property of the arm that RAN: an arm that was not selected
+        // never initialised its binding slot, so an entry left on the
+        // ENCLOSING scope for every arm (the rejected first attempt) disposed
+        // an uninitialised slot at that scope's exit whichever arm ran —
+        // MEASURED: a plain-build SEGV (rc 139) on
+        // `var v := (case h.MakeE() of Text(r) => r.Id(), Two(a, b) => 2,
+        // Empty => 3);` with `Empty` selected and nothing owned allocated.
         //
-        // §27.5: a binding CAPTURED by a closure lives in a CAPTURE CELL, and
-        // that cell is owned by the scope the binding was DECLARED in — the
-        // scope ENCLOSING this `case`. So the enclosing-scope backstop, which
-        // runs at that scope's exit, could read a FREED cell (MEASURED on
-        // r43-m46-9094 in the statement-position twin: heap-use-after-free,
-        // ASan). The backstop is therefore registered AFTER the arm's
-        // expression is lowered (so the capture is visible) and SKIPS a
-        // captured binding; the NORMAL exit below still disposes it, at the
-        // arm's own exit, where the cell is alive.
+        // EXACTLY-ONCE. Each entry is null-guarded on the BINDING's own slot,
+        // and every other discharge §35.5 names reclaims through that same
+        // slot and NULLS it — `move r` (#4734's per-occurrence null),
+        // `r.Dispose()` (#4734's reclaim-and-null) and `_ := r;` (§17.13's
+        // discard) — so whichever runs first reclaims the block and the later
+        // one reloads the nulled slot and skips.
         std::vector<Disposal> armBindingDisposals;
         if (scrutChoiceSlot && patternBindsAnySlot(arm.pattern.get()))
             armBindingDisposals =
                 owningMatchArmBindingDisposals(arm.pattern.get());
-        llvm::Value* v = lowerExpr(*arm.exprBody);
-        // §27.5's capture-cell test: the slot IS a cell holder (the
-        // already-boxed path), or a FRESH holder keeps it in sync (the
-        // `cellVarSyncSlot_` map's holder -> original direction).
-        auto capturedByClosure = [&](llvm::AllocaInst* s) {
-            if (!s) return false;
-            if (cellVars_.count(s)) return true;
-            for (const auto& entry : cellVarSyncSlot_)
-                if (entry.second == s) return true;
-            return false;
-        };
-        if (!disposeStack_.empty())
+        const bool armBindingsOnStack =
+            !armBindingDisposals.empty() && !disposeStack_.empty();
+        const std::size_t armBindingScopeIdx =
+            disposeStack_.empty() ? 0 : disposeStack_.size() - 1;
+        if (armBindingsOnStack)
             for (const auto& d : armBindingDisposals)
-                if (!capturedByClosure(d.slot)) disposeStack_.back().push_back(d);
+                disposeStack_.back().push_back(d);
+        llvm::Value* v = lowerExpr(*arm.exprBody);
+        // Take this arm's entries off again, and drop the binding through the
+        // entries AS THEY NOW STAND. The entries the arm's expression
+        // registered meanwhile (its own temporaries, which belong to the
+        // enclosing scope) keep their place.
+        //
+        // §27.5: a closure in the arm that CAPTURES the binding boxes it, and
+        // the boxing rebinds every pending disposal of the binding's slot to
+        // the cell HOLDER (`rebindDisposalSlot`), whose read falls back to the
+        // pre-boxing slot while no cell exists. So an entry is this arm's when
+        // its slot is the binding's slot or a holder kept in sync with it
+        // (`cellVarSyncSlot_`, holder -> pre-boxing slot), and the normal-exit
+        // drop must go through that rebound entry: dropping through the
+        // pre-boxing slot instead nulls only that slot and leaves the cell
+        // naming the freed payload (MEASURED: heap-use-after-free on
+        // `Text(r) => (lambda() => r.Id())()` with the stale entry left behind).
+        if (armBindingsOnStack && armBindingScopeIdx < disposeStack_.size()) {
+            auto& scope = disposeStack_[armBindingScopeIdx];
+            auto isThisArmsEntry = [&](const Disposal& e,
+                                       llvm::AllocaInst* bindingSlot) {
+                if (!e.dynamicDispose || e.boxedCellFreeDeferred) return false;
+                if (e.slot == bindingSlot) return true;
+                auto sync = cellVarSyncSlot_.find(e.slot);
+                return sync != cellVarSyncSlot_.end() &&
+                       sync->second == bindingSlot;
+            };
+            for (auto& d : armBindingDisposals)
+                for (auto it = scope.begin(); it != scope.end(); ++it)
+                    if (isThisArmsEntry(*it, d.slot)) {
+                        d = *it;
+                        scope.erase(it);
+                        break;
+                    }
+        }
         // §35.5: "falling off the arm still owning the value auto-drops it".
-        // A DIVERGED arm body (a `throw`) has already terminated its block, so
-        // nothing is emitted here and the enclosing scope's entry above covers
-        // that edge.
+        // A DIVERGED arm body (a `throw`) has already terminated its block and
+        // disposed the binding on that edge, so nothing is emitted here.
         if (!diverged_ && !terminatorOrNull(builder_.GetInsertBlock()))
             emitDisposals(armBindingDisposals);
         // CG40 (§17.12 / §19): an arm body that diverges (`throw E`, or a

@@ -224,3 +224,196 @@ BEZEL_TEST(owning_match_scrutinee_temp_disposed_9094,
     BEZEL_EXPECT_EQ(r.stdoutText,
                     std::string("N=200 Made=200 S=1400\n"));
 }
+
+// ===========================================================================
+// fix-forward of #9094 (§35.5, §28.3, v0.359): EXPRESSION position, an
+// owned-binding arm that is NOT the selected one.
+//
+// The first attempt registered every owned-binding arm's disposal on the
+// scope ENCLOSING the `case` expression, at lowering time, so that scope's
+// exit disposed the binding slot of an arm that never ran — an uninitialised
+// slot. MEASURED on that attempt (commit 9e4fd56a4): each row below crashed,
+// SEGV in a plain build (rc 139) as well as under ASan. §35.5: the binding
+// "is an owned local of the arm body's scope, and §28.3's standard rules
+// apply to it on every arm-exit edge — falling off the arm still owning the
+// value auto-drops it". Falling off the arm is a property of the arm that
+// RAN; an arm that did not run has no binding to drop.
+//
+// Every row is a 200-iteration loop on `runAotChecked`, and its oracle is the
+// EXACT destructor count against the construction count (`N` vs `Made`):
+// below is a leak, above a double free, and a crash prints nothing.
+// ===========================================================================
+namespace {
+
+const char* kDecls2 =
+    "public class Res "
+    "  public static N: int := 0; "
+    "  public static Made: int := 0; "
+    "  public constructor() Res.Made := Res.Made + 1; end constructor; "
+    "  destructor Res.N := Res.N + 1; end destructor; "
+    "  public method Id(): int => 7; "
+    "end Res; "
+    "public choice OChoice Text(owned r: Res), Two(owned a: Res, owned b: Res), "
+    "  Empty; "
+    "end OChoice; "
+    "public class H "
+    "  public constructor() end constructor; "
+    "  public method Make(): OChoice return OChoice.Text(new Res()); end Make; "
+    "  public method MakeTwo(): OChoice "
+    "    return OChoice.Two(new Res(), new Res()); "
+    "  end MakeTwo; "
+    "  public method MakeE(): OChoice return OChoice.Empty; end MakeE; "
+    "  public method Kaboom(): int throw new Exception(\"boom\"); end Kaboom; "
+    "end H; "
+    "public class G "
+    "  public static method Mk(i: int): Result<Res, string> "
+    "    if i mod 2 = 0 then return Result<Res, string>.Ok(new Res()); end; "
+    "    return Result<Res, string>.Error(\"bad\"); "
+    "  end Mk; "
+    "end G; ";
+
+std::string prog2(const std::string& loopBody) {
+    return std::string("module M; ") + kDecls2 +
+           "public class Program "
+           "  public static method Main(): int "
+           "    var h := new H(); "
+           "    var s := 0; "
+           "    var i := 0; "
+           "    while i < 200 do " + loopBody +
+           "      i := i + 1; "
+           "    end while; "
+           "    Console.WriteLine($\"N={Res.N} Made={Res.Made} S={s}\"); "
+           "    return 0; "
+           "  end Main; "
+           "end Program;";
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// CONTROL — the `Empty` arm is selected, the two owned-binding arms are not,
+// and nothing owned is ever allocated. Correct before #9094 was touched; the
+// first attempt SEGV'd here (the unselected arms' slots were disposed at the
+// enclosing scope's exit).
+// ---------------------------------------------------------------------------
+BEZEL_TEST(owning_match_scrutinee_temp_disposed_9094,
+           control_35_5_expr_unselected_owned_binding_arms_dispose_nothing) {
+    auto r = runAotChecked(prog2(
+        "var v := (case h.MakeE() of Text(r) => r.Id(), Two(a, b) => 2, "
+        "          Empty => 3); "
+        "s := s + v; "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("N=0 Made=0 S=600\n"));
+}
+
+// ---------------------------------------------------------------------------
+// The stdlib `Result<Res, string>` in expression position, `case move`, the
+// arms alternating: `Ok(v)` on even iterations, `Error(e)` on odd ones. Each
+// `Ok` payload is dropped at its arm's exit (100 of them); no `Ok` slot is
+// touched on an `Error` iteration.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(owning_match_scrutinee_temp_disposed_9094,
+           spec_35_5_expr_stdlib_result_alternating_arms_disposes_each_ok_once) {
+    auto r = runAotChecked(prog2(
+        "var k := 0; "
+        "var b := G.Mk(i); "
+        "k := (case move b of Ok(v) => v.Id(), Error(e) => 2); "
+        "s := s + k; "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("N=100 Made=100 S=900\n"));
+}
+
+// ---------------------------------------------------------------------------
+// A `when` guard: the guarded `Text(r)` arm is selected on even iterations,
+// the unguarded `Text(r)` arm on odd ones, and `Two`/`Empty` never. The guard
+// is evaluated BEFORE the transfer, so a declined guard transfers nothing and
+// the next arm's binding is the one that owns (and drops) the payload.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(owning_match_scrutinee_temp_disposed_9094,
+           spec_35_5_expr_guarded_arm_drops_only_the_selected_arms_binding) {
+    auto r = runAotChecked(prog2(
+        "var v := (case h.Make() of Text(r) when i mod 2 = 0 => 1, "
+        "          Text(r) => 2, Two(a, b) => 3, Empty => 4); "
+        "s := s + v; "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("N=200 Made=200 S=300\n"));
+}
+
+// ---------------------------------------------------------------------------
+// A NESTED owning match: the inner `case` is the outer `Text(r)` arm's
+// expression. Both selected arms' payloads are dropped (two per iteration),
+// and neither match's unselected `Two(a, b)` arm disposes anything.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(owning_match_scrutinee_temp_disposed_9094,
+           spec_35_5_expr_nested_owning_match_drops_both_selected_bindings) {
+    auto r = runAotChecked(prog2(
+        "var v := (case h.Make() of "
+        "            Text(r) => (case h.Make() of Text(q) => r.Id() + q.Id(), "
+        "                        Two(a, b) => 0, Empty => 0), "
+        "            Two(a, b) => 2, Empty => 3); "
+        "s := s + v; "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("N=400 Made=400 S=2800\n"));
+}
+
+// ---------------------------------------------------------------------------
+// The arms ALTERNATE over all three cases (`Two` when i mod 3 = 0, `Empty`
+// when 1, `Text` when 2): 67 + 67 `Two` payloads and 66 `Text` payloads are
+// made, and each is dropped exactly once, by the arm that ran.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(owning_match_scrutinee_temp_disposed_9094,
+           spec_35_5_expr_alternating_arms_drop_only_the_arm_that_ran) {
+    auto r = runAotChecked(prog2(
+        "var o: OChoice := h.MakeE(); "
+        "if i mod 3 = 0 then o := h.MakeTwo(); end; "
+        "if i mod 3 = 2 then o := h.Make(); end; "
+        "var v := (case move o of Text(r) => r.Id(), Two(a, b) => 2, "
+        "          Empty => 3); "
+        "s := s + v; "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    // i mod 3 = 0: 67 iterations (Two, 2 each), = 1: 67 (Empty, 3), = 2: 66
+    // (Text, 7): Made = 134 + 66 = 200, S = 134 + 201 + 462 = 797.
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("N=200 Made=200 S=797\n"));
+}
+
+// ---------------------------------------------------------------------------
+// The arm's EXCEPTIONAL exit in expression position: the selected `Text(r)`
+// arm's expression throws, and the payload is dropped on that edge — while
+// the exception unwinds out of the arm, inside the arm's own control flow.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(owning_match_scrutinee_temp_disposed_9094,
+           spec_35_5_expr_throwing_arm_drops_its_binding_on_unwind) {
+    auto r = runAotChecked(prog2(
+        "try "
+        "  var v := (case h.Make() of Text(r) => h.Kaboom(), Two(a, b) => 2, "
+        "            Empty => 3); "
+        "  s := s + v; "
+        "catch var e: Exception => s := s + 1; "
+        "end; "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("N=200 Made=200 S=200\n"));
+}
+
+// ---------------------------------------------------------------------------
+// A closure in the selected arm CAPTURES the binding (§27.5): the capture
+// boxes `r` into a cell and rebinds the binding's pending disposal to the
+// cell holder, so the arm-exit drop must go through that holder. Dropping
+// through the pre-boxing slot left the cell naming the freed payload, and a
+// stale entry then read it (heap-use-after-free; a plain-build SEGV).
+// ---------------------------------------------------------------------------
+BEZEL_TEST(owning_match_scrutinee_temp_disposed_9094,
+           spec_35_5_expr_arm_capturing_its_binding_drops_it_once) {
+    auto r = runAotChecked(prog2(
+        "var v := (case h.Make() of Text(r) => (lambda() => r.Id())(), "
+        "          Two(a, b) => 2, Empty => 3); "
+        "s := s + v; "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("N=200 Made=200 S=1400\n"));
+}
