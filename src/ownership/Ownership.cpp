@@ -2475,6 +2475,40 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
             if (!(isDeferredActivationCallResult(exprBody) &&
                   returnTypeIsDeferredActivation()))
                 reportCallBounded(exprBody.span.begin, src->name, "returned");
+        } else {
+            // fix #9142 (§28.14 *The call-bounded default*, v0.359): the `=> E`
+            // body is a USER-AUTHORED CALLEE body, so §28.14's callee-side
+            // obligations bind it exactly as they bind a block body — but only
+            // the RETURN sink above was ever reached here. A block body runs
+            // `callBoundedScan` + `scopedPreScan` (`run`); an expression body
+            // ran NEITHER, so every other sink was INVISIBLE on `=> E`:
+            // forwarding the call-bounded parameter into a `scoped` parameter
+            // position, and storing it into a collection reachable beyond the
+            // call, were SILENTLY ACCEPTED where the block-bodied twin is
+            // rejected. MEASURED on r30-c1 (#9142):
+            //   `public method M(q: () -> int): int => (new Sink()).Take(q);`
+            // compiled with zero diagnostics, while
+            //   `public method M(q: () -> int): int return (new Sink()).Take(q); end M;`
+            // was rejected with §28.14's forward diagnostic.
+            //
+            // Run the SAME call-bounded walk over the expression body. The
+            // walk reports the forward-into-a-`scoped`-position sink itself
+            // (`callBoundedReportsScopedForward_`), with the admission's own
+            // diagnostic (`reportCallBoundedScopedForward`) — no admission
+            // pass runs on an expression body, exactly as on an accessor body
+            // (the #9084 precedent, `checkAccessorCallBounded`). The walk
+            // ALWAYS runs (as `callBoundedScan` always does), so a body with
+            // no function-typed formal of its own is still reached when it
+            // carries a lambda that has one (#1432).
+            //
+            // It runs ONLY when the body is not itself a call-bounded source:
+            // the block-body twin's `return E;` (the ReturnStmt case of
+            // `callBoundedWalkStmt`) REPORTS the return sink and STOPS — it
+            // does not descend into the returned value — so the expression
+            // body must not descend either. // per §28.14, v0.359
+            callBoundedReportsScopedForward_ = true;
+            callBoundedWalkExpr(exprBody);
+            callBoundedReportsScopedForward_ = false;
         }
     }
     // §28.3 SB01-B (v0.190, #1919): the `=>` expression-body sibling of the
