@@ -14029,7 +14029,21 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // the IndexExpr-borrow shape `xs[0]()` has `call.callee` =
             // IndexExpr (a borrow — the read produces no +1 to balance), and
             // skips the release.
-            if (dynamic_cast<const ast::CallExpr*>(call.callee.get()))
+            //
+            // fix #9112 (stdlib §4.11 / §28.11 / §28.9, v0.359): the
+            // "+1 producer by the contract above" clause has an EXCEPTION the
+            // contract did not state: a BUILT-IN collection's element read
+            // (`Stack<T>.Peek()`, `Queue<T>.Dequeue()`) hands out a BORROW of
+            // the collection's own element (stdlib §4.11: "borrow of top
+            // element"), so it mints NOTHING. Releasing it dropped the
+            // collection's only reference to the closure and freed it while
+            // the caller was still calling it — MEASURED (issue #9112):
+            // `st.Peek()()` on a `Stack<() -> int>`, a heap-use-after-free
+            // "freed by bz_closure_release" in main.
+            const ast::CallExpr* innerChainCall =
+                dynamic_cast<const ast::CallExpr*>(call.callee.get());
+            if (innerChainCall &&
+                !isBuiltinCollectionElementBorrowCall(*innerChainCall))
                 emitClosureRelease(closurePtr);
             return ccRes;
         }
@@ -20192,6 +20206,42 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
 // always had, and their mutual disjointness is what lets them share one
 // cleanup block and one release list (the argument is restated at the
 // install site below, where the three are combined).
+// fix #9112 (stdlib §4.11 / §28.11 / §28.9, v0.359): is `inner` a call to a
+// BUILT-IN collection's element read whose result is a BORROW of the
+// collection's own element — `Stack<T>.Peek()`, `Queue<T>.Dequeue()` and their
+// `Try*` twins?
+//
+// stdlib §4.11 declares `Peek` as "borrow of top element" (and, for the
+// BORROWING forms, `Pop` / `Dequeue` produce "borrows whose compile-time
+// source is the collection"). The result is therefore the collection's own
+// reference, NOT a fresh one the caller owns: the caller may read it and call
+// it, but it must not RELEASE it — the collection's element is still there.
+//
+// The OWNING forms are excluded: `OwningStack<T>.Pop()` / `OwningQueue<T>
+// .Dequeue()` are declared `owned T` (stdlib §4.11) — a TRANSFER out — so
+// their result IS owned by the caller and the chain-call's release is correct
+// there. (The owning family requires `where T: class`, so a function-typed
+// element cannot reach it in any case.)
+bool Emitter::isBuiltinCollectionElementBorrowCall(
+    const ast::CallExpr& inner) const {
+    const auto* ma =
+        dynamic_cast<const ast::MemberAccessExpr*>(inner.callee.get());
+    if (!ma) return false;
+    const std::string_view m = ma->member;
+    if (m != "Peek" && m != "Pop" && m != "Dequeue" &&
+        m != "TryPeek" && m != "TryPop" && m != "TryDequeue")
+        return false;
+    const sema::TypeRef* rt = ctx_.exprType(*ma->target);
+    if (!rt) return false;
+    // The BUILT-IN collections only: their TypeRef has no declaration (the
+    // stdlib's builtin collection types are declared-less), so a user class
+    // that happens to be named `Stack` is not mistaken for one.
+    if (rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    const std::string_view head = rt->headName();
+    return head == "Stack" || head == "Queue";
+}
+
 Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
     sema::MethodSymbol* ms, const std::vector<llvm::Value*>& args,
     const std::vector<const ast::Expr*>& argExprs, const ast::CallExpr& call) {

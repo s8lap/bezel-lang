@@ -32569,6 +32569,39 @@ bool Emitter::isTypeParamStringFieldLvalue(const ast::Expr& target) {
     return isClassFieldStorageLvalue(target);
 }
 
+
+// fix #9112 (§28.9 / §14.1 / §3.6 rule 2, v0.359): the FUNCTION-typed twin of
+// isTypeParamStringFieldLvalue (fix #4965) — is `target` a CLASS field whose
+// DECLARED type is a bare type parameter that the ACTIVE substitution binds
+// to a FUNCTION type (`Box<T>.item` at `Box<() -> int>`)?
+//
+// §28.11's element-slot policy puts a function type in the SAME
+// *runtime-managed reference* row as `string`, so such a field owns an
+// INDEPENDENT +1 exactly as a directly-declared function-typed field does. The
+// DISCHARGE half of that pair already exists — emitOwnedFieldDisposals
+// releases the field through isTypeParamFunctionStorageMember (fix #5389) —
+// but the TAKE half did not: `isClosureFieldLvalue` reads the DECLARED type
+// (`T`), which is not a `Kind::Function`, so the field's store took NO
+// reference. The pair was therefore half-paired in the worst direction: the
+// disposal released a reference the field never took, and the value's own
+// holder released it too — two releases for one reference, the runtime's fatal
+// over-release (issue #9112, MEASURED: exit 134, "refcount over-release
+// (closure)").
+//
+// §14.1 (monomorphization) keeps the DECLARATION's spelling inside the
+// generic body, and §3.6's rule 2 evaluates the element category per
+// INSTANTIATION, after substituting the type arguments — so the substitution
+// is exactly what decides the row here, and the same substitution the
+// discharge half reads (isTypeParamBoundToFunction → resolveTypeParamRef).
+bool Emitter::isTypeParamFunctionFieldLvalue(const ast::Expr& target) {
+    if (isClosureFieldLvalue(target)) return false;  // the concrete twin's case
+    if (!isTypeParamBoundToFunction(ctx_.exprType(target))) return false;
+    // The storage classification (everything after the type test) is the
+    // string row's own shared helper, so the two rows can never disagree about
+    // WHICH locations are class field storage.
+    return isClassFieldStorageLvalue(target);
+}
+
 // fix #4965: the storage classification (everything after the type test),
 // shared by isStringFieldLvalue and isTypeParamStringFieldLvalue so the two can
 // never disagree about WHICH locations are class field storage.
@@ -40002,6 +40035,23 @@ bool Emitter::lowerClosureFieldStore(const ast::Expr& target,
                                      llvm::Value* fieldAddr,
                                      llvm::Value* newVal,
                                      const ast::Expr* valueExpr) {
+    // fix #9112 (§28.9 / §14.1, v0.359): a bare-`T` class field stored from
+    // inside the generic body at `T = () -> int` (Box<T>'s constructor
+    // `item := x`). RETAIN the new value unconditionally (a `T`-typed value
+    // expression is never a recognised +1 producer, and a spurious retain can
+    // only leak) so the field owns the +1 its specialized disposer releases.
+    // Do NOT release the old value: a `T` local in this same body holds no +1
+    // of its own, so releasing the displaced value could dangle it — the
+    // leak-over-UAF default the string row's twin uses (fix #4965). This is
+    // the TAKE half of the pair whose DISCHARGE half is
+    // isTypeParamFunctionStorageMember's release at the owner's disposal.
+    if (isTypeParamFunctionFieldLvalue(target)) {
+        if (!fieldAddr || !newVal || !newVal->getType()->isPointerTy())
+            return false;
+        emitClosureRetain(newVal);
+        builder_.CreateStore(newVal, fieldAddr);
+        return true;
+    }
     if (!isClosureFieldLvalue(target)) return false;
     if (!fieldAddr || !newVal) return false;
     if (!newVal->getType()->isPointerTy()) return false;

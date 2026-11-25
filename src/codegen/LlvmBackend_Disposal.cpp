@@ -1905,6 +1905,31 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // reclaims only the SURVIVING box (no double-free).
             if (!elemDisp && isDict)
                 elemDisp = dictValueBoxFreer(it->collTy);
+            // fix #9112 (§28.11 / §28.9 / §14.1, v0.359): the FUNCTION-typed
+            // twin of the string arm above. §28.11's element-slot policy puts a
+            // function type in the SAME *runtime-managed reference* row as
+            // `string` (whose borrowing-family column reads "shared
+            // references"), so an `owned Array<T>` field whose element is a
+            // function type co-owns ONE reference per slot — the take half is
+            // the store (`Add`), the give-back half is THIS free, and the two
+            // must read the SAME element type (§3.6's rule 2 fixes the
+            // category per instantiation; §14.1 keeps the DECLARATION's
+            // spelling inside the generic body, so `collElem` is resolved
+            // above). Before this the free released NOTHING for a function
+            // element: the slot's reference was stranded and the closure's env
+            // outlived the collection (issue #9112, MEASURED: LSan 72 B / 2
+            // allocations for `Bag<T>` with an `owned Array<T>` field at
+            // `T = () -> int`).
+            //
+            // The kind gate is the PAIRED one (`Array`): a collection whose
+            // removal path does not release its slot's reference (the STACK /
+            // QUEUE — issue #8453, OPEN) must not take a reference at the
+            // store either, so the two halves stay paired there too.
+            if (!elemDisp && !isDict &&
+                    fieldCollPol.cat == ElementPolicy::Category::RuntimeManaged &&
+                    collElem &&
+                    isFunctionElementSlotPaired(it->collTy->headName(), collElem))
+                elemDisp = functionElementReleaseThunk();
             llvm::Value* disp = elemDisp
                 ? llvm::cast<llvm::Value>(elemDisp)
                 : llvm::ConstantPointerNull::get(ptrTy());

@@ -17630,6 +17630,27 @@ private:
         return isTypeParamBoundToFunction(recordMemberType(m));
     }
 
+    // fix #9112 (§28.9 / §14.1 / §3.6 rule 2, v0.359): the FUNCTION-typed twin
+    // of isTypeParamStringFieldLvalue (fix #4965) — is `target` a CLASS field
+    // whose DECLARED type is a bare type parameter that the ACTIVE
+    // substitution binds to a FUNCTION type (e.g. `Box<T>.item` at
+    // `Box<() -> int>`)? Such a field is the same §28.11 *runtime-managed
+    // reference* row as a directly-declared function-typed field, and its
+    // DISCHARGE half already exists (isTypeParamFunctionStorageMember releases
+    // it at the owner's disposal) — without the matching TAKE half the field's
+    // store took NO reference and the disposal released one it never took:
+    // two releases for one reference, the runtime's fatal over-release
+    // (issue #9112, exit 134). §14.1 / §3.6 rule 2 fix the element category at
+    // the INSTANTIATION, so the substitution is what decides.
+    bool isTypeParamFunctionFieldLvalue(const ast::Expr& target);
+    // fix #9112 (stdlib §4.11 / §28.11 / §28.9, v0.359): is `inner` a call to
+    // a BUILT-IN collection's element read whose result is a BORROW of the
+    // collection's own element (`Stack<T>.Peek()`, `Queue<T>.Dequeue()` and
+    // their `Try*` twins)? Such a result mints nothing, so the chain-call
+    // site must not release it. The OWNING forms are excluded — their
+    // `Pop`/`Dequeue` are declared `owned T` (a transfer out).
+    bool isBuiltinCollectionElementBorrowCall(const ast::CallExpr& inner) const;
+
     // fix #8964 (§9.7 / §28.9, v0.359): the CLOSURE twin of
     // isStringStorageMemberResolved — a record component whose RESOLVED type
     // is a FUNCTION type (sema::TypeRef::Kind::Function). `recordMemberTypeResolved`

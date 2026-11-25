@@ -5039,6 +5039,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // own +1 (a closure `??` is not normalized), so it is a transfer.
             // The expression-bodied faces (emitMethodBody, the generic faces in
             // LlvmBackend_Calls2.cpp) use this same exclusion list.
+            // fix #9112 (§28.9 / §28.3 / §28.11, v0.359): the declared return
+            // type is read as the DECLARATION spells it — a BARE type parameter
+            // is NOT a minting return type. §28.3's producers table reads a
+            // bare type parameter as a BORROW (row 5), so a generic method
+            // whose declared return type is `T` (`Box<T>.Pop(): T`) hands the
+            // caller a BORROW of the field's reference — it mints nothing, and
+            // the caller's `T`-typed local holds no +1 of its own to release
+            // (the same discipline `isTypeParamBoundToString` states for the
+            // string row). Minting here instead stranded the minted reference:
+            // the local never releases it, so the closure's count never
+            // reached zero and its env leaked (MEASURED: LSan 72 B / 2
+            // allocations over 200 iterations of `Box<() -> int>.Pop()`).
+            // The value the caller reads is the FIELD's reference, which the
+            // field's own store took (the #9112 take half) and the owner's
+            // disposal gives back — one reference, one release.
             if (declRet && declRet->kind == sema::TypeRef::Kind::Function &&
                 !isPlusOneClosureProducer(rs->value.get()) &&
                 !isUserMethodClosureReturnCall(rs->value.get()) &&

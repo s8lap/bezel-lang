@@ -8518,6 +8518,49 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         "capacity argument of the `Array<T>` constructor",
                         ne->args[0].value.get());
                 }
+                // fix #9112 (stdlib §4.11, v0.359): `Stack<T>` / `Queue<T>` (and
+                // their owning twins) declare ONLY the no-argument constructor —
+                // stdlib §4.11 lists `public constructor();` and no other. A
+                // collection LITERAL argument is already rejected by the #2725
+                // arm above; an ordinary argument (`new Stack<() -> int>(arr)`)
+                // was not, and codegen read it as the ARRAY family's CAPACITY
+                // argument — a pointer where an `int` capacity was expected, so
+                // the emitted IR was malformed ("Invalid operands for select
+                // instruction! %21 = select i1 %20, ptr %15, i64 1") and the
+                // compile died with "IR verification failed" instead of a
+                // diagnostic. MEASURED (issue #9112, item e05): the compiler
+                // must never emit malformed IR; the program is not valid, so
+                // the compile must FAIL with a diagnostic that says why.
+                //
+                // The diagnostic names the constructor the type DOES declare
+                // (the #2725 rule: a diagnostic naming a constructor the type
+                // does not have is worse than one naming none).
+                if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                    rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty() &&
+                    (rt->headName() == "Stack" ||
+                     rt->headName() == "OwningStack" ||
+                     rt->headName() == "Queue" ||
+                     rt->headName() == "OwningQueue") &&
+                    !ne->args.empty()) {
+                    for (const auto& a : ne->args) {
+                        if (!a.value) continue;
+                        // A collection literal is rejected by the #2725 arm
+                        // above (skip it here so the same argument is not
+                        // diagnosed twice).
+                        if (dynamic_cast<const ast::CollectionLiteralExpr*>(
+                                a.value.get()))
+                            continue;
+                        ctx_.diagnostics().report(
+                            Severity::Error, a.value->span.begin,
+                            "stdlib §4.11: the '" + std::string(rt->headName()) +
+                            "<T>' constructor takes no arguments — it declares "
+                            "only the no-argument form — so this argument has "
+                            "no constructor to bind to. Build the collection "
+                            "empty and fill it through `Push` / `Enqueue` "
+                            "(\xC2\xA7""4.11, #9112)");
+                    }
+                }
                 // stdlib §4.4 v0.165 (#1375): the sized-fill constructor
                 // `Array<T>(size: int, fill: T)` requires `fill` to be
                 // assignable to the element type T (and `size` to be int-like).

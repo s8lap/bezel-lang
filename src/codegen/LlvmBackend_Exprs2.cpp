@@ -9885,6 +9885,37 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     return arr;
                 };
                 if (!ne.args.empty() && ne.args[0].value) {
+                    // fix #9112 (stdlib §4.11, v0.359): the CAPACITY argument
+                    // belongs to the kinds that DECLARE one — `Array<T>` /
+                    // `OwningArray<T>` (stdlib §4.4 / §4.5) and `Set<T>` /
+                    // `OwningSet<T>` (stdlib §4.10). The LIFO/FIFO families
+                    // declare ONLY the no-argument constructor (stdlib §4.11),
+                    // so an argument there has no constructor to bind to: the
+                    // argument was read as a capacity, and a POINTER capacity
+                    // produced malformed IR — `select i1 %20, ptr %15, i64 1`
+                    // — and the compile died with "IR verification failed"
+                    // (issue #9112, item e05). Semantics rejects the call
+                    // first (ExprTypecheck_Exprs.cpp, the #9112 arm); this
+                    // guard is the codegen-side backstop, so the compiler
+                    // never emits malformed IR even if the sema check is
+                    // ever relaxed. The diagnostic names the constructor the
+                    // type DOES declare.
+                    bool declaresCapacity =
+                        colName == "Array" || colName == "OwningArray" ||
+                        colName == "Set" || colName == "OwningSet";
+                    if (!declaresCapacity) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ne.args[0].value->span.begin,
+                            "stdlib §4.11: the '" + std::string(colName) +
+                            "<T>' constructor takes no arguments — it declares "
+                            "only the no-argument form — so this argument has "
+                            "no constructor to bind to. Build the collection "
+                            "empty and fill it through `Push` / `Enqueue` "
+                            "(\xC2\xA7""4.11, #9112)");
+                        return tagOwningElems(builder_.CreateCall(
+                            allocFn, {builder_.getInt64(elemSize),
+                                      builder_.getInt64(16)}));
+                    }
                     llvm::Value* capArg = lowerExpr(*ne.args[0].value);
                     if (capArg) {
                         capArg = ctorIntTo(capArg, *ne.args[0].value, i64());
