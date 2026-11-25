@@ -2125,8 +2125,40 @@ private:
     // verdicts).
     bool getterSuppressedError_ = false;
 
+    // fix #9098 (§28.2, v0.359): set while the lambda-body pre-pass walks a
+    // loop body or a `finally` body a SECOND time (`rewalkLambdaBlock`). The
+    // second visit exists for ONE family of verdicts, §28.2's use after a
+    // disposal that reaches the use on every / some path, so `report` lets
+    // only that family through (and the notes that belong to it) and drops a
+    // report identical to one already made (severity, location, message).
+    // Everything else the second visit would say -- a move across iterations
+    // is the flow-insensitive pre-pass's documented, separate gap (#4117,
+    // #4141) -- is not this fix's to change.
+    bool dedupDiag_ = false;
+    bool rewalkLastErrorPassed_ = false;
+
     void report(Severity sev, SourceLocation loc, std::string msg) {
         if (suppressDiag_) return;
+        if (dedupDiag_) {
+            if (sev == Severity::Note) {
+                if (!rewalkLastErrorPassed_) return;
+            } else {
+                rewalkLastErrorPassed_ =
+                    msg.find("after a dominating explicit Dispose()") !=
+                        std::string::npos ||
+                    msg.find("may have already been disposed on another "
+                             "branch") != std::string::npos ||
+                    msg.find("which was disposed before this invocation") !=
+                        std::string::npos ||
+                    msg.find("is disposed again here") != std::string::npos;
+                if (!rewalkLastErrorPassed_) return;
+            }
+            for (const auto& d : ctx_.diagnostics().diagnostics())
+                if (d.severity == sev && d.location.offset == loc.offset &&
+                    d.location.line == loc.line &&
+                    d.location.column == loc.column && d.message == msg)
+                    return;
+        }
         if (getterScopeOnly_) {
             if (sev == Severity::Error) getterSuppressedError_ = true;
             return;
@@ -2811,6 +2843,14 @@ private:
     // `usingVarSourceIsBorrow`); recurses into nested lambdas via
     // `applyUsingVarBorrowPinInLambdaBody`.
     void applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s);
+    // fix #9098 (§28.2, §28.3.10, v0.359): walk `body` through the pre-pass a
+    // second time from the CURRENT `states_`, for a verdict only the second
+    // visit can reach (a loop body at its back edge; a `finally` body at the
+    // paths that skipped the first walk), then put `states_` back. Reports
+    // are de-duplicated against the first visit, and the walk's `return`
+    // exit states and pending `break`/`continue` states are dropped.
+    void rewalkLambdaBlock(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
     // #2166 / §28.10 (v0.220): per-lambda body walker — saves/restores
     // `states_` and `fieldMovedFrom_` (the lambda body is its own scope) and
     // descends into the lambda's stmts and any nested lambdas.

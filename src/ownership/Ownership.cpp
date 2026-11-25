@@ -16064,6 +16064,19 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdas(
         // measured leak signature. // per §28.3, §28.6, §28.7, v0.298, #4271
         states_.clear();
         fieldMovedFrom_.clear();
+        // fix #9098 (§28.2, §28.3.10, v0.359): this lambda's own capture set.
+        // The flat list holds every nesting depth, and `seedCapturedOuterLocals`
+        // classifies a local declared inside a NESTED lambda's body as
+        // captured by the enclosing one (the nested body's identifiers are
+        // collected into the enclosing lambda's list), so the set left by the
+        // enclosing lambda's walk named the nested lambda's own locals
+        // "captured" when the nested lambda was walked next, and the discard
+        // arm (a captured outer binding is not this body's to dispose) skipped
+        // them: `_ := x;` in a doubly nested lambda killed no holder. The
+        // nested-body driver (`applyUsingVarBorrowPinInLambdaBody`) already
+        // gives each body its own set. // per §28.2, §28.3.10
+        auto savedCapturedSyms = std::move(lambdaCapturedSyms_);
+        lambdaCapturedSyms_.clear();
         seedCapturedOuterLocals(*lam, savedStates);
         // Walk the lambda's own body. Expression-bodied lambdas carry their
         // body as a single `exprBody`; block-bodied lambdas carry `stmts`.
@@ -16101,6 +16114,7 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdas(
         recordLambdaBodyExitOwnedLocals(*lam);
         lambdaExitStates_ = std::move(savedLambdaExits);
         lambdaExitUncertain_ = savedExitUncertain;
+        lambdaCapturedSyms_ = std::move(savedCapturedSyms);
         // prep #4146 Stage 2-A (§28.3, v0.298): when the experimental lambda
         // dataflow flag is set, ALSO run the CFG-based dataflow walk over the
         // lambda body, seeded with the captured states. The pre-pass walk above
@@ -17203,6 +17217,15 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             joinInto(states_, savedWhileStates, ws->span.begin,
                      /*emitClash=*/false, /*unionKeys=*/false);
         }
+        // fix #9098 (§28.2, §28.3.10, v0.359): the BACK EDGE. `states_` is now
+        // the state at the loop head on every iteration after the first (the
+        // join of the entry and the end of a pass through the body), so a
+        // kill made late in one pass reaches a use made early in the next —
+        // `while ... do use y; if ... then x.Dispose(); end; end`, a closure
+        // over `x` invoked in the pass after one that discarded `x`. The
+        // method body's CFG carries this edge; the first walk above cannot.
+        // The second visit reports only what the first could not. // per §28.2
+        if (!armNeverFallsThrough(ws->body)) rewalkLambdaBlock(ws->body);
         // fix #4141: join every break/continue-arm end-state pushed
         // during this body's walk into the post-loop join. Each one is
         // a path through the body that EXITED the loop early; together
@@ -17254,6 +17277,9 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             joinInto(states_, savedForStates, fs->span.begin,
                      /*emitClash=*/false, /*unionKeys=*/false);
         }
+        // fix #9098: the back edge, as in the WhileStmt arm above.
+        // per §28.2
+        if (!armNeverFallsThrough(fs->body)) rewalkLambdaBlock(fs->body);
         for (std::size_t i = pendingStart; i < pendingEnd; ++i) {
             joinInto(states_, pendingDivertedStates_[i], fs->span.begin,
                      /*emitClash=*/false, /*unionKeys=*/false);
@@ -17324,6 +17350,40 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             //     owner keeps it (#3253);
             //   * NOT an `owned` PARAMETER — parameters are out of band for
             //     this pass (the method's own arm treats them separately).
+            // fix #9098 (§28.2, §28.3.10, v0.359): the discard's operand is a
+            // READ of the binding, and the method arm walks it
+            // (`handleDischarge`, after the repeated-discard carve-out) before
+            // it announces the consume. The lambda arm did not, so a discard
+            // reached with the binding already disposed on SOME path — the
+            // second pass of a loop whose first pass discarded it, the case
+            // the closure `g` over `x` is invoked in — read freed memory
+            // unremarked. The operand is walked here exactly as the method
+            // arm walks it, including its "disposed again" warning for a
+            // discard of a binding an explicit disposal reaches on every
+            // path. // per §28.2, §28.3.10
+            {
+                bool repeatedDiscard = false;
+                if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+                        ds->value.get())) {
+                    if (rid->name != "this" && rid->name != "base") {
+                        auto* rst = lookupStateFor(*rid);
+                        if (rst && rst->state == OwnershipState::Disposed &&
+                            rst->explicitlyDisposed && !rst->awaitSpent) {
+                            report(
+                                Severity::Warning, rid->span.begin,
+                                std::string("local `") +
+                                    std::string(rid->name) +
+                                    "` is disposed again here — the discard "
+                                    "of an already explicitly disposed "
+                                    "binding is a no-op (disposal is "
+                                    "idempotent, §28.2); the redundant "
+                                    "discard usually indicates a bug");
+                            repeatedDiscard = true;
+                        }
+                    }
+                }
+                if (!repeatedDiscard) handleDischarge(*ds->value);
+            }
             if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                     ds->value.get())) {
                 if (id->name != "this" && id->name != "base") {
@@ -17591,6 +17651,19 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         }
         for (const auto& bs : trys->finallyBody)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        // fix #9098 (§28.2, §28.3.10, v0.359): `finally` runs on EVERY path to
+        // the code after the `try`, so what it does — a `Dispose()` of `x`
+        // that kills `x` and every holder of its value — is true of the
+        // post-try state. The overwrite below dropped it, so `try ...
+        // finally x.Dispose(); end; return y.tag;` was admitted (the method
+        // body's CFG rejects it). When no operand was excluded the state the
+        // finally walk ended in IS the post-try state; when one was (a body
+        // ending in `return`/`throw`), the filtered join is walked through
+        // `finally` again below. // per §28.2
+        const bool postTryIsFinallyExit =
+            !trys->finallyBody.empty() &&
+            tryEndsForJoin.size() == tryEndsForFinally.size();
+        if (postTryIsFinallyExit) return;
         // #4142: the post-try state. When the entire operand set is
         // excluded (every body + every catch arm ends in `return`/`throw`),
         // the post-try code is unreachable via any live path — fall back to
@@ -17604,6 +17677,18 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                 joinInto(tryJoined, tryEndsForJoin[i], trys->span.begin,
                          /*emitClash=*/false, /*unionKeys=*/false);
             states_ = std::move(tryJoined);
+            // fix #9098: the excluded-operand case — see the comment above.
+            if (!trys->finallyBody.empty()) {
+                const std::size_t exitMark = lambdaExitStates_.size();
+                const std::size_t pendingMark = pendingDivertedStates_.size();
+                const bool savedDedup = dedupDiag_;
+                dedupDiag_ = true;
+                for (const auto& bs : trys->finallyBody)
+                    if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+                dedupDiag_ = savedDedup;
+                lambdaExitStates_.resize(exitMark);
+                pendingDivertedStates_.resize(pendingMark);
+            }
         }
         return;
     }
@@ -17701,6 +17786,21 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         return;
     }
     // Break / Continue / etc.: no child expressions reachable.
+}
+
+void MethodOwnership::rewalkLambdaBlock(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    const BlockState entry = states_;
+    const std::size_t exitMark = lambdaExitStates_.size();
+    const std::size_t pendingMark = pendingDivertedStates_.size();
+    const bool savedDedup = dedupDiag_;
+    dedupDiag_ = true;
+    for (const auto& bs : body)
+        if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+    dedupDiag_ = savedDedup;
+    lambdaExitStates_.resize(exitMark);
+    pendingDivertedStates_.resize(pendingMark);
+    states_ = entry;
 }
 
 // #2166: walk a single (nested) lambda body with its own save/restore. The
