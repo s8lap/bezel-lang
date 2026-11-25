@@ -9475,6 +9475,92 @@ void ExprTC::checkAssignable(
             return;
         }
     }
+    // fix #8757 (§5.1 "Reference conversions" / "Nullable conversions",
+    // stdlib §4.6, §12.4, v0.359): a source that is NOT the compiler-known
+    // class `LinkedListNode<T>` at a `LinkedListNode<T>` target.
+    //
+    // THE RULE. §5.1's implicit reference conversions are a CLOSED list (see
+    // the #8408 arm above): identity, class to base class, any type to
+    // `Object`, a type to an interface it implements or conforms to,
+    // interface to extended interface, a type parameter to a class/interface
+    // its constraints guarantee, and §12.9's variance-induced conversions.
+    // stdlib §4.6 declares `public class LinkedListNode<T>` — a COMPILER-KNOWN
+    // class — and §12.4 (v0.338) closes every compiler-known class to
+    // inheritance unless its text opens it (stdlib §1 opens only Encoding,
+    // Stream, TextReader, TextWriter and the §31.4 exception family;
+    // `LinkedListNode` is not among them — the compiler refuses `class
+    // MyNode: LinkedListNode<Item>` with "cannot inherit from compiler-known
+    // class `LinkedListNode` … (§12.4, §31.4)"). So NO user type is a
+    // subtype of `LinkedListNode<T>` and the "class to base class" row never
+    // applies to it; a PRIMITIVE has no reference conversion to a class at
+    // all (its only one is boxing to `Object`, §8.6). A `LinkedListNode<T>`
+    // target therefore admits only ITSELF — identity, and the §5.1 nullable
+    // lift `LinkedListNode<T>` → `LinkedListNode<T>?` — plus the `null`
+    // literal (§7.3).
+    //
+    // WHAT WAS BROKEN. `LinkedListNode<T>` is a compiler-known class with NO
+    // user TypeSymbol (a declaration-less Named), so the declaration-keyed
+    // Named↔Named block above never sees the pair; the builtin-generic block
+    // below (#1935 / #6312) refuses a non-convertible source only at the
+    // SPAN, COLLECTION and ITERABLE-INTERFACE heads, and `LinkedListNode` is
+    // in none of them; and the function's final "Mixed / generic-parameter /
+    // null-literal cases: skip" ACCEPTED the pair. MEASURED on the base
+    // (r30-c1 @ 983559b09, and again on the rebased base e97a8efbc): the
+    // issue's repro `var c: LinkedListNode<int>? :=
+    // m.First;` (with `m: LinkedList<int>`) COMPILED — `m.First` is `int?`
+    // (stdlib §4.6's `First: T?`), and §5.1 lists no conversion from `int`
+    // to `LinkedListNode<int>`, so the nullable lift does not apply either.
+    // The same shape was accepted at `LinkedListNode<Item>?` (a user-class
+    // source), at `Last` instead of `First`, and for a non-nullable source.
+    //
+    // WHAT STAYS ADMITTED, each for its own §5.1 row:
+    //   * `LinkedListNode<T>` at a `LinkedListNode<T>` target — "identity",
+    //     and its nullable lift (§5.1 "Nullable conversions");
+    //   * the `null` literal at a `LinkedListNode<T>?` target — §7.3 (the
+    //     literal's type is the nullable `Object?`, which this arm leaves
+    //     alone);
+    //   * a `LinkedListNode<U>` at a `LinkedListNode<T>` target with a
+    //     different element type — the builtin-generic block below refuses
+    //     it (§12.9 invariance), with its own wording;
+    //   * an INTERFACE source — the #8408 arm above already refuses it;
+    //   * a built-in CLASS source — the builtin-generic block below refuses
+    //     it;
+    //   * a TYPE PARAMETER source — §5.1's type-parameter row converts it to
+    //     the class its constraints guarantee, so it is not refused here.
+    {
+        // The TARGET: stdlib §4.6's `LinkedListNode<T>` — a compiler-known
+        // class with one type parameter and no user TypeSymbol.
+        const bool toIsNodeClass =
+            to->kind == TypeRef::Kind::Named && !to->declaration &&
+            !to->genericArgs.empty() && to->headName() == "LinkedListNode";
+        if (toIsNodeClass) {
+            // The SOURCE: a PRIMITIVE (a value type; its only reference
+            // conversion is boxing to `Object`) or a USER-DECLARED type (no
+            // user type is a subtype of the closed `LinkedListNode<T>`).
+            const bool fromIsPrimitiveValue =
+                from->kind == TypeRef::Kind::Primitive &&
+                from->primitive != PrimitiveType::Object;
+            const bool fromIsUserDeclared =
+                from->kind == TypeRef::Kind::Named && from->declaration;
+            if (fromIsPrimitiveValue || fromIsUserDeclared) {
+                const std::string fromName =
+                    from->kind == TypeRef::Kind::Primitive
+                        ? spellPrimitiveName(from->primitive)
+                        : std::string(namedTypeSimpleName(from));
+                reportNotConvertible(
+                    std::string("`LinkedListNode<T>` is a compiler-known "
+                                "class (stdlib §4.6) and §5.1 lists no "
+                                "implicit conversion into it from `") +
+                    fromName +
+                    "`: the class is closed to inheritance (§12.4), so no "
+                    "type is a subtype of it but `LinkedListNode<T>` itself, "
+                    "and a value type does not convert to a class — read the "
+                    "element through `First` / `Last` (stdlib §4.6) or the "
+                    "node through `FirstNode` / `LastNode`");
+                return;
+            }
+        }
+    }
     // §4.16 / §8.6 (#970): a span type (ArraySpan<T>/ReadOnlyArraySpan<T>/
     // Span<T>/ReadOnlySpan<T>) is implicitly coercible to IReadOnlySpan<T>
     // for call-bounded parameter passing. The span is boxed into a heap-managed
@@ -10546,16 +10632,6 @@ void ExprTC::checkAssignable(
         }
         return;
     }
-    // A nullable source assigned to a non-nullable target whose shapes did not
-    // match either branch above — notably the `null` literal (typed `Object?`, a
-    // Primitive) assigned to a non-nullable NAMED reference target
-    // (`var x: Box := null`). The Named-Named branch requires both sides Named,
-    // so this fell through unhandled and a null stored into a non-nullable
-    // reference faulted on first use. Reject it (§7 / §5.1). The Primitive→
-    // Primitive and Named→Named nullable cases are already handled above; the
-    // generic-deferral path returned before reaching here, so generics are
-    // unaffected.
-    if (from->nullable && !to->nullable) { reportNullable(); return; }
     // §5.1 / §4.6 (#1178): a mixed pair of a CONCRETE user-declared class /
     // record / interface and a CONCRETE primitive (incl. `string`, which is a
     // Primitive in this type model) matches neither the Primitive-Primitive nor
@@ -10569,6 +10645,28 @@ void ExprTC::checkAssignable(
     // slices handle those) and the Primitive side is NOT `Object` (the `null`
     // literal is typed `Object?`, and Object boxing/unboxing is handled
     // elsewhere). Enum↔primitive is already rejected by the §5.4/§10 gate above.
+    //
+    // fix #8757 (§5.1 "Nullable conversions", §7.1, v0.359): this gate now
+    // runs BEFORE the §7 nullability drop below, so a NULLABLE source at a
+    // CONCRETE-PRIMITIVE target (or the reverse) draws the §5.1 TYPE
+    // mismatch rather than the §7 nullability one. The reason: §5.1's
+    // "Nullable conversions" say "`S?` implicitly converts to `T?` whenever
+    // `S` implicitly converts to `T`" — so when `S` does NOT convert to `T`
+    // at all, the assignment fails the §5.1 rule and the nullability is a
+    // second, independent condition, not the one that decides it. The
+    // compiler's own NON-nullable twin already drew the §5.1 diagnostic
+    // (`var s: string := d;` for a `Dog d`), and the nullable twin must draw
+    // the same rule. MEASURED on the base (r30-c1 @ 983559b09, and again on
+    // the rebased base e97a8efbc): the issue's
+    // repro `var d: string := l.First;` (with `l: LinkedList<Item>`, so
+    // `l.First` is `Item?` per stdlib §4.6) was refused with "the initializer
+    // for `d` is nullable but the target type is non-nullable (§7)" — a
+    // §7 message for a §5.1 failure. The PURE nullability cases are NOT
+    // affected: a source whose base type DOES convert to the target's base
+    // type keeps the §7 message (`var b: int := m.First;` for `int?`, and
+    // `var k: Item := l.First;` for `Item?`), and the `null` literal — whose
+    // type is the nullable `Object?` — keeps it too (`var x: Box := null;`),
+    // because `Object` is excluded from the gate above.
     {
         bool fromConcreteClass = from->kind == TypeRef::Kind::Named &&
                                  from->declaration &&
@@ -10587,6 +10685,20 @@ void ExprTC::checkAssignable(
             return;
         }
     }
+    // A nullable source assigned to a non-nullable target whose shapes did not
+    // match either branch above — notably the `null` literal (typed `Object?`, a
+    // Primitive) assigned to a non-nullable NAMED reference target
+    // (`var x: Box := null`). The Named-Named branch requires both sides Named,
+    // so this fell through unhandled and a null stored into a non-nullable
+    // reference faulted on first use. Reject it (§7 / §5.1). The Primitive→
+    // Primitive and Named→Named nullable cases are already handled above; the
+    // generic-deferral path returned before reaching here, so generics are
+    // unaffected. fix #8757 (§5.1 "Nullable conversions", v0.359): this is the
+    // PURE nullability drop — the source's base type DOES convert to the
+    // target's base type, so §7.1's distinction is the only thing that fails.
+    // The class↔primitive pair whose base types do NOT convert is decided by
+    // the §5.1 gate above, which now runs first.
+    if (from->nullable && !to->nullable) { reportNullable(); return; }
     // stdlib §4.3 (conformance cases l4_3_0002, l4_3_0003): the borrowing
     // and owning collection families are UNRELATED — there is no implicit
     // conversion between them. OwningArray<T> does not convert to Array<T>,
