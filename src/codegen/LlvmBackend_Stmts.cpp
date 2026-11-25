@@ -1487,13 +1487,40 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // scope end, and so does an `owned` parameter (§28.3: the
                 // callee owns it); a `ref` / `out` parameter writes the
                 // caller's slot and keeps the arm's own disposal, as before.
+                //
+                // "A LocalSymbol" is not "an owning local" either. Only a
+                // `var` DECLARATION (`ast::LocalDecl`) can hold an owned value
+                // of its own: a `for` element binding (decl = the ForStmt) is
+                // a borrow of the collection's slot on the default, borrowing
+                // path (§29.2), and a `case` pattern binding (decl = the
+                // binding pattern) "is a borrow whose source is the
+                // scrutinee's source" (§19.3 *Pattern binding and
+                // ownership*), so neither disposes what it is assigned and the
+                // CG60 registration stays the value's only disposal. On the
+                // OWNING path (`for var w in xs.Drain()`) the element binding
+                // is instead "a plain owned local" (§29.2) that the loop
+                // auto-drops at each body exit when the ownership pass set
+                // `ForStmt::ownedIterVarAutoDropAtBodyEnd` (the slot's CURRENT
+                // value), so there it does own what it is assigned. The
+                // other non-LocalDecl owner is an inline `out owned var` local
+                // the ownership pass marked `autoDropAtScopeEnd` (§28.3,
+                // #1387), whose scope-end disposal codegen registers. Beyond
+                // those two, this is the structural gate the drop-on-overwrite
+                // pass applies (`disposeDisplacedOwnedClassLocal`: "not a
+                // plain `var` local") and the ownership side mirrors
+                // (`localDropOnOverwriteCovered`: LOCALDECL-ONLY).
                 bool assignTargetOwns = false;
                 if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                         as->target.get())) {
                     sema::Symbol* tsym = ctx_.exprSymbol(*tid);
-                    if (dynamic_cast<sema::LocalSymbol*>(tsym))
-                        assignTargetOwns = true;
-                    else if (auto* tps =
+                    if (auto* tls = dynamic_cast<sema::LocalSymbol*>(tsym)) {
+                        auto* tfs =
+                            dynamic_cast<const ast::ForStmt*>(tls->decl);
+                        assignTargetOwns =
+                            dynamic_cast<const ast::LocalDecl*>(tls->decl) ||
+                            tls->autoDropAtScopeEnd ||
+                            (tfs && tfs->ownedIterVarAutoDropAtBodyEnd);
+                    } else if (auto* tps =
                                  dynamic_cast<sema::ParameterSymbol*>(tsym))
                         assignTargetOwns = tps->modifier == "owned";
                 }
@@ -3625,7 +3652,26 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // is a plain class/interface type) hands its caller a BORROW
                 // the caller never disposes, so there the CG60 registration
                 // stays the value's only disposal.
-                v = borrowReturnFns_.count(builder_.GetInsertBlock()->getParent())
+                //
+                // Nor inside the Resume function of an async body whose task
+                // carries NO result (`asyncResultTy_` null: a no-value `Task`,
+                // §30.1). `emitFunctionBody` rewrites the expression body of an
+                // async METHOD (`async method Fire(): Task => C.Make()();`)
+                // into exactly this `return <expr>;`, and the completion
+                // discards the value (emitAsyncComplete gets no result slot),
+                // so the task never owns it: it is §28.3.11's unbound
+                // temporary and the CG60 registration is its only disposal.
+                // The twin of the `resultTy` test in emitAsyncLambda's
+                // expression-body face. The `currentFn_ == asyncResumeFn_`
+                // conjunct keeps a nested sync lambda lowered mid-body to its
+                // own rule, as the collection-literal arm above does.
+                const bool asyncUnitReturn =
+                    smKind_ == SuspendKind::Await && smStateStruct_ &&
+                    asyncResumeFn_ && currentFn_ == asyncResumeFn_ &&
+                    !asyncResultTy_;
+                v = (asyncUnitReturn ||
+                     borrowReturnFns_.count(
+                         builder_.GetInsertBlock()->getParent()))
                         ? lowerExpr(*rs->value)
                         : lowerChainCallHandedOff(rs->value.get());
                 returnedRecordStringArgsToRetain_ = std::move(savedArgs);

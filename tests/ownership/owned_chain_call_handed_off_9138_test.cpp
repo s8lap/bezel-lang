@@ -488,3 +488,132 @@ BEZEL_TEST(owned_chain_call_not_handed_off_9138,
     JitResult r = runAotChecked(plainParameterAssignProgram());
     expectClean(r, 0, "600\n200\n");
 }
+
+// ---------------------------------------------------------------------------
+// The NOT-handed-off positions, second fix-forward (review r43-rev-c38-9138-ff).
+//
+//   * the expression body of an ASYNC method whose task carries no result
+//     (`async method Fire(): Task => C.Make()();`, static and instance). The
+//     body is lowered as a `return <expr>;` inside the task's frame, and a
+//     no-value `Task` has "no result value" (§30.1), so the completion takes
+//     nothing: the value is §28.3.11's unbound temporary, the method twin of
+//     the async-lambda row above.
+//   * a `:=` into a `for` element binding or a `case` pattern binding. Each is
+//     a local symbol but a BORROW — of the collection's slot on the default
+//     (borrowing) iteration path (§29.2), of the scrutinee for a pattern
+//     binding (§19.3 *Pattern binding and ownership*) — so it disposes
+//     nothing and the store is no transfer into an owning location.
+//
+// Each was clean (count = values produced, no leak) before the first cut and
+// leaked every value on the first fix-forward (MEASURED, 200 iterations:
+// 200 leaked allocations, destructor count 0).
+
+namespace {
+
+std::string asyncUnitArrowMethodProgram() {
+    return std::string("module M; ") + kCountingClass +
+        "public class C "
+        "  " + kProducer +
+        "  public static async method Fire(): Task => C.Make()(); "
+        "  public static async method Main(): Task<int> "
+        "    for var j in 0..<200 do "
+        "      await C.Fire(); "
+        "    end; "
+        "    Console.WriteLine(W.Drops); "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+}
+
+std::string asyncUnitInstanceArrowMethodProgram() {
+    return std::string("module M; ") + kCountingClass +
+        "public class C "
+        "  " + kProducer +
+        "  public async method Fire(): Task => C.Make()(); "
+        "  public static async method Main(): Task<int> "
+        "    var c := new C(); "
+        "    for var j in 0..<200 do "
+        "      await c.Fire(); "
+        "    end; "
+        "    Console.WriteLine(W.Drops); "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+}
+
+std::string forElementAssignProgram() {
+    return std::string("module M; ") + kCountingClass +
+        "public class C "
+        "  " + kProducer +
+        "  public static method Main(): int "
+        "    var t := 0; "
+        "    var xs := new OwningArray<W>(); "
+        "    xs.Add(new W()); "
+        "    xs.Add(new W()); "
+        "    for var j in 0..<100 do "
+        "      for var w in xs do "
+        "        w := C.Make()(); "
+        "        t := t + 1; "
+        "      end; "
+        "    end; "
+        "    Console.WriteLine(t); "
+        "    Console.WriteLine(W.Drops); "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+}
+
+std::string caseBindingAssignProgram() {
+    return std::string("module M; ") + kCountingClass +
+        "public class C "
+        "  " + kProducer +
+        "  public static method Main(): int "
+        "    var t := 0; "
+        "    var o: W? := new W(); "
+        "    for var j in 0..<200 do "
+        "      case o of "
+        "        var b: W => do b := C.Make()(); t := t + 1; end, "
+        "        _ => () "
+        "      end; "
+        "    end; "
+        "    Console.WriteLine(t); "
+        "    Console.WriteLine(W.Drops); "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+}
+
+}  // namespace
+
+// RED on the first fix-forward (200 leaked allocations, count 0): the static
+// async unit arrow method's synthesized `return` handed the value off, and the
+// no-value task's completion dropped it.
+BEZEL_TEST(owned_chain_call_not_handed_off_9138,
+           async_unit_arrow_method_body_result_is_disposed_exactly_once) {
+    JitResult r = runAotChecked(asyncUnitArrowMethodProgram());
+    expectClean(r, 0, "200\n");
+}
+
+// RED on the first fix-forward (200 leaked allocations, count 0): the instance
+// twin of the row above.
+BEZEL_TEST(owned_chain_call_not_handed_off_9138,
+           async_unit_instance_arrow_method_body_result_is_disposed_exactly_once) {
+    JitResult r = runAotChecked(asyncUnitInstanceArrowMethodProgram());
+    expectClean(r, 0, "200\n");
+}
+
+// RED on the first fix-forward (200 leaked allocations, count 0): the `:=` arm
+// treated the borrowing `for` element binding as an owning local.
+BEZEL_TEST(owned_chain_call_not_handed_off_9138,
+           for_element_binding_assign_result_is_disposed_exactly_once) {
+    JitResult r = runAotChecked(forElementAssignProgram());
+    expectClean(r, 0, "200\n200\n");
+}
+
+// RED on the first fix-forward (200 leaked allocations, count 0): the `:=` arm
+// treated the borrowing `case` pattern binding as an owning local.
+BEZEL_TEST(owned_chain_call_not_handed_off_9138,
+           case_binding_assign_result_is_disposed_exactly_once) {
+    JitResult r = runAotChecked(caseBindingAssignProgram());
+    expectClean(r, 0, "200\n200\n");
+}
