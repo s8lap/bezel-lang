@@ -4207,7 +4207,8 @@ void MethodOwnership::seedOwnedIterVar(const ast::ForStmt& fs) {
 
 // fix #5134 (§35.5, §28.3 K3.4, v0.308): see the declaration comment
 // (Ownership_impl.hpp) for the full rationale.
-void MethodOwnership::seedOwningMatchArmBindings(const ast::CaseArm& arm) {
+void MethodOwnership::seedOwningMatchArmBindings(const ast::CaseArm& arm,
+                                                 std::vector<sema::Symbol*>* seeded) {
     if (owningMatchTransferBindings_.empty()) return;
     std::vector<const ast::Node*> anchors;
     collectArmBindingAnchors(arm.pattern.get(), anchors);
@@ -4228,6 +4229,10 @@ void MethodOwnership::seedOwningMatchArmBindings(const ast::CaseArm& arm) {
         // per-slot mark (#4617), never this dataflow's own diagnostics.
         lo.obligationOrigin = nullptr;
         states_[bindSym] = lo;
+        // fix #9237 (§35.5, §28.3 K1.3, v0.359): report the seeded symbol so
+        // the EXPRESSION-position arm walk can take it back out of the arm's
+        // end state (the binding's scope is the arm body).
+        if (seeded) seeded->push_back(bindSym);
     }
 }
 

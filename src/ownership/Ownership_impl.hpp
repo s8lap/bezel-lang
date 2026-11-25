@@ -4959,7 +4959,18 @@ private:
     // symmetric endState exemption (a transferred binding must never be
     // reported "undischarged": its physical reclaim is codegen's own
     // per-slot mark, #4617) lives in `run()`. // per §35.5, §28.3 K3.4, v0.308
-    void seedOwningMatchArmBindings(const ast::CaseArm& arm);
+    //
+    // fix #9237 (§35.5, §28.3 K1.3/K3.3, v0.359): `seeded`, when non-null,
+    // receives the symbols this call seeded. The EXPRESSION-position arm
+    // walks (the marker-free `CaseExpr` arms of `recordMovesIn` /
+    // `handleDischarge`) use it to take the arm-local binding back out of
+    // the arm's END state before the construct's post-state join: §35.5
+    // makes the binding "an owned local of the ARM BODY's scope", so it must
+    // not survive the construct as an enclosing-scope binding — the same
+    // shape `processMarkedArmConstruct` gets by restoring `states_`
+    // wholesale. // per §35.5, §28.3, v0.359
+    void seedOwningMatchArmBindings(const ast::CaseArm& arm,
+                                    std::vector<sema::Symbol*>* seeded = nullptr);
 
     // fix #4664 (§35.5 *The borrowing match* + §28.3 K8.3/K3.1, §19.3,
     // v0.307): the class/interface-typed arm pattern bindings that the `case`

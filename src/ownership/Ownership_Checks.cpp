@@ -2043,7 +2043,41 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
             const bool absorbing =
                 dynamic_cast<const ast::ThrowExpr*>(arm.exprBody.get()) ||
                 dynamic_cast<const ast::NullLiteralExpr*>(arm.exprBody.get());
+            // fix #9237 (§35.5, §28.3 K1.3/K3.3, v0.359): seed THIS arm's
+            // owning-match TRANSFERRED payload binding before its body is
+            // walked. §35.5 makes such a binding "an owned local of the arm
+            // body's scope", so the §28.3 rules apply to it in an
+            // EXPRESSION-position arm exactly as they do in a
+            // statement-position one — and the statement-position one
+            // rejects a second `move v` of it with "owned value in `v` was
+            // already moved out at this point (§28.3)".
+            //
+            // The hole was that the ownership dataflow keeps NO `states_`
+            // entry for a pattern binding, so `markMovedByName`'s
+            // `if (!st) return;` accepted the consume SILENTLY: in an
+            // expression-position arm `G.Two(move v, move v)` — two moves of
+            // the same payload binding in ONE call — was admitted, and the
+            // callee received the already-nulled slot for its second,
+            // non-nullable `owned` parameter (§28.3 K1.3: a moved-from
+            // binding is unreadable until reassigned).
+            //
+            // The seed is the one `processMarkedArmConstruct` already uses
+            // for the MARKED-arm path (fix #5134's site, Ownership_Checks.cpp
+            // ~36320) and `processBlock` uses for the statement-position one
+            // (Ownership.cpp ~3920) — the ordinary (marker-free) expression
+            // walk was the only arm walk that seeded nothing. With a real
+            // entry, the EXISTING K3.3 / K1.3 machinery does the rejecting;
+            // no parallel state machine is invented for it.
+            //
+            // The binding is ARM-LOCAL (§35.5: "an owned local of the arm
+            // body's scope"), so it is taken back out of the arm's end state
+            // before the construct's post-state join — the same shape
+            // `processMarkedArmConstruct` gets by restoring `states_`
+            // wholesale. // per §35.5, §28.3 K1.3/K3.3, §19.2, v0.359
+            std::vector<sema::Symbol*> seeded;
+            seedOwningMatchArmBindings(arm, &seeded);
             recordMovesIn(*arm.exprBody);
+            for (sema::Symbol* sym : seeded) states_.erase(sym);
             if (!absorbing) ends.push_back(states_);
         }
         joinMarkerFreeArmEnds(std::move(ends), std::move(saved), ce->span.begin);
@@ -2766,6 +2800,21 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             states_ = saved;
             if (arm.guard) checkRead(*arm.guard, /*selfTarget=*/false);
             if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
+                // fix #9237 (§35.5, §28.3 K1.3/K3.3, v0.359): the
+                // DISCHARGE-position twin of `recordMovesIn`'s CaseExpr arm
+                // seed (same file, above): an owning match's transferred
+                // payload binding is "an owned local of the arm body's scope"
+                // (§35.5), so the second `move v` of it in ONE call is
+                // rejected with "owned value in `v` was already moved out at
+                // this point (§28.3)" here too — as it already is in the
+                // statement-position arm, whose binding the CFG seeds
+                // (`processBlock` -> `seedOwningMatchArmBindings`). Without
+                // this seed the ownership dataflow has no `states_` entry for
+                // the pattern binding, and `markMovedByName`'s
+                // `if (!st) return;` accepted the consume silently.
+                // // per §35.5, §28.3 K1.3/K3.3, v0.359
+                std::vector<sema::Symbol*> seeded;
+                seedOwningMatchArmBindings(arm, &seeded);
                 if (arm.exprBody) handleDischarge(*arm.exprBody);
             } else {
                 for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
