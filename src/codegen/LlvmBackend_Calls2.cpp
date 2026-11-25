@@ -13315,8 +13315,48 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // release to the unwind edge (a leak on the throw path is the
                 // safe direction; the reference is not released TWICE).
                 bool calleeMintsRef = propertyReadMintsClosureRef(call.callee.get());
+                // fix #9124 (§28.9 / §27.5 / §28.3 / §28.3.11, v0.359): an
+                // AUTO-PROPERTY's read is a LEND of the backing field's own
+                // reference (§28.9's *Accessor faces are uniform across type
+                // kinds*: "A property or indexer **read** is a lend for every
+                // declared type … a getter never transfers a reclamation
+                // obligation to its reader"; §28.3's *Function-typed holders*:
+                // "A function value **read** from any holder — a field, a
+                // property or indexer … — carries the empty set"). The holder
+                // keeps the reference, and the callee may REASSIGN the
+                // property while it runs (`x.Drop()` sets
+                // `P := lambda(x: Hx) => 0;`), which releases that reference
+                // and, if it was the last one, frees the closure object (with
+                // the captured variables §27.5 heap-allocates in it) while the
+                // body still reads them. MEASURED (issue #9124): a
+                // heap-use-after-free in `lam$1`, freed by
+                // `bz$lam$1$envdtor`.
+                //
+                // So the call takes a reference of its OWN for the duration of
+                // the call and gives it back after it (§28.3.11's discharge
+                // at the end of the full expression — here the end of the call
+                // expression) — the same discipline #9096's field arm takes.
+                //
+                // The predicate is `calleeReadsClosureField` — the SAME one
+                // the field arm and the null-conditional arm ask — so the
+                // question "is the callee a HOLDER's function value?" has one
+                // answer everywhere. A COMPUTED property is not this shape:
+                // its read MINTS the reader's reference (#8763's
+                // `propertyReadMintsClosureRef`), which the release above
+                // already gives back, so `calleeIsField` is false there and
+                // the two releases cannot both fire.
+                const bool calleeIsField = calleeReadsClosureField(call.callee.get());
+                if (calleeIsField) emitClosureRetain(closurePtr);
                 llvm::Value* r = emitClosureCall(closurePtr, rt, &call);
                 if (calleeMintsRef && !diverged_ && closurePtr &&
+                    closurePtr->getType()->isPointerTy())
+                    emitClosureRelease(closurePtr);
+                // `!diverged_` mirrors #4078's release discipline in
+                // `emitClosureCall` and #9096's field arm: the release is
+                // emitted only where the code is still reachable (a leak on
+                // the throw path is the safe direction — the reference is not
+                // released TWICE).
+                if (calleeIsField && !diverged_ && closurePtr &&
                     closurePtr->getType()->isPointerTy())
                     emitClosureRelease(closurePtr);
                 return r;
