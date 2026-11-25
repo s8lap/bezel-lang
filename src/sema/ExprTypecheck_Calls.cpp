@@ -8256,6 +8256,8 @@ static bool concreteCollectionCallHasDedicatedDiagnostic(
     std::string_view head, std::string_view member);
 static std::string_view concreteCollectionReceiverHead(const TypeRef* t);
 static bool isDocumentedStdlibLinqOperatorName(std::string_view n);
+static bool isStdlibLinqLazyTierOperatorName(std::string_view n);
+static std::string owningDictionaryStdlib49Rejection(std::string_view n);
 
 void ExprTC::typeCall(const ast::CallExpr& ce) {
     if (!ce.callee) return;
@@ -19300,22 +19302,36 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                          // block, with no applicable stdlib member here for
                          // the same reason as their non-nullable twins.
                          m == "FirstOrNull" || m == "LastOrNull" ||
-                         m == "SingleOrNull")) {
+                         m == "SingleOrNull" ||
+                         // fix #9285 (stdlib §4.9 / §5, v0.359): §5's LAZY
+                         // TIER — `Take` / `Skip` / `TakeWhile` / `SkipWhile`
+                         // / `Where` / `Select` / `SelectMany` / `OrderBy` /
+                         // `OrderByDescending` (and §5's `where T: hashable`
+                         // block's `Distinct`) are members of the SAME §5
+                         // `extension IEnumerable<T>` block as the eager
+                         // element-access tier above, so §4.9's
+                         // `IDisposable`-only conformance leaves them with no
+                         // applicable stdlib member on an
+                         // `OwningDictionary<K, V>` either — exactly as it
+                         // leaves their eager twins with none.
+                         //
+                         // MEASURED at the base (r30-c1 @ d66898662): these
+                         // ten names were ADMITTED — the program COMPILED
+                         // (exit 0), and only the CONSUMPTION of the result
+                         // failed, at codegen ("not yet implemented: codegen
+                         // for this for statement"). The generic §5 LINQ
+                         // exemption every concrete-collection head reads
+                         // (`concreteCollectionCallSurfaceAdmits` →
+                         // `isDocumentedStdlibLinqOperatorName`) admits the
+                         // WHOLE §5 name table for EVERY head,
+                         // `OwningDictionary` included, so the §4.9 rule —
+                         // the one block that knows this receiver's
+                         // conformance — has to be extended by hand, the same
+                         // shape as #8232 and #9262 above.
+                         isStdlibLinqLazyTierOperatorName(m))) {
                         ctx_.diagnostics().report(
                             Severity::Error, ce.span.begin,
-                            std::string("`OwningDictionary<K, V>` does not "
-                                        "expose `") +
-                            std::string(m) +
-                            "` — its interface conformance is `IDisposable` "
-                            "only (stdlib §4.9): a borrowing entry view over "
-                            "an owning dictionary is a decision the stdlib "
-                            "deliberately does not take (a `DictionaryEntry<K, "
-                            "V>` is a record and cannot own the dictionary's "
-                            "owned `Value`, unlike `Drain()`'s "
-                            "`DrainedEntry<K, V>`). Use `Drain()` "
-                            "(ownership-transferring, one pass) or the "
-                            "borrowing key-driven surface (`Keys`, "
-                            "`GetOrNull`, the indexer) instead.");
+                            owningDictionaryStdlib49Rejection(m));
                     }
                     // §4.15 (#549): Array<T>.AsSpan() / AsSpan(start) /
                     // AsSpan(start,length) / AsSpan(range) → ArraySpan<T>.
@@ -39416,6 +39432,78 @@ static bool isDocumentedStdlibLinqOperatorName(std::string_view n) {
     return bezel::sema::stdlibLinqLookup(n, /*arity=*/-1) != nullptr;
 }
 
+// fix #9285 (stdlib §4.9 / §5, v0.359): stdlib §5's LAZY TIER — the operator
+// names that build a DEFERRED sequence over their receiver instead of
+// answering one value from it.
+//
+// THE SET. stdlib §5's element-access surface is ONE `public extension
+// IEnumerable<T>` block (`docs/Bezel_Standard_Library.md:3692`), plus the
+// `where T: hashable` block's `Distinct`. The names below are the ones of
+// those blocks whose RESULT is a sequence — the §5 paragraph's own words
+// ("The callback-free lazy operators (`Take`, `Skip`, `Reverse`, `Distinct`,
+// `Concat`, `Union`, `Intersect`, `Except`) hold no callback"; the
+// callback-taking lazy operators are `Where`, `Select`, `SelectMany`,
+// `TakeWhile`, `SkipWhile`, `OrderBy`, `OrderByDescending`, `ThenBy`,
+// `ThenByDescending`, `GroupBy`, `Zip`). `Reverse`, `Concat`, `Union`,
+// `Intersect`, `Except` and `Zip` are NOT here: each of them needs an
+// `IEnumerable<T>` ARGUMENT that an `OwningDictionary<K, V>` receiver cannot
+// produce (§4.9 declares no `IEnumerable<T>` conformance), so sema already
+// refuses them before codegen — with codegen's own wording, which is the
+// separate wording defect filed alongside this fix. `ThenBy` /
+// `ThenByDescending` live on `IOrderedEnumerable<T>` (§5's second block), not
+// on `IEnumerable<T>`, so they are not reachable on this receiver at all.
+//
+// WHY THE SET MATTERS ON THIS RECEIVER. stdlib §4.9's `OwningDictionary<K,
+// V>` conformance is `IDisposable` ONLY — "not
+// `IOwningCollection<DictionaryEntry<K, V>>` … Default `for var entry in
+// ownedDict do` iteration is not provided on `OwningDictionary<K, V>` … a
+// borrowing look-don't-take entry view over an owning dictionary is a
+// separate decision deliberately not taken here" — so the receiver is not an
+// `IEnumerable<T>` and NO member of §5's `extension IEnumerable<T>` block has
+// an applicable stdlib member on it. The names above are therefore members
+// the stdlib does not declare on this receiver, exactly as `First` / `Last` /
+// `Single` / `ElementAt` (the EAGER element-access tier, refused since
+// #3716) are.
+//
+// The names NOT in this set are the ones stdlib §4.9's OWN declaration block
+// declares, so spec §26.5 rule 1 commits to the instance member and the §5
+// extension is never consulted: `Count` (a `pure readonly property Count:
+// int`) and `Contains(key: K)`. `ToArray` / `ToSet` / `ToDictionary` are
+// refused by their OWN dedicated diagnostic (the owning-collection copy-form
+// refusal, stdlib §4.5), so they must not be listed here as well.
+static bool isStdlibLinqLazyTierOperatorName(std::string_view n) {
+    return n == "Take" || n == "Skip" || n == "TakeWhile" ||
+           n == "SkipWhile" || n == "Where" || n == "Select" ||
+           n == "SelectMany" || n == "OrderBy" ||
+           n == "OrderByDescending" || n == "Distinct";
+}
+
+// fix #9285 (stdlib §4.9 / §5, v0.359): the §4.9 refusal's TEXT, in ONE
+// place, so the `.` spelling (typeCall's `OwningDictionary` block) and the
+// `?.` spelling (the null-conditional call path's gate) cannot disagree
+// about what a user reads — language spec §7.5 rule 2 (v0.359) makes the two
+// spellings of ONE member resolve identically.
+//
+// The TEXT is byte-identical to the one the eager element-access tier has
+// read since #3716 (the gtest rows in tests/sema/dict_first_last_elementat_
+// 3716_test.cpp and tests/codegen/dict_first_last_elementat_3716_test.cpp
+// pin it), so extending the §4.9 block to the LAZY tier does not reword
+// anything that already exists.
+static std::string owningDictionaryStdlib49Rejection(std::string_view n) {
+    return std::string("`OwningDictionary<K, V>` does not expose `") +
+           std::string(n) +
+           "` — its interface conformance is `IDisposable` "
+           "only (stdlib §4.9): a borrowing entry view over "
+           "an owning dictionary is a decision the stdlib "
+           "deliberately does not take (a `DictionaryEntry<K, "
+           "V>` is a record and cannot own the dictionary's "
+           "owned `Value`, unlike `Drain()`'s "
+           "`DrainedEntry<K, V>`). Use `Drain()` "
+           "(ownership-transferring, one pass) or the "
+           "borrowing key-driven surface (`Keys`, "
+           "`GetOrNull`, the indexer) instead.";
+}
+
 // fix #7015 (language spec §27.6, §8.1, v0.340; stdlib §4.1, §4.2, §4.12,
 // §4.13) + fix #7027 (language spec §27.6, v0.340; stdlib §4.1, §4.2): the
 // builtin collection interface heads whose CALL form this reject covers —
@@ -49966,6 +50054,50 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         // The CALL form only. The BARE-reference form (`d?.Bogus`, no call)
         // is the `.` spelling's OTHER gate (the #2536 catch-all, ~42457),
         // which this arm does not touch.
+        //
+        // fix #9285 (stdlib §4.9 / §5, v0.359): the `?.` TWIN of the `.`
+        // spelling's §4.9 refusal (typeCall's `colName == "OwningDictionary"`
+        // block), for stdlib §5's LAZY TIER — the operator names
+        // `isStdlibLinqLazyTierOperatorName` holds.
+        //
+        // §7.5 rule 2 (v0.359): "`x?.M` resolves `M` as `x.M` does." The
+        // `?.` CALL is typed by the SPECULATIVE `.` TWIN this file builds for
+        // it (typeCall's #6529 arm) and that twin DISCARDS anything it
+        // reports (`ctx_.diagnostics().rollbackTo(mark)`), so the `.`
+        // spelling's §4.9 refusal is rolled back with the rest of the twin's
+        // report and the `?.` spelling compiles.
+        //
+        // MEASURED at the base (r30-c1 @ d66898662): `od2?.Take(1)` on an
+        // `OwningDictionary<string, Box>?` COMPILED with no diagnostic at
+        // all, and `od2?.First()` compiled with only a degradation warning —
+        // while the `.` spellings of the same calls were refused. §7.5 rule 2
+        // forbids that disagreement, so the refusal is raised HERE, where it
+        // survives the twin's rollback.
+        //
+        // The EAGER element-access tier (`First` / `Last` / `Single` /
+        // `ElementAt` / `ElementAtOrNull` / `FirstOrNull` / `LastOrNull` /
+        // `SingleOrNull`) is NOT part of this arm: the `?.` spelling of those
+        // names was already admitted at the base (a PRE-EXISTING divergence
+        // from the `.` spelling, which has refused them since #3716), and
+        // this fix does not change an already-admitted program's verdict.
+        // Filed alongside this fix.
+        //
+        // §26.5 rule 2 is preserved exactly as the gate below preserves it: a
+        // USER extension that declares the name on the receiver IS the member
+        // and is NOT refused.
+        if (&nm == calleeOfCallCtx_ && recvTyForDiag &&
+            concreteCollectionReceiverHead(recvTyForDiag) == "OwningDictionary" &&
+            isStdlibLinqLazyTierOperatorName(nm.member)) {
+            SourceLocation loc = nm.span.begin;
+            if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+            if (!lookupExtensionMember(recvTyForDiag, nm.member, nullptr, loc,
+                                       /*reportAmbiguity=*/false)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    owningDictionaryStdlib49Rejection(nm.member));
+                return;
+            }
+        }
         if (!member && &nm == calleeOfCallCtx_ && recvTyForDiag) {
             const std::string_view surfaceHead =
                 concreteCollectionReceiverHead(recvTyForDiag);
