@@ -5361,9 +5361,50 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // INLINE (a lambda literal) is a +1 transient we own; the eager op fully
         // consumes it in a loop that completes before the call returns, so we
         // release it at the loop-end. A closure arriving via a variable/field is a
-        // BORROW (not ours to free). Only release the inline-lambda form — exactly
-        // the GetOrAdd factoryIsInlineLambda guard. (Null-safe; LAZY ops differ —
-        // they store the closure and release at enumerator dispose, see below.)
+        // BORROW (not ours to free). Only release the INLINE-PRODUCER form — the
+        // same guard the GetOrAdd factoryIsInlineLambda uses. (Null-safe; LAZY
+        // ops differ — they store the closure and release at enumerator dispose,
+        // see below.)
+        //
+        // fix #9012 (§27.6 / §28.9 / stdlib §5, v0.359): the producer set is
+        // WIDER than "a lambda literal" — an ORDINARY METHOD REFERENCE is the
+        // same kind of producer, and the old local predicate could not see it.
+        // `a.Sum(P)` / `a.Sum(s.P)` forms a fresh +1 closure cell AT THE
+        // REFERENCE (§27.6: `makeMethodThunk` -> `buildMethodClosureCell`
+        // callocs one rc=1 cell, 64 B), and the eager operator consumes it
+        // during the call and retains nothing (stdlib §5: "the eager operators
+        // ... are call-bounded as their unmarked signatures state — they invoke
+        // the callback during the call and retain nothing"), so the CALL SITE
+        // solely owns that +1 and must release it at the loop-end exactly as it
+        // does the lambda's. Before this, `relCl` was false for a method group,
+        // the release never fired, and the cell leaked 64 B PER CALL (MEASURED
+        // on the base: 200 calls -> 12800 B in 200 allocations, LeakSanitizer —
+        // the issue #9012 repro).
+        //
+        // THE GATE IS THE SHARED `isPlusOneClosureProducer` — the predicate the
+        // rest of the compiler already asks for exactly this question ("does
+        // this expression mint a fresh +1 closure cell the consumer must
+        // release"): the general call path asks it for a call-bounded
+        // function-typed formal (LlvmBackend_Calls2.cpp, `producerArg`), and the
+        // LAZY path's `argIsFreshClosureCell` (LlvmBackend_Calls3.cpp, #7160)
+        // mirrors its shape. Asking the SHARED question here is what keeps the
+        // three from drifting — the drift IS the defect: the eager path had its
+        // own narrower copy of the answer and therefore missed the method-
+        // reference shape the other two already knew.
+        //
+        // WHY IT CANNOT OVER-RELEASE. `isPlusOneClosureProducer` answers true
+        // only for an expression that MINTS a cell (a lambda literal, a
+        // conditional of two such, a method reference, a primitive-intrinsic /
+        // Object-member / function-typed-property reference), and each of its
+        // arms is gated on the shape that actually mints one — so the released
+        // set is a subset of the produced set and the release fires EXACTLY
+        // ONCE, at the loop-end, after the last invocation. A closure arriving
+        // via a variable / field / parameter is a BORROW (the local's own
+        // scope-end discharge owns it) and answers false.
+        //
+        // (The predicate's NAME is historical — it no longer asks only about a
+        // lambda literal. It is the eager path's copy of the shared question,
+        // and the copy is what drifted.)
         auto argIsInlineLambda = [&](size_t i) -> bool {
             if (i >= call.args.size() || !call.args[i].value) return false;
             const ast::Expr* a = call.args[i].value.get();
@@ -5372,7 +5413,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // (`arr.Any(char.IsDigit)`) is likewise a fresh +1 closure the eager
             // op fully consumes and must release at loop-end — same inline-
             // producer shape as a lambda literal (#1758 pre-gate review).
-            return isPrimIntrinsicMethodRef(a);
+            if (isPrimIntrinsicMethodRef(a)) return true;
+            // fix #9012 (§27.6 / §28.9, v0.359): an ORDINARY method reference
+            // (`arr.Sum(P)`, `arr.Sum(c.P)`) — the #9012 shape — is the same
+            // fresh +1 producer.
+            return isPlusOneClosureProducer(a);
         };
 
         // per §5 LINQ: .Any(pred: (T)->bool): bool
