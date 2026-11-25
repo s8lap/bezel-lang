@@ -38883,9 +38883,10 @@ bool Emitter::propertyReadMintsClosureRef(const ast::Expr* e) const {
     //   * not slot-dispatched (`propGetSlot_` / `ifacePropertyGetIndex_`): a
     //     virtual or interface read runs the OVERRIDE's getter, a different
     //     body, whose mint this classification cannot see;
-    //   * the declared type is a non-nullable function type (a nullable
-    //     function value has no owner for a closure reference — #8763's
-    //     fix-forward 2).
+    //   * the declared type is a function type. A NULLABLE function type is
+    //     admitted for THIS form (fix #9307, below); the BLOCK form's own
+    //     nullable gate lives in `blockGetterMintsClosureRef` and is not
+    //     touched.
     // Plus the two that make this form ITS OWN:
     //   * the getter body is an EXPRESSION (the property-level `=> expr` of
     //     §23.2 or an accessor's `get => expr`), not a block body (that is
@@ -38901,8 +38902,18 @@ bool Emitter::propertyReadMintsClosureRef(const ast::Expr* e) const {
     const ast::PropertyDecl* pd = propertyDeclOf(ps);
     if (!pd || !pd->type) return false;
     const sema::TypeRef* pty = ctx_.resolvedType(*pd->type);
-    if (!pty || pty->kind != sema::TypeRef::Kind::Function || pty->nullable)
-        return false;
+    // fix #9307 (§28.9 / §27.5 / §7.5, v0.359): the declared type MAY be a
+    // NULLABLE function type. The EXPRESSION-bodied getter is inlined in the
+    // reader's frame, so a lambda-literal body allocates its closure cell
+    // THERE and the reader owns that +1 whatever the declared nullability is
+    // (§28.9: every function value holder releases exactly one reference). The
+    // "no owner for a closure reference" reason of #8763's fix-forward 2 is
+    // the BLOCK getter's (its `mintReaderRef = false` variant), which returned
+    // above and never reaches this line. The nullable function value is a
+    // plain pointer (null = null) and `bz_closure_release` is null-safe, so
+    // the discharge sites release it exactly as they release the non-nullable
+    // one (the `?.` comment above says the same).
+    if (!pty || pty->kind != sema::TypeRef::Kind::Function) return false;
     const ast::Expr* body = exprGetterBodyOfDecl(pd);
     if (!body) return false;
     // fix-forward #8981 (§23.2, §28.9, v0.359): a getter body that reads a

@@ -5359,6 +5359,21 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (calleeIsField && !diverged_ && closurePtr &&
             closurePtr->getType()->isPointerTy())
             emitClosureRelease(closurePtr);
+        // fix #9307 (§28.9 / §27.5 / §7.5, v0.359): the MINT twin. A
+        // NULLABLE function-typed property whose EXPRESSION-bodied getter
+        // produces a fresh lambda hands the READER a +1 reference (the cell is
+        // allocated in the reader's frame, §23.2), so `P?(this)` owns it and
+        // gives it back once the call has returned — the same release the
+        // non-nullable `P(this)` takes (`calleeMintsRef`, LlvmBackend_Calls2.cpp).
+        // It is on the CALL edge only: when the property reads null the call
+        // is skipped and nothing was minted. Gated on the SHARED predicate
+        // `propertyReadMintsClosureRef`, which is mutually exclusive with
+        // `calleeReadsClosureField` (a lend), so the two releases cannot both
+        // fire. `!diverged_` as above.
+        if (!calleeIsField && !diverged_ && closurePtr &&
+            closurePtr->getType()->isPointerTy() &&
+            propertyReadMintsClosureRef(nc->callee.get()))
+            emitClosureRelease(closurePtr);
         auto* callEndBB = builder_.GetInsertBlock();
         builder_.CreateBr(endBB);
 
