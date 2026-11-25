@@ -22336,6 +22336,39 @@ void Emitter::consumeLastLambdaCapturedCells(
                     Disposal dcd{ce.newSlot, nullptr};
                     dcd.boxedCellFreeDeferred = true;
                     dcd.skipCellFreeOnUnwind = ce.unwindUnsafe;
+                    // fix #9252 (§28.11 / §28.9, v0.359): carry #4165's
+                    // DictionaryEntry-Key release flag onto THIS deferred
+                    // cell free.
+                    //
+                    // WHY IT IS MISSING HERE. A captured string-keyed
+                    // `DictionaryEntry<string,V>` local's rebuilt Key is a
+                    // fresh runtime-managed string (§28.11's element slot
+                    // policy: the copy-out holds the Key, whose lifetime the
+                    // runtime manages, §28.9) whose single producer +1 is
+                    // discharged by a `bz_string_release` at the cell's free.
+                    // #4165 put that flag on the cell free — but the cell
+                    // free can be registered in FOUR places, and only the
+                    // `lowerLambda` arm (#3508's owner-scope deferral) and
+                    // this function's main arm carried it. THIS arm is the
+                    // one that registers the deferred free whenever the
+                    // #3508 arm DECLINED — and it declines when a loop is in
+                    // scope (a loop allocates a cell per iteration, so
+                    // deferring to the owner scope would free only the last
+                    // iteration's cell). So for a capture behind an `if`
+                    // INSIDE A LOOP the Key's +1 was never discharged: the
+                    // cell was freed and the Key leaked (35 B per iteration,
+                    // MEASURED on r30-c1 @ d66898662 — 7000 B in 400
+                    // allocations over 200 iterations).
+                    //
+                    // THE SAFETY CASE is #4165's, unchanged: the deferred
+                    // free is registered only for a cell of a `cellFreeEligible_`
+                    // local (a non-escaping capture), so `singleCaptureLocals_`
+                    // holds — exactly one holder and exactly one +1 to
+                    // balance — and the local's own scope-end Key release is
+                    // still declined (StringEscapeWalker treats any capture
+                    // as an escape), so this release is the only one.
+                    if (ce.dictEntryKeyReleaseDeferred)
+                        dcd.dictEntryKeyReleaseDeferred = true;
                     disposeStack_[ownerScopeIdx].push_back(dcd);
                     if (ce.inlineArrayN > 0) {
                         Disposal da{ce.newSlot, nullptr};

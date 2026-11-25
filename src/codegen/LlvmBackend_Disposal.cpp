@@ -14354,24 +14354,54 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                     // The slot is either the struct itself or a cell holder.
                     // Check the slot's allocated type: struct = direct
                     // access, ptr* = load cell and cast.
-                    llvm::Value* structPtr;
                     if (d.slot->getAllocatedType()->isPointerTy()) {
                         // Guarded: d.slot is cell holder (ptr*). The cell
                         // pointer is already loaded into `cell` above
                         // (before this block, line ~7956). Cast and use.
+                        //
+                        // fix #9252 (§28.11 / §28.9, v0.359): THE CELL MAY BE
+                        // NULL HERE. The holder read goes through #9210's
+                        // funnel, whose fall-back is the constant null, and a
+                        // CONDITIONAL capture site — the capture behind an
+                        // `if`, which is exactly this issue's shape — never
+                        // allocates a cell on the paths that did not take the
+                        // branch. Releasing the Key means LOADING it THROUGH
+                        // the cell, so an unguarded load reads address 0.
+                        // MEASURED on the base (r30-c1 @ d66898662), for a
+                        // capture behind an `if` whose branch is never taken:
+                        //   "ERROR: AddressSanitizer: SEGV on unknown address
+                        //    0x000000000000" — the `dictek.deferred.val` load
+                        //    through the null cell.
+                        // The release is SKIPPED when there is no cell: there
+                        // is then no Key copy in a cell to release, and
+                        // `bz_string_release` is null-safe, so the guard
+                        // changes nothing for a non-null cell.
+                        llvm::Value* isNull = builder_.CreateICmpEQ(
+                            cell, llvm::ConstantPointerNull::get(ptrTy()));
+                        auto* relBB = llvm::BasicBlock::Create(
+                            llvm_, "dictek.deferred.rel", currentFn_);
+                        auto* contBB = llvm::BasicBlock::Create(
+                            llvm_, "dictek.deferred.cont", currentFn_);
+                        builder_.CreateCondBr(isNull, contBB, relBB);
+                        builder_.SetInsertPoint(relBB);
                         llvm::Value* cellTyped = builder_.CreatePointerCast(
                             cell, st->getPointerTo(),
                             "dictek.deferred.cellcast");
-                        structPtr = cellTyped;
+                        llvm::Value* keyAddr = builder_.CreateStructGEP(
+                            st, cellTyped, 0, "dictek.deferred.addr");
+                        llvm::Value* keyVal = builder_.CreateLoad(
+                            ptrTy(), keyAddr, "dictek.deferred.val");
+                        emitStringRelease(keyVal);
+                        builder_.CreateBr(contBB);
+                        builder_.SetInsertPoint(contBB);
                     } else {
                         // Non-guarded: d.slot IS the struct alloca.
-                        structPtr = d.slot;
+                        llvm::Value* keyAddr = builder_.CreateStructGEP(
+                            st, d.slot, 0, "dictek.deferred.addr");
+                        llvm::Value* keyVal = builder_.CreateLoad(
+                            ptrTy(), keyAddr, "dictek.deferred.val");
+                        emitStringRelease(keyVal);
                     }
-                    llvm::Value* keyAddr = builder_.CreateStructGEP(
-                        st, structPtr, 0, "dictek.deferred.addr");
-                    llvm::Value* keyVal = builder_.CreateLoad(
-                        ptrTy(), keyAddr, "dictek.deferred.val");
-                    emitStringRelease(keyVal);
                 }
             }
         }
