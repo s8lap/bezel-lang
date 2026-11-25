@@ -9888,12 +9888,51 @@ llvm::Function* Emitter::ensureIndexerSetterFn(const sema::TypeSymbol* cls,
         return fwd;
     }
 
+    // fix #9152 (§23.3 / §23.4 / §12.5 / §21.6, v0.359): the accessor's
+    // BODY KIND is the "does this accessor have a body?" test — NOT
+    // `!a.stmts.empty()`.
+    //
+    // WHY. `!a.stmts.empty()` is a PROXY for "the accessor has a body", and
+    // the proxy misreads a block accessor whose block is EMPTY. Grammar A.4
+    // admits it: `AccessorBody ::= "=>" (Expression | AssignmentStmt | "do"
+    // Statement* "end") ";"` — `Statement*` is zero-or-more, so `set => do
+    // end;` is a legal accessor body, and §21.6 (v0.359) makes the empty
+    // `do ... end` block a first-class shape. §12.5 (v0.359) decides what it
+    // is: "An abstract member ends with `;` and has no `end`" — so `do end` is
+    // NOT abstract, it is a CONCRETE accessor whose body does nothing, and
+    // §23.3 (v0.359) judges the store "whatever the setter's body does with
+    // `value`". §23.4 (v0.359) makes a virtual indexer's accessor dispatch
+    // dynamically, so the accessor MUST EXIST for the dispatch to have a
+    // target.
+    //
+    // THE DEFECT. The proxy answered false for an empty block, so this
+    // emitter concluded "this indexer has no setter at all" and returned
+    // nullptr; `declareVtables` Pass D then left the vtable/itable setter
+    // slot at its `ConstantPointerNull` initialiser (`if (fn) elems[...] =
+    // fn;`) and the write called ADDRESS 0x0. MEASURED on r30-c1 @ e97a8efbc
+    // (issue #9152): `AddressSanitizer: SEGV on unknown address
+    // 0x000000000000 (pc 0x000000000000)` — for the class-vtable write, the
+    // override write, the compound write, the interface-itable write and the
+    // lambda-index write alike.
+    //
+    // THE TWINS THAT WERE ALREADY RIGHT, and why this change does not touch
+    // them. The indexer GETTER twin (`ensureIndexerGetterFn`, this file)
+    // already keys on `a.bodyKind == ast::PropertyAccessorBodyKind::Block`;
+    // so does the NAMED-property twin (`ensurePropertyAccessorFn`, this
+    // file), which keys on `a.bodyKind !=
+    // ast::PropertyAccessorBodyKind::Abstract`. This setter path was the
+    // only one of the three still using the statement-vector proxy, which
+    // is exactly why the issue's named-property twin and its non-empty-setter
+    // twin do not crash. The accessor AST carries the authoritative
+    // discriminator (src/ast/Node.hpp: `PropertyAccessorBodyKind {
+    // Expression, Block, Abstract }` with `bodyKind`, `exprBody`, `stmts`).
     const ast::Expr* setterExpr = nullptr;
     const std::vector<std::unique_ptr<ast::Stmt>>* setterStmts = nullptr;
     for (const auto& a : pd->accessors) {
         if (a.isSet) {
             if (a.exprBody) setterExpr = a.exprBody.get();
-            else if (!a.stmts.empty()) setterStmts = &a.stmts;
+            else if (a.bodyKind == ast::PropertyAccessorBodyKind::Block)
+                setterStmts = &a.stmts;
             break;
         }
     }
