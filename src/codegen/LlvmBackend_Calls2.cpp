@@ -13306,7 +13306,44 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // already gives back, so `calleeIsField` is false there and
                 // the two releases cannot both fire.
                 const bool calleeIsField = calleeReadsClosureField(call.callee.get());
-                if (calleeIsField) emitClosureRetain(closurePtr);
+                // fix #9147 (§28.9 / §27.5 / §28.3 / §28.3.11, v0.359): an
+                // INTERFACE-dispatched property read is a LEND as well — §28.9's
+                // *Accessor faces are uniform across type kinds* says so for
+                // "every declared type", and the interface's declared type is
+                // the receiver's static type, so the read dispatches to the
+                // OVERRIDE's getter and the reader still owns nothing. The
+                // override is chosen at RUNTIME (the itable slot), so the
+                // reader cannot see whether the override's getter MINTS a
+                // fresh value or LENDS a holder's — but it does not have to:
+                // the pair below is BALANCED, so it is right for both.
+                //
+                // The class-typed twin of this question is
+                // `calleeReadsClosureField` (the class field's / class
+                // auto-property's function value is a HOLDER's value, the
+                // holder keeps the reference, and the call takes one of its
+                // own for the duration of the call — #9096's field arm and
+                // #9124's auto-property arm). An INTERFACE property read is
+                // the same shape one level up: the reference the OVERRIDE's
+                // holder keeps is the only one, and the callee may DISPLACE
+                // it while it runs (`x.Drop()` sets `P := lambda(x: IHx) =>
+                // 0;`), which releases that reference and, if it was the last
+                // one, frees the closure object (with the captured variables
+                // §27.5 heap-allocates in it) while the body still reads them.
+                // MEASURED (issue #9147): a heap-use-after-free in `lam$1`,
+                // freed by `bz$lam$1$envdtor`.
+                //
+                // The predicate is the itable getter slot — the same map
+                // `propertyReadMintsClosureRef` consults to EXCLUDE a
+                // slot-dispatched read from the "the getter minted the
+                // reader's reference" classification. The two answers are
+                // therefore mutually exclusive by construction: a
+                // slot-dispatched read NEVER mints (the reader cannot see
+                // the override's body), so `calleeMintsRef` is false here and
+                // the two releases below cannot both fire.
+                const bool calleeIsIfaceProp =
+                    ifacePropertyGetIndex_.count(ps) != 0;
+                const bool calleeTakesOwnRef = calleeIsField || calleeIsIfaceProp;
+                if (calleeTakesOwnRef) emitClosureRetain(closurePtr);
                 llvm::Value* r = emitClosureCall(closurePtr, rt, &call);
                 if (calleeMintsRef && !diverged_ && closurePtr &&
                     closurePtr->getType()->isPointerTy())
@@ -13316,7 +13353,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // emitted only where the code is still reachable (a leak on
                 // the throw path is the safe direction — the reference is not
                 // released TWICE).
-                if (calleeIsField && !diverged_ && closurePtr &&
+                if (calleeTakesOwnRef && !diverged_ && closurePtr &&
                     closurePtr->getType()->isPointerTy())
                     emitClosureRelease(closurePtr);
                 return r;
