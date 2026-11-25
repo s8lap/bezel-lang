@@ -11160,14 +11160,32 @@ void Emitter::collectConditionalArmChainCalls(
     if (!e) return;
     if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
         if (pb->operand) e = pb->operand.get();
-    auto* ce = dynamic_cast<const ast::ConditionalExpr*>(e);
-    if (!ce) return;
-    for (const ast::Expr* arm : {ce->thenValue.get(), ce->elseValue.get()}) {
+    auto visitArm = [&](const ast::Expr* arm) {
         if (const ast::CallExpr* cc = chainCallResultNode(arm))
             out.push_back(cc);
         else
             collectConditionalArmChainCalls(arm, out);
+    };
+    if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        visitArm(ce->thenValue.get());
+        visitArm(ce->elseValue.get());
+        return;
     }
+    // fix #9340 (§28.3.11, §28.3 producers row, §19.2, §7.7, v0.359): an
+    // expression-position `case` is a pass-through of the selected arm's value
+    // exactly as a conditional is, and so is the right operand of `??` ("exactly
+    // one of the two owned values is produced at runtime and is discharged
+    // once", the `a ?? b` row). A destination that takes either takes the
+    // chain-call result of an arm / right operand. Block-bodied arms
+    // (`CaseArmBodyKind::Block`) yield through statements and are not covered.
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(e)) {
+        for (const ast::CaseArm& arm : cx->arms)
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression)
+                visitArm(arm.exprBody.get());
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e))
+        if (be->op == "??") visitArm(be->right.get());
 }
 
 llvm::Value* Emitter::lowerChainCallHandedOff(const ast::Expr* e,

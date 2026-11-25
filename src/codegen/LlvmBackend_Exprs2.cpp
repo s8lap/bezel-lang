@@ -251,7 +251,13 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
                                                         {1u});
                 builder_.CreateCondBr(hasVal, endBB, rhsBB);
                 builder_.SetInsertPoint(rhsBB);
+                // fix #9340 (§28.3.11, §7.7, v0.359): the right operand runs
+                // only when the left is null, so an owned chain-call result in
+                // it takes an entry-block `ccres.slot` (see the CG60 arm of
+                // `lowerCallDispatch`; #9270's mechanism).
+                ++conditionalOperandDepth_;
                 llvm::Value* r = lowerExpr(*bin.right);
+                --conditionalOperandDepth_;
                 bool rhsDiv = diverged_;
                 if (!r) return nullptr;
                 // #1044 / #1046: coerce the RHS default to the nullable payload
@@ -506,7 +512,13 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
         if (!coalTargetTy && bin.left) coalTargetTy = ctx_.exprType(*bin.left);
         if (coalTargetTy) r = lowerReturnCollectionLiteral(cl, coalTargetTy);
     }
-    if (!r) r = lowerExpr(*bin.right);
+    // fix #9340 (§28.3.11, §7.7, v0.359): the right operand runs only when the
+    // left is null (see the nullable-value arm above).
+    if (!r) {
+        ++conditionalOperandDepth_;
+        r = lowerExpr(*bin.right);
+        --conditionalOperandDepth_;
+    }
     bool rhsDiverged = diverged_;  // CG40: e.g. `a ?? throw E`
     if (!r) {
         // fix #7879 (§7.7): `??` is a CONTROL-FLOW JOIN (K7) — a PHI-join of
@@ -16290,7 +16302,11 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                 llvm::BasicBlock::Create(llvm_, "case.guard", currentFn_);
             builder_.CreateCondBr(pm, guardBB, nextBB);
             builder_.SetInsertPoint(guardBB);
+            // fix #9340 (§28.3.11, §19.4, v0.359): the guard runs only when
+            // the arm's pattern matched — an operand on SOME paths.
+            ++conditionalOperandDepth_;
             llvm::Value* g = lowerExpr(*arm.guard);
+            --conditionalOperandDepth_;
             if (!g) return nullptr;
             builder_.CreateCondBr(g, bodyBB, nextBB);
         } else {
@@ -16379,7 +16395,12 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
         if (armBindingsOnStack)
             for (const auto& d : armBindingDisposals)
                 disposeStack_.back().push_back(d);
+        // fix #9340 (§28.3.11, §19.2, v0.359): an arm runs on only SOME paths,
+        // so an owned chain-call result in it takes an entry-block `ccres.slot`
+        // (see the CG60 arm of `lowerCallDispatch`; #9270's mechanism).
+        ++conditionalOperandDepth_;
         llvm::Value* v = lowerExpr(*arm.exprBody);
+        --conditionalOperandDepth_;
         // Take this arm's entries off again, and drop the binding through the
         // entries AS THEY NOW STAND. The entries the arm's expression
         // registered meanwhile (its own temporaries, which belong to the

@@ -3909,8 +3909,9 @@ private:
             if (c == call) return true;
         return false;
     }
-    // fix #9270: the chain calls in the ARMS of the conditional expression `e`
-    // (a postfix `!` peeled, nested conditionals followed).
+    // fix #9270 / #9340: the chain calls in the ARMS of the conditional
+    // expression `e`, in the arms of an expression-position `case`, or in the
+    // right operand of a `??` (a postfix `!` peeled, nested ones followed).
     static void collectConditionalArmChainCalls(
         const ast::Expr* e, std::vector<const ast::CallExpr*>& out);
     // fix #9138 (§28.3.11, v0.359): the chain call `e` produces, or null when
