@@ -38191,6 +38191,71 @@ static bool bareRefSurfaceHeadCovers(std::string_view head) {
            head == "OwningLinkedList" || head == "FrozenArray";
 }
 
+// fix #8783 (§7.5 / §26.5 rule 2, v0.359): the HEAD SET a bare-reference
+// collection-surface check applies to.
+//
+//  * `DotCatchAll` — the `.` spelling's catch-all: the heads whose surface no
+//    EARLIER per-family block owns (the #2536 set above). The `Array`/
+//    `OwningArray` and `Stack`/`OwningStack`/`Queue`/`OwningQueue` families
+//    are NOT in it: their `.` spelling has its own per-family blocks
+//    (#2457 slice 1 / #2470 slice 2), which fire first and own their
+//    bare-reference surface (with their own wording).
+//  * `AllTableHeads` — EVERY head `concreteCollectionSurfaces()` has a row
+//    for. The `?.` spelling's gate uses this: §7.5 (v0.359) makes the two
+//    spellings of one member resolve identically, and the `?.` CALL form's
+//    own gate (fix #8348) already reads the SAME table for EVERY head, so
+//    the `?.` BARE form must not refuse LESS than the `?.` CALL form does.
+//    (The two head sets differ in which heads the DECISION applies to, not
+//    in the decision itself: both read the same table row, the same
+//    exemption set and the same message.)
+enum class CollectionSurfaceHeadScope {
+    DotCatchAll,
+    AllTableHeads,
+};
+
+// fix #3896 / #8783 (stdlib §4.6-§4.10, §4.14, §4.17-§4.19, v0.355): the
+// heads whose `CompareTo` has a DEDICATED refusal — "no member `CompareTo` on
+// `X<T>` (stdlib §S declares no `IComparable<T>` conformance for this type)"
+// — so the generic documented-surface sentence must not shadow it.
+//
+// ONE table, read by the `.` spelling's residual block AND by the `?.`
+// spelling's twin (fix #8783), so the two spellings of one member cannot
+// disagree about it.
+struct CollectionResidualCompareTo {
+    std::string_view name;
+    std::string_view generics;
+    std::string_view stdlibSection;
+};
+
+static const CollectionResidualCompareTo*
+collectionResidualCompareTo(std::string_view head) {
+    static constexpr CollectionResidualCompareTo kRows[] = {
+        {"OwningBuffer", "<T>", "4.14"},
+        {"Set", "<T>", "4.10"},
+        {"OwningSet", "<T>", "4.10"},
+        {"SortedSet", "<T>", "4.18"},
+        {"FrozenArray", "<T>", "4.19"},
+        {"Dictionary", "<K, V>", "4.8"},
+        {"OwningDictionary", "<K, V>", "4.9"},
+        {"LinkedList", "<T>", "4.6"},
+        {"OwningLinkedList", "<T>", "4.7"},
+    };
+    for (const auto& e : kRows)
+        if (e.name == head) return &e;
+    return nullptr;
+}
+
+// The refusal's wording — empty when the head has no dedicated `CompareTo`
+// refusal (the generic documented-surface sentence is then the authority).
+static std::string collectionResidualCompareToMessage(std::string_view head) {
+    const CollectionResidualCompareTo* e = collectionResidualCompareTo(head);
+    if (!e) return {};
+    return "no member `CompareTo` on `" + std::string(e->name) +
+           std::string(e->generics) + "` (stdlib \xC2\xA7" +
+           std::string(e->stdlibSection) +
+           " declares no `IComparable<T>` conformance for this type)";
+}
+
 // fix #8350 / #8351 (stdlib §4.6-§4.10, §4.17-§4.19, v0.355): the
 // bare-reference "no member" catch-all for the concrete built-in collection
 // heads, in ONE place, so the two receiver shapes of one head cannot disagree.
@@ -38216,18 +38281,32 @@ static bool bareRefSurfaceHeadCovers(std::string_view head) {
 // shape's CALL form already draws from the CALL-path gate).
 //
 // Returns true when it reported (the caller stops there).
+//
+// fix #8783 (§7.5 / §26.5 rule 2, v0.359): the `?.` spelling's twin calls
+// this SAME function, so the two spellings of one member cannot disagree
+// about the head's surface, the exemption set, or the diagnostic's wording.
+// The two spellings differ only in the HEAD SET they apply to
+// (`CollectionSurfaceHeadScope`): the `.` spelling's catch-all owns the
+// heads no earlier per-family block owns (the #2536 set), while the `?.`
+// spelling's gate covers EVERY head the table has a row for — the `?.` CALL
+// form's own gate (fix #8348) already reads the SAME table for EVERY head,
+// so the `?.` BARE form must not refuse less than the `?.` CALL form does.
 static bool bareRefCollectionSurfaceReject(SemaContext& ctx,
-                                            const ast::MemberAccessExpr& ma,
-                                            const ast::Expr* calleeOfCall,
-                                            std::string_view cn,
-                                            bool compareToHasResidualDiagnostic) {
+                                           std::string_view mbr,
+                                           SourceLocation loc,
+                                           bool isCallForm,
+                                           std::string_view cn,
+                                           bool compareToHasResidualDiagnostic,
+                                           CollectionSurfaceHeadScope headScope) {
     if (cn.empty()) return false;
     const ConcreteCollectionSurface* row = concreteCollectionSurfaceRow(cn);
-    if (!row || !bareRefSurfaceHeadCovers(cn)) return false;
-    const auto& mbr = ma.member;
+    if (!row) return false;
+    if (headScope == CollectionSurfaceHeadScope::DotCatchAll &&
+        !bareRefSurfaceHeadCovers(cn))
+        return false;
     // The CALL form has its own path: the CALL-path surface gate (fix #8331)
     // reads the SAME table and refuses the SAME names.
-    if (&ma == calleeOfCall) return false;
+    if (isCallForm) return false;
     // Universal Object members every reference type carries (language spec
     // §8.1) — not enumerated in each family's stdlib section but still real
     // members.
@@ -38306,8 +38385,6 @@ static bool bareRefCollectionSurfaceReject(SemaContext& ctx,
     // #8351).
     std::string section = "\xC2\xA7" + std::string(row->section);
     std::string surface = concreteCollectionSurfaceList(cn);
-    auto loc = ma.span.begin;
-    if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
     ctx.diagnostics().report(
         Severity::Error, loc,
         std::string("no member `") + std::string(mbr) + "` on `" +
@@ -42116,10 +42193,13 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // shape's CALL form already draws from the CALL-path gate.
     if (ma.target && !ctx_.exprType(ma)) {
         if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+            SourceLocation sloc = ma.span.begin;
+            if (sloc.line == 0 && ma.target) sloc = ma.target->span.begin;
             bareRefCollectionSurfaceReject(
-                ctx_, ma, calleeOfCallCtx_,
+                ctx_, ma.member, sloc, &ma == calleeOfCallCtx_,
                 bareRefStubCollectionHead(tt),
-                /*compareToHasResidualDiagnostic=*/false);
+                /*compareToHasResidualDiagnostic=*/false,
+                CollectionSurfaceHeadScope::DotCatchAll);
         }
     }
     if (!targetType || builtinDateTimeRecv) {
@@ -45455,10 +45535,13 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // is never entered for it — so it has its own call site below
                 // the block. The two shapes read the SAME table row, so they
                 // cannot disagree about a head's surface.
+                SourceLocation sloc = ma.span.begin;
+                if (sloc.line == 0 && ma.target) sloc = ma.target->span.begin;
                 bareRefCollectionSurfaceReject(
-                    ctx_, ma, calleeOfCallCtx_,
+                    ctx_, ma.member, sloc, &ma == calleeOfCallCtx_,
                     bareRefAnnotationCollectionHead(tt),
-                    /*compareToHasResidualDiagnostic=*/true);
+                    /*compareToHasResidualDiagnostic=*/true,
+                    CollectionSurfaceHeadScope::DotCatchAll);
             }
         }
         // #2444 (sibling gap to #2423/#2433; stdlib §4.8/§4.9; language spec
@@ -46507,42 +46590,32 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // only run inside a CallExpr), so this carve-out is
                     // the only thing preventing the #2434 silent-Warning
                     // degradation there, identically to OwningBuffer.
-                    struct ResidualAuditedName {
-                        std::string_view name;
-                        std::string_view generics;
-                        std::string_view stdlibSection;
-                    };
-                    static constexpr ResidualAuditedName
-                        kResidualAuditedNames[] = {
-                            {"OwningBuffer", "<T>", "4.14"},
-                            {"Set", "<T>", "4.10"},
-                            {"OwningSet", "<T>", "4.10"},
-                            {"SortedSet", "<T>", "4.18"},
-                            {"FrozenArray", "<T>", "4.19"},
-                            {"Dictionary", "<K, V>", "4.8"},
-                            {"OwningDictionary", "<K, V>", "4.9"},
-                            {"LinkedList", "<T>", "4.6"},
-                            {"OwningLinkedList", "<T>", "4.7"},
-                        };
-                    const ResidualAuditedName* residualInfo = nullptr;
-                    for (const auto& e : kResidualAuditedNames) {
-                        if (e.name == cn) { residualInfo = &e; break; }
+                    // fix #8783 (§7.5 / §26.5 rule 2, v0.359): the table
+                    // moved to file scope (`collectionResidualCompareTo` /
+                    // `collectionResidualCompareToMessage`) so the `?.`
+                    // spelling's twin draws the SAME refusal for the same
+                    // heads — the two spellings of one member cannot
+                    // disagree about it. The rows and their wording are
+                    // unchanged.
+                    if (ma.member == "CompareTo") {
+                        const std::string residualMsg =
+                            collectionResidualCompareToMessage(cn);
+                        if (!residualMsg.empty()) {
+                            auto loc = ma.span.begin;
+                            if (loc.line == 0 && ma.target)
+                                loc = ma.target->span.begin;
+                            ctx_.diagnostics().report(Severity::Error, loc,
+                                                      residualMsg);
+                            return;
+                        }
                     }
-                    if (residualInfo && ma.member == "CompareTo") {
-                        auto loc = ma.span.begin;
-                        if (loc.line == 0 && ma.target)
-                            loc = ma.target->span.begin;
-                        ctx_.diagnostics().report(
-                            Severity::Error, loc,
-                            "no member `CompareTo` on `" +
-                                std::string(residualInfo->name) +
-                                std::string(residualInfo->generics) +
-                                "` (stdlib \xC2\xA7" +
-                                std::string(residualInfo->stdlibSection) +
-                                " declares no "
-                                "`IComparable<T>` conformance for this type)");
-                        return;
-                    }
+                    // fix #8783 (§7.5 / §26.5 rule 2, v0.359): the row
+                    // lookup now reads the SAME file-scope table the
+                    // `?.` spelling's twin reads, so the two spellings of
+                    // one member cannot disagree about which heads have a
+                    // dedicated `CompareTo` / universal-member refusal.
+                    const CollectionResidualCompareTo* residualInfo =
+                        collectionResidualCompareTo(cn);
                     // fix #3883 (language spec §27.6, following the #2470
                     // precedent for Array/OwningArray): joining
                     // `isAuditedElsewhere` also removes the ONLY reject
@@ -50450,6 +50523,92 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                         std::string(mbr) +
                         "` is not yet supported in codegen");
                     return;
+                }
+            }
+            // fix #8783 (§7.5 / §26.5 rule 2, stdlib §4.4-§4.11 / §4.14 /
+            // §4.17-§4.19, v0.359): the `?.` twin of the `.` spelling's
+            // bare-reference COLLECTION-SURFACE check.
+            //
+            // THE DEFECT (issue #8783). §7.5 (v0.359): "`x?.M` returns null
+            // if `x` is null; otherwise it performs the access. The result
+            // type is always nullable" — the `?.` spelling PERFORMS the same
+            // access the `.` spelling does, and §26.5 rule 2 (v0.359) makes
+            // the member lookup IDENTICAL for the two spellings ("The
+            // outcome is the same for every member access on a value, not
+            // only a call — a property or field read or write, and a method
+            // reference ... with a `?.` or postfix-`!` receiver read at its
+            // underlying non-nullable type").
+            //
+            // MEASURED on r30-c1 @ fb1de7ae6 (the staging tip): the `.`
+            // spelling of a name a builtin collection head does NOT declare
+            // is REFUSED with the stdlib's own documented-surface diagnostic
+            // ("no member `Foo` on `SortedSet` (stdlib §4.18) -- it is not
+            // part of this collection's documented surface (...), a universal
+            // `ToString`/`Equals`/`GetHashCode`/`GetType` member (language
+            // spec §8.1), or a stdlib §5 LINQ extension operator"), while the
+            // `?.` spelling of the SAME name was ACCEPTED: the access was
+            // left UNTYPED, codegen lowered it to nothing behind the #3079
+            // warning ("the argument of this `Console.WriteLine` failed to
+            // lower to a value, so the whole statement emits nothing"), and
+            // the program exited 0 with empty stdout. The `?.` spelling over
+            // a USER class was refused all along ("no member `Foo` on type
+            // `C` (§11.3, §12.1)"), so the gap was specific to the builtin
+            // collection heads.
+            //
+            // THE FIX. The gate lives HERE — where the `?.` spelling resolves
+            // its member — and it calls the `.` spelling's OWN helper
+            // (`bareRefCollectionSurfaceReject`), so the two spellings of one
+            // member cannot disagree about the head's surface, the exemption
+            // set, or the diagnostic's wording: SAME per-head table
+            // (`concreteCollectionSurfaces`), SAME decision, SAME message.
+            //
+            // HEAD SET. The `?.` gate covers EVERY head the table has a row
+            // for (`CollectionSurfaceHeadScope::AllTableHeads`), while the
+            // `.` spelling's catch-all covers the heads no earlier
+            // per-family block owns (`DotCatchAll`): the `Array`/
+            // `OwningArray` and `Stack`/`OwningStack`/`Queue`/`OwningQueue`
+            // families have their OWN `.`-form blocks (#2457 slice 1 /
+            // #2470 slice 2), which fire first and own their surface with
+            // their own wording. The `?.` CALL form's own gate (fix #8348)
+            // already reads the SAME table for EVERY head, so the `?.` BARE
+            // form must not refuse LESS than the `?.` CALL form does.
+            //
+            // The CALL form is EXEMPT here: it has its own gate (fix #8348,
+            // above), which reads the same table and refuses the same names;
+            // this arm is the BARE-reference form only — the form the
+            // `#2536` catch-all owns on the `.` side.
+            //
+            // §26.5 rule 2 is preserved: the extension blocks were consulted
+            // ABOVE (the `lookupExtensionMember` call in this `if (!member)`
+            // block), so a USER extension that declares the name on the
+            // receiver IS the member and is NOT refused here — exactly as the
+            // `.` spelling treats it.
+            if (&nm != calleeOfCallCtx_ && recvTyForDiag) {
+                std::string_view cn = bareRefAnnotationCollectionHead(
+                    recvTyForDiag);
+                if (cn.empty())
+                    cn = bareRefStubCollectionHead(recvTyForDiag);
+                if (!cn.empty()) {
+                    // The `CompareTo` carve-out: the `.` spelling's #3896
+                    // residual refusal ("no member `CompareTo` on `X<T>`
+                    // (stdlib §S declares no `IComparable<T>` conformance
+                    // for this type)") is the authority for the nine heads
+                    // that have one, and the generic documented-surface
+                    // sentence must not shadow it — so the `?.` spelling
+                    // draws the SAME one, from the SAME table.
+                    if (nm.member == "CompareTo") {
+                        const std::string residualMsg =
+                            collectionResidualCompareToMessage(cn);
+                        if (!residualMsg.empty()) {
+                            ctx_.diagnostics().report(Severity::Error, nmLoc,
+                                                      residualMsg);
+                            return;
+                        }
+                    }
+                    bareRefCollectionSurfaceReject(
+                        ctx_, nm.member, nmLoc, /*isCallForm=*/false, cn,
+                        /*compareToHasResidualDiagnostic=*/true,
+                        CollectionSurfaceHeadScope::AllTableHeads);
                 }
             }
             // Closed-surface value-receiver gate — the primitive arm mirrors
