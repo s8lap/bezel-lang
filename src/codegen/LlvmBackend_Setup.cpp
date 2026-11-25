@@ -62360,8 +62360,19 @@ const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
 
 
 bool Emitter::lowerScopedBlock(const std::vector<std::unique_ptr<ast::Stmt>>& body,
-                      std::size_t startIdx) {
+                               std::size_t startIdx,
+                               const std::vector<Disposal>* scopeDisposals) {
     disposeStack_.emplace_back();
+    // fix #9094 (§35.5 *The owning match*, §27.5, v0.359): the disposals the
+    // CALLER wants ON THIS SCOPE (the owning match's transferred payload
+    // binding's §35.5 auto-drop) are registered HERE — on the scope this call
+    // opens — so they fire at this scope's exit (the normal edge's disposal
+    // pass below) and on its abnormal exits (the unwind edge emits the same
+    // scope's entries). They are registered FIRST, so the scope's disposal
+    // pass (reverse order) runs them LAST: the payload outlives the arm's own
+    // locals, which may still refer to it.
+    if (scopeDisposals && !scopeDisposals->empty())
+        for (const auto& d : *scopeDisposals) disposeStack_.back().push_back(d);
     // §28.3: the function-body ROOT scope (the first one pushed)
     // owns the unwind disposal of the method's `owned` parameters. Register them
     // here, where a scope finally exists, then clear so nested scopes don't

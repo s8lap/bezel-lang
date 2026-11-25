@@ -1412,6 +1412,30 @@ struct NullPattern : Pattern {};                    // `null`
 struct BindingPattern : Pattern {                   // `var IDENT (: TYPE)?`
     std::string_view name;
     std::unique_ptr<Type> type;
+
+    // fix #9094 (§35.5 *The owning match*, §19.3, §28.3.11, v0.359): this
+    // binding is the WHOLE-SLOT binding of an OWNING MATCH's transferred
+    // payload — the case's `owned` class/interface payload, transferred into
+    // the arm's binding at arm selection ("an **owning match** transfers the
+    // selected case's `owned` and move-only value payloads into the arm's
+    // bindings", §35.5).
+    //
+    // §35.5 makes that binding "an owned local of the ARM BODY's scope", so
+    // the payload is the BINDING's obligation: it is disposed at the arm's
+    // exit edge ("falling off the arm still owning the value auto-drops it"),
+    // not at the construct's completion (the transferred slot is marked
+    // moved-from there — §35.5's "transfers … into its bindings" — so the
+    // completion reclaim declines it).
+    //
+    // STAMPED BY THE OWNERSHIP PASS, which owns the transfer-set decision
+    // (`MethodOwnership::collectOwningMatchTransferBindings` — the same
+    // authority that admits `move r` on such a binding), so codegen cannot
+    // drift from it. Set ONLY for a class/interface payload whose `owned`
+    // marker is active at the instantiation (§28.1's erasure oracle): a
+    // move-only VALUE payload's per-path discharge machinery is separate, and
+    // a copyable or `Object`-typed payload carries no obligation at all.
+    // // per §35.5, §19.3, §28.3.11, v0.359
+    bool owningMatchTransferredPayload = false;
 };
 
 struct ConstantPattern : Pattern {                  // literal alternatives

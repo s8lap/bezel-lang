@@ -140,8 +140,17 @@ const char* kTailOther2 =
     "dispose other2\ndispose inner other2\n"
     "dispose other\ndispose inner other\n";
 
+// fix #9094 (§35.5 *The owning match*, v0.359): the TRANSFERRED payload `a`
+// is now disposed at the ARM's exit edge — "falling off the arm still owning
+// the value auto-drops it" — which is BEFORE the construct-completion reclaim
+// of the un-transferred remainder `b`. Before #9094 the payload was disposed
+// by NOBODY (the leak #9094 is about), so these rows' expectations did not
+// carry the `a` lines; #9094 adds them. The ORDER is the spec's: the
+// binding's scope-end auto-drop runs at the arm's exit, the construct's
+// completion reclaim at the construct's.
 std::string acceptedOut(const std::string& line) {
-    return "dispose b\ndispose inner b\n" + line + "\n" + kTailOther2;
+    return "dispose a\ndispose inner a\n"
+           "dispose b\ndispose inner b\n" + line + "\n" + kTailOther2;
 }
 
 }  // namespace

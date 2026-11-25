@@ -394,6 +394,17 @@ BEZEL_TEST(codegen_owning_match_expr_position_reclaim_4625,
     // reclaim by #4617's per-slot discharge and is the sibling
     // unadopted-binding leak (#4634) — which is why this row is `runAot`, not
     // `runAotChecked`, exactly as the row it replaces was.
+    //
+    // ⚠ FLIPPED BY fix #9094 (§35.5 *The owning match*, v0.359): the
+    // transferred payload `a` is now disposed at the ARM's exit edge —
+    // "falling off the arm still owning the value auto-drops it" — which is
+    // BEFORE the construct-completion reclaim of the un-transferred remainder
+    // `b`. Before #9094 the payload was disposed by NOBODY (the leak #9094 is
+    // about), so this row's expectation did not carry the `dispose a` line;
+    // #9094 adds it, in front of `dispose b`. The ORDER the row exists to pin
+    // is unchanged: the reclaim still runs AFTER the arm result's read of
+    // payload `a` (`w.Ping()`), which is what "dispose a / dispose b / n=7"
+    // shows.
     expectRun(
         run(kTwoPayloadDecls,
             "var o := Outer.W(new Widget(\"a\"), new Widget(\"b\")); "
@@ -403,5 +414,5 @@ BEZEL_TEST(codegen_owning_match_expr_position_reclaim_4625,
             "Console.WriteLine($\"n={n}\"); "
             "Console.WriteLine(\"after\"); "
             "return 0;"),
-        std::string("dispose b\nn=7\nafter\n"), 0);
+        std::string("dispose a\ndispose b\nn=7\nafter\n"), 0);
 }

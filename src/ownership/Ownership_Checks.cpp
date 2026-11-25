@@ -13053,7 +13053,39 @@ void MethodOwnership::registerBorrowOnlyArmBindings(
                 // the declaration in Ownership_impl.hpp for the three
                 // measured rejections. Class/interface payloads only —
                 // #4633's admission bound. // per §35.5, v0.307
-                if (classValued) owningMatchTransferBindings_.insert(bindSym);
+                if (classValued) {
+                    owningMatchTransferBindings_.insert(bindSym);
+                    // fix #9094 (§35.5 *The owning match*, §19.3, §28.3.11,
+                    // v0.359): STAMP the binding's own AST node, so codegen
+                    // knows WHICH binding received the transfer.
+                    //
+                    // §35.5 makes the transferred payload binding "an owned
+                    // local of the arm body's scope", so the PAYLOAD is the
+                    // BINDING's obligation and is disposed at the arm's exit
+                    // edge ("falling off the arm still owning the value
+                    // auto-drops it"). The construct-completion reclaim
+                    // declines it (the transferred slot is marked moved-from
+                    // there — "transfers … into its bindings"), so before this
+                    // stamp NOTHING disposed it: the payload's destructor never
+                    // ran and the block leaked (MEASURED on r30-c1 @ 74b77d29d
+                    // under ASan/LSan: "Direct leak of 1600 byte(s) in 100
+                    // object(s)" over the issue's 100-iteration loop, with the
+                    // counting destructor's total at 0).
+                    //
+                    // The stamp is set HERE, in the pass that OWNS the
+                    // transfer-set decision (`transferred` above is
+                    // `collectOwningMatchTransferBindings`'s set — the same
+                    // authority that admits `move r` on such a binding), so
+                    // codegen reads the decision instead of recomputing it and
+                    // the two cannot drift. `bindSym->decl` IS the binding's
+                    // anchor node — a `BindingPattern` for both the `var x`
+                    // spelling and #1271's naked-binding anchor.
+                    // // per §35.5, §19.3, §28.3.11, v0.359
+                    if (auto* bp = dynamic_cast<const ast::BindingPattern*>(
+                            bindSym->decl))
+                        const_cast<ast::BindingPattern*>(bp)
+                            ->owningMatchTransferredPayload = true;
+                }
                 continue;
             }
             BorrowOnlyArmBinding bob;

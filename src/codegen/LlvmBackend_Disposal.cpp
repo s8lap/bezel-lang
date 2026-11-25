@@ -9818,6 +9818,93 @@ void Emitter::dischargeOwningMatchTransfers(llvm::AllocaInst* slot,
 }
 
 
+// fix #9094 (§35.5 *The owning match*, §19.3, §28.3.11, v0.359): the
+// scope-end disposals of an owning match's TRANSFERRED payload bindings.
+//
+// §35.5: "An **owning match** transfers the selected case's `owned` and
+// move-only value payloads into the arm's bindings and consumes the scrutinee
+// value", and such a binding "is an owned local of the ARM BODY's scope, and
+// §28.3's standard rules apply to it on every arm-exit edge — falling off
+// the arm still owning the value auto-drops it with the must-use warning
+// naming the binding and the standard remedies (`using var u := move r;`
+// adoption in a `do … end` arm, an owned-consuming call, an explicit
+// `r.Dispose()`, `_ := r;`)".
+//
+// THE DEFECT. The transfer HALF was implemented and the DISCHARGE half was
+// not. `dischargeOwningMatchTransfers` marks the transferred payload slot
+// moved-from at the top of the selected arm's body — §35.5's "transfers … into
+// its bindings" — so the construct-completion reclaim DECLINES that payload
+// (§35.5's un-transferred remainder is what it disposes). The binding then
+// owns the payload, and every discharge §35.5 names reaches it THROUGH THE
+// BINDING's own slot — `move r` (#4734's per-occurrence null),
+// `r.Dispose()` (#4734's reclaim-and-null), `_ := r;` (§17.13's discard) —
+// but the arm that discharges NOTHING had no owner at all: the payload's
+// destructor never ran and the heap block leaked. MEASURED on r30-c1 @
+// 74b77d29d, ASan/LSan, over the issue's own 100-iteration program:
+// "N=0 Made=100 S=700" (the counting destructor's total is ZERO) and "Direct
+// leak of 1600 byte(s) in 100 object(s)", allocated in `bz$M.H$Make`.
+//
+// THE DISPOSAL is the §28.3 scope-end auto-drop of the BINDING's slot: a
+// null-guarded `dynamicDispose` — the same shape a `using var` class local
+// gets, and the same slot every other discharge of such a binding reclaims
+// through and NULLS. Whichever runs first reclaims the block exactly once;
+// the later one reloads the nulled slot and skips. So the binding's own
+// scope-end disposal is exactly-once with `move r`, with `r.Dispose()`, with
+// `_ := r;` and with an owned-consuming call — no double free, and the
+// previously-leaking arm now disposes.
+//
+// WHICH BINDINGS. The ones the OWNERSHIP PASS stamped
+// (`ast::BindingPattern::owningMatchTransferredPayload`), because that pass
+// owns the transfer-set decision — `collectOwningMatchTransferBindings`, the
+// same authority that admits `move r` on such a binding and the same one the
+// `move`-of-a-borrow rejection (#4664) consults. Codegen READS the decision
+// instead of recomputing it, so the two cannot drift.
+//
+// The stamp is set for a CLASS/INTERFACE payload whose `owned` marker is
+// active at the instantiation (§28.1's erasure oracle): a move-only VALUE
+// payload's per-path discharge machinery is separate (the ownership pass
+// keeps it out of the transfer admission deliberately), and a copyable or
+// `Object`-typed payload carries no obligation at all.
+//
+// NOT A DISCHARGE OF ITS OWN. This helper registers no disposal by itself —
+// the CALLER registers the returned entries on the scope that owns them (the
+// arm's scope) and emits them at the arm's exit edge. §35.5's MUST-USE
+// WARNING (the auto-drop's companion) is NOT implemented here: the ownership
+// dataflow keeps no `states_` entry for a pattern binding, so "still owning
+// the value" on the arm's exit edge is not decidable by the pass that would
+// have to warn. The auto-drop itself is the memory-safety half and is what
+// this fix delivers.
+std::vector<Emitter::Disposal> Emitter::owningMatchArmBindingDisposals(
+        const ast::Pattern* armPattern) {
+    std::vector<Disposal> out;
+    if (!armPattern) return out;
+    auto* dp = dynamic_cast<const ast::DestructuringPattern*>(armPattern);
+    if (!dp) return out;   // a whole-value / non-destructuring arm binds the
+                           // value itself (§35.5's own separate rule)
+    for (const auto& sp : dp->subPatterns) {
+        // The anchor node: #1271's synthesized BindingPattern for the naked
+        // `W(w, _)` spelling, the `var w` BindingPattern otherwise — the same
+        // node the case lowering keys the binding's SLOT on (`locals_`).
+        const ast::BindingPattern* bp = nullptr;
+        if (!sp.nakedBinding.empty())
+            bp = sp.nakedAnchor.get();
+        else
+            bp = dynamic_cast<const ast::BindingPattern*>(sp.pattern.get());
+        if (!bp || !bp->owningMatchTransferredPayload) continue;
+        auto it = locals_.find(bp);
+        if (it == locals_.end() || !it->second) continue;
+        Disposal d{it->second, nullptr};
+        // A CLASS/INTERFACE payload: the vtable dispatch plus the reclaim —
+        // `emitDisposeAndReclaim`, the §28.4-step-2 / §28.2 shape a `using
+        // var` class local gets. The payload's `owned` marker is active (the
+        // ownership pass stamped it only then), so the obligation is real.
+        d.dynamicDispose = true;
+        out.push_back(d);
+    }
+    return out;
+}
+
+
 // The recursive core of the above. `choiceAddr` is the address of a choice
 // struct (the scrutinee temp's alloca at the top level, a nested payload
 // field's address one level in); returns false — "I could not decide this

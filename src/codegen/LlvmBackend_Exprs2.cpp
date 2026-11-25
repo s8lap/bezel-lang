@@ -16060,7 +16060,64 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
         if (scrutChoiceSlot && patternBindsAnySlot(arm.pattern.get()))
             dischargeOwningMatchTransfers(scrutChoiceSlot, scrutChoiceRef,
                                           arm.pattern.get());
+        // fix #9094 (§35.5 *The owning match*, §19.3, §28.3.11, v0.359): the
+        // ARM-EXIT discharge of the payload the owning match TRANSFERRED into
+        // this arm's binding — the expression-position twin of the
+        // statement-position fix (LlvmBackend_Stmts.cpp's `lowerCaseStmt`).
+        //
+        // §35.5: the transferred binding "is an owned local of the arm body's
+        // scope, and §28.3's standard rules apply to it on every arm-exit
+        // edge — falling off the arm still owning the value auto-drops it".
+        // The transfer mark above took the payload OUT of the
+        // construct-completion reclaim — §35.5's "transfers … into its
+        // bindings" — so the binding is its only owner, and an arm that
+        // discharges nothing left the payload owned by NOBODY: the destructor
+        // never ran and the block leaked (MEASURED on r30-c1 @ 74b77d29d,
+        // ASan/LSan, over the issue's own program in EXPRESSION position:
+        // "N=0 S=700" and "Direct leak of 1600 byte(s) in 100 object(s)").
+        //
+        // The ENCLOSING scope's entry covers the arm's abnormal exits (a
+        // `throw` out of the arm expression); the explicit pass below covers
+        // the NORMAL exit — the arm's expression is evaluated, and the
+        // binding's payload is dropped with it. Both are null-guarded on the
+        // BINDING's own slot, so this is exactly-once with `move r`
+        // (#4734's per-occurrence null), `r.Dispose()` (#4734's
+        // reclaim-and-null) and `_ := r;` (§17.13's discard) — all of which
+        // reclaim through that same slot.
+        //
+        // §27.5: a binding CAPTURED by a closure lives in a CAPTURE CELL, and
+        // that cell is owned by the scope the binding was DECLARED in — the
+        // scope ENCLOSING this `case`. So the enclosing-scope backstop, which
+        // runs at that scope's exit, could read a FREED cell (MEASURED on
+        // r43-m46-9094 in the statement-position twin: heap-use-after-free,
+        // ASan). The backstop is therefore registered AFTER the arm's
+        // expression is lowered (so the capture is visible) and SKIPS a
+        // captured binding; the NORMAL exit below still disposes it, at the
+        // arm's own exit, where the cell is alive.
+        std::vector<Disposal> armBindingDisposals;
+        if (scrutChoiceSlot && patternBindsAnySlot(arm.pattern.get()))
+            armBindingDisposals =
+                owningMatchArmBindingDisposals(arm.pattern.get());
         llvm::Value* v = lowerExpr(*arm.exprBody);
+        // §27.5's capture-cell test: the slot IS a cell holder (the
+        // already-boxed path), or a FRESH holder keeps it in sync (the
+        // `cellVarSyncSlot_` map's holder -> original direction).
+        auto capturedByClosure = [&](llvm::AllocaInst* s) {
+            if (!s) return false;
+            if (cellVars_.count(s)) return true;
+            for (const auto& entry : cellVarSyncSlot_)
+                if (entry.second == s) return true;
+            return false;
+        };
+        if (!disposeStack_.empty())
+            for (const auto& d : armBindingDisposals)
+                if (!capturedByClosure(d.slot)) disposeStack_.back().push_back(d);
+        // §35.5: "falling off the arm still owning the value auto-drops it".
+        // A DIVERGED arm body (a `throw`) has already terminated its block, so
+        // nothing is emitted here and the enclosing scope's entry above covers
+        // that edge.
+        if (!diverged_ && !terminatorOrNull(builder_.GetInsertBlock()))
+            emitDisposals(armBindingDisposals);
         // CG40 (§17.12 / §19): an arm body that diverges (`throw E`, or a
         // body that branches to the unwind/propagate target) has already
         // terminated its block via the throw — mirroring lowerConditional's

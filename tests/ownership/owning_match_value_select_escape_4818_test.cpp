@@ -258,13 +258,20 @@ BEZEL_TEST(owning_match_value_select_escape_4818,
 // the payload; `w` is only READ (in a condition or a scrutinee). K7.2 unions
 // the selected values' sources only, so these must stay accepted, and must
 // print the value actually selected.
+//
+// fix #9094 (§35.5 *The owning match*, v0.359): the TRANSFERRED payload `a`
+// is now disposed at the ARM's exit edge — "falling off the arm still owning
+// the value auto-drops it" — which is BEFORE the construct-completion reclaim
+// of the un-transferred remainder `b`. Before #9094 the payload was disposed
+// by NOBODY (the leak #9094 is about), so these rows' expectations did not
+// carry the `a` lines; #9094 adds them.
 // ===========================================================================
 
 BEZEL_TEST(owning_match_value_select_escape_4818,
            expr_arm_conditional_reads_w_only_in_condition_accepted) {
     expectAccepted(
         exprArm(kWidgets, "(if w.Ping() = 7 then other else other2)"),
-        "dispose b\ndispose inner b\nr=other\n"
+        "dispose a\ndispose inner a\ndispose b\ndispose inner b\nr=other\n"
         "dispose other2\ndispose inner other2\n"
         "dispose other\ndispose inner other\n");
 }
@@ -273,7 +280,7 @@ BEZEL_TEST(owning_match_value_select_escape_4818,
            stmt_store_conditional_reads_w_only_in_condition_accepted) {
     expectAccepted(
         stmtArm(kWidgets, "keep := (if w.Ping() = 7 then other2 else other);"),
-        "dispose b\ndispose inner b\nkeep=other2\n"
+        "dispose a\ndispose inner a\ndispose b\ndispose inner b\nkeep=other2\n"
         "dispose other2\ndispose inner other2\n"
         "dispose other\ndispose inner other\n");
 }
@@ -282,7 +289,7 @@ BEZEL_TEST(owning_match_value_select_escape_4818,
            expr_arm_nested_case_scrutinizes_w_only_accepted) {
     expectAccepted(
         exprArm(kWidgets, "(case w.Ping() of 7 => other2, _ => other)"),
-        "dispose b\ndispose inner b\nr=other2\n"
+        "dispose a\ndispose inner a\ndispose b\ndispose inner b\nr=other2\n"
         "dispose other2\ndispose inner other2\n"
         "dispose other\ndispose inner other\n");
 }
@@ -292,7 +299,7 @@ BEZEL_TEST(owning_match_value_select_escape_4818,
     expectAccepted(
         exprArm(kWidgets,
                 "(if w.Ping() = 7 then null else other) ?? other2"),
-        "dispose b\ndispose inner b\nr=other2\n"
+        "dispose a\ndispose inner a\ndispose b\ndispose inner b\nr=other2\n"
         "dispose other2\ndispose inner other2\n"
         "dispose other\ndispose inner other\n");
 }
@@ -306,7 +313,7 @@ BEZEL_TEST(owning_match_value_select_escape_4818,
              "    var n := (case move o of W(var w, _) => "
              "        (if p then w.Ping() else 0), X => 0); "
              "    Console.WriteLine($\"n={n}\"); "),
-        "dispose b\ndispose inner b\nn=7\n"
+        "dispose a\ndispose inner a\ndispose b\ndispose inner b\nn=7\n"
         "dispose other2\ndispose inner other2\n"
         "dispose other\ndispose inner other\n");
 }
@@ -318,6 +325,6 @@ BEZEL_TEST(owning_match_value_select_escape_4818,
     expectAccepted(
         stmtArm(kInners,
                 "keep := (if w.In().Ping() = 11 then other2 else other);"),
-        "dispose b\ndispose inner b\nkeep=other2\n"
+        "dispose a\ndispose inner a\ndispose b\ndispose inner b\nkeep=other2\n"
         "dispose inner other2\ndispose inner other\n");
 }

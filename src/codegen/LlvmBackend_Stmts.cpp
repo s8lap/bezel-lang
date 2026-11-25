@@ -14794,7 +14794,51 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
         if (scrutChoiceSlot && patternBindsAnySlot(arm.pattern.get()))
             dischargeOwningMatchTransfers(scrutChoiceSlot, scrutChoiceRef,
                                           arm.pattern.get());
-        bool armTerm = lowerScopedBlock(arm.stmts);
+        // fix #9094 (§35.5 *The owning match*, §19.3, §28.3.11, v0.359): the
+        // ARM-EXIT discharge of the payload the owning match TRANSFERRED into
+        // this arm's binding.
+        //
+        // §35.5: the transferred binding "is an owned local of the arm body's
+        // scope, and §28.3's standard rules apply to it on every arm-exit
+        // edge — falling off the arm still owning the value auto-drops it".
+        // The transfer mark above (`dischargeOwningMatchTransfers`) took the
+        // payload OUT of the construct-completion reclaim — §35.5's
+        // "transfers … into its bindings" — so the binding is its only owner,
+        // and before this the arm that discharges nothing left the payload
+        // owned by NOBODY: the destructor never ran and the block leaked
+        // (MEASURED on r30-c1 @ 74b77d29d, ASan/LSan: "Direct leak of 1600
+        // byte(s) in 100 object(s)" over the issue's 100-iteration program,
+        // the counting destructor's total at 0).
+        //
+        // WHERE IT IS REGISTERED. On the ARM BODY'S OWN SCOPE — the scope
+        // `lowerScopedBlock` opens for the arm's statements — because that is
+        // the scope §35.5 names ("an owned local of the arm body's scope").
+        // The scope's own disposal pass fires on its NORMAL exit (§35.5's
+        // "falling off the arm") and the unwind edge fires the same scope's
+        // entries on the ABNORMAL exits (a `throw`, a `return`, a
+        // `break`/`continue` out of the arm) — one registration, every
+        // arm-exit edge.
+        //
+        // NOT on the scope ENCLOSING the `case`. That scope outlives the arm,
+        // and §27.5's CAPTURE CELL — the storage a closure-captured binding
+        // lives in — is owned by the scope the binding was DECLARED in, so a
+        // disposal that ran after that scope's exit would read a FREED cell.
+        // MEASURED on r43-m46-9094 with the enclosing-scope registration:
+        // heap-use-after-free (ASan) in `owning_match_arm_capture_escape_5135`'s
+        // accept control — the closure-captured binding's cell, freed at the
+        // enclosing scope's exit, read by the backstop.
+        //
+        // EXACTLY-ONCE. The entry is null-guarded on the BINDING's own slot,
+        // and every other discharge §35.5 names reclaims through that same
+        // slot and NULLS it — `move r` (#4734's per-occurrence null),
+        // `r.Dispose()` (#4734's reclaim-and-null) and `_ := r;` (§17.13's
+        // discard). Whichever runs first reclaims the block; the later one
+        // reloads the nulled slot and skips.
+        std::vector<Disposal> armBindingDisposals;
+        if (scrutChoiceSlot && patternBindsAnySlot(arm.pattern.get()))
+            armBindingDisposals =
+                owningMatchArmBindingDisposals(arm.pattern.get());
+        bool armTerm = lowerScopedBlock(arm.stmts, 0, &armBindingDisposals);
         if (!armTerm) builder_.CreateBr(endBB);
         builder_.SetInsertPoint(nextBB);
     }

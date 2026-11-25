@@ -25494,8 +25494,24 @@ private:
     // normal fall-through, disposes its `using var`s in reverse and pops.
     // If the block terminated early (return/break/continue), that
     // terminator already emitted the needed disposals, so we only pop.
+    //
+    // fix #9094 (§35.5 *The owning match*, v0.359): `scopeDisposals` names
+    // disposals to REGISTER ON THE SCOPE THIS CALL OPENS, before the body is
+    // lowered. The owning match's arm body is the scope §35.5 gives the
+    // transferred payload binding ("an owned local of the ARM BODY's scope"),
+    // and the scope's own exit is where §35.5's auto-drop belongs
+    // ("falling off the arm still owning the value auto-drops it") — on the
+    // NORMAL edge (the scope's disposal pass) and on the ABNORMAL ones (the
+    // unwind edge emits the same scope's entries). Registering on the ARM's
+    // own scope — rather than on the scope ENCLOSING the `case` — is what
+    // keeps a CAPTURED binding sound: §27.5's capture cell is owned by the
+    // scope the binding was DECLARED in (the enclosing one), so a disposal
+    // that ran after that scope's exit would read a FREED cell (MEASURED on
+    // r43-m46-9094: heap-use-after-free, the cell read at the enclosing
+    // scope's exit).
     bool lowerScopedBlock(const std::vector<std::unique_ptr<ast::Stmt>>& body,
-                          std::size_t startIdx = 0);
+                          std::size_t startIdx = 0,
+                          const std::vector<Disposal>* scopeDisposals = nullptr);
 
     // §27.5 / #754: lower a for-loop body. If the loop variable is captured by a
     // closure anywhere in the body, first pre-box it into a fresh per-iteration
@@ -25772,6 +25788,41 @@ private:
     bool markOwningMatchTransferredSlots(llvm::Value* choiceAddr,
                                          const sema::TypeRef* choiceRef,
                                          const ast::Pattern* p);
+
+    // fix #9094 (§35.5 *The owning match*, §19.3, §28.3.11, v0.359): the
+    // SCOPE-END DISPOSALS of an owning match's transferred payload bindings.
+    //
+    // §35.5: "An **owning match** transfers the selected case's `owned` and
+    // move-only value payloads into the arm's bindings and consumes the
+    // scrutinee value", and such a binding "is an owned local of the ARM
+    // BODY's scope, and §28.3's standard rules apply to it on every arm-exit
+    // edge — falling off the arm still owning the value auto-drops it".
+    //
+    // So the payload's obligation is the BINDING's, and the construct's
+    // completion reclaim must NOT dispose it: `dischargeOwningMatchTransfers`
+    // marks the transferred slot moved-from there (the transfer), which is why
+    // fix #4617's per-slot mark leaves the payload to the binding — and why,
+    // before this helper existed, NOTHING disposed it: the destructor never
+    // ran and the block leaked (MEASURED on r30-c1 @ 74b77d29d, ASan/LSan:
+    // "Direct leak of 1600 byte(s) in 100 object(s)" over the issue's
+    // 100-iteration loop, the counting destructor's total at 0).
+    //
+    // The entries are NULL-GUARDED scope-end disposals of the BINDING's own
+    // slot — the same `dynamicDispose` shape a `using var` class local gets,
+    // and the same slot every OTHER discharge of such a binding reclaims
+    // through and NULLS (`move r` — #4734's per-occurrence null; `r.Dispose()`
+    // — #4734's reclaim-and-null; `_ := r;` — §17.13's discard). So the
+    // binding's scope-end disposal is exactly-once with all of them: whichever
+    // runs first reclaims the block, and the later one reloads the nulled slot
+    // and skips.
+    //
+    // WHICH BINDINGS: the ones the OWNERSHIP PASS stamped
+    // (`ast::BindingPattern::owningMatchTransferredPayload`), because that
+    // pass owns the transfer-set decision — the same authority that admits
+    // `move r` on such a binding. Codegen reads the decision instead of
+    // recomputing it, so the two cannot drift.
+    std::vector<Disposal> owningMatchArmBindingDisposals(
+        const ast::Pattern* armPattern);
 
     // Lower a statement list into the current block; returns true if the
     // list terminated the block (so the caller stops adding to it).
