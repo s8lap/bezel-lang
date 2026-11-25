@@ -1827,6 +1827,36 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                                n == "LinkedList" || n == "FrozenArray";
                     }(it->collTy->headName()))
                 elemDisp = stringElementReleaseThunk();
+            // fix #9183 (§28.9 / §28.11, v0.359): the FIELD path must decide
+            // the collection's VALUE disposal the way the scope-end LOCAL path
+            // does (`buildCollectionTempDisposal`, LlvmBackend_Setup.cpp), and
+            // for a BORROWING `Dictionary<K,V>` whose V is stored BOXED — a
+            // record, a choice, or a nullable value type (stdlib §4.8's value
+            // encoding) — that decision is `dictValueBoxFreer`: the table
+            // HOLDS the box, so the box goes back with the table (§28.9: the
+            // compiler-inserted free of a collection releases the instance's own
+            // allocation, and a boxed value in a value slot is storage the
+            // collection holds; §28.11's element-slot policy: the borrowing
+            // family's value slot for a record value is a COPY slot, and the
+            // copy's storage is the collection's to release).
+            //
+            // `elementPolicyFor` cannot supply this disposer: a record / choice
+            // / nullable value type is a VALUE (a value type carries no
+            // disposal obligation of its own — §3.2 / §9), so its policy row
+            // has NO disposer thunk, and this arm freed the table with a NULL
+            // disposer — the box was never freed (MEASURED on r30-c1: 8 B per
+            // stored record value, LSan, at the holder's disposal).
+            //
+            // `dictValueBoxFreer` is the SAME helper the local path installs for
+            // this shape, and it is self-gating: it returns null for every V
+            // that stores no box (a scalar, a string, a class) and for the
+            // owning family (`OwningDictionary`, whose V is disposed through
+            // the policy row above), so every other V is UNCHANGED here. The
+            // box is freed EXACTLY ONCE: the indexer-set path frees the
+            // DISPLACED box when a key is overwritten, and the free below
+            // reclaims only the SURVIVING box (no double-free).
+            if (!elemDisp && isDict)
+                elemDisp = dictValueBoxFreer(it->collTy);
             llvm::Value* disp = elemDisp
                 ? llvm::cast<llvm::Value>(elemDisp)
                 : llvm::ConstantPointerNull::get(ptrTy());
