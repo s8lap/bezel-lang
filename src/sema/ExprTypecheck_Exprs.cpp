@@ -3445,29 +3445,70 @@ bool consoleStreamSurfaceDeclares(std::string_view typeName,
 void ExprTC::checkConsoleStreamMemberAccess(const ast::MemberAccessExpr& ma,
                                             std::size_t errorsBefore) {
     if (!ma.target) return;
+    checkConsoleStreamMemberAccessOn(ma.target.get(), ma.member, &ma,
+                                     errorsBefore);
+}
+
+// fix #9223 (§26.5 rule 2, §7.5, v0.359): the SAME check for the
+// NULL-CONDITIONAL spelling.
+//
+// §26.5 rule 2 (v0.359): "The outcome is the same for every member access on
+// a value, not only a call — a property or field read or write, and a method
+// reference, which resolves its member exactly as the call does (§27.6) —
+// **with a `?.` or postfix-`!` receiver read at its underlying non-nullable
+// type (§7.5, §7.8).** The `?.` spelling is a DIFFERENT AST node
+// (`ast::NullCondMemberExpr`) with its own resolver
+// (`resolveNullCondMember`), and that resolver reaches neither the #9184
+// check nor the ordinary member lookup's receiver type: the console stream
+// property read is UNTYPED outside a call-argument position (§2.1's rule —
+// `consoleStreamArgumentType`), so the null-conditional resolver had NO
+// receiver type to resolve against, found no member, reported NOTHING, and
+// codegen lowered the whole access to NOTHING.
+//
+// §7.5 (v0.359): "`x?.M` returns null if `x` is null; otherwise it performs
+// the access." — the `?.` spelling performs the SAME access the `.` spelling
+// does, so the two spellings of ONE member may not disagree about whether
+// that member exists. The receiver's static type is the stdlib-DECLARED one
+// — `TextReader` for `Console.In`, `TextWriter` for `Console.Out` /
+// `Console.Error` — so the refusal is the ORDINARY no-member diagnostic, the
+// one the `.` spelling already draws.
+void ExprTC::checkConsoleStreamMemberAccess(const ast::NullCondMemberExpr& nm,
+                                            std::size_t errorsBefore) {
+    if (!nm.target) return;
+    checkConsoleStreamMemberAccessOn(nm.target.get(), nm.member, &nm,
+                                     errorsBefore);
+}
+
+// fix #9184 / #9223: the shared core of the two spellings. The receiver is
+// the access's TARGET expression, the name is the access's MEMBER, and the
+// access node itself supplies the diagnostic's location.
+void ExprTC::checkConsoleStreamMemberAccessOn(const ast::Expr* target,
+                                               std::string_view member,
+                                               const ast::Expr* access,
+                                               std::size_t errorsBefore) {
+    if (!target) return;
     // Something already reported about this access — do not add a second
     // diagnostic for it (the same discipline `checkBuiltinClosedRecordMember`
     // uses).
     if (ctx_.diagnostics().errorCount() != errorsBefore) return;
-    const std::string typeName =
-        consoleStreamDeclaredType(ctx_, ma.target.get());
+    const std::string typeName = consoleStreamDeclaredType(ctx_, target);
     if (typeName.empty()) return;
-    if (consoleStreamSurfaceDeclares(typeName, ma.member)) return;
+    if (consoleStreamSurfaceDeclares(typeName, member)) return;
     // §26.5 rule 2's extension search: a member an extension block whose
     // head applies to the receiver's type declares IS a member of it, so the
     // name is not "no member". The receiver has no TypeRef to offer the
     // matcher (the property read is untyped), so the head's NAME is what the
     // predicate is asked — the same escape the #7661 closed-surface check
     // takes (`anyExtensionAppliesToBuiltin`).
-    if (anyExtensionAppliesToBuiltin(nullptr, typeName, ma.member, nullptr))
+    if (anyExtensionAppliesToBuiltin(nullptr, typeName, member, nullptr))
         return;
-    // The MemberAccessExpr span is degenerate (line 0) when the access is a
-    // call callee (`x.M()`); fall back to the receiver's span.
-    auto loc = ma.span.begin;
-    if (loc.line == 0) loc = ma.target->span.begin;
+    // The access span is degenerate (line 0) when the access is a call callee
+    // (`x.M()`); fall back to the receiver's span.
+    auto loc = access ? access->span.begin : target->span.begin;
+    if (loc.line == 0) loc = target->span.begin;
     ctx_.diagnostics().report(
         Severity::Error, loc,
-        "no member `" + std::string(ma.member) + "` on type `" + typeName +
+        "no member `" + std::string(member) + "` on type `" + typeName +
             "` (§11.3, §12.1)");
 }
 
@@ -7893,6 +7934,19 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         // `.` spelling's commitment uses (its note is built after the
         // restore).
         rule1Hide.restore();
+        // fix #9223 (§26.5 rule 2, §7.5, stdlib §2.1 / §7.4, v0.359): the
+        // `?.` spelling of the #9184 check. §26.5 rule 2 reads a `?.`
+        // receiver "at its underlying non-nullable type", so the NULL-
+        // CONDITIONAL spelling of a member stdlib §7.4's TextReader /
+        // TextWriter do NOT declare is refused with the SAME diagnostic the
+        // `.` spelling draws — the ordinary no-member one, naming the
+        // receiver's static type.
+        //
+        // The check is asked HERE, after the extensions are back in reach, so
+        // that §26.5 rule 2's extension search still excuses a name an
+        // extension block over `TextReader` / `TextWriter` declares — the
+        // same escape the `.` spelling takes.
+        checkConsoleStreamMemberAccess(*nm, errorsBeforeNullCond);
         // fix #8047 (§26.5 rule 1, §22.6, stdlib §2.5): rule 1's "the
         // committed instance lookup then fails" case on the `?.` spelling — a
         // DECLARED ARITY-0 member (a property) called WITH arguments. The

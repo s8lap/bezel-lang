@@ -5926,6 +5926,20 @@ private:
     // ExprTypecheck_Exprs.cpp, beside the expression visitor that calls it.
     void checkConsoleStreamMemberAccess(const ast::MemberAccessExpr& ma,
                                         std::size_t errorsBefore);
+    // fix #9223 (§26.5 rule 2, §7.5, v0.359): the SAME check for the
+    // NULL-CONDITIONAL spelling (`x?.M`), which is a different AST node with
+    // its own resolver — §26.5 rule 2 reads a `?.` receiver "at its
+    // underlying non-nullable type", so the two spellings of ONE member may
+    // not disagree about whether it exists.
+    void checkConsoleStreamMemberAccess(const ast::NullCondMemberExpr& nm,
+                                        std::size_t errorsBefore);
+    // The shared core of the two spellings above: the access's TARGET
+    // expression, the access's NAME, and the access node itself (for the
+    // diagnostic's location).
+    void checkConsoleStreamMemberAccessOn(const ast::Expr* target,
+                                           std::string_view member,
+                                           const ast::Expr* access,
+                                           std::size_t errorsBefore);
     // per §27.6 (v0.338; #5814): a method reference's explicit type-argument
     // list substituted into the formed function type.
     TypeRef* applyMethodRefTypeArgs(const ast::MemberAccessExpr& ma,
