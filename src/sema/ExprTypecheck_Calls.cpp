@@ -35768,6 +35768,25 @@ std::vector<TypeRef*> ExprTC::aggregateFoldLambdaParamTypes(const ast::CallExpr&
     if (!seedTy || !recvTy || recvTy->kind != TypeRef::Kind::Named ||
         recvTy->genericArgs.empty() || !recvTy->genericArgs[0])
         return {};
+    // fix #9198 (stdlib §5 / spec §27.4, v0.359): an `IGrouping<TKey, T>`
+    // receiver's ELEMENT type is T — the SECOND generic argument — NOT
+    // genericArgs[0], which is the KEY. §5 declares
+    // `public interface IGrouping<TKey, T>: IEnumerable<T>`, so the fold's
+    // element slot is the grouping's ELEMENT: the fold lambda of
+    // `g.Aggregate(seed, lambda(acc, x) => …)` is `(TAccum, T) -> TAccum`
+    // over that element. Reading genericArgs[0] here seeded the fold
+    // lambda's SECOND parameter with the KEY type, so a body that touches
+    // an element member failed with "string member `.age` is not yet
+    // supported in codegen" (the compiler looking for `.age` on the KEY's
+    // `string`).
+    //
+    // The recognizer is the SHARED one (`sema/GroupingElem.hpp`), so this
+    // site, `linqSourceElementType`'s single-param seeding (#8542) and
+    // `ExprTypecheck.cpp`'s for-in loop-variable inference (#6627) cannot
+    // drift — they are the SAME question ("what is the element type of this
+    // enumerable-shaped TypeRef?").
+    if (TypeRef* grpElem = iGroupingElemTypeRef(recvTy))
+        return { seedTy, grpElem };                       // {TAccum, T}
     // Same source gate as linqLambdaElementType: a collection / lazy-IEnumerable
     // sentinel carries the element as genericArgs[0]; a user class is excluded
     // (except Range, which is IEnumerable<T> over genericArgs[0]).
