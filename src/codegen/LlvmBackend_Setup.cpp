@@ -53609,6 +53609,77 @@ struct BoxEscapeWalker {
                 slotWritten = true;
     }
 
+    // fix #9206 (§28.3.8 clause 3 / §28.1 / §28.9 / §8.6, v0.359): is the
+    // argument at `i` a CALL-BOUNDED BORROW because the CALLEE at this call
+    // site is a FUNCTION VALUE whose parameter slot at that position is PLAIN?
+    //
+    // THE DEFECT (issue #9206). A RECORD implementing an interface, boxed
+    // into an interface-typed local (`var ih: IHx := r;`), whose FUNCTION-
+    // typed property is read through the interface and CALLED with the
+    // interface itself as the argument (`ih.P(ih)`), leaked the 24-byte §8.6
+    // interface box — one per boxing, unbounded. MEASURED on r30-c1 @
+    // 7fe91b2b7 (`bezelc --sanitize=address`, 200 iterations):
+    // "Direct leak of 4800 byte(s) in 200 object(s) allocated from: #1 in
+    // main" — the box the §8.6 conversion minted.
+    //
+    // THE CAUSE. This walker's `walkArgs` marks a call argument as an ESCAPE
+    // unless one of its admitted predicates says otherwise, and an escape
+    // keeps the tracked local out of `boxReleaseEligible_` — so the local's
+    // scope-end `bz_box_release` is never emitted and NOBODY ever releases
+    // the box. The admitted predicates were: two stdlib callees, a §12.7-
+    // narrowed read, the `Equals` twin, and `userCallArgNonEscaping` — the
+    // last of which reads a USER METHOD's body (§6149). A FUNCTION-VALUE
+    // callee had no predicate at all: `plainLocalUserCallee` needs a
+    // `sema::MethodSymbol`, and a property read (or a local of function type)
+    // is not one. So the gap was not a decision but a hole.
+    //
+    // THE RULE. §28.1 (v0.359): a function-type parameter slot may carry
+    // `owned`, and "the modifier is part of the function type's identity" —
+    // so a PLAIN slot is a BORROW and an `owned` slot TAKES the value. §28.3.8
+    // (v0.359) clause 3, *The residual*: "The caller's check reads only the
+    // callee's signature ... a borrow of a scope-bound local, passed to a
+    // plain parameter that the callee stores ... is admitted at the call, for
+    // a local, virtual, interface or imported callee alike. Neither source is
+    // lifetime-extended: the temporary is disposed at its K8 boundary and the
+    // local at its scope's end." A function value's plain parameter slot IS
+    // that signature, and nothing in §28.3.8 turns on whether the callee's
+    // body is in this module — the callee may STORE the borrow (the K4.3
+    // trust clause, §28.11's borrowing-collection store rule admits a
+    // parameter-sourced borrow the same way), but the CALLER's local is
+    // released at its scope's end all the same. §28.9 (v0.359): the box is
+    // runtime-managed, so its reference must be dropped exactly once; §8.6
+    // (v0.359): the box the conversion minted is the local's to reclaim.
+    //
+    // THE GATES (it fails CLOSED — an unreadable shape stays an ESCAPE, a
+    // leak, never an early release and never a double free):
+    //   * the callee must not be a METHOD: a method callee is the
+    //     `userCallArgNonEscaping` arm's business (it reads the callee's
+    //     body, §6149), and this rule is about the callee whose body the
+    //     compiler CANNOT read;
+    //   * the callee's resolved type must be a FUNCTION type, and the slot at
+    //     that position must carry NO modifier — a plain slot is a borrow, an
+    //     `owned` slot takes the value (§28.1), and a `ref`/`out` slot is an
+    //     alias, not a pass (§22.3);
+    //   * the argument must be a POSITIONAL, unmodified pass: a named or
+    //     discarded argument is not a parameter pass, and a `move`d argument
+    //     TRANSFERS the value (§28.8.1), so the caller owns nothing after.
+    bool functionValueArgNonEscaping(const ast::Expr* callee,
+                                     const std::vector<ast::CallArgument>& args,
+                                     std::size_t i) {
+        if (!callee) return false;
+        if (dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*callee)))
+            return false;
+        const sema::TypeRef* ft = ctx.exprType(*callee);
+        if (!ft || ft->kind != sema::TypeRef::Kind::Function) return false;
+        if (i >= ft->funcParams.size()) return false;
+        if (!ft->funcParams[i].modifier.empty()) return false;
+        if (i >= args.size()) return false;
+        if (!args[i].name.empty() || args[i].isDiscard ||
+            !args[i].modifier.empty())
+            return false;
+        return true;
+    }
+
     void walkArgs(const ast::Expr* callee,
                   const std::vector<ast::CallArgument>& args) {
         noteSlotWrites(args);
@@ -53619,7 +53690,9 @@ struct BoxEscapeWalker {
                          isNarrowedRead(args[i].value.get()) ||
                          isKnownBoxEqualsArg(callee, args) ||
                          (userCallArgNonEscaping &&           // fix #6149
-                          userCallArgNonEscaping(callee, args, i))) &&
+                          userCallArgNonEscaping(callee, args, i)) ||
+                         functionValueArgNonEscaping(callee, // fix #9206
+                                                     args, i)) &&
                         !inLambda;
             expr(args[i].value.get(), safe);
         }
