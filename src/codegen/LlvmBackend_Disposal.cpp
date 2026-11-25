@@ -1928,7 +1928,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             if (!elemDisp && !isDict &&
                     fieldCollPol.cat == ElementPolicy::Category::RuntimeManaged &&
                     collElem &&
-                    isFunctionElementSlotPaired(it->collTy->headName(), collElem))
+                    isFunctionElementSlotPaired(it->collTy, collElem))
                 elemDisp = functionElementReleaseThunk();
             llvm::Value* disp = elemDisp
                 ? llvm::cast<llvm::Value>(elemDisp)

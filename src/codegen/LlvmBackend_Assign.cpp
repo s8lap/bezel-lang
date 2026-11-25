@@ -2343,8 +2343,9 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             bool isFnElemArr =
                 !arrIsOwning &&
                 arrPol.cat == ElementPolicy::Category::RuntimeManaged &&
-                isFunctionElementTypeRef(arrEl) &&
-                recvTy->headName() == "Array";
+                // fix-forward #9104: every array-backed head (`IList<T>`
+                // included), the same paired-kind test the free reads.
+                isFunctionElementSlotPaired(recvTy, arrEl);
             if (isFnElemArr) {
                 // fix #9104 / #9112 / §28.11 / §28.9 (v0.359): the slot
                 // takes a reference of its OWN on the new value — a +1
@@ -13098,8 +13099,7 @@ void Emitter::freeCollectionSourceNow(llvm::Value* v,
         // string row does. The kind gate is the PAIRED one (`Array`) — the
         // collection must be the one whose slot the store sites took a
         // reference on (see `isFunctionSlotPairedCollectionName`).
-        if (!elemDisp && srcTy->headName() == "Array" &&
-            isFunctionElementTypeRef(elTy))
+        if (!elemDisp && isFunctionElementSlotPaired(srcTy, elTy))
             elemDisp = functionElementReleaseThunk();
     }
     llvm::Value* disp = elemDisp

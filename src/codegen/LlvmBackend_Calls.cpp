@@ -10833,7 +10833,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // collection's free / Remove / Clear, which releases the slot's
             // reference through `functionElementReleaseThunk`.
             if (recvTy &&
-                isFunctionElementSlotPaired(recvTy->headName(), arrElemRef))
+                isFunctionElementSlotPaired(recvTy, arrElemRef))
                 emitFunctionElementSlotRetain(v, call.args[0].value.get());
             // Store elem to stack alloca, pass pointer to runtime
             llvm::AllocaInst* slot = entryAlloca(v->getType());
@@ -11376,7 +11376,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // `functionElementReleaseThunk`); the kind gate is the PAIRED one
             // (`Array`) — see `isFunctionSlotPairedCollectionName`.
             if (recvTy &&
-                isFunctionElementSlotPaired(recvTy->headName(), arrElemRef))
+                isFunctionElementSlotPaired(recvTy, arrElemRef))
                 emitFunctionElementSlotRetain(v, call.args[1].value.get());
             llvm::AllocaInst* slot = entryAlloca(v->getType());
             builder_.CreateStore(v, slot);
@@ -11487,7 +11487,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // reference" of the displaced element) and the new value's
             // reference is taken.
             if (!setDisp && recvTy &&
-                isFunctionElementSlotPaired(recvTy->headName(), arrElemRef))
+                isFunctionElementSlotPaired(recvTy, arrElemRef))
                 setDisp = functionElementReleaseThunk();
             if (setDisp) {
                 // A borrowing string array co-owns a +1 per element: retain the
@@ -11501,7 +11501,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // store "stores the reference"), and the disposer installed
                 // above gives the DISPLACED cell's reference back.
                 if (recvTy &&
-                    isFunctionElementSlotPaired(recvTy->headName(), arrElemRef))
+                    isFunctionElementSlotPaired(recvTy, arrElemRef))
                     emitFunctionElementSlotRetain(v, call.args[1].value.get());
                 llvm::Value* oor2 = builder_.CreateICmpUGE(
                     idx, builder_.CreateCall(
@@ -11553,7 +11553,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // the removed cell's reference the collection co-owned is given
             // back here.
             if (!elemDisp && recvTy &&
-                isFunctionElementSlotPaired(recvTy->headName(), arrElemRef))
+                isFunctionElementSlotPaired(recvTy, arrElemRef))
                 elemDisp = functionElementReleaseThunk();
             if (elemDisp) {
                 auto* fn = declareC("bz_array_remove_at_disposing",
@@ -11629,7 +11629,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // the removal "removes the reference", so the removed cell's
             // co-owned reference is given back.
             if (!rmDisp && recvTy &&
-                isFunctionElementSlotPaired(recvTy->headName(), arrElemRef))
+                isFunctionElementSlotPaired(recvTy, arrElemRef))
                 rmDisp = functionElementReleaseThunk();
             if (rmDisp) {
                 auto* fn = declareC("bz_array_remove_at_disposing",
@@ -11937,7 +11937,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // `Clear()` "removes all", so every co-owned reference the
             // collection holds is given back.
             if (!elemDisp && recvTy &&
-                isFunctionElementSlotPaired(recvTy->headName(), arrElemRef))
+                isFunctionElementSlotPaired(recvTy, arrElemRef))
                 elemDisp = functionElementReleaseThunk();
             if (elemDisp) {
                 auto* fn = declareC("bz_array_clear_disposing",
@@ -12173,7 +12173,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // transfer. The GIVE-BACK half is the collection's free / Remove /
             // RemoveAt / Clear; the kind gate is the PAIRED one (`Array`).
             if (recvTy &&
-                isFunctionElementSlotPaired(recvTy->headName(), arrElemRef)) {
+                isFunctionElementSlotPaired(recvTy, arrElemRef)) {
                 llvm::Value* elemVal = builder_.CreateLoad(ptrTy(), ep, "ar.elem");
                 emitClosureRetain(elemVal);
             }

@@ -16349,8 +16349,24 @@ private:
     //     value, not an array slot); the function row's array half is not
     //     theirs to enable, and issue #9076 is the opposite half of the same
     //     slot policy for them.
+    //
+    // fix-forward #9104 (§28.11, stdlib §4.1 / §4.4 / §4.19, v0.359): the
+    // pair is a property of the RUNTIME slot, not of the static spelling of
+    // the receiver, so every head that names the SAME bz_array_t* storage is
+    // in the set. `IList<T>` and `IReadOnlyList<T>` are the borrowing
+    // array's own interface views (stdlib §4.4: `Array<T>: IList<T>`; only
+    // the array family implements the list interfaces, so the receiver is
+    // the array-backed slot — `isListInterfaceName`): a store through
+    // `xs: IList<Fn>` fills a slot the Array's free gives back, so it must
+    // take (MEASURED before this: `xs.Add(h.cb)` / `xs[0] := h.cb` through
+    // `IList<() -> int>` took nothing and the Array's `using var` free
+    // released the borrowed closure — heap-use-after-free). `FrozenArray<T>`
+    // is the copy `From(items: Array<T>)` makes of such slots (stdlib
+    // §4.19); it takes at that copy and gives back at its own free, so a
+    // `Clear()` of the source can no longer free what the copy still reads.
     static bool isFunctionSlotPairedCollectionName(std::string_view collName) {
-        return collName == "Array";
+        return collName == "Array" || collName == "IList" ||
+               collName == "IReadOnlyList" || collName == "FrozenArray";
     }
 
     // The paired-kind test for a collection SLOT: is this slot a
@@ -16361,6 +16377,15 @@ private:
                                      const sema::TypeRef* el) const {
         if (!isFunctionSlotPairedCollectionName(collName)) return false;
         return isFunctionElementSlotType(el);
+    }
+
+    // fix-forward #9104 (§28.11, v0.359): the same test keyed on the
+    // collection's TypeRef — `slotCollectionHead`, so the astNode-less
+    // factory-result shape (`FrozenArray<T>.From(...)`'s result, whose
+    // `headName` is empty) reaches the same arm its take did.
+    bool isFunctionElementSlotPaired(const sema::TypeRef* collTy,
+                                     const sema::TypeRef* el) const {
+        return isFunctionElementSlotPaired(slotCollectionHead(collTy), el);
     }
 
     // fix #9104 / #9112 (§28.11, §28.9, v0.359): the GIVE-BACK half of the
@@ -16601,11 +16626,10 @@ private:
     void emitArrayRetainClosuresIfFunctionArray(const sema::TypeRef* collTy,
                                                 llvm::Value* arr) {
         if (!arr || !collTy) return;
-        std::string_view cn = collTy->headName();
-        if (cn != "Array") return;
         if (collTy->genericArgs.empty() || !collTy->genericArgs[0]) return;
         const sema::TypeRef* el = collTy->genericArgs[0];
-        if (!isFunctionElementSlotType(el)) return;
+        // fix-forward #9104: the one paired-kind test (every array-backed head).
+        if (!isFunctionElementSlotPaired(collTy, el)) return;
         auto* fn = declareC("bz_array_retain_closures",
                             llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(fn, {arr});

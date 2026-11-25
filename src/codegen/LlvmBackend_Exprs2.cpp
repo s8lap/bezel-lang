@@ -9722,7 +9722,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         const bool fillIsFunction =
                             fillVal->getType()->isPointerTy() &&
                             !rt->genericArgs.empty() &&
-                            isFunctionElementSlotPaired(rt->headName(),
+                            isFunctionElementSlotPaired(rt,
                                                         rt->genericArgs[0]);
                         // Spill fill value into an alloca so bz_array_set
                         // can read it via a pointer (matching OwningBuffer init

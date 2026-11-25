@@ -1197,6 +1197,35 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
                      llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}),
             {copy, stringElementReleaseThunk()});
     }
+    // fix-forward #9104 (§28.11, §28.9, stdlib §4.19, v0.359): the
+    // FUNCTION-typed twin of the string arm above. A function element is the
+    // same §28.11 *runtime-managed reference* row (a shared-reference slot):
+    // the source `Array<() -> R>` co-owns one reference per slot and gives it
+    // back at its own free / `Clear()`, so a copy that merely aliased the
+    // pointers let `fs.Clear()` free a closure the FrozenArray still read
+    // (MEASURED: heap-use-after-free on `z[0]()` after `fs.Clear()`). The copy
+    // therefore takes a reference of its own per slot for a BORROWED source,
+    // inherits the source's for an OWNED one (freed below with a NULL element
+    // disposer), and gives them back at its own free — every FrozenArray
+    // release half reads `isFunctionElementSlotPaired`, whose kind set
+    // includes FrozenArray. (stdlib §4.19 restricts T to sendable value types
+    // and `string`, and §30.14 never makes a function type sendable, so sema
+    // should reject this instantiation; it does not today — the codegen pair
+    // here keeps the accepted program sound meanwhile.)
+    const bool frozenFunctionElems =
+        frozenEl && isFunctionElementSlotPaired("FrozenArray", frozenEl);
+    if (frozenFunctionElems && !sourceOwnedHere) {
+        builder_.CreateCall(
+            declareC("bz_array_retain_closures", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy()}),
+            {copy});
+    }
+    if (frozenFunctionElems) {
+        builder_.CreateCall(
+            declareC("bz_array_set_elem_disposer",
+                     llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}),
+            {copy, functionElementReleaseThunk()});
+    }
 
     // §28.3: free the source storage ONLY when ownership transferred into the
     // call (literal / `move` / explicit `owned` modifier). The source's
@@ -8942,8 +8971,8 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             // §14.1) so the take and the give-back halves agree.
             if (!elemDisp &&
                 arrElemPol.cat == ElementPolicy::Category::RuntimeManaged &&
-                recvTy->headName() == "Array" &&
-                isFunctionElementTypeRef(arrElem))
+                // fix-forward #9104: the one paired-kind test.
+                isFunctionElementSlotPaired(recvTy, arrElem))
                 elemDisp = functionElementReleaseThunk();
             llvm::Value* disp = elemDisp
                 ? llvm::cast<llvm::Value>(elemDisp)
@@ -9099,8 +9128,8 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             // §14.1) so the take and the give-back halves agree.
             if (!elemDisp &&
                 arrElemPol.cat == ElementPolicy::Category::RuntimeManaged &&
-                recvTy->headName() == "Array" &&
-                isFunctionElementTypeRef(arrElem))
+                // fix-forward #9104: the one paired-kind test.
+                isFunctionElementSlotPaired(recvTy, arrElem))
                 elemDisp = functionElementReleaseThunk();
             llvm::Value* disp = elemDisp
                 ? llvm::cast<llvm::Value>(elemDisp)

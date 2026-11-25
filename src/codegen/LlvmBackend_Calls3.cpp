@@ -9936,6 +9936,15 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(rf, {result});
             }
+            // fix-forward #9104 (§28.11, §15.1.2, v0.359): the FUNCTION-typed
+            // twin — the result `Array<() -> R>` gives one closure reference
+            // back per slot at its free (`functionElementReleaseThunk`), so it
+            // takes one per slot here; the inline array keeps its own.
+            if (isFunctionElementSlotPaired("Array", elemRef)) {
+                auto* rf = declareC("bz_array_retain_closures",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(rf, {result});
+            }
         }
         return result;
     }

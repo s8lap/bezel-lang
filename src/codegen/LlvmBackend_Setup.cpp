@@ -18747,8 +18747,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                             // The kind gate is the PAIRED one (`Array`) and the
                             // element type is read RESOLVED (§3.6 rule 2 /
                             // §14.1), so the take and the give-back agree.
-                            else if (collTy->headName() == "Array" &&
-                                     isFunctionElementTypeRef(elt))
+                            else if (isFunctionElementSlotPaired(collTy, elt))
                                 d.collectionElemDisposer =
                                     functionElementReleaseThunk();
                         }
@@ -21007,8 +21006,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         // RESOLVED (§3.6 rule 2 / §14.1) so the take and the give-back agree.
         if (!d.collectionElemDisposer &&
             ep.cat == ElementPolicy::Category::RuntimeManaged &&
-            rt && rt->headName() == "Array" &&
-            isFunctionElementTypeRef(el)) {
+            rt && isFunctionElementSlotPaired(rt, el)) {
             d.collectionElemDisposer = functionElementReleaseThunk();
         }
         disposeStack_.back().push_back(d);
@@ -25145,7 +25143,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 // §14.1) so that a monomorphized generic body's take and
                 // give-back halves agree.
                 if (!d.collectionElemDisposer && collTy &&
-                    isFunctionElementSlotPaired(collTy->headName(), collEl)) {
+                    isFunctionElementSlotPaired(collTy, collEl)) {
                     d.collectionElemDisposer = functionElementReleaseThunk();
                 }
             }
@@ -34200,7 +34198,9 @@ static bool isBuiltinArrayComparerArg(const ast::Expr* callee, size_t i,
 // reference; a `Stack`/`Queue`/`LinkedList`/`Dictionary` is not this row
 // (the Stack's `Pop` gives the slot's reference back at the POP, which does
 // not release it — issue #8453, OPEN — so a take there would strand it);
-// and an interface-headed alias (`IList<T>`) has its own free path.
+// fix-forward #9104 (v0.359): the `IList<T>` view IS this row — it is the
+// borrowing array's own interface (stdlib §4.4), and its `Add` / `Insert`
+// lower through the same slot take (`isFunctionElementSlotPaired`).
 //
 // The element type is read as WRITTEN: inside a monomorphized generic body
 // the collection's `genericArgs[0]` is still the placeholder `T`, and the
@@ -34225,7 +34225,7 @@ static bool isBuiltinArrayFunctionElementStore(const ast::Expr* callee, size_t i
     const sema::TypeRef* rt = ctx.exprType(*ma->target);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
-    if (rt->headName() != "Array") return false;
+    if (rt->headName() != "Array" && rt->headName() != "IList") return false;
     if (rt->genericArgs.empty() || !rt->genericArgs[0]) return false;
     const sema::TypeRef* el = rt->genericArgs[0];
     return el->kind == sema::TypeRef::Kind::Function;
@@ -61751,7 +61751,9 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
             // other value is retained), matching the per-element release its
             // scope-end free issues. The kind gate is the PAIRED one
             // (`Array`) — see `isFunctionSlotPairedCollectionName`.
-            if (name == "Array" && isFunctionElementSlotType(elemRef))
+            // fix-forward #9104: every array-backed head (an `IList<T>` /
+            // `FrozenArray<T>.From` literal target included).
+            if (isFunctionElementSlotPaired(name, elemRef))
                 emitFunctionElementSlotRetain(ev, elemPtr.get());
         }
         // fix #2771 (§8.6, §15.4, v0.240): BOX the element against the declared

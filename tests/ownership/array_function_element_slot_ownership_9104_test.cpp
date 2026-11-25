@@ -202,6 +202,94 @@ const char* kFillCtorClosureReturningCall =
     "  end Main;\n"
     "end C;\n";
 
+// fix-forward #9104 (review finding 1): the SAME `Array<Fn>` reached through
+// stdlib §4.4's `IList<T>` interface (`Array<T>: IList<T>`). The slot's take
+// fired only on the static `Array` spelling while the give-back fired on every
+// `Array<Fn>`, so an `Add` through an `IList<() -> int>` parameter stored a
+// borrowed closure WITHOUT a take, and the array's disposal then released the
+// holder's own reference: a use-after-free at the next read of `keep.cb`.
+const char* kIListAddBorrowed =
+    "module P;\n"
+    "import System;\n"
+    "import System.Collections;\n"
+    "public class H\n"
+    "  public cb: () -> int := lambda() => 3;\n"
+    "end H;\n"
+    "public class Program\n"
+    "  public static method Fill(xs: IList<() -> int>, h: H)\n"
+    "    xs.Add(h.cb);\n"
+    "  end Fill;\n"
+    "  public static method Main(): int\n"
+    "    var total := 0;\n"
+    "    var keep := new H();\n"
+    "    for var i in 0..<200 do\n"
+    "      using var fs: Array<() -> int> := new Array<() -> int>();\n"
+    "      Fill(fs, keep);\n"
+    "      total := total + fs[0]();\n"
+    "    end for;\n"
+    "    total := total + keep.cb();\n"
+    "    Console.WriteLine(total);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+// The indexer-set twin through `IList<T>`: the store must take the new
+// element's reference (a borrowed one and a fresh one) and give back the one
+// it displaces, as the static `Array` spelling does.
+const char* kIListIndexerSet =
+    "module P;\n"
+    "import System;\n"
+    "import System.Collections;\n"
+    "public class H\n"
+    "  public cb: () -> int := lambda() => 3;\n"
+    "end H;\n"
+    "public class Program\n"
+    "  public static method Put(xs: IList<() -> int>, h: H)\n"
+    "    xs[0] := h.cb;\n"
+    "    xs[1] := lambda() => 4;\n"
+    "  end Put;\n"
+    "  public static method Main(): int\n"
+    "    var total := 0;\n"
+    "    var keep := new H();\n"
+    "    for var i in 0..<200 do\n"
+    "      using var fs: Array<() -> int> := new Array<() -> int>();\n"
+    "      fs.Add(lambda() => 9);\n"
+    "      fs.Add(lambda() => 9);\n"
+    "      Put(fs, keep);\n"
+    "      total := total + fs[0]() + fs[1]();\n"
+    "    end for;\n"
+    "    total := total + keep.cb();\n"
+    "    Console.WriteLine(total);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+// fix-forward #9104 (review finding 1): `FrozenArray<T>.From(items)` (stdlib
+// §4.19) COPIES the array's slots. The copy's free gave the element reference
+// back while the copy never took one, so a `Clear()` of the source freed the
+// closure the frozen copy still read: a use-after-free at `z[0]()`.
+const char* kFrozenFromThenClear =
+    "module P;\n"
+    "import System;\n"
+    "import System.Collections;\n"
+    "public class H\n"
+    "  public cb: () -> int := lambda() => 3;\n"
+    "end H;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var total := 0;\n"
+    "    for var i in 0..<200 do\n"
+    "      using var fs: Array<() -> int> := new Array<() -> int>();\n"
+    "      fs.Add(lambda() => 2);\n"
+    "      using var z := FrozenArray<() -> int>.From(fs);\n"
+    "      fs.Clear();\n"
+    "      total := total + z[0]();\n"
+    "    end for;\n"
+    "    Console.WriteLine(total);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
 void expectClean(const char* src, const char* out) {
     JitResult r = runAotChecked(src);
     BEZEL_EXPECT_TRUE(r.ran);          // no leak (the bug), no double-free
@@ -249,4 +337,19 @@ BEZEL_TEST(ownership_array_function_element_slot_ownership_9104,
 BEZEL_TEST(ownership_array_function_element_slot_ownership_9104,
            fill_constructor_of_a_closure_returning_call_takes_every_slot_spec_28_11) {
     expectClean(kFillCtorClosureReturningCall, "4200\n");
+}
+
+BEZEL_TEST(ownership_array_function_element_slot_ownership_9104,
+           ilist_add_of_a_borrowed_closure_takes_its_reference_spec_28_11) {
+    expectClean(kIListAddBorrowed, "603\n");
+}
+
+BEZEL_TEST(ownership_array_function_element_slot_ownership_9104,
+           ilist_indexer_set_takes_and_gives_back_spec_28_11) {
+    expectClean(kIListIndexerSet, "1403\n");
+}
+
+BEZEL_TEST(ownership_array_function_element_slot_ownership_9104,
+           frozen_array_from_copy_takes_its_own_references_spec_28_11) {
+    expectClean(kFrozenFromThenClear, "400\n");
 }
