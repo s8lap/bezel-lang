@@ -8273,6 +8273,47 @@ bool Emitter::rejectUnimplementedComparerCtor(const ast::NewExpr& ne,
     return true;
 }
 
+// fix-forward #9112 (§28.9 / §28.11 / §14.1 / §28.3 *Set-erasing positions*,
+// v0.359): see the declaration. A +1 closure producer (a capture-free lambda
+// literal, a method reference) passed to a constructor formal declared at the
+// class's own bare type parameter, at an instantiation binding it to a
+// function type (`new Box<() -> int>(lambda() => 2)`). The body's store of the
+// formal into a field declared at that parameter TAKES the field's own
+// reference (lowerClosureFieldStore's generic-`T` arm), so the literal's +1 is
+// still the caller's, exactly as the string loop's at the same two sites.
+// MEASURED before this arm: 64 B leaked per construction (200 iterations,
+// 12800 B in 200 allocations). The fail-closed formal walk proves the body
+// keeps nothing else — an invocation, a null- or type-test, or a store into
+// such a field, and nothing more; any other use keeps the +1 (a leak, the safe
+// direction). Disjoint from lowerNew's `ctorClosureArgs`, which admits only
+// formals DECLARED at a function type.
+void Emitter::emitTypeParamClosureCtorArgReleases(
+    const ast::ConstructorDecl& cd, const sema::TypeSymbol* cls,
+    const std::vector<llvm::Value*>& args,
+    const std::vector<const ast::Expr*>& ctorArgExprs) {
+    if (!cls || diverged_) return;
+    for (std::size_t pi = 0; pi < cd.params.size() &&
+                             pi < ctorArgExprs.size() && pi + 1 < args.size();
+         ++pi) {
+        const ast::Param& p = cd.params[pi];
+        if (!p.modifier.empty() || !p.type ||
+            p.type->kind != ast::TypeKind::Named || !p.type->name ||
+            p.type->name->parts.size() != 1)
+            continue;
+        const ast::Expr* ae = ctorArgExprs[pi];
+        if (!ae || !isPlusOneClosureProducer(ae)) continue;
+        const sema::TypeRef* argTy = ctx_.exprType(*ae);
+        if (!argTy || argTy->kind != sema::TypeRef::Kind::Function) continue;
+        const auto taking = typeParamFunctionTakingFields(
+            ctx_, cls, p.type->name->parts.front());
+        if (taking.empty() ||
+            !calleeBodyUsesFormalOnlyByInvocationInspectionOrTakingFieldStore(
+                ctx_, cd, p.name, taking))
+            continue;
+        emitClosureRelease(args[pi + 1]);
+    }
+}
+
 llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // §17.7 `new(args)` shorthand: there is no explicit `ne.type` — the target
     // type is inferred from context (the LHS annotation / assignment target) and
@@ -11864,6 +11905,10 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             continue;
                         emitStringRelease(args[ai]);
                     }
+                    // fix-forward #9112: the closure twin of the string loop
+                    // above (see the helper's comment).
+                    emitTypeParamClosureCtorArgReleases(*cd, cs->parent, args,
+                                                        ctorArgExprs);
                 }
             } else {
                 // fix #2319: the ctor body never runs (buildOrderedArgs failed
@@ -13235,6 +13280,10 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             continue;
                         emitStringRelease(args[ai]);
                     }
+                    // fix-forward #9112: the closure twin of the string loop
+                    // above (see the helper's comment).
+                    emitTypeParamClosureCtorArgReleases(*cd, cs->parent, args,
+                                                        ctorArgExprs);
                 }
             } else {
                 // fix #2319: the ctor body / call never ran (buildOrderedArgs

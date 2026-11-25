@@ -177,6 +177,231 @@ const char* kStackCtorWithArgument =
     "  end Main;\n"
     "end Program;\n";
 
+// fix-forward #9112 (review finding 2): `Pop` REMOVES the element, so the
+// chain call's release is the only discharge of a freshly pushed lambda's
+// reference (the borrowing `Stack<T>` takes none of its own at `Push`, #9172).
+// The parent fix dropped that release with `Peek`'s: a leak per iteration.
+const char* kStackPopFresh =
+    "module P;\n"
+    "import System;\n"
+    "import System.Collections;\n"
+    "public class H\n"
+    "  public cb: () -> int := lambda() => 3;\n"
+    "end H;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var total := 0;\n"
+    "    var keep := new H();\n"
+    "    for var i in 0..<200 do\n"
+    "      using var st: Stack<() -> int> := new Stack<() -> int>();\n"
+    "      st.Push(lambda() => 2);\n"
+    "      total := total + st.Pop()();\n"
+    "    end for;\n"
+    "    Console.WriteLine(total);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+// The `Queue` twin: `Dequeue` removes the element too.
+const char* kQueueDequeueFresh =
+    "module P;\n"
+    "import System;\n"
+    "import System.Collections;\n"
+    "public class H\n"
+    "  public cb: () -> int := lambda() => 3;\n"
+    "end H;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var total := 0;\n"
+    "    var keep := new H();\n"
+    "    for var i in 0..<200 do\n"
+    "      using var q: Queue<() -> int> := new Queue<() -> int>();\n"
+    "      q.Enqueue(lambda() => 2);\n"
+    "      total := total + q.Dequeue()();\n"
+    "    end for;\n"
+    "    Console.WriteLine(total);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+// fix-forward #9112 (review finding 3): the constructor's generic-`T` store
+// TAKES a reference; a later store into the same field (here from outside the
+// generic body) must give the displaced one back. The local `f` keeps its own
+// reference and releases it at scope end.
+const char* kBoxFieldReassignOutside =
+    "module P;\n"
+    "import System;\n"
+    "import System.Collections;\n"
+    "public class H\n"
+    "  public cb: () -> int := lambda() => 3;\n"
+    "end H;\n"
+    "public class Box<T>\n"
+    "  public item: T;\n"
+    "  public constructor(x: T)\n"
+    "    item := x;\n"
+    "  end constructor;\n"
+    "  public method Set(x: T)\n"
+    "    item := x;\n"
+    "  end Set;\n"
+    "end Box;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var total := 0;\n"
+    "    var keep := new H();\n"
+    "    for var i in 0..<200 do\n"
+    "      var f: () -> int := lambda() => 2;\n"
+    "      using var b := new Box<() -> int>(f);\n"
+    "      b.item := keep.cb;\n"
+    "      total := total + b.item();\n"
+    "    end for;\n"
+    "    total := total + keep.cb();\n"
+    "    Console.WriteLine(total);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+// The generic-`T` store from INSIDE the generic body (`Set`): it releases the
+// value it displaces, and a lambda LITERAL passed to the `T` formal is the
+// caller's temporary, released once the call returns (the store took its own
+// reference).
+const char* kBoxSetOverwriteLiteral =
+    "module P;\n"
+    "import System;\n"
+    "import System.Collections;\n"
+    "public class H\n"
+    "  public cb: () -> int := lambda() => 3;\n"
+    "end H;\n"
+    "public class Box<T>\n"
+    "  public item: T;\n"
+    "  public constructor(x: T)\n"
+    "    item := x;\n"
+    "  end constructor;\n"
+    "  public method Set(x: T)\n"
+    "    item := x;\n"
+    "  end Set;\n"
+    "end Box;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var total := 0;\n"
+    "    var keep := new H();\n"
+    "    for var i in 0..<200 do\n"
+    "      using var b := new Box<() -> int>(keep.cb);\n"
+    "      b.Set(lambda() => 4);\n"
+    "      total := total + b.item();\n"
+    "    end for;\n"
+    "    total := total + keep.cb();\n"
+    "    Console.WriteLine(total);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+// A lambda LITERAL passed to the constructor's `T` formal: the store takes
+// the field's reference, so the caller's temporary must still be released.
+const char* kBoxCtorLiteral =
+    "module P;\n"
+    "import System;\n"
+    "import System.Collections;\n"
+    "public class H\n"
+    "  public cb: () -> int := lambda() => 3;\n"
+    "end H;\n"
+    "public class Box<T>\n"
+    "  public item: T;\n"
+    "  public constructor(x: T)\n"
+    "    item := x;\n"
+    "  end constructor;\n"
+    "  public method Set(x: T)\n"
+    "    item := x;\n"
+    "  end Set;\n"
+    "end Box;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var total := 0;\n"
+    "    var keep := new H();\n"
+    "    for var i in 0..<200 do\n"
+    "      using var b := new Box<() -> int>(lambda() => 2);\n"
+    "      total := total + b.item();\n"
+    "    end for;\n"
+    "    Console.WriteLine(total);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+// fix-forward #9112: `b.Get()()` — a user method whose declared return is
+// the bare `T` hands out a BORROW of the field (its `return item` takes no
+// reference), so the chain call must not release it the way it releases a
+// +1 producer. With a BORROWED constructor argument the parent's release
+// dropped the field's own reference, and the next read `b.item()` was a
+// use-after-free.
+const char* kBoxGetChainCall =
+    "module P;\n"
+    "import System;\n"
+    "public class H\n"
+    "  public cb: () -> int := lambda() => 3;\n"
+    "end H;\n"
+    "public class Box<T>\n"
+    "  public item: T;\n"
+    "  public constructor(x: T)\n"
+    "    item := x;\n"
+    "  end constructor;\n"
+    "  public method Get(): T\n"
+    "    return item;\n"
+    "  end Get;\n"
+    "end Box;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var total := 0;\n"
+    "    var keep := new H();\n"
+    "    for var i in 0..<200 do\n"
+    "      using var b := new Box<() -> int>(keep.cb);\n"
+    "      total := total + b.Get()() + b.item();\n"
+    "    end for;\n"
+    "    total := total + keep.cb();\n"
+    "    Console.WriteLine(total);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+// fix-forward #9112: a generic class's `Array<T>` FIELD at `T = () -> int`.
+// The element store TAKES the slot's reference (§28.11), so a lambda literal
+// passed to `Put(x: T)` is still the caller's to release, and the local `f`
+// keeps its own scope-end release; `At(i)()` borrows the element.
+const char* kGenericBagArrayField =
+    "module P;\n"
+    "import System;\n"
+    "import System.Collections;\n"
+    "public class H\n"
+    "  public cb: () -> int := lambda() => 3;\n"
+    "end H;\n"
+    "public class Bag<T>\n"
+    "  private owned items: Array<T> := new Array<T>();\n"
+    "  public method Put(x: T)\n"
+    "    items.Add(x);\n"
+    "  end Put;\n"
+    "  public method At(i: int): T\n"
+    "    return items[i];\n"
+    "  end At;\n"
+    "  public method Drop()\n"
+    "    items.RemoveAt(0);\n"
+    "  end Drop;\n"
+    "end Bag;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var total := 0;\n"
+    "    var keep := new H();\n"
+    "    for var i in 0..<200 do\n"
+    "      using var b := new Bag<() -> int>();\n"
+    "      var f: () -> int := lambda() => 2;\n"
+    "      b.Put(f); b.Put(keep.cb); b.Put(lambda() => 4);\n"
+    "      var g := b.At(0);\n"
+    "      total := total + g() + b.At(1)() + b.At(2)();\n"
+    "      b.Drop();\n"
+    "    end for;\n"
+    "    total := total + keep.cb();\n"
+    "    Console.WriteLine(total);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
 void expectClean(const char* src, const char* out) {
     JitResult r = runAotChecked(src);
     BEZEL_EXPECT_TRUE(r.ran);          // no leak, no over-release, no UAF
@@ -222,4 +447,39 @@ BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
     JitResult r = runAot(kStackCtorWithArgument);
     BEZEL_EXPECT_FALSE(r.ran);              // rejected, not compiled
     BEZEL_EXPECT_TRUE(hasNoArgumentCtorDiagnostic(r));
+}
+
+BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
+           stack_pop_invoke_releases_the_removed_element_spec_28_9) {
+    expectClean(kStackPopFresh, "400\n");
+}
+
+BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
+           queue_dequeue_invoke_releases_the_removed_element_spec_28_9) {
+    expectClean(kQueueDequeueFresh, "400\n");
+}
+
+BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
+           generic_t_field_reassign_gives_back_the_displaced_reference_spec_28_11) {
+    expectClean(kBoxFieldReassignOutside, "603\n");
+}
+
+BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
+           generic_t_setter_store_of_a_literal_balances_spec_28_11) {
+    expectClean(kBoxSetOverwriteLiteral, "803\n");
+}
+
+BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
+           generic_t_constructor_store_of_a_literal_balances_spec_28_11) {
+    expectClean(kBoxCtorLiteral, "400\n");
+}
+
+BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
+           type_param_return_chain_call_borrows_the_field_spec_28_9) {
+    expectClean(kBoxGetChainCall, "1203\n");
+}
+
+BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
+           generic_array_t_field_element_store_balances_spec_28_11) {
+    expectClean(kGenericBagArrayField, "1803\n");
 }

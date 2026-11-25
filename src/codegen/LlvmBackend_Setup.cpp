@@ -32591,6 +32591,27 @@ bool Emitter::isTypeParamStringFieldLvalue(const ast::Expr& target) {
 // INSTANTIATION, after substituting the type arguments — so the substitution
 // is exactly what decides the row here, and the same substitution the
 // discharge half reads (isTypeParamBoundToFunction → resolveTypeParamRef).
+// fix-forward #9112 (§28.9 / §14.1, v0.359): see the declaration. `locals_`
+// holds every local bound so far in the function being emitted (an
+// over-approximation of the ones still in scope, which only widens the leak
+// side).
+bool Emitter::bareTypeParamFunctionLocalBound() {
+    for (const auto& kv : locals_) {
+        const sema::TypeRef* t = nullptr;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(kv.first)) {
+            if (ld->type) t = ctx_.resolvedType(*ld->type);
+            else if (ld->initializer) t = ctx_.exprType(*ld->initializer);
+        } else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(kv.first)) {
+            if (lc->type) t = ctx_.resolvedType(*lc->type);
+            else if (lc->value) t = ctx_.exprType(*lc->value);
+        } else {
+            continue;
+        }
+        if (isTypeParamBoundToFunction(t)) return true;
+    }
+    return false;
+}
+
 bool Emitter::isTypeParamFunctionFieldLvalue(const ast::Expr& target) {
     if (isClosureFieldLvalue(target)) return false;  // the concrete twin's case
     if (!isTypeParamBoundToFunction(ctx_.exprType(target))) return false;
@@ -40037,19 +40058,40 @@ bool Emitter::lowerClosureFieldStore(const ast::Expr& target,
                                      const ast::Expr* valueExpr) {
     // fix #9112 (§28.9 / §14.1, v0.359): a bare-`T` class field stored from
     // inside the generic body at `T = () -> int` (Box<T>'s constructor
-    // `item := x`). RETAIN the new value unconditionally (a `T`-typed value
-    // expression is never a recognised +1 producer, and a spurious retain can
-    // only leak) so the field owns the +1 its specialized disposer releases.
-    // Do NOT release the old value: a `T` local in this same body holds no +1
-    // of its own, so releasing the displaced value could dangle it — the
-    // leak-over-UAF default the string row's twin uses (fix #4965). This is
-    // the TAKE half of the pair whose DISCHARGE half is
+    // `item := x`, a method's `item := x`). It is the same §28.11
+    // *runtime-managed reference* slot as a directly-declared function-typed
+    // field, so it takes the SAME four steps as the concrete arm below:
+    // load-old, retain-or-transfer-new, store-new, release-old. This is the
+    // TAKE half of the pair whose DISCHARGE half is
     // isTypeParamFunctionStorageMember's release at the owner's disposal.
+    //
+    // fix-forward #9112: the displaced value IS released. The field held a
+    // +1 of its own (this arm's take, or the concrete arm's for a store from
+    // outside the generic body), so a store that drops the field's pointer
+    // without giving that +1 back leaked it on EVERY reassignment — MEASURED:
+    // `b.Set(g); b.Set(lambda() => 4)` on a `Box<() -> int>` leaked one 64 B
+    // closure cell per overwrite. Retaining the new value BEFORE releasing the
+    // old keeps a self-assignment (`item := item`) from ever reaching zero.
+    //
+    // ONE exception keeps fix #4965's leak-over-UAF default: a bare-`T` LOCAL
+    // of this body. At `T = () -> int` such a local takes no reference of its
+    // own (its declared type is `T`, not a function type, so the closure-local
+    // retain never arms), so `var old := item; item := x; return old;` would
+    // dangle `old` if the store released what it displaced — MEASURED: a
+    // heap-use-after-free at the caller's `o()`. When any such local has been
+    // bound in this function the store keeps the displaced +1 (a leak, the
+    // safe direction); see bareTypeParamFunctionLocalBound. Issue #9239 is
+    // the alias's own missing reference, which would retire this guard.
     if (isTypeParamFunctionFieldLvalue(target)) {
         if (!fieldAddr || !newVal || !newVal->getType()->isPointerTy())
             return false;
-        emitClosureRetain(newVal);
+        llvm::Value* oldVal =
+            builder_.CreateLoad(ptrTy(), fieldAddr, "tpclf.old");
+        if (!isClosureSlotProducer(valueExpr))
+            emitClosureRetain(newVal);
         builder_.CreateStore(newVal, fieldAddr);
+        if (!bareTypeParamFunctionLocalBound())
+            emitClosureRelease(oldVal);
         return true;
     }
     if (!isClosureFieldLvalue(target)) return false;
@@ -42443,7 +42485,72 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
     const sema::TypeRef* at = ctx.exprType(*a.value);
     if (!at || at->kind != sema::TypeRef::Kind::Function || at->nullable)
         return false;
-    return calleeBodyUsesFormalOnlyByInvocationOrInspection(*md, p.name);
+    if (calleeBodyUsesFormalOnlyByInvocationOrInspection(*md, p.name))
+        return true;
+    // fix-forward #9112 (§28.9 / §28.11 / §14.1, v0.359): a store of the
+    // formal into a field declared at this same type parameter TAKES the
+    // field's own reference at a function-type substitution
+    // (lowerClosureFieldStore's generic-`T` arm), so the caller's local keeps
+    // its +1 and must still release it at scope end. MEASURED before this arm:
+    // `var g := lambda() => 5; b.Set(g);` on a `Box<() -> int>` leaked the
+    // 64 B cell per iteration (the local was classified as escaped).
+    const auto taking =
+        typeParamFunctionTakingFields(ctx, ms->parent, formalHead);
+    return !taking.empty() &&
+           calleeBodyUsesFormalOnlyByInvocationInspectionOrTakingFieldStore(
+               ctx, *md, p.name, taking);
+}
+
+// fix-forward #9112 (§28.9 / §28.11 / §14.1, v0.359): the CONSTRUCTOR twin of
+// closureArgBindsMethodOwnTypeParamBorrow's class-own arm. Is argument `ai` of
+// `new C<…>(…)` — a function value at a constructor formal declared at the
+// class's own bare type parameter — one the constructor body only invokes,
+// inspects, or stores into a field declared at that parameter (a store that
+// takes its own reference)? Then the caller's closure LOCAL keeps its +1, and
+// its scope-end release must fire. MEASURED before this arm: `var f := lambda()
+// => 2; using var b := new Box<() -> int>(f);` leaked the 64 B cell per
+// iteration once the store took its reference. Fail-closed: a named argument,
+// a modifier, an imported class, an unresolved or ambiguous constructor, or
+// any other use of the formal in the body answers false (an escape: a leak,
+// never an early release).
+inline bool closureArgBindsCtorTypeParamTakingField(
+        const sema::SemaContext& ctx, const ast::NewExpr& ne, std::size_t ai) {
+    if (ai >= ne.args.size() || !ne.args[ai].value) return false;
+    for (std::size_t j = 0; j <= ai; ++j)
+        if (!ne.args[j].name.empty() || !ne.args[j].modifier.empty())
+            return false;
+    const sema::TypeRef* at = ctx.exprType(*ne.args[ai].value);
+    if (!at || at->kind != sema::TypeRef::Kind::Function || at->nullable)
+        return false;
+    const sema::TypeRef* nt = ctx.exprType(ne);
+    if (!nt || nt->kind != sema::TypeRef::Kind::Named || !nt->declaration)
+        return false;
+    auto* cls = dynamic_cast<const sema::TypeSymbol*>(nt->declaration);
+    if (!cls || cls->kind != ast::TypeDeclKind::Class || ctx.isImported(cls))
+        return false;
+    const sema::ConstructorSymbol* cs = ctx.resolvedNewCtor(&ne.args);
+    if (!cs) {
+        for (const sema::Symbol* m : cls->members) {
+            auto* c = dynamic_cast<const sema::ConstructorSymbol*>(m);
+            if (!c || c->isStatic) continue;
+            if (cs) return false;  // overloaded and unresolved: fail closed
+            cs = c;
+        }
+    }
+    if (!cs || cs->parent != cls) return false;
+    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+    if (!cd || ai >= cd->params.size() || cd->params.size() != ne.args.size())
+        return false;
+    const ast::Param& p = cd->params[ai];
+    if (!p.modifier.empty() || !p.type ||
+        p.type->kind != ast::TypeKind::Named || !p.type->name ||
+        p.type->name->parts.size() != 1 || p.type->nullable)
+        return false;
+    const auto taking =
+        typeParamFunctionTakingFields(ctx, cls, p.type->name->parts.front());
+    return !taking.empty() &&
+           calleeBodyUsesFormalOnlyByInvocationInspectionOrTakingFieldStore(
+               ctx, *cd, p.name, taking);
 }
 
 // fix #8872 (§28.14 / §28.9 / §27.5, v0.359): the FUNCTION-VALUE twin of
@@ -44131,7 +44238,18 @@ struct ClosureEscapeWalker {
             // fix-forward #8847: see curCall_.
             const ast::Expr* savedCall = curCall_;
             curCall_ = n;
-            for (auto& a : n->args) expr(a.value.get(), /*safeRead=*/false);
+            // fix-forward #9112: a closure local passed to a constructor
+            // formal declared at the class's own type parameter, whose body
+            // only invokes, inspects or stores it into a field that takes
+            // its own reference, is a READ, not an escape (see
+            // closureArgBindsCtorTypeParamTakingField).
+            for (std::size_t ai = 0; ai < n->args.size(); ++ai) {
+                const ast::Expr* av = n->args[ai].value.get();
+                const bool takenByField =
+                    av && argIsTarget(av) &&
+                    closureArgBindsCtorTypeParamTakingField(ctx, *n, ai);
+                expr(av, /*safeRead=*/takenByField);
+            }
             curCall_ = savedCall;
             return;
         }

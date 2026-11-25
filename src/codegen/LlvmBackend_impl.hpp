@@ -1005,6 +1005,31 @@ bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
 bool calleeBodyUsesFormalOnlyByInvocationOrInspection(
         const ast::MethodDecl& md, std::string_view name);
 
+// fix-forward #9112 (§28.9 / §28.11 / §14.1, v0.359): the invocation-or-
+// inspection walk, which ALSO admits `field := formal;` where the field is in
+// `takingFields` — a class field declared at a bare type parameter that the
+// call's instantiation binds to a function type (see
+// typeParamFunctionTakingFields below). Such a store takes the field's own
+// reference (lowerClosureFieldStore's generic-`T` arm), so the callee keeps
+// nothing the caller passed and the caller's +1 producer must be released at
+// the call's end. Every other use fails closed, as in the walks above.
+// The class's OWN instance fields (and auto-property storage) whose declared
+// type is the bare type parameter `tpName` (nullable or not): the fields whose
+// store takes a reference at a function-type substitution of `tpName`
+// (Emitter::isTypeParamFunctionFieldLvalue). Empty when `cls` declares no such
+// parameter.
+std::unordered_set<const void*> typeParamFunctionTakingFields(
+        const sema::SemaContext& ctx, const sema::TypeSymbol* cls,
+        std::string_view tpName);
+bool calleeBodyUsesFormalOnlyByInvocationInspectionOrTakingFieldStore(
+        const sema::SemaContext& ctx, const ast::MethodDecl& md,
+        std::string_view name,
+        const std::unordered_set<const void*>& takingFields);
+bool calleeBodyUsesFormalOnlyByInvocationInspectionOrTakingFieldStore(
+        const sema::SemaContext& ctx, const ast::ConstructorDecl& cd,
+        std::string_view name,
+        const std::unordered_set<const void*>& takingFields);
+
 // fix #9061 (§28.9 / §8.1 / §27.5, v0.359): the dynamic function-value storage
 // fields (Emitter::dynFnvalStorageFields_) of the module being lowered, for the
 // free-function walks below; set by the Emitter once the pre-pass has run.
@@ -17667,13 +17692,34 @@ private:
     // (issue #9112, exit 134). §14.1 / §3.6 rule 2 fix the element category at
     // the INSTANTIATION, so the substitution is what decides.
     bool isTypeParamFunctionFieldLvalue(const ast::Expr& target);
+    // fix-forward #9112 (§28.9 / §14.1, v0.359): has the function being
+    // emitted bound a LOCAL whose type is a bare type parameter the active
+    // substitution binds to a function type? Such a local holds no reference
+    // of its own, so lowerClosureFieldStore's generic-`T` arm must not release
+    // the value it displaces while one may still alias it.
+    bool bareTypeParamFunctionLocalBound();
+    // fix-forward #9112: release, after a constructor call (either arm), each
+    // +1 closure producer passed to a formal declared at the class's own bare
+    // type parameter at a function-type instantiation, when the body only
+    // invokes / inspects it or stores it into a field that takes its own
+    // reference. Defined beside lowerNew (LlvmBackend_Exprs2.cpp).
+    void emitTypeParamClosureCtorArgReleases(
+        const ast::ConstructorDecl& cd, const sema::TypeSymbol* cls,
+        const std::vector<llvm::Value*>& args,
+        const std::vector<const ast::Expr*>& ctorArgExprs);
     // fix #9112 (stdlib §4.11 / §28.11 / §28.9, v0.359): is `inner` a call to
     // a BUILT-IN collection's element read whose result is a BORROW of the
-    // collection's own element (`Stack<T>.Peek()`, `Queue<T>.Dequeue()` and
-    // their `Try*` twins)? Such a result mints nothing, so the chain-call
-    // site must not release it. The OWNING forms are excluded — their
-    // `Pop`/`Dequeue` are declared `owned T` (a transfer out).
+    // collection's own element (`Stack<T>.Peek()` / `Queue<T>.Peek()`)? Such a
+    // result mints nothing, so the chain-call site must not release it.
+    // `Pop` / `Dequeue` REMOVE the element and are excluded (fix-forward
+    // #9112; the definition says why).
     bool isBuiltinCollectionElementBorrowCall(const ast::CallExpr& inner) const;
+    // fix-forward #9112 (§28.9 / §14.1, v0.359): is `inner` a call to a user
+    // method whose DECLARED return type is a bare type parameter (its own or
+    // its class's)? At a function-type instantiation its result is a borrow
+    // (the `return` takes no closure retain), so the chain call `b.Get()()`
+    // must not release it.
+    bool isTypeParamReturnCall(const ast::CallExpr& inner) const;
 
     // fix #8964 (§9.7 / §28.9, v0.359): the CLOSURE twin of
     // isStringStorageMemberResolved — a record component whose RESOLVED type

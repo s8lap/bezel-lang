@@ -14062,17 +14062,32 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // fix #9112 (stdlib §4.11 / §28.11 / §28.9, v0.359): the
             // "+1 producer by the contract above" clause has an EXCEPTION the
             // contract did not state: a BUILT-IN collection's element read
-            // (`Stack<T>.Peek()`, `Queue<T>.Dequeue()`) hands out a BORROW of
+            // (`Stack<T>.Peek()` / `Queue<T>.Peek()`) hands out a BORROW of
             // the collection's own element (stdlib §4.11: "borrow of top
-            // element"), so it mints NOTHING. Releasing it dropped the
+            // element"), so it mints NOTHING. (fix-forward #9112: `Pop` /
+            // `Dequeue` REMOVE the element and keep this release — see
+            // `isBuiltinCollectionElementBorrowCall`.) Releasing it dropped the
             // collection's only reference to the closure and freed it while
             // the caller was still calling it — MEASURED (issue #9112):
             // `st.Peek()()` on a `Stack<() -> int>`, a heap-use-after-free
             // "freed by bz_closure_release" in main.
             const ast::CallExpr* innerChainCall =
                 dynamic_cast<const ast::CallExpr*>(call.callee.get());
+            //
+            // fix-forward #9112 (§28.9 / §28.11 / §14.1, v0.359): the SECOND
+            // exception — a user method whose DECLARED return is a bare type
+            // parameter (`Box<T>.Get(): T`, instantiated at `() -> int`). Its
+            // `return item;` mints nothing (only a return declared AT a
+            // function type takes the ReturnStmt closure retain), and every
+            // other reader of that result already treats it as a borrow
+            // (`var g := b.Get();` takes no ownership: isUserMethodClosureReturnCall
+            // answers false for it). Releasing it here dropped the field's
+            // own reference — MEASURED: `b.Get()()` on a `Box<() -> int>`, a
+            // heap-use-after-free in the next read of the field (it was
+            // masked on the parent only by the constructor's leaked +1).
             if (innerChainCall &&
-                !isBuiltinCollectionElementBorrowCall(*innerChainCall))
+                !isBuiltinCollectionElementBorrowCall(*innerChainCall) &&
+                !isTypeParamReturnCall(*innerChainCall))
                 emitClosureRelease(closurePtr);
             return ccRes;
         }
@@ -20205,6 +20220,71 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
 
     return result;
 }
+
+// fix #9112 (stdlib §4.11 / §28.11 / §28.9, v0.359): is `inner` a call to a
+// BUILT-IN collection's element read whose result is a BORROW of the
+// collection's own element — `Stack<T>.Peek()` / `Queue<T>.Peek()`?
+//
+// stdlib §4.11 declares `Peek` as "borrow of top element": the element stays
+// in the collection, so the result is the collection's own reference, NOT a
+// fresh one the caller owns — the caller may read it and call it, but it must
+// not RELEASE it. Releasing it dropped the collection's only reference while
+// the element was still there, so a second `Peek()()` or a later `Pop()()`
+// read freed memory (issue #9112's b14, MEASURED: heap-use-after-free).
+//
+// fix-forward #9112 (v0.359): `Pop` / `Dequeue` are deliberately NOT here.
+// They REMOVE the element, so the reference the slot held leaves with the
+// result, and the chain call's release is the only discharge of it: the
+// borrowing `Stack<T>` / `Queue<T>` take no reference of their own at
+// `Push` / `Enqueue` and give none back at their free (issue #9172, OPEN —
+// the Stack/Queue slot pair). Dropping that release left a freshly pushed
+// lambda with no owner at all (MEASURED: `st.Push(lambda() => 2);
+// st.Pop()()` and its `Queue` twin went from clean to an LSan leak of
+// 12800 B / 200 allocations over 200 iterations). The `Try*` forms return
+// `bool` and are never chain-called.
+//
+// The OWNING forms are excluded: `OwningStack<T>.Peek()` is a borrow too,
+// but the owning family requires `where T: class`, so a function-typed
+// element cannot reach it.
+bool Emitter::isBuiltinCollectionElementBorrowCall(
+    const ast::CallExpr& inner) const {
+    const auto* ma =
+        dynamic_cast<const ast::MemberAccessExpr*>(inner.callee.get());
+    if (!ma) return false;
+    if (ma->member != "Peek") return false;
+    const sema::TypeRef* rt = ctx_.exprType(*ma->target);
+    if (!rt) return false;
+    // The BUILT-IN collections only: their TypeRef has no declaration (the
+    // stdlib's builtin collection types are declared-less), so a user class
+    // that happens to be named `Stack` is not mistaken for one.
+    if (rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    const std::string_view head = rt->headName();
+    return head == "Stack" || head == "Queue";
+}
+
+// fix-forward #9112 (§28.9 / §14.1, v0.359): see the declaration and the
+// chain-call release in lowerCallDispatch.
+bool Emitter::isTypeParamReturnCall(const ast::CallExpr& inner) const {
+    if (!inner.callee) return false;
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*inner.callee));
+    if (!ms || ms->isOperator || ctx_.isImported(ms)) return false;
+    // SEAM-ACCESSOR: local-path cast; the imported case returned above.
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md || !md->returnType) return false;
+    const ast::Type& t = *md->returnType;
+    if (t.kind != ast::TypeKind::Named || !t.name ||
+        t.name->parts.size() != 1)
+        return false;
+    const std::string_view head = t.name->parts.front();
+    for (const auto& gp : md->genericParams)
+        if (gp.name == head) return true;
+    if (ms->parent)
+        for (const sema::Symbol* gp : ms->parent->genericParams)
+            if (gp && gp->name == head) return true;
+    return false;
+}
+
 // fix #8624 (§7.5 / §28.14 / §28.9, v0.359): the closure-ARGUMENT
 // discharge of a call to a USER method — the ONE definition the `.` call
 // path (`lowerCallDispatch`) and the `?.` call path
@@ -20235,42 +20315,6 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
 // always had, and their mutual disjointness is what lets them share one
 // cleanup block and one release list (the argument is restated at the
 // install site below, where the three are combined).
-// fix #9112 (stdlib §4.11 / §28.11 / §28.9, v0.359): is `inner` a call to a
-// BUILT-IN collection's element read whose result is a BORROW of the
-// collection's own element — `Stack<T>.Peek()`, `Queue<T>.Dequeue()` and their
-// `Try*` twins?
-//
-// stdlib §4.11 declares `Peek` as "borrow of top element" (and, for the
-// BORROWING forms, `Pop` / `Dequeue` produce "borrows whose compile-time
-// source is the collection"). The result is therefore the collection's own
-// reference, NOT a fresh one the caller owns: the caller may read it and call
-// it, but it must not RELEASE it — the collection's element is still there.
-//
-// The OWNING forms are excluded: `OwningStack<T>.Pop()` / `OwningQueue<T>
-// .Dequeue()` are declared `owned T` (stdlib §4.11) — a TRANSFER out — so
-// their result IS owned by the caller and the chain-call's release is correct
-// there. (The owning family requires `where T: class`, so a function-typed
-// element cannot reach it in any case.)
-bool Emitter::isBuiltinCollectionElementBorrowCall(
-    const ast::CallExpr& inner) const {
-    const auto* ma =
-        dynamic_cast<const ast::MemberAccessExpr*>(inner.callee.get());
-    if (!ma) return false;
-    const std::string_view m = ma->member;
-    if (m != "Peek" && m != "Pop" && m != "Dequeue" &&
-        m != "TryPeek" && m != "TryPop" && m != "TryDequeue")
-        return false;
-    const sema::TypeRef* rt = ctx_.exprType(*ma->target);
-    if (!rt) return false;
-    // The BUILT-IN collections only: their TypeRef has no declaration (the
-    // stdlib's builtin collection types are declared-less), so a user class
-    // that happens to be named `Stack` is not mistaken for one.
-    if (rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
-        return false;
-    const std::string_view head = rt->headName();
-    return head == "Stack" || head == "Queue";
-}
-
 Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
     sema::MethodSymbol* ms, const std::vector<llvm::Value*>& args,
     const std::vector<const ast::Expr*>& argExprs, const ast::CallExpr& call) {
@@ -20869,10 +20913,34 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
                                 formalIsFunction = true;
                         }
                     }
+                    // fix-forward #9112 (§28.9 / §28.11 / §14.1, v0.359):
+                    // the walk's one failing use that no longer keeps the
+                    // caller's reference is a STORE into a field declared at
+                    // this same type parameter: at a function-type
+                    // substitution that store TAKES the field's own
+                    // reference (lowerClosureFieldStore's generic-`T` arm),
+                    // so the call site still owns — and must drop — the
+                    // literal's +1. Without this the store's take and the
+                    // literal's +1 were both kept, MEASURED: `b.Set(lambda()
+                    // => 4)` on a `Box<() -> int>` leaked 64 B per call.
+                    // Only at a FUNCTION argument: the `Object` substitution's
+                    // store takes no closure reference.
                     if (formalIsFunction && isClassOwnTypeParam &&
                         !calleeBodyUsesFormalOnlyByInvocationOrInspection(
-                            *mdCb, p.name))
-                        continue;
+                            *mdCb, p.name)) {
+                        const sema::TypeRef* argTy =
+                            argExprs[ai] ? ctx_.exprType(*argExprs[ai])
+                                         : nullptr;
+                        if (!argTy ||
+                            argTy->kind != sema::TypeRef::Kind::Function)
+                            continue;
+                        const auto taking = typeParamFunctionTakingFields(
+                            ctx_, ms->parent, formalHead);
+                        if (taking.empty() ||
+                            !calleeBodyUsesFormalOnlyByInvocationInspectionOrTakingFieldStore(
+                                ctx_, *mdCb, p.name, taking))
+                            continue;
+                    }
                 }
                 // fix #8843 (§28.9 / §8.1 / §27.5, v0.359): an `Object` formal
                 // whose callee only null-/type-tests it. Not function-typed,
@@ -20902,6 +20970,58 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
                     rel.callBoundedAsync.push_back(args[ai]);
                 else
                     rel.callBounded.push_back(args[ai]);
+            }
+        } else if (!isAsyncMethod(ms) && !isSyncIterCallee &&
+                   ms->parent && mdCb->returnType &&
+                   mdCb->returnType->kind == ast::TypeKind::Named &&
+                   mdCb->returnType->name &&
+                   mdCb->returnType->name->parts.size() == 1 &&
+                   argExprs.size() == args.size() &&
+                   args.size() >= mdCb->params.size() &&
+                   args.size() - mdCb->params.size() <= 1) {
+            // fix-forward #9112 (§28.9 / §28.11 / §14.1, v0.359): a callee
+            // whose declared return is the CLASS's own bare type parameter
+            // (`Swap(x: T): T`) is left out of the arm above, because its
+            // `return` may hand the caller's own argument back as a borrow.
+            // The taking walk below proves it does not (a `return x` is a
+            // use of the formal the walk does not admit), and that the
+            // formal's one store goes into a generic-`T` field whose store
+            // TAKES its own reference — so the literal's +1 is still the
+            // caller's to drop. Without this the store's take stranded it,
+            // MEASURED: `var o := b.Swap(lambda() => 5)` leaked 64 B/call.
+            // A name is the class's own type parameter when the method does
+            // not shadow it with one of its own.
+            auto isClassOwnTp = [&](std::string_view h) {
+                for (const auto& gp : mdCb->genericParams)
+                    if (gp.name == h) return false;
+                for (const sema::Symbol* gp : ms->parent->genericParams)
+                    if (gp && gp->name == h) return true;
+                return false;
+            };
+            if (isClassOwnTp(mdCb->returnType->name->parts.front())) {
+                const std::size_t off = args.size() - mdCb->params.size();
+                for (std::size_t pi = 0; pi < mdCb->params.size(); ++pi) {
+                    const ast::Param& p = mdCb->params[pi];
+                    if (!p.modifier.empty() || !p.type) continue;
+                    if (p.type->kind != ast::TypeKind::Named || !p.type->name ||
+                        p.type->name->parts.size() != 1)
+                        continue;
+                    std::string_view formalHead = p.type->name->parts.front();
+                    if (!isClassOwnTp(formalHead)) continue;
+                    const std::size_t ai = off + pi;
+                    if (!argExprs[ai] || !isPlusOneClosureProducer(argExprs[ai]))
+                        continue;
+                    const sema::TypeRef* argTy = ctx_.exprType(*argExprs[ai]);
+                    if (!argTy || argTy->kind != sema::TypeRef::Kind::Function)
+                        continue;
+                    const auto taking = typeParamFunctionTakingFields(
+                        ctx_, ms->parent, formalHead);
+                    if (taking.empty() ||
+                        !calleeBodyUsesFormalOnlyByInvocationInspectionOrTakingFieldStore(
+                            ctx_, *mdCb, p.name, taking))
+                        continue;
+                    rel.callBounded.push_back(args[ai]);
+                }
             }
         }
     }
@@ -22433,6 +22553,12 @@ struct FormalInvocationOnlyWalk {
     // store, a return, an escaping capture, a read into a callee-local)
     // stays declined, exactly as the plain walk declines it.
     bool refFormalMode = false;
+    // fix-forward #9112 (§28.9 / §28.11 / §14.1, v0.359): admit `field :=
+    // formal;` into one of these fields — a class field declared at a bare
+    // type parameter the call's instantiation binds to a function type, whose
+    // store (lowerClosureFieldStore's generic-`T` arm) TAKES the field's own
+    // reference. Null: no such store is admitted (fail closed).
+    const std::unordered_set<const void*>* takingFieldStores = nullptr;
     // fix #8933: the depth of the forwarding chain already walked (a cycle
     // in the call graph must not recurse forever; the limit fails closed).
     int forwardDepth = 0;
@@ -22524,6 +22650,18 @@ struct FormalInvocationOnlyWalk {
                (isNull(be.left.get()) && isName(be.right.get()));
     }
 
+    // fix-forward #9112: which kind of TAKING field does `target` name? 0 =
+    // none, 1 = a field declared at the bare type parameter, 2 = an
+    // `Array<T>` / `IList<T>` field of it (typeParamFunctionTakingFields).
+    int takingFieldKind(const ast::Expr* target) const {
+        if (!takingFieldStores || !ctx || !target) return 0;
+        const sema::Symbol* fs = ctx->exprSymbol(*target);
+        if (!fs || !takingFieldStores->count(static_cast<const void*>(fs)))
+            return 0;
+        const sema::TypeRef* t = sema::storageComponentType(fs, *ctx);
+        if (!t) return 0;
+        return t->genericArgs.empty() ? 1 : 2;
+    }
     bool isName(const ast::Expr* e) const {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
         return id && id->name == name;
@@ -22729,6 +22867,26 @@ struct FormalInvocationOnlyWalk {
                 expr(as->target.get());
                 return;
             }
+            // fix-forward #9112: the generic-`T` twin of the #9061 admission
+            // above — the field's store retains, so it keeps nothing the
+            // caller passed.
+            if (lambdaDepth == 0 && as->op == ":=" && as->target &&
+                isName(as->value.get())) {
+                if (takingFieldKind(as->target.get()) == 1) {
+                    expr(as->target.get());
+                    return;
+                }
+                // The collection twin: `items[i] := formal` into an
+                // `Array<T>` / `IList<T>` field — the indexer set TAKES the
+                // slot's reference and gives back the one it displaces.
+                if (auto* ix = dynamic_cast<const ast::IndexExpr*>(
+                        as->target.get());
+                    ix && takingFieldKind(ix->target.get()) == 2) {
+                    expr(ix->target.get());
+                    args(ix->indices);
+                    return;
+                }
+            }
             expr(as->target.get());
             expr(as->value.get());
             return;
@@ -22833,6 +22991,32 @@ struct FormalInvocationOnlyWalk {
             return;
         }
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            // fix-forward #9112 (§28.11 / §28.9 / §14.1, v0.359): the formal
+            // stored as an ELEMENT of an `Array<T>` / `IList<T>` field of the
+            // class (`items.Add(x)` / `items.Insert(i, x)`). At a function
+            // substitution that slot is a paired shared-reference slot: the
+            // store TAKES the element's own reference and the collection's
+            // free gives it back, so the call keeps nothing the caller passed.
+            if (lambdaDepth == 0 && takingFieldStores) {
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        c->callee.get());
+                    ma && takingFieldKind(ma->target.get()) == 2) {
+                    const std::size_t elemAt =
+                        ma->member == "Add" && c->args.size() == 1    ? 0
+                        : ma->member == "Insert" && c->args.size() == 2 ? 1
+                                                                        : SIZE_MAX;
+                    bool plain = elemAt != SIZE_MAX;
+                    for (const auto& a : c->args)
+                        if (!a.modifier.empty() || !a.name.empty() || !a.value)
+                            plain = false;
+                    if (plain && isName(c->args[elemAt].value.get())) {
+                        expr(ma->target.get());
+                        for (std::size_t i = 0; i < c->args.size(); ++i)
+                            if (i != elemAt) expr(c->args[i].value.get());
+                        return;
+                    }
+                }
+            }
             // fix #8482: inside a lambda body the invocation is a capture.
             // fix #8983 (§28.14 / §28.9, v0.359): an INVOCATION through an
             // admitted ALIAS is the invocation through the formal — §28.14
@@ -23092,6 +23276,92 @@ bool calleeBodyUsesFormalOnlyByInvocationInspectionOrFnvalFieldStore(
         return false;
     }
     return w.ok;
+}
+
+// fix-forward #9112 (§28.9 / §28.11 / §14.1, v0.359): see the declaration.
+std::unordered_set<const void*> typeParamFunctionTakingFields(
+        const sema::SemaContext& ctx, const sema::TypeSymbol* cls,
+        std::string_view tpName) {
+    std::unordered_set<const void*> out;
+    if (!cls || cls->kind != ast::TypeDeclKind::Class || tpName.empty())
+        return out;
+    bool declared = false;
+    for (const sema::Symbol* gp : cls->genericParams)
+        if (gp && gp->name == tpName) { declared = true; break; }
+    if (!declared) return out;
+    for (const sema::Symbol* m : cls->members) {
+        if (!m) continue;
+        const bool storage = dynamic_cast<const sema::FieldSymbol*>(m) ||
+                             sema::isAutoPropertyStorageSymbol(m, ctx);
+        if (!storage) continue;
+        if (auto* ms = dynamic_cast<const sema::MemberSymbol*>(m)) {
+            bool isStatic = false;
+            for (std::string_view mod : ms->modifiers)
+                if (mod == "static") { isStatic = true; break; }
+            if (isStatic) continue;
+        }
+        const sema::TypeRef* t = sema::storageComponentType(m, ctx);
+        if (!t || t->kind != sema::TypeRef::Kind::Named) continue;
+        auto isBareTp = [&](const sema::TypeRef* r) {
+            return r && r->kind == sema::TypeRef::Kind::Named &&
+                   !r->declaration && r->genericArgs.empty() &&
+                   r->headName() == tpName;
+        };
+        if (isBareTp(t)) {
+            out.insert(static_cast<const void*>(m));
+            continue;
+        }
+        // An `Array<T>` / `IList<T>` field: the array-backed slot whose
+        // function-element take and give-back are paired (§28.11;
+        // `isFunctionSlotPairedCollectionName`). `IReadOnlyList<T>` and
+        // `FrozenArray<T>` have no element store to admit.
+        const std::string_view h = t->headName();
+        if ((h == "Array" || h == "IList") && t->genericArgs.size() == 1 &&
+            !t->nullable && isBareTp(t->genericArgs[0]))
+            out.insert(static_cast<const void*>(m));
+    }
+    return out;
+}
+
+static bool calleeBodyUsesFormalOnlyOrTakingFieldStoreImpl(
+        const sema::SemaContext& ctx,
+        const std::vector<std::unique_ptr<ast::Stmt>>* body,
+        const ast::Expr* exprBody, std::string_view name,
+        const std::unordered_set<const void*>& takingFields) {
+    if (name.empty()) return false;
+    FormalInvocationOnlyWalk w{name};
+    w.allowInspection = true;
+    w.takingFieldStores = &takingFields;
+    w.ctx = &ctx;
+    if (exprBody) w.expr(exprBody);
+    else if (body) w.stmts(*body);
+    else return false;
+    return w.ok;
+}
+
+bool calleeBodyUsesFormalOnlyByInvocationInspectionOrTakingFieldStore(
+        const sema::SemaContext& ctx, const ast::MethodDecl& md,
+        std::string_view name,
+        const std::unordered_set<const void*>& takingFields) {
+    for (auto mod : md.modifiers)
+        if (mod == "virtual" || mod == "abstract" || mod == "override")
+            return false;
+    if (md.bodyKind == ast::MethodBodyKind::Expression)
+        return md.exprBody && calleeBodyUsesFormalOnlyOrTakingFieldStoreImpl(
+                                  ctx, nullptr, md.exprBody.get(), name,
+                                  takingFields);
+    if (md.bodyKind == ast::MethodBodyKind::Block)
+        return calleeBodyUsesFormalOnlyOrTakingFieldStoreImpl(
+            ctx, &md.stmts, nullptr, name, takingFields);
+    return false;
+}
+
+bool calleeBodyUsesFormalOnlyByInvocationInspectionOrTakingFieldStore(
+        const sema::SemaContext& ctx, const ast::ConstructorDecl& cd,
+        std::string_view name,
+        const std::unordered_set<const void*>& takingFields) {
+    return calleeBodyUsesFormalOnlyOrTakingFieldStoreImpl(
+        ctx, &cd.body, nullptr, name, takingFields);
 }
 
 // fix #8933 (§28.14 / §28.9, v0.359): the FORWARDING admission — the same
