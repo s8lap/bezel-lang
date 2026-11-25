@@ -8,11 +8,11 @@
 //! cites: 28.3.8, 28.9
 //! expect: run
 //! stdout: 200
-//! notes: The pin for #9092 (verified already fixed on staging). `h.F` is read out of a
-//!   function-typed field and passed at the `Object` parameter of `Keep`; the closure
-//!   `lambda() => 1` is capture-free, which is the one kind of function value those positions
-//!   admit. `RunInt` narrows the stored `Object` back to `() -> int` and calls it: 1 per
-//!   iteration, 200 iterations: 200.
+//! notes: The pin for #9092 (reviewer r43-rev-h10 replacement for 8735). `Via` reads `h.F` out of a
+//!   function-typed field and passes it at the `Object` parameter of `Keep`, then the holder `h`
+//!   is disposed when `Via` returns; the kept `Object` box must still hold a live closure, so
+//!   the later `RunInt` call (1 per iteration, 200 iterations: 200) is valid. Segfaults on the
+//!   compiler before db3dafb3b.
 module Conf;
 public class Reg2
   private _o: Object? := null;
@@ -30,12 +30,15 @@ public class Hold
 end Hold;
 
 public class Program
+  public static method Via(rg: Reg2)
+    var h := new Hold();
+    rg.Keep(h.F);
+  end Via;
   public static method Main(): int
     using var reg := new Reg2();
     var n: int := 0;
     for var i in 0 ..< 200 do
-      var h := new Hold();
-      reg.Keep(h.F);
+      Via(reg);
       n := n + reg.RunInt();
     end for;
     Console.WriteLine($"{n}");

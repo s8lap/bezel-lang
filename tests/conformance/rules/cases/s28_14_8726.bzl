@@ -6,7 +6,7 @@
 //! cites: 28.14, 6.6, 7.7
 //! expect: run
 //! stdout: 600
-//! notes: Pins #9110 (`??=` with a local). `fl[g] ??= 3` stores 3 only when the indexer reads null:
+//! notes: Pins #9102 (a call-bounded closure local `g` as the index argument of a `??=`; not #9110). `fl[g] ??= 3` stores 3 only when the indexer reads null:
 //!   the first statement stores it (the field starts null), the second finds 3 and stores
 //!   nothing. The read-back then adds 3 per iteration, 200 iterations: 600.
 module Conf;

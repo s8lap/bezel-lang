@@ -3,7 +3,7 @@
 //! section: 4.6
 //! title: a generic identity lambda at a nullable string substitution passes string and null
 //!   through
-//! rule: `string` is **runtime-managed**: its memory is reclaimed automatically.
+//! rule: An **instantiation** of a generic declaration is the constructed type or constructed member obtained by substituting type arguments for its type parameters
 //! cites: 4.6, 28.9, 27.3
 //! expect: run
 //! stdout: 1290

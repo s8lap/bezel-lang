@@ -2,7 +2,7 @@
 //! doc: spec
 //! section: 4.6
 //! title: the non-nullable string substitution of the same generic lambda behaves identically
-//! rule: `string` is **runtime-managed**: its memory is reclaimed automatically.
+//! rule: An **instantiation** of a generic declaration is the constructed type or constructed member obtained by substituting type arguments for its type parameters
 //! cites: 4.6, 28.9, 14.1
 //! expect: run
 //! stdout: 1090
