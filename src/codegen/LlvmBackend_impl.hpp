@@ -16296,7 +16296,13 @@ private:
         // per §28.11 v0.135: RuntimeManaged AND specifically `string` (not fn type).
         ElementPolicy pol = elementPolicyFor(el, /*owningFamily=*/false);
         if (pol.cat != ElementPolicy::Category::RuntimeManaged) return;
-        if (!isStringElementTypeRef(el)) return;
+        // fix #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the bulk retain
+        // is the TAKE half of the pair (the copy's free is the release half),
+        // so it must read the SAME element type the release reads: the
+        // SUBSTITUTED one for the ARRAY family (the kind whose slot lifecycle
+        // is paired), the declaration-site one for the kinds whose removal
+        // path does not release (the STACK / QUEUE, issue #8453).
+        if (!isStringElementSlotPaired(cn, el)) return;
         auto* fn = declareC("bz_array_retain_strings",
                             llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(fn, {arr});
@@ -18232,6 +18238,83 @@ private:
     bool isStringElementTypeRef(const sema::TypeRef* rt) const {
         return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
                rt->primitive == sema::PrimitiveType::String;
+    }
+
+    // fix #9100 / §3.6 rule 2 / §14.1 / §14.4 / §28.11 (v0.359): the RESOLVING
+    // form of the string-element predicate. The ELEMENT CATEGORY of a
+    // collection's slot is a DERIVED TYPE PROPERTY (§3.6), and §3.6's rule 2
+    // ("Per-instantiation evaluation for generics") evaluates it at each
+    // instantiation, AFTER substituting the type arguments; §14.1's
+    // *Instantiation and its site* defines an instantiation as the constructed
+    // type obtained by substituting type arguments for its type parameters;
+    // §14.4 fixes the element category at the instantiation. So inside a
+    // MONOMORPHIZED generic body the collection's `genericArgs[0]` is still the
+    // PLACEHOLDER type parameter `T` (a Named TypeRef with a null
+    // declaration — §14.1's monomorphization keeps the DECLARATION's spelling),
+    // and a string-element co-ownership decision that reads it raw falls past
+    // the string test: the generic `Box<T>`'s `owned items: Array<T>` took NO
+    // +1 per element at insert while the DISPOSAL side — which resolves the
+    // element type (`emitOwnedFieldDisposals`, LlvmBackend_Disposal.cpp) —
+    // released one: an UNPAIRED pair, and (for an element whose owner had
+    // died) a heap-use-after-free — issue #9100: `Box<string?>` read a freed
+    // element. `resolveTypeParamRef` returns its argument unchanged for any
+    // non-parameter ref and outside an active substitution, so nothing outside
+    // a monomorphized generic body changes.
+    bool isStringElementTypeRefResolved(const sema::TypeRef* rt) const {
+        const sema::TypeRef* r = resolveTypeParamRef(rt);
+        return r && r->kind == sema::TypeRef::Kind::Primitive &&
+               r->primitive == sema::PrimitiveType::String;
+    }
+
+    // fix #9100 / §28.11 (v0.359): the collection kinds whose string-element
+    // slot reference the collection gives back ITSELF — the slot's +1 is
+    // released by the collection's free / Remove / Clear, so a retain at insert
+    // is PAIRED with it (§28.11's element slot policy is a PAIR: the store
+    // takes a reference of its own, and the slot's release gives it back).
+    //
+    // The other array-backed kinds are deliberately NOT here: the STACK and
+    // the QUEUE give their slot's reference back at Pop()/Dequeue(), which
+    // does NOT release it (issue #8453, OPEN) — a generic body that took that
+    // reference would strand it, so their insert keeps the declaration-site
+    // reading (and their free keeps the matching one). The interface-headed
+    // aliases (IList / IReadOnlyList) are not here either: they have their own
+    // free path (the `using var` interface branch in
+    // LlvmBackend_Setup.cpp), which does not resolve the element type.
+    static bool isSlotReferencePairedCollectionName(std::string_view n) {
+        return n == "Array";
+    }
+
+    // fix #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the string-element
+    // test for a collection SLOT, keyed on the kind whose slot lifecycle is
+    // PAIRED — the kind that gives the slot's reference back ITSELF (its free
+    // / Remove / Clear release it), so the retain at insert is PAIRED with
+    // that release (§28.11's element slot policy is a PAIR: the store takes a
+    // reference of its own, and the slot's release gives it back).
+    //
+    // For such a kind the two halves must read the SAME element type, and
+    // inside a MONOMORPHIZED generic body that is the SUBSTITUTED type
+    // (§3.6's rule 2 evaluates the element category per instantiation, after
+    // substituting the type arguments; §14.1's monomorphization keeps the
+    // DECLARATION's spelling, so the collection's `genericArgs[0]` is still
+    // the placeholder type parameter `T`; §14.4 fixes the element category at
+    // the instantiation). The other kinds keep the DECLARATION-SITE reading:
+    // the STACK and the QUEUE strand the slot's reference at Pop()/Dequeue()
+    // (issue #8453, OPEN) and the LINKED LIST's insert is `!nullable`-gated
+    // (issue #9107's lane), so neither may take a reference the paired half
+    // does not give back.
+    bool isStringElementSlotPaired(std::string_view collName,
+                                   const sema::TypeRef* el) const {
+        if (isSlotReferencePairedCollectionName(collName))
+            return isStringElementTypeRefResolved(el);
+        return isStringElementTypeRef(el);
+    }
+
+    // The same test, keyed on the collection's TypeRef (the alias-transparent
+    // head — `TypeRef::headName`).
+    bool isStringElementSlotPaired(const sema::TypeRef* collTy,
+                                   const sema::TypeRef* el) const {
+        return isStringElementSlotPaired(
+            collTy ? collTy->headName() : std::string_view{}, el);
     }
 
     // fix #4127 (§27.5 / §28.9, stdlib §4.8, v0.295): is `rt` the synthetic

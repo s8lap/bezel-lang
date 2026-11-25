@@ -9671,6 +9671,23 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         // the caller's string (review F1 of #8654). The
                         // StringEscapeWalker arm for this constructor
                         // (LlvmBackend_Setup.cpp) is keyed the same way.
+                        //
+                        // fix #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359):
+                        // the fill loop is the TAKE half of the pair — the
+                        // array's free is the release half (it gives the
+                        // slot's reference back per slot), so both halves
+                        // must read the SAME element type. The ARRAY
+                        // family's slot lifecycle is PAIRED, so the pair
+                        // reads the SUBSTITUTED element type (§3.6's rule 2
+                        // evaluates the element category per instantiation,
+                        // after substituting the type arguments; §14.1's
+                        // monomorphization keeps the DECLARATION's spelling,
+                        // so inside a monomorphized generic body the
+                        // collection's `genericArgs[0]` is still the
+                        // placeholder type parameter `T`; §14.4 fixes the
+                        // element category at the instantiation). The other
+                        // array-backed kinds keep the declaration-site
+                        // reading (the STACK / QUEUE, issue #8453).
                         const bool fillIsString =
                             fillVal->getType()->isPointerTy() &&
                             !rt->genericArgs.empty() &&
@@ -9684,7 +9701,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             // does — and its free gives one back per slot. The
                             // per-slot retain below is the matching half (the
                             // `!nullable` gate was issue #9064 / #8485).
-                            isStringElementTypeRef(rt->genericArgs[0]);
+                            isStringElementSlotPaired(rt, rt->genericArgs[0]);
                         // for i = 0 ..<  sizeArg: bz_array_set(buf, i, fillSlot, esz)
                         llvm::AllocaInst* iSlot = entryAlloca(i64());
                         builder_.CreateStore(builder_.getInt64(0), iSlot);

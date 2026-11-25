@@ -9040,10 +9040,18 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             // `V?` as `V`, nullability stripped), so the collection co-owns
             // a +1 per element and releases it here too (`null` is the
             // null-safe release no-op).
+            //
+            // fix #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the
+            // explicit Dispose is the RELEASE half of the pair (the insert's
+            // retain is the take half), so both halves read the SAME element
+            // type — the SUBSTITUTED one for the ARRAY family (the kind whose
+            // slot lifecycle is paired), the declaration-site one for the
+            // kinds whose removal path does not release (the STACK / QUEUE,
+            // issue #8453).
             bool arrIsStringElem =
                 arrElemPol.cat ==
                     ElementPolicy::Category::RuntimeManaged &&
-                isStringElementTypeRef(arrElem);
+                isStringElementSlotPaired(recvTy, arrElem);
             if (!elemDisp && arrIsStringElem)
                 elemDisp = stringElementReleaseThunk();
             llvm::Value* disp = elemDisp

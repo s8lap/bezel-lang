@@ -10131,9 +10131,28 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // elementPolicyFor which now correctly covers both Class and Interface
         // element types.  No DIVERGENCE — the factory handles the full
         // class/interface row of the §28.11 table.
+        // fix #9100 / §3.6 rule 2 / §14.1 / §14.4 / §28.11 (v0.359): the
+        // ELEMENT CATEGORY of the slot is fixed at the INSTANTIATION, so the
+        // string-element decision must read the SUBSTITUTED element type:
+        // inside a MONOMORPHIZED generic body the collection's `genericArgs[0]`
+        // is still the PLACEHOLDER type parameter `T` (§14.1's monomorphization
+        // keeps the DECLARATION's spelling), and reading it raw fell past the
+        // string test — the generic `Box<T>`'s `owned items: Array<T>` took NO
+        // +1 per element at insert while the DISPOSAL side (which resolves the
+        // element type) released one: an UNPAIRED pair, and a
+        // heap-use-after-free for an element whose owner had died (issue
+        // #9100).
+        //
+        // The resolution is applied to the ARRAY family only — the kinds whose
+        // slot reference the collection gives back ITSELF (its free / Remove /
+        // Clear), so the retain at insert is PAIRED with it (§28.11's element
+        // slot policy is a pair). The STACK and the QUEUE give their slot's
+        // reference back at Pop()/Dequeue(), which does NOT release it (issue
+        // #8453, OPEN), so their insert keeps the declaration-site reading —
+        // and their free keeps the matching one, exactly as before.
         bool arrIsStringElem =
             arrElemPol.cat == ElementPolicy::Category::RuntimeManaged &&
-            isStringElementTypeRef(arrElemRef);
+            isStringElementSlotPaired(recvTy, arrElemRef);
         // arrElemIsClass: whether the element is a class-or-interface type —
         // drives both the ClassOwned disposer (for owning arrays) and ClassBorrow
         // reference identity (for emitRemoveElementEquality).  Per §28.11 v0.135

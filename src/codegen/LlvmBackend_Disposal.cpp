@@ -1773,7 +1773,9 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                     // insert) and the field's free gives it back. The ARRAY-
                     // backed family's +1 is #9064's; the LINKED LIST's is
                     // #9107's (`llIsStrElem` / `llitIsStrElem` /
-                    // `ctorRetainStr`).
+                    // `ctorRetainStr`). fix #9100 (v0.359): the collection
+                    // KIND gate #9100 kept here (for the linked list, whose
+                    // `string?` retain was missing before #9107) goes with it.
                     isStringElementTypeRef(collElem) &&
                     [](std::string_view n){
                         // #2603 / issue #401: IList<T>/IReadOnlyList<T> are
@@ -7598,6 +7600,14 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
         if (elemPol.disposerThunk) {
             elemDisposer = elemPol.disposerThunk;
         } else if (elemPol.cat == ElementPolicy::Category::RuntimeManaged &&
+                   // fix #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the
+                   // result collection's free is the RELEASE half of the pair
+                   // (the insert's retain is the take half), so both halves
+                   // read the SAME element type — the SUBSTITUTED one for the
+                   // ARRAY family (the kind whose slot lifecycle is paired),
+                   // the declaration-site one for the kinds whose removal path
+                   // does not release (the STACK / QUEUE, issue #8453).
+                   //
                    // fix #9064 / fix #9107 / §3.6 / §28.9 / §28.11 (v0.359):
                    // the nullable string release is NOT gated by COLLECTION
                    // KIND any more — §28.11's slot policy is a PAIR (the store
@@ -7626,7 +7636,7 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
                    //     was still missing, and a `Task<LinkedList<string?>>`
                    //     holding a borrowed element then aborted with "bezel:
                    //     fatal: refcount over-release (string)" (rc 134).
-                   isStringElementTypeRef(elemForDisposer)) {
+                   isStringElementSlotPaired(resultCollTy, elemForDisposer)) {
             // Borrowing Array<string> / Dictionary<string, int> / etc. —
             // release each string element. Mirrors the
             // collectionElemDisposer wiring in LlvmBackend_Setup.cpp

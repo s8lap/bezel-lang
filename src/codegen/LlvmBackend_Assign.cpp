@@ -2240,7 +2240,14 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                 // own (a +1 producer's reference is TRANSFERRED, anything else
                 // is retained) and releases the displaced old value (`null` is
                 // the null-safe retain/release no-op).
-                isStringElementTypeRef(arrEl) &&
+                // fix #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the
+                // indexer-set releases the DISPLACED slot value, so it must
+                // read the SAME element type the insert read: the SUBSTITUTED
+                // one for the ARRAY family (whose slot lifecycle is paired —
+                // its free / Remove / Clear give the slot's reference back),
+                // the declaration-site one for the kinds whose removal path
+                // does not release (the STACK / QUEUE, issue #8453).
+                isStringElementSlotPaired(recvTy, arrEl) &&
                 [](std::string_view n){
                     // #2598: IList<T> is array-backed + borrowing (issue #401),
                     // same bz_array_set ABI as Array<T>; admitted alongside the
@@ -6620,7 +6627,14 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
             // reads the element category of `V?` as `V`, nullability stripped),
             // so the slot co-owns a +1 of its own and releases the displaced
             // old value (`null` is the null-safe retain/release no-op).
-            isStringElementTypeRef(sArrEl) &&
+            // fix #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the
+            // indexer-set releases the DISPLACED slot value, so it must read
+            // the SAME element type the insert read: the SUBSTITUTED one for
+            // the ARRAY family (whose slot lifecycle is paired — its free /
+            // Remove / Clear give the slot's reference back), the
+            // declaration-site one for the kinds whose removal path does not
+            // release (the STACK / QUEUE, issue #8453).
+            isStringElementSlotPaired(recvTy, sArrEl) &&
             [](std::string_view n){
                 // #2598: IList<T> is array-backed + borrowing (issue #401),
                 // same bz_array_set ABI as Array<T>; admitted alongside the
@@ -12874,7 +12888,13 @@ void Emitter::freeCollectionSourceNow(llvm::Value* v,
             // reads the element category of `V?` as `V`, nullability stripped),
             // so the source array co-owns a +1 per element and releases it
             // here (`null` is the null-safe release no-op).
-            isStringElementTypeRef(elTy);
+            // fix #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the source
+            // array's free is the HALF that gives the slot's reference back, so
+            // it must read the SAME element type the insert read: the
+            // SUBSTITUTED one for the ARRAY family (whose slot lifecycle is
+            // paired), the declaration-site one for the kinds whose removal
+            // path does not release (the STACK / QUEUE, issue #8453).
+            isStringElementSlotPaired(srcTy, elTy);
         if (!elemDisp && arrIsStringElem)
             elemDisp = stringElementReleaseThunk();
     }

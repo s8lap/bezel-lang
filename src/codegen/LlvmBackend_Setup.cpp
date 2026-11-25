@@ -18689,7 +18689,14 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                             const sema::TypeRef* elt =
                                 (!collTy->genericArgs.empty())
                                     ? collTy->genericArgs[0] : nullptr;
-                            if (isStringElementTypeRef(elt))
+                            // fix #9100 / §3.6 rule 2 / §14.1 / §28.11
+                            // (v0.359): the release half of the pair (the
+                            // literal's retain is the take half) — the ARRAY
+                            // family's slot lifecycle is paired, so it reads
+                            // the SUBSTITUTED element type; the other kinds
+                            // keep the declaration-site reading (the STACK /
+                            // QUEUE, issue #8453).
+                            if (isStringElementSlotPaired(collTy, elt))
                                 d.collectionElemDisposer = stringElementReleaseThunk();
                         }
                         // fix #5173 / §28.11: for a borrowing Array<T> with
@@ -20941,7 +20948,13 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         // `!nullable` gate was issue #9064 / #8485.
         if (!d.collectionElemDisposer &&
                 ep.cat == ElementPolicy::Category::RuntimeManaged &&
-                isStringElementTypeRef(el)) {
+                // fix #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the
+                // release half of the pair (the copy's bulk retain is the
+                // take half — `emitArrayRetainStringsIfStringArray`) — the
+                // ARRAY family's slot lifecycle is paired, so it reads the
+                // SUBSTITUTED element type; the other kinds keep the
+                // declaration-site reading (the STACK / QUEUE, issue #8453).
+                isStringElementSlotPaired(rt, el)) {
             d.collectionElemDisposer = stringElementReleaseThunk();
         }
         disposeStack_.back().push_back(d);
@@ -23921,7 +23934,16 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                         // issue #9064 / #8485.
                         if (!d.collectionElemDisposer && !collIsOwning &&
                             cp.cat == ElementPolicy::Category::RuntimeManaged &&
-                            isStringElementTypeRef(collEl))
+                            // fix #9100 / §3.6 rule 2 / §14.1 / §28.11
+                            // (v0.359): the ASYNC twin of the scope-end free
+                            // (LlvmBackend_Setup.cpp ~24983) — it must read the
+                            // SAME element type the insert read: the SUBSTITUTED
+                            // one for the ARRAY family (whose slot lifecycle is
+                            // paired — its free / Remove / Clear), the
+                            // declaration-site one for the kinds whose removal
+                            // path does not release (the STACK / QUEUE, issue
+                            // #8453).
+                            isStringElementSlotPaired(collTy, collEl))
                             d.collectionElemDisposer = stringElementReleaseThunk();
                         disposeStack_.back().push_back(d);
                     }
@@ -25031,7 +25053,15 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 // `Dictionary<K, string?>` value.
                 if (!d.collectionElemDisposer &&
                         cp.cat == ElementPolicy::Category::RuntimeManaged &&
-                        isStringElementTypeRef(collEl)) {
+                        // fix #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359):
+                        // the scope-end free is the HALF that gives the slot's
+                        // reference back, so it must read the SAME element type
+                        // the insert read: the SUBSTITUTED one for the ARRAY
+                        // family (whose slot lifecycle is paired — its free /
+                        // Remove / Clear), the declaration-site one for the
+                        // kinds whose removal path does not release (the
+                        // STACK / QUEUE, issue #8453).
+                        isStringElementSlotPaired(collTy, collEl)) {
                     d.collectionElemDisposer = stringElementReleaseThunk();
                 }
             }
@@ -60660,7 +60690,14 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
         // retain/release no-op). The `!nullable` gate was issue #9064 / #8485.
         {
             bool litIsStrArr =
-                isStringElementTypeRef(elemRef) &&
+                // fix #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the
+                // literal's retain is the TAKE half of the pair (the local's
+                // scope-end free is the release half), so both halves read the
+                // SAME element type — the SUBSTITUTED one for the ARRAY family
+                // (the kind whose slot lifecycle is paired), the
+                // declaration-site one for the kinds whose removal path does
+                // not release (the STACK / QUEUE, issue #8453).
+                isStringElementSlotPaired(name, elemRef) &&
                 elementPolicyFor(elemRef, /*owning=*/false).cat ==
                     ElementPolicy::Category::RuntimeManaged &&
                 (name == "Array" || name == "Stack" || name == "Queue");
@@ -61377,11 +61414,21 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
     // keeps the `!nullable` gate above — its per-element retain is still
     // `!nullable`-gated, so releasing a `string?` there would be an unpaired
     // release (the double-free direction).
-    auto isStrElemCoOwned = [&](const sema::TypeRef* el, bool owning) {
+    // fix #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the RESOLVING form of
+    // the string-element test, for the kinds whose slot reference the
+    // collection gives back ITSELF (the ARRAY family) — the
+    // free must read the SAME element type the insert read, and §3.6's rule 2
+    // evaluates the element category at each instantiation, after substituting
+    // the type arguments (§14.1's monomorphization keeps the DECLARATION's
+    // spelling, so inside a monomorphized generic body the collection's
+    // `genericArgs[0]` is still the placeholder type parameter `T`).
+    // The `!nullable`-gated `isStrElem` above stays the LINKED-LIST's and the
+    // DICTIONARY's test — their per-element retain is `!nullable`-gated too.
+    auto isStrElemResolved = [&](const sema::TypeRef* el, bool owning) {
         if (!el) return false;
         ElementPolicy p = elementPolicyFor(el, owning);
         return p.cat == ElementPolicy::Category::RuntimeManaged &&
-               isStringElementTypeRef(el);
+               isStringElementSlotPaired(collTy, el);
     };
 
     // LinkedList / OwningLinkedList → bz_llist_free.
@@ -61392,14 +61439,17 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
             (!collTy->genericArgs.empty()) ? collTy->genericArgs[0] : nullptr;
         d.collectionElemDisposer = elementPolicyFor(el, isOwning).disposerThunk;
         // fix #9107 / §3.6 / §28.9 / §28.11 (v0.359): the `!nullable` gate is
-        // GONE — `isStrElemCoOwned` is the same test #9064 uses for the
+        // GONE — `isStrElemResolved` is the same test #9064 uses for the
         // array-backed family: a `string?` element is the same §28.11
         // *runtime-managed reference* row as a `string` one (§3.6's *Nullable
         // forms* rule reads the element category of `V?` as `V`, nullability
         // stripped), so the linked list co-owns a +1 per element — taken at
         // insert by `llIsStrElem` / `llitIsStrElem` / the source constructor's
         // `ctorRetainStr` — and gives it back here.
-        if (!d.collectionElemDisposer && isStrElemCoOwned(el, /*owning=*/false))
+        // (fix #9100: `isStrElemResolved` reads the declaration-site element
+        // type for a linked list — `isStringElementSlotPaired` resolves only
+        // for the ARRAY family — i.e. exactly #9107's test.)
+        if (!d.collectionElemDisposer && isStrElemResolved(el, /*owning=*/false))
             d.collectionElemDisposer = stringElementReleaseThunk();
         return d;
     }
@@ -61471,7 +61521,17 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
     // — a `string?` element included (the same §28.11 *runtime-managed
     // reference* row as `string`; null is the null-safe retain/release
     // no-op).
-    if (!d.collectionElemDisposer && isStrElemCoOwned(el, /*owning=*/false))
+    // fix #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the ARRAY family's
+    // free gives the slot's reference back, so it must read the SAME element
+    // type the insert read — the SUBSTITUTED one (§3.6's rule 2 evaluates the
+    // element category at each instantiation, after substituting the type
+    // arguments; §14.1's monomorphization keeps the DECLARATION's spelling, so
+    // inside a monomorphized generic body the collection's `genericArgs[0]` is
+    // still the placeholder type parameter `T`). The other array-backed kinds
+    // keep the declaration-site reading: their removal path does not give the
+    // slot's reference back (the STACK / QUEUE, issue #8453).
+    if (!d.collectionElemDisposer &&
+        isStrElemResolved(el, /*owning=*/false))
         d.collectionElemDisposer = stringElementReleaseThunk();
     return d;
 }

@@ -206,15 +206,19 @@ BEZEL_TEST(codegen_str_collection_release, string_fill_constructor_takes_a_refer
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
 }
 
-// #8654 / #8453 (§28.11 / §28.9, v0.357): inside a generic body at
-// `T = string`, `new Array<T>(n, x)` builds an `Array<T>` local, and such a
-// local takes and gives back no reference for its elements (#8453 is open).
-// The fill loop must not retain per slot there: keyed on the element type
-// seen through `T` it did, and every construction leaked the caller's
-// string (n = 1, 2, 3, and a fill through `G.Id(x)`; review F1 of the
-// first #8654 fix). Keyed on the WRITTEN element type the generic body
-// keeps its own model. 200x.
-BEZEL_TEST(codegen_str_collection_release, generic_body_fill_constructor_does_not_retain_at_t_string_8654_spec_28_11) {
+// #8654 / #8453 (§28.11 / §28.9, v0.357; #9100, v0.359): inside a generic
+// body at `T = string`, `new Array<T>(n, x)` builds an `Array<T>` local.
+// fix #9100: the generic body's collection co-owns its string elements like
+// the non-generic one does — the ELEMENT CATEGORY is fixed at the
+// INSTANTIATION (§3.6's rule 2, §14.1, §14.4), so the fill loop takes a
+// reference per slot and the array's free gives one back per slot: the PAIR
+// is balanced, and the caller's string is not leaked (n = 1, 2, 3, and a fill
+// through `G.Id(x)`; review F1 of the first #8654 fix). Before #9100 neither
+// half acted (the element type read through `T` fell past the string test),
+// and the row pinned that: the fill loop must not retain per slot there.
+// The row still pins what it pinned — the caller's string is neither leaked
+// nor over-released and the program's result is unchanged. 200x.
+BEZEL_TEST(codegen_str_collection_release, generic_body_fill_constructor_is_paired_with_its_free_at_t_string_8654_spec_28_11) {
     auto r = runAotChecked(
         "module M; "
         "class G "
