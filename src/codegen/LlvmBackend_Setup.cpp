@@ -40239,6 +40239,24 @@ bool Emitter::lowerClosureFieldStore(const ast::Expr& target,
 // `closureEscapingScopeEndRelease_`), unless the slot is a captured cell
 // (the env destructor owns it). A reassigned local that verdict does not
 // cover still gets the #4422 call-site release (`emitClosureCall`).
+// fix #9327 (§28.9, §28.11, v0.359): is `target` a NULLABLE function-typed
+// local that collectClosureReleaseEligible made an owned alias of an `Array`
+// element read (`var g := arr[0];`)? Such a local holds its own reference from
+// the bind, so each overwrite must take the new value's reference and give
+// the old one back, exactly as the non-nullable alias's does; a plain store
+// would leave the slot holding a value the scope-end release does not own.
+// bz_closure_retain / bz_closure_release are null-safe, so a `null` on either
+// side is a no-op. Keyed on the declaration the collect pass classified, and
+// only for a type that is a nullable Function at the AST level.
+bool Emitter::ownedNullableAliasTarget(const ast::Expr& target) const {
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(target));
+    if (!loc || !loc->decl ||
+        !closureAliasOwned_.count(static_cast<const void*>(loc->decl)))
+        return false;
+    const sema::TypeRef* tt = ctx_.exprType(target);
+    return tt && tt->nullable && tt->kind == sema::TypeRef::Kind::Function;
+}
+
 bool Emitter::lowerClosureLocalReassign(const ast::Expr& target,
                                         llvm::Value* slotAddr, llvm::Type* elemTy,
                                         llvm::Value* newVal,
@@ -40255,7 +40273,7 @@ bool Emitter::lowerClosureLocalReassign(const ast::Expr& target,
     // non-nullable scope) — bz_closure_retain/release are null-safe, but the
     // conservative scope keeps this increment in step with the rest of the
     // closure-local machinery rather than reasoning about a new surface.
-    if (tt->nullable) return false;
+    if (tt->nullable && !ownedNullableAliasTarget(target)) return false;
     llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slotAddr, "clol.old");
     // fix #4422 (cluster-revert, §27.5 / §28.9, v0.298): CONDITIONAL retain —
     // only retain when the assigned expression is NOT a +1 producer (a lambda,
@@ -40361,7 +40379,9 @@ bool Emitter::lowerCapturedClosureLocalReassign(const ast::Expr& target,
     // Must be a closure-typed captured local's cell.
     const sema::TypeRef* tt = ctx_.exprType(target);
     if (!tt || tt->kind != sema::TypeRef::Kind::Function) return false;
-    if (tt->nullable) return false;  // nullable: leave as plain store
+    // nullable: a plain store, except for a local that owns its reference
+    // from the bind (fix #9327, ownedNullableAliasTarget).
+    if (tt->nullable && !ownedNullableAliasTarget(target)) return false;
     llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), cellAddr, "clccr.old");
     bool isProducer = isPlusOneClosureProducer(valueExpr) ||
                       isUserMethodClosureReturnCall(valueExpr);
@@ -44946,6 +44966,12 @@ struct ClosureEscapeWalker {
 struct ClosureLocalAssignScan {
     const sema::SemaContext& ctx;
     std::unordered_set<const void*>& assigned;
+    // fix #9327: when set, the locals assigned through a COMPOUND form
+    // (`g ??= e;`), which lowers as a plain store.
+    std::unordered_set<const void*>* compound = nullptr;
+    // fix #9327: when set, the locals assigned (`:=`) from a built-in
+    // `Array` element read (`g := arr[i];`).
+    std::unordered_set<const void*>* fromArrayRead = nullptr;
 
     void target(const ast::Expr* e) {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -45029,6 +45055,30 @@ struct ClosureLocalAssignScan {
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
             // `x := e` and every compound form are one AssignmentStmt node.
             target(as->target.get());
+            if (fromArrayRead && as->op == ":=")
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->target.get()))
+                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                            ctx.exprSymbol(*id)))
+                        if (loc->decl && as->value) {
+                            auto* ix = dynamic_cast<const ast::IndexExpr*>(
+                                as->value.get());
+                            const sema::TypeRef* tt =
+                                ix && ix->target ? ctx.exprType(*ix->target)
+                                                 : nullptr;
+                            if (ix && ctx.exprSymbol(*ix) == nullptr && tt &&
+                                tt->headName() == "Array")
+                                fromArrayRead->insert(
+                                    static_cast<const void*>(loc->decl));
+                        }
+            if (compound && as->op != ":=")
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->target.get()))
+                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                            ctx.exprSymbol(*id)))
+                        if (loc->decl)
+                            compound->insert(
+                                static_cast<const void*>(loc->decl));
             expr(as->target.get()); expr(as->value.get()); return; }
         if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
             target(inc->target.get());
@@ -46283,8 +46333,12 @@ void Emitter::collectClosureReleaseEligible(
     // walker read `var cmp := g;` as an escape of `g`): the 64 B the
     // issue's control leaked.
     std::unordered_set<const void*> assignedLocals;
+    std::unordered_set<const void*> compoundAssignedLocals;
+    std::unordered_set<const void*> arrayReadAssignedLocals;
     {
         ClosureLocalAssignScan as{ctx_, assignedLocals};
+        as.compound = &compoundAssignedLocals;
+        as.fromArrayRead = &arrayReadAssignedLocals;
         for (auto& s : body) as.stmt(s.get());
     }
     std::function<bool(const ast::Expr*)> isBorrowedClosureRead =
@@ -46305,6 +46359,28 @@ void Emitter::collectClosureReleaseEligible(
                    dynamic_cast<sema::FieldSymbol*>(sym);
         }
         return false;
+    };
+    // fix #9327: an element read of a built-in `Array` (`arr[i]`), the one
+    // borrowed read a NULLABLE function-typed alias is admitted for.
+    auto isArrayElementRead = [&](const ast::Expr* e) -> bool {
+        auto* ix = dynamic_cast<const ast::IndexExpr*>(e);
+        if (!ix || ctx_.exprSymbol(*e) != nullptr || !ix->target) return false;
+        const sema::TypeRef* tt = ctx_.exprType(*ix->target);
+        return tt && tt->headName() == "Array";
+    };
+    // fix #9327: is the local declared by `s` captured by a lambda in this
+    // body? The capture machinery (cell ownership, the env destructor's
+    // content release) classifies only a NON-nullable function-typed local,
+    // so a captured nullable alias keeps the pre-fix behaviour.
+    auto isCapturedByLambda = [&](const ast::Stmt* s) -> bool {
+        ClosureEscapeWalker w{ctx_, static_cast<const void*>(s)};
+        w.scrutineeBorrowMode = true;
+        w.reassignedLocals = &assignedLocals;
+        for (auto& ss : body) {
+            w.stmt(ss.get());
+            if (w.escaped && !w.escapedDueToReassign) break;
+        }
+        return w.isCapturedCellSlot_;
     };
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
@@ -46359,6 +46435,55 @@ void Emitter::collectClosureReleaseEligible(
                     // fix #8440 / fix #8479: an alias owns its reference
                     // from the bind (see the header comment above) and is
                     // walked as a producer-initialized local.
+                    closureAliasOwned_.insert(static_cast<const void*>(s));
+                    candidates.push_back(s);
+                    closureLocalCandidates_.insert(
+                        static_cast<const void*>(s));
+                } else if (lt && lt->nullable &&
+                           lt->kind == sema::TypeRef::Kind::Function &&
+                           isArrayElementRead(v.init) &&
+                           !compoundAssignedLocals.count(
+                               static_cast<const void*>(s)) &&
+                           !isCapturedByLambda(s)) {
+                    // fix #9327 (§28.9, §28.11, v0.359): a NULLABLE function
+                    // value read out of an `Array` element is a second name
+                    // for the element's value, exactly as a non-nullable one
+                    // is, so it takes its own reference at the bind and is
+                    // walked as a producer-initialized local (`q01`-shaped:
+                    // a nullable local with a lambda initializer is
+                    // released at scope end the same way). Without it
+                    // `var g := arr[0]; arr.Clear(); g!()` called a cell
+                    // `Clear()` had released. The type gate is the AST-level
+                    // declared / inferred type of THIS declaration (never a
+                    // type parameter resolved at an instantiation), so a
+                    // generic body shared by several instantiations decides
+                    // the same way at each. A `:=` overwrite of such a local
+                    // retains the new value and releases the old
+                    // (ownedNullableAliasTarget); a COMPOUND overwrite
+                    // (`g ??= e;`) is a plain store and a CAPTURED local
+                    // takes the capture machinery, which classifies only a
+                    // non-nullable local, so both keep the pre-fix behaviour.
+                    closureAliasOwned_.insert(static_cast<const void*>(s));
+                    candidates.push_back(s);
+                    closureLocalCandidates_.insert(
+                        static_cast<const void*>(s));
+                } else if (lt && lt->nullable &&
+                           lt->kind == sema::TypeRef::Kind::Function &&
+                           dynamic_cast<const ast::NullLiteralExpr*>(v.init) &&
+                           arrayReadAssignedLocals.count(
+                               static_cast<const void*>(s)) &&
+                           !compoundAssignedLocals.count(
+                               static_cast<const void*>(s)) &&
+                           !isCapturedByLambda(s)) {
+                    // fix #9327 (§28.9, §28.11, v0.359): the ASSIGNED
+                    // spelling, `var g: (() -> int)? := null; … g := arr[0];`.
+                    // The `null` initializer owns nothing, so the slot owns
+                    // exactly what its assignments give it from the first
+                    // one on: each `:=` takes a reference to a borrowed
+                    // value, or a producer's, and releases the old one
+                    // (ownedNullableAliasTarget), and the scope-end release
+                    // gives the last one back. Admitted only for a local
+                    // some `:=` assigns from an `Array` element read.
                     closureAliasOwned_.insert(static_cast<const void*>(s));
                     candidates.push_back(s);
                     closureLocalCandidates_.insert(

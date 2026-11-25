@@ -23966,6 +23966,9 @@ private:
     // disclaims the reclaim MECHANISM ("reference counting... is not part
     // of this specification"); see the regression test file's header for
     // the full citation discussion.
+    // fix #9327: a nullable function-typed local that owns its reference
+    // from the bind (an owned alias of an `Array` element read).
+    bool ownedNullableAliasTarget(const ast::Expr& target) const;
     bool lowerClosureLocalReassign(const ast::Expr& target, llvm::Value* slotAddr,
                                    llvm::Type* elemTy, llvm::Value* newVal,
                                    const ast::Expr* valueExpr);
