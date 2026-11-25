@@ -38,6 +38,7 @@
 using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
+using bezel::test::runAotCheckedLenient;
 
 namespace {
 
@@ -260,41 +261,6 @@ const char* kBoxFieldReassignOutside =
     "  end Main;\n"
     "end Program;\n";
 
-// The generic-`T` store from INSIDE the generic body (`Set`): it releases the
-// value it displaces, and a lambda LITERAL passed to the `T` formal is the
-// caller's temporary, released once the call returns (the store took its own
-// reference).
-const char* kBoxSetOverwriteLiteral =
-    "module P;\n"
-    "import System;\n"
-    "import System.Collections;\n"
-    "public class H\n"
-    "  public cb: () -> int := lambda() => 3;\n"
-    "end H;\n"
-    "public class Box<T>\n"
-    "  public item: T;\n"
-    "  public constructor(x: T)\n"
-    "    item := x;\n"
-    "  end constructor;\n"
-    "  public method Set(x: T)\n"
-    "    item := x;\n"
-    "  end Set;\n"
-    "end Box;\n"
-    "public class Program\n"
-    "  public static method Main(): int\n"
-    "    var total := 0;\n"
-    "    var keep := new H();\n"
-    "    for var i in 0..<200 do\n"
-    "      using var b := new Box<() -> int>(keep.cb);\n"
-    "      b.Set(lambda() => 4);\n"
-    "      total := total + b.item();\n"
-    "    end for;\n"
-    "    total := total + keep.cb();\n"
-    "    Console.WriteLine(total);\n"
-    "    return 0;\n"
-    "  end Main;\n"
-    "end Program;\n";
-
 // A lambda LITERAL passed to the constructor's `T` formal: the store takes
 // the field's reference, so the caller's temporary must still be released.
 const char* kBoxCtorLiteral =
@@ -409,6 +375,95 @@ void expectClean(const char* src, const char* out) {
     BEZEL_EXPECT_EQ(r.stdoutText, std::string(out));
 }
 
+// fix-forward #9112 (§28.9 / §9.7, v0.359): a method whose declared return
+// is the bare `T` hands its caller the field's pointer with NO reference of
+// its own (#9239), so a generic-`T` field store must NOT release the value it
+// displaces: `var r := b.Get(); b.Set(lambda() => 7); r()` would call a freed
+// closure. §28.9 makes the function value's lifetime the runtime's, so `r`
+// stays callable. Review r43-rev-c44-9104-ff's r01e (straight-line).
+const char* kGetAliasThenSet =
+    "module P;\n"
+    "import System;\n"
+    "import System.Collections;\n"
+    "public class H\n"
+    "  public cb: () -> int := lambda() => 3;\n"
+    "end H;\n"
+    "public class Box<T>\n"
+    "  public item: T;\n"
+    "  public constructor(x: T)\n"
+    "    item := x;\n"
+    "  end constructor;\n"
+    "  public method Get(): T\n"
+    "    return item;\n"
+    "  end Get;\n"
+    "  public method Set(x: T)\n"
+    "    item := x;\n"
+    "  end Set;\n"
+    "end Box;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n"
+    "    var total := 0;\n"
+    "    var keep := new H();\n"
+    "    using var b := new Box<() -> int>(lambda() => 2);\n"
+    "    var r := b.Get();\n"
+    "    b.Set(lambda() => 7);\n"
+    "    total := total + r() + b.item();\n"
+    "    total := total + keep.cb();\n"
+    "    Console.WriteLine(total);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+// The same alias held in ANOTHER generic function (`Swap2<T>`), where no
+// guard local to the storing method could see it. Review probe r03.
+const char* kGetAliasInOtherGenericFunction =
+    "module P;\n"
+    "import System;\n"
+    "import System.Collections;\n"
+    "public class H\n"
+    "  public cb: () -> int := lambda() => 3;\n"
+    "end H;\n"
+    "public class Box<T>\n"
+    "  public item: T;\n"
+    "  public constructor(x: T)\n"
+    "    item := x;\n"
+    "  end constructor;\n"
+    "  public method Get(): T\n"
+    "    return item;\n"
+    "  end Get;\n"
+    "  public method Set(x: T)\n"
+    "    item := x;\n"
+    "  end Set;\n"
+    "end Box;\n"
+    "public class Program\n"
+    "  public static method Swap2<T>(b: Box<T>, x: T): T\n"
+    "    var old := b.Get();\n"
+    "    b.Set(x);\n"
+    "    return old;\n"
+    "  end Swap2;\n"
+    "  public static method Main(): int\n"
+    "    var total := 0;\n"
+    "    for var i in 0..<200 do\n"
+    "      using var b := new Box<() -> int>(lambda() => 2);\n"
+    "      var o := Swap2<() -> int>(b, lambda() => 9);\n"
+    "      total := total + o() + b.item();\n"
+    "    end for;\n"
+    "    Console.WriteLine(total);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+// Memory-safety oracle only: ASan stays armed (a use-after-free or double
+// free fails the row) but LeakSanitizer is off — the displaced value is kept
+// on purpose (a leak, tracked under #9239), so these rows pin the ABSENCE of
+// the use-after-free and the program's output.
+void expectSafe(const char* src, const char* out) {
+    JitResult r = runAotCheckedLenient(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string(out));
+}
+
 // True iff SOME diagnostic names the constructor shape the stdlib declares
 // for the LIFO/FIFO families (stdlib §4.11) and cites the issue.
 bool hasNoArgumentCtorDiagnostic(const JitResult& r) {
@@ -432,6 +487,9 @@ BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
     expectClean(kGenericTFieldRead, "600\n");
 }
 
+// CONTROL (green on staging as well; one of this suite's at most two named
+// controls): a builtin collection held in a generic `T` field keeps its slot's
+// own reference.
 BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
            generic_t_collection_field_slot_is_co_owned_spec_28_11) {
     expectClean(kGenericTCollectionField, "3\n");
@@ -465,11 +523,6 @@ BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
 }
 
 BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
-           generic_t_setter_store_of_a_literal_balances_spec_28_11) {
-    expectClean(kBoxSetOverwriteLiteral, "803\n");
-}
-
-BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
            generic_t_constructor_store_of_a_literal_balances_spec_28_11) {
     expectClean(kBoxCtorLiteral, "400\n");
 }
@@ -482,4 +535,14 @@ BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
 BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
            generic_array_t_field_element_store_balances_spec_28_11) {
     expectClean(kGenericBagArrayField, "1803\n");
+}
+
+BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
+           get_alias_survives_a_setter_store_spec_28_9) {
+    expectSafe(kGetAliasThenSet, "12\n");
+}
+
+BEZEL_TEST(ownership_generic_t_closure_field_ownership_9112,
+           get_alias_in_another_generic_function_survives_a_setter_store_spec_28_9) {
+    expectSafe(kGetAliasInOtherGenericFunction, "2200\n");
 }

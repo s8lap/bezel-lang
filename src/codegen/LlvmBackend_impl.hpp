@@ -17692,12 +17692,6 @@ private:
     // (issue #9112, exit 134). §14.1 / §3.6 rule 2 fix the element category at
     // the INSTANTIATION, so the substitution is what decides.
     bool isTypeParamFunctionFieldLvalue(const ast::Expr& target);
-    // fix-forward #9112 (§28.9 / §14.1, v0.359): has the function being
-    // emitted bound a LOCAL whose type is a bare type parameter the active
-    // substitution binds to a function type? Such a local holds no reference
-    // of its own, so lowerClosureFieldStore's generic-`T` arm must not release
-    // the value it displaces while one may still alias it.
-    bool bareTypeParamFunctionLocalBound();
     // fix-forward #9112: release, after a constructor call (either arm), each
     // +1 closure producer passed to a formal declared at the class's own bare
     // type parameter at a function-type instantiation, when the body only

@@ -32591,27 +32591,6 @@ bool Emitter::isTypeParamStringFieldLvalue(const ast::Expr& target) {
 // INSTANTIATION, after substituting the type arguments — so the substitution
 // is exactly what decides the row here, and the same substitution the
 // discharge half reads (isTypeParamBoundToFunction → resolveTypeParamRef).
-// fix-forward #9112 (§28.9 / §14.1, v0.359): see the declaration. `locals_`
-// holds every local bound so far in the function being emitted (an
-// over-approximation of the ones still in scope, which only widens the leak
-// side).
-bool Emitter::bareTypeParamFunctionLocalBound() {
-    for (const auto& kv : locals_) {
-        const sema::TypeRef* t = nullptr;
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(kv.first)) {
-            if (ld->type) t = ctx_.resolvedType(*ld->type);
-            else if (ld->initializer) t = ctx_.exprType(*ld->initializer);
-        } else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(kv.first)) {
-            if (lc->type) t = ctx_.resolvedType(*lc->type);
-            else if (lc->value) t = ctx_.exprType(*lc->value);
-        } else {
-            continue;
-        }
-        if (isTypeParamBoundToFunction(t)) return true;
-    }
-    return false;
-}
-
 bool Emitter::isTypeParamFunctionFieldLvalue(const ast::Expr& target) {
     if (isClosureFieldLvalue(target)) return false;  // the concrete twin's case
     if (!isTypeParamBoundToFunction(ctx_.exprType(target))) return false;
@@ -40060,38 +40039,41 @@ bool Emitter::lowerClosureFieldStore(const ast::Expr& target,
     // inside the generic body at `T = () -> int` (Box<T>'s constructor
     // `item := x`, a method's `item := x`). It is the same §28.11
     // *runtime-managed reference* slot as a directly-declared function-typed
-    // field, so it takes the SAME four steps as the concrete arm below:
-    // load-old, retain-or-transfer-new, store-new, release-old. This is the
-    // TAKE half of the pair whose DISCHARGE half is
-    // isTypeParamFunctionStorageMember's release at the owner's disposal.
+    // field, so the store takes the field's own reference as the concrete arm
+    // below does (retain-or-transfer-new, store-new). This is the TAKE half of
+    // the pair whose DISCHARGE half is isTypeParamFunctionStorageMember's
+    // release at the owner's disposal.
     //
-    // fix-forward #9112: the displaced value IS released. The field held a
-    // +1 of its own (this arm's take, or the concrete arm's for a store from
-    // outside the generic body), so a store that drops the field's pointer
-    // without giving that +1 back leaked it on EVERY reassignment — MEASURED:
-    // `b.Set(g); b.Set(lambda() => 4)` on a `Box<() -> int>` leaked one 64 B
-    // closure cell per overwrite. Retaining the new value BEFORE releasing the
-    // old keeps a self-assignment (`item := item`) from ever reaching zero.
-    //
-    // ONE exception keeps fix #4965's leak-over-UAF default: a bare-`T` LOCAL
-    // of this body. At `T = () -> int` such a local takes no reference of its
-    // own (its declared type is `T`, not a function type, so the closure-local
-    // retain never arms), so `var old := item; item := x; return old;` would
-    // dangle `old` if the store released what it displaced — MEASURED: a
-    // heap-use-after-free at the caller's `o()`. When any such local has been
-    // bound in this function the store keeps the displaced +1 (a leak, the
-    // safe direction); see bareTypeParamFunctionLocalBound. Issue #9239 is
-    // the alias's own missing reference, which would retire this guard.
+    // fix-forward #9112 (§28.9 / §9.7, v0.359): the displaced value is NOT
+    // released (fix #4965's leak-over-UAF default, kept). The release would
+    // be sound only if no un-referenced alias of the field existed anywhere,
+    // and one does: a method whose declared return is the bare `T` hands its
+    // caller the field's pointer with no reference of its own (#9239), so
+    // `var r := b.Get(); b.Set(lambda() => 7); r()` — or the same alias held
+    // in ANOTHER generic function, `var old := b.Get(); b.Set(x); return
+    // old;` — would call a freed closure. MEASURED with the release: a
+    // heap-use-after-free on both, where staging is clean or leaking. §28.9
+    // gives the value a runtime-managed lifetime that the alias must be able
+    // to rely on, so the store keeps the displaced +1 (one cell leaked per
+    // overwrite) until #9239 gives the alias its own reference; then this arm
+    // can release the old value exactly as the concrete arm below does.
     if (isTypeParamFunctionFieldLvalue(target)) {
         if (!fieldAddr || !newVal || !newVal->getType()->isPointerTy())
             return false;
-        llvm::Value* oldVal =
-            builder_.CreateLoad(ptrTy(), fieldAddr, "tpclf.old");
-        if (!isClosureSlotProducer(valueExpr))
-            emitClosureRetain(newVal);
+        if (!isClosureSlotProducer(valueExpr)) {
+            // A self-assignment (`item := item`) keeps the one reference the
+            // field already holds: with the displaced value kept, a retain of
+            // the SAME pointer would be a +1 nothing gives back. The retain is
+            // null-safe, so the unchanged case retains null (a no-op).
+            llvm::Value* oldVal =
+                builder_.CreateLoad(ptrTy(), fieldAddr, "tpclf.old");
+            llvm::Value* changed =
+                builder_.CreateICmpNE(oldVal, newVal, "tpclf.changed");
+            emitClosureRetain(builder_.CreateSelect(
+                changed, newVal, llvm::ConstantPointerNull::get(ptrTy()),
+                "tpclf.retain"));
+        }
         builder_.CreateStore(newVal, fieldAddr);
-        if (!bareTypeParamFunctionLocalBound())
-            emitClosureRelease(oldVal);
         return true;
     }
     if (!isClosureFieldLvalue(target)) return false;
