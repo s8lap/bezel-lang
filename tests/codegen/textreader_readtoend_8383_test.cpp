@@ -42,13 +42,14 @@
 // place — the "fail-without" arm). The second block is the CONTROL block: the
 // rows there pin behaviour that must NOT move (they are GREEN on both arms).
 //
-// THE CONTROL BLOCK'S `Console.In.ReadLine()` ROW is a "must not move" pin on
+// THE CONTROL BLOCK'S `Console.In.ReadLine()` ROW was a "must not move" pin on
 // a KNOWN, SEPARATE, PRE-EXISTING gap: `TextReader.ReadLine()` (stdlib §7.4's
-// other member) has no lowering arm either, so `Console.In.ReadLine()` still
-// degrades to a zero-initialised slot behind #2434's warning on BOTH arms. It
-// is NOT #8383's member and is deliberately NOT widened into this lane; the row
-// exists to prove this lane's `ReadToEnd` arm did not change it, and the gap
-// itself is reported in the lane handoff.
+// other member) had no lowering arm either, so `Console.In.ReadLine()`
+// degraded to a zero-initialised slot behind #2434's warning on BOTH arms. It
+// is NOT #8383's member and was deliberately NOT widened into this lane; the
+// gap itself was reported in the lane handoff — and fix #9260 closed it
+// (stdlib §7.4, v0.359), so that row's expectation MOVED with it (see the
+// row's own comment).
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -478,14 +479,21 @@ BEZEL_TEST(textreader_readtoend_8383, user_textwriter_subclass_still_dispatches_
     BEZEL_EXPECT_EQ(o.stdoutText, std::string("[a]<c>\n"));
 }
 
-// THE "MUST NOT MOVE" PIN on the SIBLING gap. `TextReader.ReadLine()`
-// (stdlib §7.4's other member) has NO lowering arm either, so
-// `Console.In.ReadLine()` still degrades to a zero-initialised slot behind
-// #2434's warning on BOTH arms and the narrowed read renders "0". This is a
-// KNOWN, SEPARATE, PRE-EXISTING gap — NOT #8383's member, and deliberately
-// NOT widened into this lane; it is reported in the lane handoff. The row
-// exists to prove this lane's `ReadToEnd` arm did not change it.
-BEZEL_TEST(textreader_readtoend_8383, console_in_read_line_is_unchanged_7_4) {
+// THE SIBLING GAP IS NOW CLOSED — fix #9260 (stdlib §7.4, v0.359). This row
+// was #8383's "MUST NOT MOVE" PIN on the sibling gap: `TextReader.ReadLine()`
+// (stdlib §7.4's other member) had NO lowering arm either, so
+// `Console.In.ReadLine()` degraded to a zero-initialised slot behind #2434's
+// warning and the narrowed read rendered "0". #9260 gave §7.4's `ReadLine()`
+// its arm, so the row's EXPECTATION MOVED: the read now returns the LINE
+// ("hello", the terminator stripped — §7.4's `ReadLine(): string?`), not the
+// degraded slot's "0". The row keeps its place (and its program) as the
+// cross-file pin that §7.4's line member reads the line; its own file's rows
+// are `tests/codegen/console_in_readline_read_9260_test.cpp`.
+//
+// (The row was RENAMED with its expectation: `console_in_read_line_is_unchanged_7_4`
+// → `console_in_read_line_reads_the_line_7_4`, because "is_unchanged" is
+// false after #9260.)
+BEZEL_TEST(textreader_readtoend_8383, console_in_read_line_reads_the_line_7_4) {
     const char* src =
         "module P;\n"
         "public class Program\n"
@@ -497,7 +505,7 @@ BEZEL_TEST(textreader_readtoend_8383, console_in_read_line_is_unchanged_7_4) {
     auto o = runWithStdin(src, "hello\nworld\n");
     BEZEL_EXPECT_TRUE(o.compiled);
     BEZEL_EXPECT_EQ(o.exitCode, 0);
-    BEZEL_EXPECT_EQ(o.stdoutText, std::string("[0]\n"));
+    BEZEL_EXPECT_EQ(o.stdoutText, std::string("[hello]\n"));
 }
 
 // A USER CLASS's own `ReadToEnd` is the USER's member (stdlib §1's

@@ -690,7 +690,7 @@ struct BuiltinParamRow {
     std::string_view sig;
 };
 
-constexpr std::array<BuiltinParamRow, 387> kBuiltinParams = {{
+constexpr std::array<BuiltinParamRow, 389> kBuiltinParams = {{
     // fix #7421 (stdlib §9.6, §5.1, §7.3, v0.345): the §9.6 `String` head's
     // DECLARED PARAMETER TYPES, transcribed from the standard library's own
     // listing.
@@ -1501,22 +1501,30 @@ constexpr std::array<BuiltinParamRow, 387> kBuiltinParams = {{
     // nullability mask is 0 (no position). The `sig` column carries the
     // declaration as the standard library writes it.
     //
-    // §7.4 declares `Read()` and `ReadLine()` on the same head and they are
-    // NOT transcribed here: neither has a lowering arm, so transcribing them
-    // would record a form the compiler cannot honour. `ReadToEnd` is
-    // transcribed because it IS honoured (the codegen arm in
-    // `src/codegen/LlvmBackend_Calls2.cpp`).
+    // §7.4 declares `Read()` and `ReadLine()` on the same head and they were
+    // NOT transcribed here while they had NO lowering arm: transcribing them
+    // would have recorded a form the compiler could not honour. fix #9260
+    // gave both a lowering arm (`src/codegen/LlvmBackend_Calls2.cpp`), so
+    // the ONE table now carries all THREE of §7.4's reader members, each in
+    // the standard library's own words.
     //
-    // THE ROW IS BEHAVIOURALLY INERT TODAY, and that is measured, not
+    // THE ROWS ARE BEHAVIOURALLY INERT TODAY, and that is measured, not
     // assumed: the §5.1 admission gate (`checkBuiltinCallAdmission`) reaches
     // the VALUE built-ins only, `builtinParamNameCandidates` skips a row
     // that carries no §22.5 name, `builtinParamIsNonNullable` asks a
     // POSITION and this form has none, and the arity gates are keyed on the
     // `Math` / `Convert` / `Path` / `Directory` / `File` / `Environment` /
-    // `string` / value-built-in heads. The row records the DECLARED FORM so
-    // the ONE table carries the built-in member the way it carries every
+    // `string` / value-built-in heads. The rows record the DECLARED FORMS so
+    // the ONE table carries the built-in members the way it carries every
     // other declared built-in form.
     {"TextReader", "ReadToEnd", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ReadToEnd(): string"},
+    // fix #9260 (stdlib §7.4, v0.359): `TextReader`'s `Read(): int` — the
+    // next code point of standard input, or -1 at the end of it — and
+    // `TextReader`'s `ReadLine(): string?` — one line, or NULL at the end of
+    // the input. Both take NO parameter, so the columns are empty the same
+    // way `ReadToEnd`'s are.
+    {"TextReader", "Read", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Read(): int"},
+    {"TextReader", "ReadLine", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ReadLine(): string?"},
 }};
 
 

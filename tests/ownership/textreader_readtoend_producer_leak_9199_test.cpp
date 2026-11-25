@@ -325,13 +325,19 @@ BEZEL_TEST(textreader_readtoend_producer_leak_9199,
 // ===========================================================================
 
 // THE `ReadLine()` TWIN the issue asks about. `TextReader.ReadLine()`
-// (stdlib §7.4's other member) has NO lowering arm at all — the gap the
-// #8383 lane deliberately did not widen — so `Console.In.ReadLine()` degrades
-// to a zero-initialised slot behind #2434's warning and reads NOTHING. It
-// therefore mints no string and leaks nothing, on the base and on the tip.
+// (stdlib §7.4's other member) had NO lowering arm at all — the gap the
+// #8383 lane deliberately did not widen — so `Console.In.ReadLine()` degraded
+// to a zero-initialised slot behind #2434's warning and read NOTHING. It
+// therefore minted no string and leaked nothing, on the base and on the tip.
 // The row pins THAT (the leak property this issue is about), not the
 // degraded output: a future fix that gives `ReadLine()` a lowering must not
 // make it leak.
+//
+// fix #9260 (stdlib §7.4, v0.359) IS that future fix: §7.4's `ReadLine()`
+// now HAS a lowering arm, so every one of the 200 reads MINTS a line — and
+// the row's expectation is UNCHANGED (the stdout is still "200" and the leak
+// oracle still says zero), which is exactly what the row was written to pin:
+// the lowering must not make the read line leak.
 BEZEL_TEST(textreader_readtoend_producer_leak_9199,
            the_in_readline_twin_leaks_nothing_7_4) {
     auto o = runWithStdin(

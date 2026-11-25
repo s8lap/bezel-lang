@@ -31231,6 +31231,61 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             TextReaderReceiverKind::None)
             return true;  // emitTextReaderReadToEnd → initStringRc → rc=1
     }
+    // fix #9260 (stdlib §7.4 / §2.1 / §4.6 / §28.3 / §28.9, v0.359): the
+    // built-in `TextReader.ReadLine(): string?` is a +1 string PRODUCER — the
+    // §7.4 sibling of the `ReadToEnd` arm above.
+    //
+    // WHY IT IS A PRODUCER. stdlib §7.4 declares, on the abstract
+    // `TextReader`,
+    //
+    //     public abstract method ReadLine(): string?;  // null at EOF
+    //
+    // and stdlib §2.1 declares `Console.In` as that class's ONE instance. The
+    // `ReadLine` lowering (`emitConsoleReadLine`, LlvmBackend_Calls.cpp —
+    // the SAME reader §2.1's `Console.ReadLine()` uses) reads one line from
+    // standard input into a heap buffer and mints the result the way every
+    // fresh string production is minted: a `malloc`'d `bz.string` header
+    // whose rc is set to 1 (`initStringRc`) — the producer's reference, §28.3's
+    // "Fresh productions are owned" and §28.9's "the implementation reclaims
+    // the production" (§4.6: "`string` is runtime-managed: its memory is
+    // reclaimed automatically"). So the CALLER owns exactly ONE reference to
+    // it.
+    //
+    // WITHOUT THIS ARM every consumer treated the result as a BORROW and
+    // never discharged the producer's +1: the bound local was not a release
+    // candidate at all, so nothing released it and the read line leaked once
+    // per read. That leak is the ONE #9213 MEASURED for §2.1's own
+    // `Console.ReadLine()` — the same reader, the same shape, the same
+    // missing arm: 38 bytes in 2 allocations for one read, and 7600 bytes in
+    // 400 allocations over a 200-iteration loop (generated-code
+    // LeakSanitizer). On the BASE of this issue the leak cannot be seen at
+    // all, because the call was not lowered and minted NOTHING — the arm is
+    // what keeps the new lowering leak-free.
+    //
+    // A bound local TRANSFERS the single reference (no extra retain) and the
+    // scope-end release drops rc 1->0 exactly once; a call argument and the
+    // `Console.Write` #1031 arm discharge it at the end of the full
+    // expression. No double free: an ESCAPING local is excluded from the
+    // scope-end release by the escape walk (its +1 then leaks — the safe
+    // direction).
+    //
+    // THE NULL AT EOF. The result is `string?`: at end of input the call
+    // returns NULL and mints NOTHING. The arm says only WHETHER the call can
+    // mint a fresh production, never whether THIS run produced a value, and
+    // the runtime's string release is null-safe — so the EOF case discharges
+    // nothing and crashes nothing.
+    //
+    // THE DISCRIMINATOR IS THE LOWERING'S OWN (`classifyTextReaderReadLine`,
+    // `src/codegen/LlvmBackend_TextReader.hpp`), so the two halves agree on
+    // WHICH call is the built-in member: the SYNTACTIC receiver `Console.In`,
+    // or a VALUE of the built-in `TextReader` type. A USER's own `ReadLine`
+    // (its callee resolves to a MethodSymbol) and a USER class named
+    // `TextReader` are both excluded, exactly as the lowering excludes them.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (classifyTextReaderReadLine(*call, ctx_) !=
+            TextReaderReceiverKind::None)
+            return true;  // emitConsoleReadLine → initStringRc → rc=1
+    }
     // fix #8016 (stdlib §7.3 / §4.6 / §28.9, v0.350): `File.ReadAllText(path)`
     // is a +1 string PRODUCER — the §7.3 sibling of #7865's §7.4 `Path` arm
     // above.

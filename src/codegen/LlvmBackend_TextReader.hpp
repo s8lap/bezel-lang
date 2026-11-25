@@ -1,14 +1,13 @@
 #pragma once
 
 // fix #9199 (stdlib §7.4 / §2.1 / §4.6 / §28.3 / §28.9, v0.359): the ONE
-// classifier for the built-in `TextReader.ReadToEnd(): string` call.
+// classifier for the built-in `TextReader` member calls.
 //
-// WHY THIS HEADER EXISTS. One question about the built-in reader's
-// read-to-EOF member is asked from TWO translation units, and the two answers
-// must agree:
+// WHY THIS HEADER EXISTS. One question about the built-in reader's members
+// is asked from TWO translation units, and the two answers must agree:
 //
 //   1. the LOWERING (LlvmBackend_Calls2.cpp): "is this call the built-in
-//      `TextReader.ReadToEnd()`?" — the built-in `TextReader` carries NO
+//      `TextReader` member?" — the built-in `TextReader` carries NO
 //      member surface in sema (it has no `TypeDecl`), so the ordinary member
 //      dispatch cannot find the call and an arm must recognise it
 //      STRUCTURALLY (fix #8383);
@@ -25,9 +24,9 @@
 // discipline `LlvmBackend_IndexerParams.hpp` states for the indexer's
 // index-parameter shape.
 //
-// THE RECEIVER. stdlib §7.4 declares `ReadToEnd` on the abstract
-// `TextReader`, and §2.1 declares `Console.In` as its one instance. Two
-// spellings reach the member:
+// THE RECEIVER. stdlib §7.4 declares `ReadToEnd`, `ReadLine` and `Read` on
+// the abstract `TextReader`, and §2.1 declares `Console.In` as its one
+// instance. Two spellings reach the member:
 //
 //   * `Console.In.ReadToEnd()` — the receiver is the built-in `Console`
 //     class's `In` PROPERTY read. The read itself is left UNTYPED by sema
@@ -47,6 +46,20 @@
 //
 // ⇒ `Console.In` is the only `TextReader` instance stdlib §7.4 admits, so
 // BOTH receivers denote the same reader — standard input.
+//
+// THE MEMBERS. §7.4 declares three, and each has its own classifier here so
+// the lowering and the consumer-side classification can ask about ONE member
+// each:
+//
+//   * `ReadToEnd(): string` — #8383's arm (the read-to-EOF member);
+//   * `ReadLine(): string?` — #9260's arm (the line member, NULL at EOF);
+//   * `Read(): int` — #9260's arm (the next-code-point member, -1 at EOF).
+//
+// ⇒ `Read()` and `ReadLine()` are the members #9260's issue names: they had
+// NO lowering arm at all, so the calls degraded to a zero-initialised slot
+// behind #2434's warning and read NOTHING.
+
+#include <string_view>
 
 #include "ast/Node.hpp"
 #include "sema/SemaContext.hpp"
@@ -55,29 +68,41 @@
 
 namespace bezel::codegen {
 
-// Which receiver the built-in `TextReader.ReadToEnd()` call has.
+// Which receiver the built-in `TextReader` member call has.
 enum class TextReaderReceiverKind {
     None,       // not the built-in member — the ordinary dispatch owns it
     ConsoleIn,  // `Console.In.ReadToEnd()` — the syntactic receiver
     TypedValue, // `r.ReadToEnd()` on a value of the built-in `TextReader` type
 };
 
-// Is `call` the built-in `TextReader.ReadToEnd()` member call? (§7.4)
-inline TextReaderReceiverKind classifyTextReaderReadToEnd(
-    const ast::CallExpr& call, const sema::SemaContext& ctx) {
-    if (!call.callee) return TextReaderReceiverKind::None;
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
-    if (!ma || !ma->target) return TextReaderReceiverKind::None;
-    // §7.4: `ReadToEnd()` takes no argument.
-    if (ma->member != "ReadToEnd" || !call.args.empty())
-        return TextReaderReceiverKind::None;
-    // A USER-declared `ReadToEnd` on a user receiver is the user's own
-    // member: the ordinary dispatch owns it, and this arm must not claim it.
-    if (dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*call.callee)))
-        return TextReaderReceiverKind::None;
-    // (1) `Console.In.ReadToEnd()` — the syntactic receiver.
-    if (auto* inner =
-            dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get())) {
+// The RECEIVER of a built-in `TextReader` member access (§7.4): the ONE
+// recognition every member of the built-in reader shares.
+//
+// ⇒ The SYNTACTIC receiver `Console.In` — the built-in `Console` class's `In`
+//   PROPERTY read. The read itself is left UNTYPED by sema (§2.1's rule, of
+//   which `Console.In` is an instance — the same "syntactic receiver"
+//   treatment `Console.Out` / `Console.Error` get), so the receiver is
+//   recognised SYNTACTICALLY, exactly as `tryLowerConsoleCall` recognises
+//   `Console.Out.WriteLine(x)`. A VALUE named `Console` is member access, not
+//   the built-in class (fix #8126, §2.7 rule 1, v0.355).
+//
+// ⇒ The TYPED receiver `r` — a value of the built-in `TextReader` type,
+//   recognised by its TYPE (a declaration-less Named ref whose head is
+//   `TextReader`), the same discriminator `isBuiltinTextWriterTypeRef` uses
+//   for the `TextWriter` family.
+//
+// ⇒ A USER class of the same name is excluded: `TextReader` is a built-in
+//   class head, so a user declaration of that name has its OWN member surface
+//   and its own dispatch.
+//
+// ⇒ `Console.In` is the only `TextReader` instance stdlib §7.4 admits, so
+//   BOTH receivers denote the same reader — standard input.
+inline TextReaderReceiverKind classifyTextReaderReceiver(
+    const ast::MemberAccessExpr& ma, const sema::SemaContext& ctx) {
+    if (!ma.target) return TextReaderReceiverKind::None;
+    // (1) `Console.In.<member>()` — the syntactic receiver.
+    if (auto* inner = dynamic_cast<const ast::MemberAccessExpr*>(
+            ma.target.get())) {
         if (inner->member == "In" && inner->target) {
             if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
                     inner->target.get())) {
@@ -91,11 +116,65 @@ inline TextReaderReceiverKind classifyTextReaderReadToEnd(
         }
     }
     // (2) a value of the built-in `TextReader` type.
-    const sema::TypeRef* rt = ctx.exprType(*ma->target);
+    const sema::TypeRef* rt = ctx.exprType(*ma.target);
     if (rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
         rt->headName() == "TextReader")
         return TextReaderReceiverKind::TypedValue;
     return TextReaderReceiverKind::None;
+}
+
+// The SHAPE every built-in `TextReader` member call shares (§7.4): a
+// zero-argument member access on the built-in reader, whose callee sema did
+// NOT resolve to a user-declared method.
+//
+// THE ARITY. §7.4 declares `Read()`, `ReadLine()` and `ReadToEnd()` with NO
+// parameter, so only the zero-argument call is the built-in member.
+//
+// THE USER'S OWN MEMBER. A callee that resolves to a `MethodSymbol` is a
+// user-declared member (stdlib §1's Extensibility — a user class may derive
+// from `TextReader` and own its own `ReadLine`), so the ordinary dispatch
+// owns it and this arm must not claim it.
+inline TextReaderReceiverKind classifyTextReaderMember(
+    const ast::CallExpr& call, const sema::SemaContext& ctx,
+    std::string_view member) {
+    if (!call.callee) return TextReaderReceiverKind::None;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return TextReaderReceiverKind::None;
+    if (ma->member != member || !call.args.empty())
+        return TextReaderReceiverKind::None;
+    if (dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*call.callee)))
+        return TextReaderReceiverKind::None;
+    return classifyTextReaderReceiver(*ma, ctx);
+}
+
+// Is `call` the built-in `TextReader.ReadToEnd()` member call? (§7.4)
+inline TextReaderReceiverKind classifyTextReaderReadToEnd(
+    const ast::CallExpr& call, const sema::SemaContext& ctx) {
+    return classifyTextReaderMember(call, ctx, "ReadToEnd");
+}
+
+// fix #9260 (stdlib §7.4, v0.359): is `call` the built-in
+// `TextReader.ReadLine(): string?` member call?
+//
+// §7.4 declares `public abstract method ReadLine(): string?;  // null at EOF`
+// on the abstract `TextReader`, and §2.1 declares `Console.In` as that
+// class's ONE instance — so `Console.In.ReadLine()` and `r.ReadLine()` on a
+// value of the built-in `TextReader` type are the SAME read of standard
+// input, through the same arm (the §7.4 sibling of #8383's `ReadToEnd`).
+inline TextReaderReceiverKind classifyTextReaderReadLine(
+    const ast::CallExpr& call, const sema::SemaContext& ctx) {
+    return classifyTextReaderMember(call, ctx, "ReadLine");
+}
+
+// fix #9260 (stdlib §7.4, v0.359): is `call` the built-in
+// `TextReader.Read(): int` member call?
+//
+// §7.4 declares `public abstract method Read(): int;  // next char as int, or
+// -1 at EOF` on the abstract `TextReader` — the §7.4 sibling of #8383's
+// `ReadToEnd`.
+inline TextReaderReceiverKind classifyTextReaderRead(
+    const ast::CallExpr& call, const sema::SemaContext& ctx) {
+    return classifyTextReaderMember(call, ctx, "Read");
 }
 
 }  // namespace bezel::codegen

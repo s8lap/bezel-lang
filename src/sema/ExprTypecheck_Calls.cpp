@@ -39749,6 +39749,51 @@ static bool lazySentinelCommitsMemberName(std::string_view m) {
            m == "GetType" || m == "GetEnumerator" || m == "Dispose";
 }
 
+// fix #9260 (stdlib §7.4, §2.1, v0.359): is the receiver of the member
+// access `ma` the built-in `TextReader`?
+//
+// THE RECEIVER. stdlib §7.4 declares `ReadToEnd` / `ReadLine` / `Read` on the
+// abstract `TextReader`, and stdlib §2.1 declares `Console.In` as that
+// class's ONE instance ("`TextReader` has no concrete subclass in this
+// library: its one instance is `Console.In`"). Two spellings reach the
+// member:
+//
+//   * `Console.In.ReadLine()` — the SYNTACTIC receiver: the built-in
+//     `Console` class's `In` PROPERTY read, which sema leaves UNTYPED outside
+//     a call-argument position (§2.1's rule — `consoleStreamArgumentType`,
+//     ExprTypecheck_Exprs.cpp), so it is recognised structurally. A VALUE
+//     named `Console` is member access on the user's own object, not the
+//     built-in class (fix #8126, §2.7 rule 1, v0.355).
+//
+//   * `r.ReadLine()` — the TYPED receiver: a value of the built-in
+//     `TextReader` type (a declaration-less Named ref whose head is
+//     `TextReader`), so a USER class of that name keeps its own member
+//     surface.
+//
+// ⇒ BOTH receivers denote the same reader — standard input.
+static bool builtinTextReaderReceiver(SemaContext& ctx,
+                                      const ast::MemberAccessExpr& ma) {
+    if (!ma.target) return false;
+    // (1) `Console.In.<member>()` — the syntactic receiver.
+    if (auto* inner =
+            dynamic_cast<const ast::MemberAccessExpr*>(ma.target.get())) {
+        if (inner->member == "In" && inner->target) {
+            if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
+                    inner->target.get())) {
+                if (cid->name == "Console" &&
+                    receiverMayReachBuiltinStaticArm(ctx.exprSymbol(*cid)))
+                    return true;
+            }
+        }
+    }
+    // (2) `r.<member>()` on a value of the built-in `TextReader` type.
+    const TypeRef* rt = ctx.exprType(*ma.target);
+    if (rt && rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+        rt->headName() == "TextReader")
+        return true;
+    return false;
+}
+
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // §16.3 / stdlib §9.8 (#6798): `Range<T>.Start` and `.End` are `T?`
     // ("a `null` endpoint indicates the range is open-ended on that side").
@@ -39833,33 +39878,68 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // and is not typed here either.
     if (ma.target && ma.member == "ReadToEnd" && &ma == calleeOfCallCtx_ &&
         currentCallArity_ == 0) {
-        bool builtinReceiver = false;
-        // (1) `Console.In.ReadToEnd()` — the syntactic receiver.
-        if (auto* inner = dynamic_cast<const ast::MemberAccessExpr*>(
-                ma.target.get())) {
-            if (inner->member == "In" && inner->target) {
-                if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
-                        inner->target.get())) {
-                    // fix #8126 (§2.7 rule 1, v0.355): a VALUE named `Console`
-                    // is member access on the user's own object, not the
-                    // built-in reader.
-                    if (cid->name == "Console" &&
-                        receiverMayReachBuiltinStaticArm(
-                            ctx_.exprSymbol(*cid)))
-                        builtinReceiver = true;
-                }
-            }
-        }
-        // (2) `r.ReadToEnd()` on a value of the built-in `TextReader` type.
-        if (!builtinReceiver) {
-            const TypeRef* rt = ctx_.exprType(*ma.target);
-            if (rt && rt->kind == TypeRef::Kind::Named && !rt->declaration &&
-                rt->headName() == "TextReader")
-                builtinReceiver = true;
-        }
-        if (builtinReceiver) {
+        // fix #9260: the receiver recognition is now the ONE helper
+        // `builtinTextReaderReceiver` (above) — a literal extraction of the
+        // two tests this arm spelled out, so the three members of the built-in
+        // reader cannot drift on WHICH call is the built-in one.
+        if (builtinTextReaderReceiver(ctx_, ma)) {
             ctx_.setExprType(&ma,
                              ctx_.primitiveTypeRef(PrimitiveType::String));
+            return;
+        }
+    }
+    // fix #9260 (stdlib §7.4, §2.1, v0.359): `TextReader.ReadLine(): string?`
+    // and `TextReader.Read(): int` — the built-in reader's two remaining
+    // members.
+    //
+    // stdlib §7.4 (v0.359) declares, on the abstract `TextReader`,
+    //
+    //     public abstract method Read(): int;        // next char as int, or
+    //                                                 //   -1 at EOF
+    //     public abstract method ReadLine(): string?; // null at EOF
+    //
+    // and stdlib §2.1 (v0.359) declares `Console.In` as that class's ONE
+    // instance, so both members are the standard input's readers and both
+    // must work.
+    //
+    // WHY THE MISSING TYPE IS A DEFECT AND NOT A COSMETIC ONE — the #9057
+    // story: an untyped initializer infers NOTHING for the local it binds
+    // (§21.1's `var greeting := "Hello"; // type inferred`), so
+    //
+    //     var l := Console.In.ReadLine();
+    //     Console.WriteLine(l.Length);
+    //
+    // had no `string` receiver for codegen's §9.6 string-member dispatch to
+    // find (`tryLowerStringMethod`'s `tt->primitive == PrimitiveType::String`
+    // gate), and the `l <> null` comparison had no nullable type to narrow.
+    //
+    // THE DISCRIMINATOR IS CODEGEN'S OWN (`classifyTextReaderReadLine` /
+    // `classifyTextReaderRead`, `src/codegen/LlvmBackend_TextReader.hpp`), so
+    // the two halves agree on WHICH call is the built-in member: the
+    // SYNTACTIC receiver `Console.In` or a VALUE of the built-in `TextReader`
+    // type, exactly as `classifyTextReaderReadToEnd` answers for §7.4's
+    // third member — and both halves read the ONE helper
+    // `builtinTextReaderReceiver` (above).
+    //
+    // THE ARITY GATE. §7.4's declarations take NO parameter, so only the
+    // zero-argument call is the built-in member — the same gate the #9057 arm
+    // reads, and for the same reason: codegen's #2966 gate reads "SEMA never
+    // typed the call either" as one of its conjuncts, so typing an
+    // arity-wrong call would SILENCE that refusal. A BARE reference
+    // (`var f := Console.In.ReadLine;`) is not a call and is not typed here
+    // either.
+    if (ma.target && &ma == calleeOfCallCtx_ && currentCallArity_ == 0 &&
+        (ma.member == "ReadLine" || ma.member == "Read")) {
+        if (builtinTextReaderReceiver(ctx_, ma)) {
+            // §7.4: `ReadLine(): string?` — NULL at EOF; `Read(): int` — the
+            // next code point, -1 at EOF.
+            if (ma.member == "ReadLine")
+                ctx_.setExprType(
+                    &ma,
+                    ctx_.primitiveTypeRef(PrimitiveType::String,
+                                          /*nullable=*/true));
+            else
+                ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
             return;
         }
     }

@@ -11443,6 +11443,114 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             }
         }
     }
+    // fix #9260 (stdlib §7.4 / §2.1, v0.359): `TextReader.ReadLine(): string?`
+    // and `TextReader.Read(): int` — the built-in reader's TWO remaining
+    // members.
+    //
+    // THE GAP. stdlib §7.4 (v0.359) declares, on the abstract `TextReader`,
+    //
+    //     public abstract method Read(): int;        // next char as int, or
+    //                                                 //   -1 at EOF
+    //     public abstract method ReadLine(): string?; // null at EOF
+    //
+    // and stdlib §2.1 (v0.359) declares `Console.In` as that class's ONE
+    // instance, so BOTH members are the standard input's readers and both
+    // must work. NEITHER had a lowering arm: the call lowered to NOTHING, the
+    // local it initialised was zero-initialised behind #2434's warning, and
+    // the program exited 0 having printed the wrong value — the
+    // silent-wrong-code shape (the same shape #8383 closed for §7.4's third
+    // member, `ReadToEnd`).
+    //
+    // Intercepted HERE — beside #8383's arm, before the ordinary member
+    // dispatch and before its "no dispatch arm emitted any code" refusal
+    // (#2935) — because the built-in `TextReader` carries no MethodSymbol for
+    // the ordinary path to find.
+    //
+    // THE RECEIVER. The same two spellings #8383's arm serves, read through
+    // the same classifier header (`src/codegen/LlvmBackend_TextReader.hpp`):
+    // the SYNTACTIC `Console.In` and the TYPED value of the built-in
+    // `TextReader` type. `Console.In` is §2.1's ONE instance, so BOTH denote
+    // standard input.
+    {
+        const TextReaderReceiverKind rlKind =
+            classifyTextReaderReadLine(call, ctx_);
+        if (rlKind != TextReaderReceiverKind::None) {
+            // The receiver of a member call is an EVALUATED OPERAND (§22.3).
+            // For the `Console.In` spelling the property read denotes the
+            // standard input and has NO run-time effect, so it is not
+            // lowered (the `Console.In` property read has no codegen arm, and
+            // lowering it would emit #2434) — the syntactic receiver is
+            // recognised, exactly as `tryLowerConsoleCall` recognises
+            // `Console.Out.WriteLine(x)`. For the typed spelling the value IS
+            // the reader: it is lowered for its effects, exactly once, before
+            // the read.
+            bool receiverOk = true;
+            if (rlKind == TextReaderReceiverKind::TypedValue) {
+                auto* rteMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                    call.callee.get());
+                receiverOk =
+                    rteMa && lowerExpr(*rteMa->target) != nullptr;
+            }
+            if (receiverOk) {
+                // THE READ. §2.1's `Console.ReadLine()` reader — the same
+                // `fgets`-on-`stdin` shape, the same trailing-'\n' strip
+                // (§7.4's `ReadLine` returns the line WITHOUT its
+                // terminator, as §2.1's does), the same NULL at EOF — so the
+                // two members AGREE on what a line of standard input is, and
+                // the minted string has the same {data, len, width=1, rc=1}
+                // shape (the producer's reference, §4.6 / #422), which is what
+                // `Emitter::isPlusOneStringProducer`'s arm discharges.
+                llvm::Value* line = emitConsoleReadLine();
+                if (line) {
+                    // fix #9260 (§7.4): the RESULT is a `string?` — stamp it
+                    // so the call's type is the member's declared return type
+                    // and the `l <> null` narrowing has a nullable type to
+                    // narrow (the #9057 story).
+                    ctx_.setExprType(
+                        &call,
+                        ctx_.primitiveTypeRef(sema::PrimitiveType::String,
+                                              /*nullable=*/true));
+                    return line;
+                }
+            }
+        }
+    }
+    {
+        const TextReaderReceiverKind rKind =
+            classifyTextReaderRead(call, ctx_);
+        if (rKind != TextReaderReceiverKind::None) {
+            bool receiverOk = true;
+            if (rKind == TextReaderReceiverKind::TypedValue) {
+                auto* rteMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                    call.callee.get());
+                receiverOk =
+                    rteMa && lowerExpr(*rteMa->target) != nullptr;
+            }
+            if (receiverOk) {
+                // THE READ. `getchar()` — the next code point of standard
+                // input as an `int`, or EOF (-1) at the end of it (§7.4's
+                // `Read(): int`, "next char as int, or -1 at EOF"). The same
+                // libc call §2.1's `Console.ReadKey()` lowering uses, with the
+                // same `EOF == -1` reading (glibc and musl, the two supported
+                // C libraries, both define `EOF` as -1).
+                auto* gcFn = module_->getFunction("getchar");
+                if (!gcFn) {
+                    auto* ft =
+                        llvm::FunctionType::get(i32(), {}, false);
+                    gcFn = llvm::Function::Create(
+                        ft, llvm::Function::ExternalLinkage, "getchar",
+                        module_.get());
+                }
+                llvm::Value* codePoint =
+                    builder_.CreateCall(gcFn, {}, "read.codepoint");
+                // fix #9260 (§7.4): the RESULT is an `int` — stamp it so the
+                // call's type is the member's declared return type.
+                ctx_.setExprType(
+                    &call, ctx_.primitiveTypeRef(sema::PrimitiveType::Int));
+                return codePoint;
+            }
+        }
+    }
     // stdlib §5 (#755): the #1296 hand-rolled IGrouping terminal slot used to sit
     // here. It is gone: an IGrouping receiver is now restated as its element
     // `Array<T>` in tryLowerLazyLinqCall / tryLowerCollectionInstanceCall below,
