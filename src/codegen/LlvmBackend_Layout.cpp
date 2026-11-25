@@ -6952,6 +6952,16 @@ void Emitter::fixupCapturedCellHolderReads() {
         auto* ld = llvm::dyn_cast_or_null<llvm::Instruction>(
             static_cast<llvm::Value*>(p.load));
         if (!ld || !ld->getParent() || !ld->getFunction()) continue;
+        // fix #9210 (§27.5 / §28.9, v0.359): a read whose fall-back is NULL
+        // carries NO sync slot. It is a capture cell's scope-end RECLAIM
+        // (`Emitter::emitDisposals`'s `boxedCellFree` / deferred-free /
+        // `cellRelease` arms), which wants "the cell, or NOTHING" — not the
+        // variable's pre-boxing storage, which is not a cell at all. Its
+        // fall-back is the constant null, so it needs neither the sync slot
+        // (DECLINE 2 below) nor the state-machine round-trip (DECLINE 3): a
+        // constant is the same after a resume.
+        const bool nullFallback =
+            !static_cast<llvm::Value*>(p.syncSlot);
         // DECLINE 2 — the fall-back slot is gone, has been moved out of this
         // function, or is now a value the lowered read cannot address.
         // Originally: "must be an AllocaInst of this function" — that is what
@@ -6965,17 +6975,19 @@ void Emitter::fixupCapturedCellHolderReads() {
         // nulls on true deletion, so a destroyed GEP still declines.
         // Anything else (a constant, a phi, an unrelated instruction) is
         // declined exactly as before.
-        auto* syncInst = llvm::dyn_cast_or_null<llvm::Instruction>(
-            static_cast<llvm::Value*>(p.syncSlot));
-        if (!syncInst || !syncInst->getParent() ||
-            syncInst->getFunction() != ld->getFunction()) continue;
-        if (!llvm::isa<llvm::AllocaInst>(syncInst) &&
-            !llvm::isa<llvm::GetElementPtrInst>(syncInst)) continue;
+        if (!nullFallback) {
+            auto* syncInst = llvm::dyn_cast_or_null<llvm::Instruction>(
+                static_cast<llvm::Value*>(p.syncSlot));
+            if (!syncInst || !syncInst->getParent() ||
+                syncInst->getFunction() != ld->getFunction()) continue;
+            if (!llvm::isa<llvm::AllocaInst>(syncInst) &&
+                !llvm::isa<llvm::GetElementPtrInst>(syncInst)) continue;
+        }
         // DECLINE 3 — inside a state machine, the fall-back slot is not restored
         // across a suspension, so addressing it after a resume would read a
         // fresh-stack alloca: a plausible WRONG VALUE in place of a loud SIGSEGV,
         // which is strictly worse. Leave the read exactly as it was.
-        if (!p.syncSurvivesSuspend) continue;
+        if (!nullFallback && !p.syncSurvivesSuspend) continue;
         byFn[ld->getFunction()].push_back(&p);
     }
     for (auto& [fn, reads] : byFn) {
@@ -6992,8 +7004,22 @@ void Emitter::fixupCapturedCellHolderReads() {
             // form (the matched DECLINE 2 above already accepted both); an
             // `Instruction` is sufficient here because we only pass it as a
             // pointer-typed operand to `CreateSelect`.
-            auto* sync = llvm::cast<llvm::Instruction>(
-                static_cast<llvm::Value*>(p->syncSlot));
+            //
+            // fix #9210 (§27.5 / §28.9, v0.359): a NULL-fall-back read (a
+            // capture cell's scope-end RECLAIM) has NO sync slot — its
+            // fall-back is the constant null, because "no cell" is what the
+            // reclaim wants when the capture site never ran. The select below
+            // then folds to the loaded holder, and the null-initialisation
+            // above is what makes "no cell" mean NULL rather than UNDEF.
+            const bool nullFallback =
+                !static_cast<llvm::Value*>(p->syncSlot);
+            llvm::Value* sync = nullptr;
+            if (nullFallback) {
+                sync = llvm::ConstantPointerNull::get(ptrTy());
+            } else {
+                sync = llvm::cast<llvm::Instruction>(
+                    static_cast<llvm::Value*>(p->syncSlot));
+            }
             // Dominated by any completion point of this holder's boxing ⇒ the
             // cell is allocated on every path that reaches this read. Leave the
             // IR untouched — that bit-identity is what keeps a program with an

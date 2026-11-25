@@ -11316,6 +11316,69 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
     if (!isUnwind && !scope.empty() && builder_.GetInsertBlock() &&
         !terminatorOrNull(builder_.GetInsertBlock()))
         excAtPassEntry = snapshotInFlightExc();
+    // fix #9210 (§27.5 / §28.9 / §28.14, v0.359): the scope-end RECLAIM of a
+    // capture cell reads the cell HOLDER — the alloca that holds the pointer
+    // to the §27.5 capture cell this frame owns a reference to. Three arms
+    // reclaim through it: `boxedCellFree` (a non-escaping lambda's cell),
+    // #1017's deferred free (the owner-disposal ordering) and #4509's
+    // `cellRelease` (a COUNTED cell).
+    //
+    // THE DEFECT. §27.5 gives a captured variable ONE cell per binding, and
+    // the frame's reference to that cell is dropped at the declaring scope's
+    // end. The holder is written ONLY at the capture site — the point where
+    // the cell is allocated — and every reclaim NULLS it afterwards, so the
+    // next capture re-allocates ("boxLocalSlot's guard allocates a fresh cell
+    // on the next capture"). A scope whose capture site is CONDITIONAL
+    // therefore reaches its reclaim on a path where no cell was ever formed:
+    // there the holder holds no cell at all.
+    //
+    // `boxLocalSlot` has two strategies. The GUARDED one null-initialises its
+    // holder in the entry block, so "no cell" reads as NULL and the reclaim is
+    // a no-op (free(null) / bz_cell_release(null)). The FRESH one (a local
+    // declared in a loop body, or re-initialised each pass) leaves a BARE
+    // `entryAlloca`, so on a path that never reached the capture site the
+    // holder holds UNDEF. #3484's repair (#4612's extension) gives every
+    // EXPOSED holder read a null fall-back AND null-initialises the holder it
+    // guards — but only for the reads `boxedStorage` ENROLLS, and the reclaim
+    // is not one of them: it reads the holder RAW.
+    //
+    // MEASURED (issue #9210, on r30-c1 @ 702fb3d9c): the reclaim's raw read
+    // returned stack residue and the reclaim freed it —
+    //   "AddressSanitizer: SEGV in __asan::Allocator::Deallocate", with the
+    //   freed pointer 0x5756555453525150 ("PQSRSTUV") — a wild free of a
+    //   pointer that was never a heap allocation.
+    //
+    // THE REPAIR. The reclaim reads the holder through the SAME funnel the
+    // §27.5 reads use, with a NULL fall-back: "the cell, or NOTHING" is what a
+    // reclaim wants when the capture site never ran, and the pre-boxing
+    // storage — the fall-back the value reads use — is not a cell at all and
+    // must never be freed. The fall-back being a CONSTANT also means the read
+    // needs no state-machine round-trip, so `fixupCapturedCellHolderReads`
+    // admits it where it declines the value reads.
+    //
+    // The repair is a NO-OP for a capture site that always runs: the fixup
+    // leaves a read whose holder-completion block DOMINATES it untouched, so
+    // every unconditional-capture program keeps byte-identical IR (the same
+    // discipline #3484 established for the value reads).
+    auto loadCaptureCellHolder =
+        [this](llvm::AllocaInst* holder, const char* name) -> llvm::Value* {
+        llvm::Value* cell = builder_.CreateLoad(ptrTy(), holder, name);
+        // A holder that is not a capture-cell holder (no `cellVars_` entry) is
+        // not this defect's shape: leave the read exactly as it was.
+        if (!cellVars_.count(holder)) return cell;
+        PendingHolderRead p;
+        p.load = llvm::WeakTrackingVH(cell);
+        // NO sync slot: the fall-back is the constant null, not the
+        // pre-boxing storage (see above).
+        p.syncSlot = llvm::WeakTrackingVH();
+        // Snapshot the holder's completion blocks NOW, while `holder` is
+        // certainly live — the capture site was lowered before this scope's
+        // reclaim was emitted.
+        auto rb = cellHolderReadyBlocks_.find(holder);
+        if (rb != cellHolderReadyBlocks_.end()) p.readyBlocks = rb->second;
+        pendingHolderReads_.push_back(std::move(p));
+        return cell;
+    };
     for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
         // fix #3070 / §30.5 + §28.3 *Unbound owned temporaries* (v0.249): an
         // awaited Pattern A `Task<T:class>` temporary produced by an anonymous
@@ -11890,7 +11953,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 }
             }
             llvm::Value* cell =
-                builder_.CreateLoad(ptrTy(), it->slot, "cell.ptr");
+                loadCaptureCellHolder(it->slot, "cell.ptr");
             builder_.CreateCall(freeFn(), {cell});
             // A guarded capture may be re-entered (for example, a case arm in
             // a loop). Null the holder after reclaim so the next entry allocates
@@ -14040,7 +14103,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // cell alive).
         if (refcountedCellSlots_.count(d.slot)) continue;
         llvm::Value* cell =
-            builder_.CreateLoad(ptrTy(), d.slot, "cell.deferred.ptr");
+            loadCaptureCellHolder(d.slot, "cell.deferred.ptr");
         // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): if this deferred
         // entry also carries dictEntryKeyReleaseDeferred, emit the DictionaryEntry
         // Key release BEFORE freeing the cell — the same GEP field 0 +
@@ -14146,7 +14209,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
     for (const auto& d : scope) {
         if (!d.cellRelease) continue;
         llvm::Value* cell =
-            builder_.CreateLoad(ptrTy(), d.slot, "cell.rc.ptr");
+            loadCaptureCellHolder(d.slot, "cell.rc.ptr");
         builder_.CreateCall(
             declareC("bz_cell_release", llvm::Type::getVoidTy(llvm_),
                      {ptrTy()}),
