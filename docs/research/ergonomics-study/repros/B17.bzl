@@ -1,9 +1,9 @@
 // bug: B17
-// title: `Select` with an interpolated-string projection is rejected as a leak (contested: #7170, #7215)
-// issue: #7170, #7215 (open spec questions: contested)
+// title: `Select` with an interpolated-string projection is rejected as a leak (ruled 2026-10-27, a compiler bug: #7170, #7215)
+// issue: #7170, #7215 (ruled 2026-10-27; implementation trackers)
 // rests-on: spec §28.1/§28.9: `string` is runtime-managed, with no ownership and nothing to leak
 // source: data/compiler-bugs.md, verbatim below this header
-// note: Contested: the expectation is the study's reading of §28.1; #7170/#7215 may rule otherwise.
+// note: The expectation follows the #7170/#7215 rulings (§28.3 Calls mint clause 7, Bare-type-parameter returns clause 1, K1.6).
 // expect: run
 // stdout: <1> <2>
 // stdout: 1 2
