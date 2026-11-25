@@ -1,5 +1,6 @@
 #include "codegen/LlvmBackend_impl.hpp"
 #include "codegen/LlvmBackend_Console.hpp"  // fix #9213: the ONE built-in `Console.ReadLine()` classifier (lowering + consumer-side classification)
+#include "codegen/LlvmBackend_CallBoundedDecl.hpp"  // fix #9150 / #9151: the ONE §28.14 call-bounded declaration proof (no-body + imported callee)
 #include "codegen/LlvmBackend_TextReader.hpp"  // fix #9199: the ONE built-in `TextReader.ReadToEnd()` classifier (lowering + consumer-side classification)
 #include "llvm/ADT/STLFunctionalExtras.h"  // llvm::function_ref (fix #4901 shared-event gate)
 #include "sema/BuiltinInterfaceAncestors.hpp"  // fix #6828: the §26.5 built-in interface table — the ONE copy, shared with sema's §14.5 phase-1 unification
@@ -23045,11 +23046,110 @@ bool calleeBodyUsesFormalOnlyByInvocationInspectionOrForwarding(
     return bodyWalkAllowsForwarding(ctx, md, name, /*depth=*/0);
 }
 
+// fix #9150 (§28.14 / §28.9 / §12.1 / §12.5 / §11.2 / §11.8, v0.359): the
+// DECLARATION-ONLY call-bounded proof for a callee with NO BODY to walk — an
+// ABSTRACT member (§12.5: an abstract member "declares it without a body; every
+// concrete subclass must override it") or an INTERFACE member (§11.2: interface
+// members "have no body"; §11.8 declines default interface methods).
+//
+// THE DEFECT THIS ADMITS (issue #9150). The walk refused to look at a
+// `virtual` / `abstract` / `override` callee at all, and failed closed on a
+// callee with no body (`ast::MethodBodyKind::Abstract` → `return false`), so
+// the premise failed for EVERY abstract and interface member: the argument was
+// classified an ESCAPE, `collectClosureReleaseEligible` did not arm the local's
+// scope-end `bz_closure_release`, and the local's own +1 was never dropped.
+// MEASURED on r30-c1 @ 6c504f755 with `bezelc --sanitize=address`, the issue's
+// own 200-iteration repro (a caller-owned closure local passed to an ABSTRACT
+// member):
+//
+//     Direct leak of 12800 byte(s) in 200 object(s) allocated from:
+//     Indirect leak of 1600 byte(s) in 200 object(s) allocated from:
+//     Indirect leak of 1600 byte(s) in 200 object(s) allocated from:
+//     SUMMARY: AddressSanitizer: 16000 byte(s) leaked in 600 allocation(s).
+//
+// WHY THE DECLARATION IS ENOUGH. §28.14 (v0.359), *The call-bounded default*:
+// "A function-typed parameter declared *without* `scoped` is **call-bounded**:
+// the callee receives the callback for the duration of the call only … These
+// obligations are compiler-verified for user-authored callees." The default is a
+// property of the PARAMETER, not of the dispatch: an abstract member's runtime
+// callee is an OVERRIDE and an interface member's is an IMPLEMENTATION, and
+// §12.1 / §11.2 require those to match the base member's parameter modifiers
+// and return type EXACTLY — so the override's / implementation's own formal is
+// plain and function-typed too, and its body (user-authored, in its own module)
+// was §28.14-verified there.
+//
+// THE ONE THING THE DECLARATION MUST ALSO RULE OUT is §28.14's own exception —
+// a callee that "mints a deferred-activation frame" keeps the callback "for
+// that frame's life". The frame is announced by the RETURN SLOT, so the
+// declaration-only proof declines a Task-family / iterable-family return, a
+// function-typed return (it could carry the callback out of the call) and a
+// return whose origin is unknown (a CLASS type parameter a subclass may
+// instantiate at such a head). Every clause fails closed → ESCAPE → a leak,
+// never an early release and never a double free.
+//
+// The proof itself is the ONE copy in LlvmBackend_CallBoundedDecl.hpp, shared
+// with the IMPORTED arm of the escape walk (LlvmBackend_Setup.cpp) so the two
+// cannot drift.
+static bool noBodyCalleeFormalIsCallBounded(const sema::SemaContext& ctx,
+                                             const ast::MethodDecl& md,
+                                             std::string_view name) {
+    // The FORMAL, as the callee declares it. §12.6 forbids `async abstract`, so
+    // an `async` modifier cannot appear here — but a callee that mints a
+    // deferred-activation frame is declined on its RETURN slot below, and an
+    // `async` one is declined here outright, fail closed.
+    for (auto mod : md.modifiers)
+        if (mod == "async") return false;
+    const ast::Param* formal = nullptr;
+    for (const ast::Param& p : md.params)
+        if (p.name == name) { formal = &p; break; }
+    if (!formal || !formal->type) return false;
+    CallBoundedDeclaration d;
+    d.formalModifier = formal->modifier;
+    // The formal's RESOLVED type: §28.14's default is stated for a
+    // function-typed parameter, and the resolved type is alias-transparent
+    // (§27.8), so `type Show := (int) -> string` reads as a function type here
+    // exactly as `resolvedFormalIsFunction` reads it.
+    d.formalType = ctx.resolvedType(*formal->type);
+    if (md.returnType) d.returnType = ctx.resolvedType(*md.returnType);
+    // The return type's ORIGIN (§12.1: return types must match exactly, so the
+    // base's declaration decides what an override may return).
+    if (d.returnType && d.returnType->kind == sema::TypeRef::Kind::Named) {
+        if (d.returnType->isResolvedTypeParam()) {
+            // A type parameter the METHOD declares itself stays abstract in
+            // every override (§12.1) → it cannot become an async or iterator
+            // return → frame-free. A CLASS type parameter may be instantiated
+            // at a Task-family or iterable head by a subclass → decline.
+            const std::string_view head = d.returnType->headName();
+            bool methodOwn = false;
+            for (const ast::GenericParam& gp : md.genericParams)
+                if (gp.name == head) { methodOwn = true; break; }
+            d.returnOrigin = methodOwn
+                                 ? CallBoundedDeclaration::ReturnOrigin::MethodTypeParam
+                                 : CallBoundedDeclaration::ReturnOrigin::Unknown;
+        } else if (d.returnType->isResolvedNonTypeParam()) {
+            d.returnOrigin = CallBoundedDeclaration::ReturnOrigin::Concrete;
+        } else {
+            d.returnOrigin = CallBoundedDeclaration::ReturnOrigin::Unknown;
+        }
+    } else {
+        d.returnOrigin = CallBoundedDeclaration::ReturnOrigin::Concrete;
+    }
+    return declaredFormalIsCallBounded(d);
+}
+
 // fix #8933: the walk driver with the forwarding chain depth.
 static bool bodyWalkAllowsForwarding(const sema::SemaContext& ctx,
                                      const ast::MethodDecl& md,
                                      std::string_view name, int depth) {
     if (name.empty()) return false;
+    // fix #9150 (§28.14 / §28.9 / §12.1 / §12.5 / §11.2 / §11.8, v0.359): a
+    // callee with NO BODY — an ABSTRACT member or an INTERFACE member — is
+    // proved from its DECLARATION (see `noBodyCalleeFormalIsCallBounded`
+    // above). The walk below has no body to read for it, and failing closed
+    // there cost a LEAK (the issue's own repro: 16000 B / 600 allocations over
+    // 200 iterations).
+    if (md.bodyKind == ast::MethodBodyKind::Abstract)
+        return noBodyCalleeFormalIsCallBounded(ctx, md, name);
     for (auto mod : md.modifiers)
         if (mod == "virtual" || mod == "abstract" || mod == "override")
             return false;
