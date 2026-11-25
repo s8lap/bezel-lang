@@ -1,0 +1,37 @@
+//! case: s3_6_9101
+//! doc: spec
+//! section: 3.6
+//! title: a `string?` read out of a FrozenArray outlives the array that held it
+//! rule: a nullable type `V?` is read as `V`, nullability stripped
+//! cites: 28.11, 3.6
+//! expect: run
+//! output: 690
+//! issue: 9121
+//! notes: Pins the #9100/#9107/#9121 stack (picks 7c5182e2e..d7a045e3d): the element take/release
+//!   of a `string?` slot in a generic collection or FrozenArray. A `string?` slot is a
+//!   shared-reference slot like `string` (3.6 Nullable forms; 28.11 element slot policy), so
+//!   the store takes one shared reference and the release gives it back; a mis-balanced
+//!   reference shows as a crash or a wrong total. The 200-iteration loop is the program's own,
+//!   the output is a checksum of the string lengths.
+module Conf;
+
+public class G
+  public static method Pick(i: int): string?
+    var s := new Array<string?>(); s.Add("w" + i.ToString()); s.Add(null);
+    using var f := FrozenArray<string?>.From(s);
+    var x: string? := f[0];
+    return x;
+  end Pick;
+end G;
+
+public class Program
+  public static method Main(): int
+    var tot := 0;
+    for var i in 0..<200 do
+      var x := G.Pick(i);
+      tot := tot + (x ?? "").Length;
+    end;
+    Console.WriteLine(tot);
+    return 0;
+  end Main;
+end Program;
