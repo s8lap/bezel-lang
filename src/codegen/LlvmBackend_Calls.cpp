@@ -6685,10 +6685,32 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             bool decSelectorMM = false;
             if (!call.args.empty() && call.args[0].value)
                 if (auto* lamTy = ctx_.exprType(*call.args[0].value))
-                    if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn)
-                        if (lamTy->funcReturn->kind == sema::TypeRef::Kind::Primitive &&
-                            lamTy->funcReturn->primitive == sema::PrimitiveType::Decimal)
+                    if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
+                        // fix #8689 (stdlib §5, spec §3.6 rule 2 / §14.1,
+                        // v0.359): read the selector's RETURN type through the
+                        // generic substitution, so a selector returning the
+                        // PLACEHOLDER `T` is recognised as the decimal arm's
+                        // when `T` is instantiated at `decimal`. Without this
+                        // the decimal arm was skipped at T = decimal and the
+                        // numeric arm below took the `decimal` STRUCT as its
+                        // accumulator, which the integer compare cannot
+                        // accept. See the `uRef` read below for the full
+                        // rationale; the same resolution is applied there.
+                        //
+                        // The NULLABLE return keeps the PRE-FIX reading (the
+                        // same nullability discipline #8338 used for the
+                        // `Sum` arm): a nullable `U` is not a §2.19
+                        // `INumber<U>` conformer, so the sema gate owns that
+                        // shape (#8107). The check below is otherwise the
+                        // pre-fix one, so every shape that is NOT a
+                        // placeholder keeps the answer it had.
+                        const sema::TypeRef* sRetMM = lamTy->funcReturn->nullable
+                            ? lamTy->funcReturn
+                            : resolveTypeParamRef(lamTy->funcReturn);
+                        if (sRetMM && sRetMM->kind == sema::TypeRef::Kind::Primitive &&
+                            sRetMM->primitive == sema::PrimitiveType::Decimal)
                             decSelectorMM = true;
+                    }
             if (elemTy == decTy && call.args.empty()) {
                 // stdlib §5.1: Array<decimal>.Min()/Max(): decimal
                 // Throws InvalidOperationException on empty source.
@@ -7596,8 +7618,52 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!call.args.empty() && call.args[0].value)
                 if (auto* lamTy = ctx_.exprType(*call.args[0].value))
                     if (lamTy->kind == sema::TypeRef::Kind::Function &&
-                        lamTy->funcReturn)
+                        lamTy->funcReturn) {
                         uRef = lamTy->funcReturn;
+                        // fix #8689 (stdlib §5, spec §3.6 rule 2 / §14.1 /
+                        // §14.2, v0.359): read U through the GENERIC
+                        // SUBSTITUTION (`resolveTypeParamRef`) — the SAME
+                        // resolution the `Sum` arm applies to the selector's
+                        // return type (#8338) and the no-selector branch below
+                        // applies to the ELEMENT type (#8240).
+                        //
+                        // stdlib §5 declares the selector form as
+                        //     public method Min<U>(selector: (T) -> U): U
+                        //                                     where U: IComparable<U>;
+                        // (and `Max<U>` beside it), so U is the SELECTOR's
+                        // return type; and spec §3.6 rule 2 evaluates a
+                        // generic body's use of its parameter "at each
+                        // instantiation, after substituting the type
+                        // arguments".
+                        //
+                        // THE DEFECT. Inside a generic body the selector's
+                        // return type is still the PLACEHOLDER `T` — a
+                        // `Kind::Named` type parameter, never a
+                        // `Kind::Primitive` — so the `selNumeric` test below
+                        // never matched, the accumulator stayed the `int`
+                        // DEFAULT, and the emitted IR mixed an i32 accumulator
+                        // with the INSTANTIATED use site:
+                        //
+                        //   %mm.r = load i32, ptr %1, align 4
+                        //   double %dbl.r0 = call ptr @bz_double_to_string_r(i32 %mm.r)
+                        //   bezelc: codegen error: IR verification failed
+                        //            (malformed IR emitted; see report above)
+                        //
+                        // MEASURED on the base (r30-c1 @ c00f5a63f): at
+                        // T = double and T = float the program aborted in the
+                        // IR verifier, at T = long the total was TRUNCATED to
+                        // 32 bits (1705032704 for 6_000_000_000), and at
+                        // T = string the POINTER was truncated (3883072).
+                        //
+                        // A NULLABLE return keeps the pre-fix reading (the
+                        // nullability discipline #8338 used for the `Sum`
+                        // arm): a nullable U is not a §2.8 `IComparable<U>`
+                        // conformer, so the sema gate owns that shape
+                        // (#8107).
+                        if (uRef && !uRef->nullable)
+                            uRef = const_cast<sema::TypeRef*>(
+                                resolveTypeParamRef(uRef));
+                    }
 
             // --- Selector projecting to a POINTER U: a class implementing
             // IComparable<U> (§14.2) or string (§9.6). Mirror the no-selector
