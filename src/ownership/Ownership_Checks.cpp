@@ -13019,9 +13019,48 @@ void MethodOwnership::registerBorrowOnlyArmBindings(
                     }
                 }
             }
-            if (!bt || bt->kind != sema::TypeRef::Kind::Named ||
-                !bt->declaration)
+            if (!bt || bt->kind != sema::TypeRef::Kind::Named)
                 continue;
+            // fix #9153 (§28.1 clause 3, §35.5, v0.359): a BARE TYPE
+            // PARAMETER binding — the payload's declared type at an
+            // uninstantiated generic declaration — is an OWNING-CLASS binding
+            // under §28.1 clause 3's class-or-interface assumption: "The
+            // generic body type-checks under the class-or-interface
+            // assumption … At a class or interface substitution the marker has
+            // its ordinary transfer meaning". §35.5's owning match therefore
+            // owes such a binding the same auto-drop it owes a class-typed
+            // one ("an `owned`-payload binding … is an owned local of the arm
+            // body's scope … falling off the arm still owning the value
+            // auto-drops it").
+            //
+            // The DECLARATION half is decided here; the per-INSTANTIATION
+            // half — whether the substitution is a class at all, and hence
+            // whether there is a class reference to dispose — is CODEGEN's,
+            // because only the instantiation knows the concrete type (§28.1
+            // clause 3's erasure is per instantiation). The stamp is the
+            // "may carry an owning transfer" half, exactly as it is for a
+            // class-typed payload.
+            //
+            // `bt->declaration == nullptr` on a Named type is this shape: a
+            // bare type parameter, or a value builtin (`string`, `DateTime`,
+            // …) whose `owned` marker erases (§28.1 clause 3) and which can
+            // therefore never be in the transfer set — so the transfer test
+            // below separates them, and a builtin binding keeps its
+            // pre-#9153 behaviour exactly.
+            if (!bt->declaration) {
+                bool typeParamTransfers = false;
+                for (const sema::Symbol* t : transferred)
+                    if (t == bindSym) { typeParamTransfers = true; break; }
+                if (!typeParamTransfers) continue;
+                // The stamp, as the class-typed case stamps it (§35.5,
+                // §28.1 clause 3, v0.359): codegen reads the decision
+                // instead of recomputing it, so the two cannot drift.
+                if (auto* bp = dynamic_cast<const ast::BindingPattern*>(
+                        bindSym->decl))
+                    const_cast<ast::BindingPattern*>(bp)
+                        ->owningMatchTransferredPayload = true;
+                continue;
+            }
             const bool classValued =
                 (bt->declaration->kind == ast::TypeDeclKind::Class ||
                  bt->declaration->kind == ast::TypeDeclKind::Interface) &&

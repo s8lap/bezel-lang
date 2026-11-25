@@ -25982,8 +25982,20 @@ private:
     // pass owns the transfer-set decision — the same authority that admits
     // `move r` on such a binding. Codegen reads the decision instead of
     // recomputing it, so the two cannot drift.
+    //
+    // fix #9153 (§28.1 clause 3, §35.5, v0.359): `choiceRef` is the
+    // SCRUTINEE's type at THIS instantiation, and the stamp is a
+    // per-DECLARATION decision — §28.1 clause 3 fixes an `owned` bare-type-
+    // parameter marker's meaning PER INSTANTIATION ("at a class or interface
+    // substitution the marker has its ordinary transfer meaning … at every
+    // other value or runtime-managed substitution it is erased by the
+    // substitution"). So the class-reference test is applied to the
+    // INSTANTIATED payload type here: the auto-drop is emitted where the
+    // substitution really is a class, and not where the marker is erased (a
+    // value or runtime-managed substitution) or where the declaration is still
+    // generic (the erased template).
     std::vector<Disposal> owningMatchArmBindingDisposals(
-        const ast::Pattern* armPattern);
+        const ast::Pattern* armPattern, const sema::TypeRef* choiceRef);
 
     // Lower a statement list into the current block; returns true if the
     // list terminated the block (so the caller stops adding to it).

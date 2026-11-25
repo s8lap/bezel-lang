@@ -27,6 +27,31 @@
 namespace bezel::codegen {
 
 
+// fix #9153 (§28.1 clause 3, §35.4, §35.5, v0.359): is this type a CLASS or
+// INTERFACE reference at the instantiation in hand — the shape the vtable
+// disposal path (`emitDisposeAndReclaim`, the §28.4-step-2 / §28.2 shape a
+// `using var` class local gets) dispatches on?
+//
+// A Named type with a declaration that is a class or an interface, and not a
+// value builtin (a value builtin's `owned` marker erases — §28.1's
+// per-instantiation erasure). Everything else — a primitive, an enum, a
+// record, a choice, a runtime-managed reference (`string`, `Type`, a function
+// type), and a BARE TYPE PARAMETER (which at the instantiation in hand is
+// either unresolved — the erased template — or a concrete type the
+// substitution bound) — is not a class reference here.
+//
+// The sibling helper `isClassOrInterfaceRef` (LlvmBackend_Setup.cpp) is the
+// same test WITHOUT the value-builtin exclusion, which its call sites (the
+// task/async shapes) do not need.
+static bool isOwningClassReferenceType(const sema::TypeRef* t) {
+    if (!t || t->kind != sema::TypeRef::Kind::Named || !t->declaration)
+        return false;
+    if (t->declaration->isValueBuiltin) return false;
+    return t->declaration->kind == ast::TypeDeclKind::Class ||
+           t->declaration->kind == ast::TypeDeclKind::Interface;
+}
+
+
 // §28.4: at most one destructor per class. Returns the AST DestructorDecl for
 // `ts` (or nullptr if none — emitDisposerBody then skips the destructor-body
 // step and runs only owned-field disposal + base-chain Dispose).
@@ -5315,6 +5340,31 @@ void Emitter::emitOwningChoiceActiveCaseDisposal(
             // or a payload-defaulted construction. `emitDisposeAndReclaim`
             // is null-safe (free(null) no-op) but the dispatch on a null
             // vtable would crash — guard explicitly.
+            //
+            // fix #9153 (§28.1 clause 3, §35.4, v0.359): the vtable disposal
+            // below dispatches on a CLASS REFERENCE, so it is emitted only
+            // where the payload's storage IS a pointer. §28.1 clause 3 fixes
+            // an `owned` bare-type-parameter marker's meaning PER
+            // INSTANTIATION — at a class or interface substitution it has its
+            // ordinary transfer meaning, at a value or runtime-managed
+            // substitution it is ERASED by the substitution — and the ERASED
+            // TEMPLATE of a generic declaration has no instantiation at all:
+            // there the payload's storage is the `i32` placeholder (the
+            // lowered type of an unresolved type parameter), not a class
+            // reference, and there is nothing for the vtable path to dispatch
+            // on. Emitting the disposal anyway produced MALFORMED IR — "Both
+            // operands to ICmp instruction are not of the same type ...
+            // %ocd.owned.field": an i32 compared with a ptr — so the whole
+            // compile failed (LLVM verification) for every generic function
+            // holding an `owned` choice whose payload type is a bare type
+            // parameter (`Use<T>(owned b: Result<T,string>)` and the same
+            // shape over a user choice). The per-instantiation
+            // SPECIALIZATION — the body that actually runs — has the concrete
+            // payload type and emits the disposal there (a `ptr` payload for
+            // `Result<Res,string>`), so the ownership obligation is still
+            // discharged exactly once (§35.4 "Disposal is defined by the
+            // active case").
+            if (!fieldVal->getType()->isPointerTy()) continue;
             llvm::Value* isNull = builder_.CreateICmpEQ(
                 fieldVal, llvm::ConstantPointerNull::get(ptrTy()));
             auto* dispBB = llvm::BasicBlock::Create(
@@ -9955,13 +10005,37 @@ void Emitter::dischargeOwningMatchTransfers(llvm::AllocaInst* slot,
 // have to warn. The auto-drop itself is the memory-safety half and is what
 // this fix delivers.
 std::vector<Emitter::Disposal> Emitter::owningMatchArmBindingDisposals(
-        const ast::Pattern* armPattern) {
+        const ast::Pattern* armPattern, const sema::TypeRef* choiceRef) {
     std::vector<Disposal> out;
     if (!armPattern) return out;
     auto* dp = dynamic_cast<const ast::DestructuringPattern*>(armPattern);
     if (!dp) return out;   // a whole-value / non-destructuring arm binds the
                            // value itself (§35.5's own separate rule)
+    // fix #9153 (§28.1 clause 3, §35.5, v0.359): the PER-INSTANTIATION
+    // refinement of the stamp. The ownership pass's stamp is a
+    // per-DECLARATION decision — "this binding may carry an owning
+    // transfer" — while §28.1 clause 3 fixes an `owned` bare-type-parameter
+    // marker's meaning PER INSTANTIATION: "at a class or interface
+    // substitution the marker has its ordinary transfer meaning … at every
+    // other value or runtime-managed substitution it is ERASED by the
+    // substitution". Only the instantiation knows which of the two it is, so
+    // the class-reference test is applied to the INSTANTIATED payload type:
+    // the auto-drop fires where the substitution really is a class reference,
+    // and not at a value / runtime-managed substitution (where the marker is
+    // erased and the payload carries no disposal obligation) nor in the
+    // ERASED TEMPLATE of a generic declaration (where the payload's storage
+    // is the i32 placeholder, not a pointer — the same fact #9153's
+    // `emitOwningChoiceActiveCaseDisposal` guard relies on).
+    const sema::TypeSymbol* choiceTy =
+        choiceRef ? choiceRef->declaration : nullptr;
+    const sema::ChoiceCaseSymbol* cc = nullptr;
+    if (choiceTy && dp->typeName && !dp->typeName->parts.empty()) {
+        std::size_t tag = 0;
+        cc = choiceCaseByName(choiceTy, dp->typeName->parts.back(), &tag);
+    }
+    std::size_t slotIdx = 0;
     for (const auto& sp : dp->subPatterns) {
+        const std::size_t j = slotIdx++;
         // The anchor node: #1271's synthesized BindingPattern for the naked
         // `W(w, _)` spelling, the `var w` BindingPattern otherwise — the same
         // node the case lowering keys the binding's SLOT on (`locals_`).
@@ -9971,6 +10045,23 @@ std::vector<Emitter::Disposal> Emitter::owningMatchArmBindingDisposals(
         else
             bp = dynamic_cast<const ast::BindingPattern*>(sp.pattern.get());
         if (!bp || !bp->owningMatchTransferredPayload) continue;
+        // The payload THIS slot carries, at THIS instantiation. An
+        // unresolvable payload type keeps the pre-#9153 behaviour (the
+        // disposal is emitted) — the refinement only ever REMOVES a disposal
+        // where the instantiated type is positively not a class reference.
+        const sema::TypeRef* ftInst = nullptr;
+        if (cc && cc->caseDecl && j < cc->caseDecl->payload.size())
+            ftInst = common::substitutedChoicePayloadType(
+                cc->caseDecl->payload[j], choiceTy, choiceRef, ctx_);
+        // §14.1 / #567: a bare type parameter in the DECLARED payload type
+        // resolves to its CONCRETE substituted type through the active
+        // monomorphization binding — the specialization's `T -> Res`
+        // substitution. Without it the erased type parameter would answer for
+        // every instantiation, and the auto-drop would fire nowhere (the
+        // leak #9153's second half) or everywhere (the erased template's
+        // malformed IR).
+        if (ftInst) ftInst = resolveTypeParamRef(ftInst);
+        if (ftInst && !isOwningClassReferenceType(ftInst)) continue;
         auto it = locals_.find(bp);
         if (it == locals_.end() || !it->second) continue;
         Disposal d{it->second, nullptr};

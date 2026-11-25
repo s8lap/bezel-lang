@@ -14870,7 +14870,8 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
         std::vector<Disposal> armBindingDisposals;
         if (scrutChoiceSlot && patternBindsAnySlot(arm.pattern.get()))
             armBindingDisposals =
-                owningMatchArmBindingDisposals(arm.pattern.get());
+                owningMatchArmBindingDisposals(arm.pattern.get(),
+                                               scrutChoiceRef);
         bool armTerm = lowerScopedBlock(arm.stmts, 0, &armBindingDisposals);
         if (!armTerm) builder_.CreateBr(endBB);
         builder_.SetInsertPoint(nextBB);

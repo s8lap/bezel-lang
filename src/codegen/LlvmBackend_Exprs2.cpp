@@ -16195,7 +16195,8 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
         std::vector<Disposal> armBindingDisposals;
         if (scrutChoiceSlot && patternBindsAnySlot(arm.pattern.get()))
             armBindingDisposals =
-                owningMatchArmBindingDisposals(arm.pattern.get());
+                owningMatchArmBindingDisposals(arm.pattern.get(),
+                                               scrutChoiceRef);
         const bool armBindingsOnStack =
             !armBindingDisposals.empty() && !disposeStack_.empty();
         const std::size_t armBindingScopeIdx =
