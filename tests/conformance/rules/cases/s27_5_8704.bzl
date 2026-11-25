@@ -11,8 +11,10 @@
 //! notes: Pins #9086 (iterator frame). `Gen` keeps `b` (captures the parameter `k`) in `box.F`
 //!   before its first yield and reassigns the local after it. Each iteration of `Main` adds
 //!   the two yielded values (1 + 2 = 3), then box.F(5, 2) = 5 - 2 + i = 3 + i: 6 + i per
-//!   iteration; summed over i = 0..199: 1200 + 19900 = 21100. No leak assertion: an iterator
-//!   frame's cell has a separate open tracker (#9126).
+//!   iteration; summed over i = 0..199: 1200 + 19900 = 21100. No leak assertion in the corpus, which has
+//!   no leak leg: #9126 (an iterator frame's capture cell was never released) is fixed by e97a8efbc and
+//!   pinned by the gtest capture_cell_released_in_async_iterator_frame_9126_test.cpp; this row pins only
+//!   the value.
 module Conf;
 type Fn := (int, int) -> int;
 public class Box

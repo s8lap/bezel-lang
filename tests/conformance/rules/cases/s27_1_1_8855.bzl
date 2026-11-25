@@ -6,7 +6,10 @@
 //! cites: 8.4, 27.6
 //! expect: reject
 //! diagnostic: convertible
-//! notes: Pins #9108 (fix da43840a9). The return slot `bool` is a primitive slot and invariant: no representation-changing conversion applies. Green on both arms. Twin: 8849.
+//! notes: Pins #9108 (fix da43840a9). Per §27.6 (v0.359) the reference's return type `bool` must unify with the
+//!   target's return type `int` under the standard implicit-conversion rules (§5.1); `bool` has no implicit
+//!   conversion to `int` (§5.2 admits only the explicit `int(b)`), so the reference is not compatible with the
+//!   target and is rejected. Green on both arms. Twin: 8849.
 module Conf;
 import System;
 public class K end K;
