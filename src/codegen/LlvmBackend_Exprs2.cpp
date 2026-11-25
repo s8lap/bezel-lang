@@ -2590,12 +2590,50 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // Declined where the root scope is not the last reader, or there is
         // no root scope to hold it: an `ensures` clause reads the parameter
         // after the body's disposals (§22.16), and `hasEnsuresClause` answers
-        // "yes" for a constructor or an unknown body; an async or iterator
-        // state machine re-enters its body per resume. A declined cell keeps
+        // "yes" for a constructor or an unknown body. A declined cell keeps
         // leaking, the safe direction.
+        //
+        // fix #9126 (§27.5 / §28.9 / §28.14, v0.359): the ASYNC / ITERATOR
+        // state machine is ADMITTED again. #7611 declined it with the note
+        // "the parameter or for-var lives in the frame struct, not a cell" —
+        // but that is the PARAMETER's own storage, not the CAPTURE CELL's. A
+        // captured parameter in a state-machine body IS boxed into a heap
+        // cell exactly as in a synchronous body (#3466: lowerLambda maps the
+        // fresh cell-HOLDER alloca to a frame field, so the holder survives
+        // every suspension), and that cell is what the capturing env points
+        // at. With the owner scope declined, `cellOwnerScopeIndex` fails, so
+        // #4509's COUNTING protocol is never armed for the parameter: no
+        // `bz_cell_retain` at the capture-store, no `bz_cell_release` in the
+        // env's envdtor and — the actual leak — no `bz_cell_release` in the
+        // declaring frame. The 4-byte cell was then allocated by the resume /
+        // moveNext frame and freed by NOBODY: 800 B in 200 allocations over
+        // 200 calls (issue #9126's own repro). MEASURED: the async repro's
+        // binary contains no `bz_cell_retain`/`bz_cell_release` call at all,
+        // while its synchronous twin contains exactly one of each.
+        //
+        // WHY THE RE-ENTRY IS SAFE HERE (the reason #7611 declined it): the
+        // frame's release goes in the state machine's ROOT scope, whose
+        // disposal runs ONCE per completion — on the fall-off (the completing
+        // activation) or on an explicit `return` — and never on a SUSPEND,
+        // which returns from the resume without touching `disposeStack_`. So
+        // the frame's counted reference is dropped exactly once per call. The
+        // cell is then freed by whoever lets go LAST: the frame's release
+        // leaves the env's own reference standing, and the env's envdtor
+        // drops it (the counted protocol is order-free by construction —
+        // #4509's own note). A RE-ENTRY of the release code is harmless: the
+        // `cellRelease` arm NULLS the holder after the release, and
+        // `bz_cell_release(null)` is a no-op.
+        //
+        // The ABANDONED frame (a dropped task, an iterator disposed while
+        // suspended) does not drain the root scope, so its cell leaks — the
+        // safe direction, and the same shape a synchronous frame has. The
+        // iterator's abandonment snapshot does NOT replay the `cellRelease`
+        // entry (`cellRelease` is on the yield handler's exclusion list — a
+        // replay would be a second drop of one counted reference), so an
+        // abandoned iterator's cell leaks rather than double-releasing.
         {
             const void* pkey = static_cast<const void*>(sym);
-            if (!alreadyBoxed && !smStateStruct_ && !disposeStack_.empty() &&
+            if (!alreadyBoxed && !disposeStack_.empty() &&
                 !hasEnsuresClause(currentMethod_))
                 cellOwnerScope_[pkey] = {currentFn_, 0};
             std::size_t pOwnerIdx = 0;
