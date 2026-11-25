@@ -5649,7 +5649,34 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 dictTypeOfLocal(ld2) ||
                                 linkedListTypeOfLocal(ld2))
                                 collLd = ld2;
-                if (collLd && !diverged_) {
+                // fix #9221 (§28.1 clause 3, §17.13, v0.359): `_ := x` where
+                // `x`'s declared type is a BARE TYPE PARAMETER whose
+                // substitution at THIS instantiation is a value or runtime-
+                // managed type. §28.1 clause 3: there the `owned` marker is
+                // "erased by the substitution … marker-keyed call-site and
+                // binding forms written under the class assumption remain
+                // admissible with no-op effect", so the announced-consume
+                // discard disposes nothing. The class reclaim below would load
+                // the `int` / `string` slot as an object pointer and dispatch
+                // on it (MEASURED: a stack-buffer-overflow at `T = int`, a
+                // global-buffer-overflow at `T = string`, for an `owned x: T`
+                // parameter and for an owning-match payload binding of type
+                // `T` alike). An unresolved parameter (the erased template)
+                // and every class / interface / builtin-class substitution
+                // keep the existing path. // per §28.1, §17.13, v0.359
+                bool discardMarkerErased = false;
+                if (const sema::TypeRef* dt = ctx_.exprType(*ds->value)) {
+                    if (isBareTypeParamRef(dt)) {
+                        const sema::TypeRef* inst = resolveTypeParamRef(dt);
+                        discardMarkerErased =
+                            inst && inst != dt &&
+                            !common::ownedMarkerActiveOnInstantiatedType(inst,
+                                                                         ctx_);
+                    }
+                }
+                if (discardMarkerErased) {
+                    // no-op: nothing to dispose at this substitution
+                } else if (collLd && !diverged_) {
                     disposeStack_.emplace_back();
                     registerUsingDisposal(collLd);
                     emitDisposals(disposeStack_.back());

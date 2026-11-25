@@ -12179,7 +12179,10 @@ void MethodOwnership::checkOwningMatchArmEscape(const ast::CaseExpr& ce) {
         // check's so the two positions cannot drift.
         std::unordered_map<const ast::Node*, const ast::Expr*> aliases;
         collectOwningMatchArmAliasInits(arm, aliases);
-        if (isBorrowableType(art) ||
+        // fix #9221 (§28.1 clause 3, v0.359): a bare type parameter admitting
+        // a class or interface substitution is borrow-carrying here under the
+        // class-or-interface assumption, as the class-typed twin's arm is.
+        if (isBorrowableType(art) || typeRefIsClassAssumedTypeParam(art) ||
             common::isBorrowBearingRecordOrSpan(art, ctx_)) {
             // fix #4715: `owningMatchEscapeRoot` is `identifierRoot` plus a
             // bounded trace through same-arm aliases, so `(var c := w; c)` —
@@ -12705,7 +12708,10 @@ void MethodOwnership::walkOwningMatchArmEscapeStmt(
         // skipped by it.
         const sema::TypeRef* vt = ctx_.exprType(*value);
         const ast::IdentifierExpr* root = nullptr;
-        if (isBorrowableType(vt) ||
+        // fix #9221 (§28.1 clause 3, v0.359): a bare type parameter admitting
+        // a class or interface substitution is borrow-carrying under the
+        // class-or-interface assumption, as the class-typed twin's value is.
+        if (isBorrowableType(vt) || typeRefIsClassAssumedTypeParam(vt) ||
             common::isBorrowBearingRecordOrSpan(vt, ctx_)) {
             // fix #4715: `owningMatchEscapeRoot` is `identifierRoot` plus a
             // bounded trace through this arm's own single-assignment local
@@ -13064,7 +13070,39 @@ void MethodOwnership::registerBorrowOnlyArmBindings(
                 bool typeParamTransfers = false;
                 for (const sema::Symbol* t : transferred)
                     if (t == bindSym) { typeParamTransfers = true; break; }
-                if (!typeParamTransfers) continue;
+                // fix #9221 (§28.1 clause 3, §35.5, §19.3, §28.3 K3.4,
+                // v0.359): the DIAGNOSTIC half. The generic body type-checks
+                // under the class-or-interface assumption, so a binding whose
+                // type is a bare type parameter admitting a class or
+                // interface substitution is classified exactly as the
+                // class-typed binding of the non-generic twin is: a
+                // TRANSFERRED payload binding of an owning match is "an owned
+                // local of the arm body's scope" (§35.5), entered in
+                // `owningMatchTransferBindings_` so it gets the ordinary
+                // owned-local `states_` seed (a second `move v`, a read after
+                // `move v`, a maybe-consumed join are K3.4/K7.4 errors) and
+                // its `move` is stamped for codegen's slot null; every other
+                // binding — a borrowing match's, or an un-transferred slot of
+                // an owning one — is "a borrow whose source is the scrutinee's
+                // source" (§19.3), entered in `borrowOnlyArmBindings_` so a
+                // `move` of it is rejected. Before this, neither set held such
+                // a binding, and all of those programs compiled — the
+                // borrowing-match transfers as a heap-use-after-free
+                // (MEASURED, issue #9221). A value builtin or a `where T:
+                // value` parameter is not class-assumed and keeps its
+                // pre-#9221 behaviour exactly. // per §28.1, §35.5, §19.3, v0.359
+                const bool classAssumed = typeRefIsClassAssumedTypeParam(bt);
+                if (!typeParamTransfers) {
+                    if (classAssumed) {
+                        BorrowOnlyArmBinding bob;
+                        bob.name = bindSym->name;
+                        bob.owningMatch = owning;
+                        bob.namedSlot = isNamedSlot;
+                        borrowOnlyArmBindings_[bindSym] = bob;
+                    }
+                    continue;
+                }
+                if (classAssumed) owningMatchTransferBindings_.insert(bindSym);
                 // The stamp, as the class-typed case stamps it (§35.5,
                 // §28.1 clause 3, v0.359): codegen reads the decision
                 // instead of recomputing it, so the two cannot drift.
@@ -23312,7 +23350,18 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
             // #4617's mark, so the owned sink is the ONLY disposer.
             // // per §35.5, §28.8, §28.3 K3.4, v0.307
             if (isOwningMatchTransferredArmBinding(loc)) return false;
-            return isBorrowableOwnedSinkType(ctx_.exprType(*id));
+            // fix #9221 (§28.1 clause 3, §19.3, §28.8, v0.359): a non-
+            // transferred arm binding whose type is a bare type parameter is
+            // a borrow under the class-or-interface assumption the generic
+            // body type-checks under, as the class-typed twin's is — the set
+            // `registerBorrowOnlyArmBindings` recorded it in. Keyed on that
+            // set, not on the type alone, so only a `case` arm binding is
+            // reclassified. // per §28.1, §19.3, §28.8, v0.359
+            const sema::TypeRef* bt = ctx_.exprType(*id);
+            if (borrowOnlyArmBindings_.count(loc) &&
+                typeRefIsClassAssumedTypeParam(bt))
+                return true;
+            return isBorrowableOwnedSinkType(bt);
         }
     }
     // Anything else we cannot positively classify as a borrow: conservatively
@@ -27361,11 +27410,17 @@ bool MethodOwnership::owningElemParamIsClassForced(
 bool MethodOwnership::captureTypeIsBorrowBearing(
     const sema::TypeRef* t) const {
     if (isBorrowableType(t)) return true;
-    // The type-parameter row. A bare type parameter reaches this point as a
-    // Named TypeRef with a null declaration — the shape isBorrowableType's
-    // §31.1 comment shares with builtin exceptions and value builtins — so it
-    // is recognized by its AST head name and the body's own parameter name set,
-    // never by the shape alone. // per §28.3 v0.326
+    return typeRefIsClassAssumedTypeParam(t);
+}
+
+// fix #9221: see the declaration. The type-parameter row, factored out of
+// `captureTypeIsBorrowBearing` unchanged. A bare type parameter reaches this
+// point as a Named TypeRef with a null declaration — the shape
+// isBorrowableType's §31.1 comment shares with builtin exceptions and value
+// builtins — so it is recognized by its AST head name and the body's own
+// parameter name set, never by the shape alone. // per §28.3 v0.326
+bool MethodOwnership::typeRefIsClassAssumedTypeParam(
+    const sema::TypeRef* t) const {
     if (!t || t->kind != sema::TypeRef::Kind::Named || t->declaration)
         return false;
     if (!t->astNode || !t->astNode->name ||

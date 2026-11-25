@@ -7504,6 +7504,16 @@ private:
     // function values, records) keeps isBorrowableType's answer verbatim.
     // // per §28.3 v0.326, §28.1 v0.326, §14.2
     bool captureTypeIsBorrowBearing(const sema::TypeRef* t) const;
+    // fix #9221 (§28.1 clause 3, §35.5, §19.3, v0.359): the type-parameter
+    // row of `captureTypeIsBorrowBearing`, asked on its own — is `t` a BARE
+    // type parameter of the analysed body that admits a class or interface
+    // substitution (not `where T: value`)? §28.1 clause 3: "The generic body
+    // type-checks under the class-or-interface assumption", so a value of such
+    // a type is held to the rules a class-typed value is held to. Recognized
+    // by the AST head name against the body's own parameter name set, never
+    // by the null-declaration Named shape alone (which builtins share).
+    // // per §28.1 v0.359, §14.2
+    bool typeRefIsClassAssumedTypeParam(const sema::TypeRef* t) const;
     // fix #5661: true when `head` names one of the analysed body's own generic
     // parameters (method-level or enclosing-type-level, the extension-block
     // vector included) and is NOT `where T: value`-constrained — §28.1 clause 5's
