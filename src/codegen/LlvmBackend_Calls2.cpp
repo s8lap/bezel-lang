@@ -13091,6 +13091,32 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 llvm::Type* ety = nullptr;
                 llvm::Value* addr = boxedStorage(pit->second, ety);
                 closurePtr = builder_.CreateLoad(ptrTy(), addr);
+            } else if (auto rit = refParams_.find(par);
+                       rit != refParams_.end()) {
+                // fix #9171 (§22.3 / §27.1 / §28.3.8, v0.359): a BY-REF
+                // parameter is NOT in `paramSlots_` — `bindParameters` puts a
+                // `ref`/`out` parameter in `refParams_` (CG50: the CALLER's
+                // storage address), not in a by-value slot — so the lookup
+                // above missed it, `closurePtr` stayed null,
+                // `emitClosureCall` declined, and the call did not lower at
+                // all: the #2491 return-degrade note ("internal:
+                // return-value expression failed to lower to a value") and a
+                // zero/null result — the method silently returned 0.
+                //
+                // §22.3: a `ref` parameter "aliases a location the caller
+                // chose" and "is read at its declared type", so the function
+                // value it names is the CONTENT of that location: the closure
+                // pointer is read THROUGH the ref slot. §28.3.8: "Where the
+                // location's declared type is a function type it is also a
+                // function-typed holder." §27.1: a function-typed value is
+                // invoked through its closure pointer.
+                //
+                // The load is the shape every other read of a `ref` parameter
+                // takes (`refParamAddr` → `lvalueAddr`): the address in
+                // `refParams_` IS the caller's storage, and a function type's
+                // LLVM type is a pointer (`lowerType`, Kind::Function).
+                closurePtr =
+                    builder_.CreateLoad(ptrTy(), rit->second.first, "ref.fn");
             }
             return emitClosureCall(closurePtr, rt, &call);
         }
