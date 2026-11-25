@@ -1532,10 +1532,25 @@ private:
     // node (for its spelling); `boundScope` resolves a LOCAL type-bound
     // constraint's bound on demand (an imported bound arrives already
     // resolved — see `sema::GenericParamConstraint`, fix #3146).
+    //
+    // fix #9052 (§14.1 *Instantiation and its site* / §14.2 *Interface
+    // conformance*, v0.359): `ownerArgs` carries the DECLARING generic's own
+    // type arguments at this instantiation site — the map from each of its
+    // type-parameter names to the argument supplied for it — EXCLUDING the
+    // parameter `paramName` this constraint is checked against (that one
+    // substitutes to the candidate, which the conformance walk already
+    // applies). A bound that names one of the DECLARING generic's OTHER
+    // parameters (`where T: IEntity<K>` on `class Repo<K, T>`) is read at the
+    // instantiation site under those arguments (§14.1), so the map is
+    // substituted into the bound before the conformance walk compares it
+    // against the candidate's implemented interfaces. `nullptr` means "no
+    // owner arguments" (the bound names no parameter of a generic owner).
     void checkOneConstraint(SourceLocation useSite, std::string_view paramName,
                             const GenericParamConstraint& item,
                             const ast::Type* argAst, TypeRef* arg,
-                            Scope* boundScope);
+                            Scope* boundScope,
+                            const std::unordered_map<std::string_view,
+                                                    TypeRef*>* ownerArgs);
 
     // §14.2: is the AST type node `t` a reference to a generic parameter
     // currently in scope (rather than a concrete type)? Used to skip

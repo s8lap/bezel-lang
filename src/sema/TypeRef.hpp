@@ -11,6 +11,7 @@
 // `SemaContext::resolvedType(const ast::Type&)`.
 
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 #include "ast/Node.hpp"

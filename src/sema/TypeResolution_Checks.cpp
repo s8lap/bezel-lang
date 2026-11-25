@@ -11,6 +11,7 @@
 #include "sema/NestedTypeWalk.hpp"  // fix #3597: promoted so PureChecker.cpp can share it too
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation
 #include "sema/SubstArgs.hpp"  // fix #4212: shared generic-substitution walker (§14.1 / §27.8, v0.298)
+#include "sema/TypeSpelling.hpp"  // fix #9052: spellTypeRefWithArgs (§14.2 bound spelling)
 #include "sema/TypeResolution.hpp"
 
 #include <algorithm>
@@ -13780,7 +13781,9 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
                                   std::string_view paramName,
                                   const GenericParamConstraint& item,
                                   const ast::Type* argAst, TypeRef* arg,
-                                  Scope* boundScope) {
+                                  Scope* boundScope,
+                                  const std::unordered_map<std::string_view,
+                                                          TypeRef*>* ownerArgs) {
     const std::string param(paramName);
     const std::string argName = argSpelling(argAst);
     auto report = [&](const std::string& reason,
@@ -13931,6 +13934,51 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
             if (!bound) bound = resolveType(*item.astBound, boundScope);
         }
         if (!bound || bound->kind == TypeRef::Kind::Error) return;  // defer
+        //
+        // fix #9052 (§14.1 *Instantiation and its site* / §14.2 *Interface
+        // conformance*, v0.359): a bound that names one of the DECLARING
+        // generic's OWN type parameters — a SIBLING of the parameter this
+        // constraint is checked against (`where T: IEntity<K>` on
+        // `class Repo<K, T>`) — is read AT THE INSTANTIATION SITE, under the
+        // arguments that instantiation supplies (§14.1: "An instantiation of a
+        // generic declaration is the constructed type or constructed member
+        // obtained by substituting type arguments for its type parameters").
+        //
+        // WITHOUT the substitution the bound stayed the OPEN `IEntity<K>` and
+        // the conformance walk compared it against the candidate's own
+        // instantiation `IEntity<int>` — `K` against `int` — so
+        // `Repo<int, User>` was REFUSED although `User` lists `IEntity<int>`
+        // in its inheritance clause (§14.2 rule 1). The walk's own fallback
+        // for a bare-parameter marker ("treat it as the candidate itself")
+        // covers only the `where T: IFoo<T>` shape, where the marker names
+        // the CONSTRAINT'S OWN parameter — the source documented the sibling
+        // shape as a gap.
+        //
+        // The constrained parameter itself is NOT in the map: it substitutes
+        // to the CANDIDATE, which the conformance walk already applies
+        // (the `isBoundParamMarker` arm of `argSatisfiesTypeBound`), so
+        // substituting it here would change that shape's behaviour.
+        //
+        // The diagnostic names the SUBSTITUTED bound — `IEntity<int>` — so
+        // the reader sees the constraint as it stands at this site (§14.2
+        // names the constraint; the type argument is part of it).
+        bool boundSubstituted = false;
+        if (ownerArgs && !ownerArgs->empty()) {
+            SubstArgs sa{ctx_, *ownerArgs};
+            if (TypeRef* substituted = sema::substituteGenericArgs(bound, sa))
+                if (substituted != bound) {
+                    bound = substituted;
+                    boundSubstituted = true;
+                }
+        }
+        // The bound as the diagnostic names it: the FULL spelling (head and
+        // type arguments) when the bound was substituted, the head name
+        // otherwise (the spelling every other §14.2 bound diagnostic uses).
+        auto boundText = [&]() -> std::string {
+            if (boundSubstituted) return spellTypeRefWithArgs(bound);
+            return bound->declaration ? std::string(bound->declaration->name)
+                                      : std::string(bound->headName());
+        };
         // #1867 / §14.2 clause 5 + §28.2/§9.7: a PRIMITIVE argument against
         // `IDisposable`/`IAsyncDisposable` — which only classes implement — can
         // never conform. These auto-imported builtin interfaces resolve to a
@@ -13940,7 +13988,7 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
         if (arg->kind == TypeRef::Kind::Primitive &&
             bound->kind == TypeRef::Kind::Named && !bound->declaration &&
             primitiveNeverConformsToBuiltinIface(bound->headName())) {
-            report(std::string(bound->headName()));
+            report(boundText());
             return;
         }
         // §9.7 (v0.307): records and enums can never implement
@@ -13955,7 +14003,7 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
              arg->declaration->kind == ast::TypeDeclKind::Enum) &&
             bound->kind == TypeRef::Kind::Named && !bound->declaration &&
             primitiveNeverConformsToBuiltinIface(bound->headName())) {
-            report(std::string(bound->headName()));
+            report(boundText());
             return;
         }
         // fix #8796 (§14.2, stdlib §9.6, v0.359): a primitive against a
@@ -13964,7 +14012,7 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
         // sequence of `char`) — decided by the predicate the call-site arm
         // reads too (TypeRef.hpp).
         if (primitiveRejectedByDeclLessIterationIface(arg, bound)) {
-            report(std::string(bound->headName()));
+            report(boundText());
             return;
         }
         // We can only verify a type-bound when both sides are user-declared
@@ -13984,7 +14032,7 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
                 bound->declaration == ctx_.builtinInterfaceSym(bn)) {
                 if (arg->nullable ||
                     !primitiveConformsToStaticIface(arg->primitive, bn))
-                    report(std::string(bn));
+                    report(boundText());
                 return;
             }
             // per §14.2 clause 5 v0.196: a primitive conforms ONLY to the
@@ -13998,7 +14046,7 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
             // conformances); reject rather than defer. Mirrors the method-call-
             // site check in ExprTypecheck_Calls.cpp.
             if (bound->declaration != ctx_.builtinInterfaceSym(bn)) {
-                report(std::string(bn));
+                report(boundText());
                 return;
             }
             // #1867: the bound IS a synthesized builtin interface. Blanket-
@@ -14012,13 +14060,13 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
             if (primitiveConformsToBuiltinInstanceIface(
                     arg->primitive, bn, bound->genericArgs) ==
                 PrimBuiltinIfaceConformance::Rejects)
-                report(std::string(bn));
+                report(boundText());
             return;
         }
         if (arg->kind != TypeRef::Kind::Named || !arg->declaration) {
             return;  // built-in / generic-param arg: defer
         }
-        const std::string boundName(bound->declaration->name);
+        const std::string boundName = boundText();
         if (arg->nullable) { report(boundName); return; }
         // §11.8 (v0.176, #807): a failed BFS here may be an ORDERING artifact —
         // the recurrence `class Meters: INumber<Meters>` checks this bound while
@@ -14330,7 +14378,21 @@ void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
                     continue;
                 }
             }
-            checkOneConstraint(t.span.begin, gp->name, item, argAst, arg, &boundScope);
+            // fix #9052 (§14.1 *Instantiation and its site* / §14.2
+            // *Interface conformance*, v0.359): the DECLARING generic's own
+            // type arguments, for a bound that names one of its OTHER
+            // parameters (`where T: IEntity<K>` on `class Repo<K, T>`). The
+            // constrained parameter is left out — it substitutes to the
+            // candidate, which the conformance walk already applies.
+            std::unordered_map<std::string_view, TypeRef*> ownerArgs;
+            for (std::size_t k = 0; k < tsym->genericParams.size() &&
+                 k < argRefs.size(); ++k) {
+                if (k == pi) continue;
+                Symbol* owner = tsym->genericParams[k];
+                if (owner && argRefs[k]) ownerArgs[owner->name] = argRefs[k];
+            }
+            checkOneConstraint(t.span.begin, gp->name, item, argAst, arg,
+                               &boundScope, &ownerArgs);
         }
     }
 }
@@ -14420,7 +14482,20 @@ void Resolver::checkGenericConstraintsAtUseSite(
                     continue;
                 }
             }
-            checkOneConstraint(useSite, gp->name, item, argAst, arg, &boundScope);
+            // fix #9052 (§14.1 / §14.2, v0.359): the DECLARING generic's own
+            // type arguments, for a bound that names one of its OTHER
+            // parameters — the same map the wrapping form passes (the
+            // constrained parameter is left out: it substitutes to the
+            // candidate, which the conformance walk already applies).
+            std::unordered_map<std::string_view, TypeRef*> ownerArgs;
+            for (std::size_t k = 0; k < tsym->genericParams.size() &&
+                 k < argRefs.size(); ++k) {
+                if (k == pi) continue;
+                Symbol* owner = tsym->genericParams[k];
+                if (owner && argRefs[k]) ownerArgs[owner->name] = argRefs[k];
+            }
+            checkOneConstraint(useSite, gp->name, item, argAst, arg,
+                               &boundScope, &ownerArgs);
         }
     }
 }
@@ -14630,8 +14705,17 @@ void Resolver::checkDeferredNestedConstraints() {
             GenericParamConstraint view;
             view.kind = p.item->kind;
             view.astBound = p.item->typeArg.get();
+            // fix #9052 (§14.1 / §14.2, v0.359): no owner arguments here.
+            // The deferred-nested record is AST-shaped and carries no
+            // resolved arguments for the INNER type's own parameters (the
+            // obligation names the OUTER type and the parameter that carries
+            // it), so a bound naming one of the inner type's OTHER
+            // parameters cannot be substituted at this site. RESIDUAL, as the
+            // ⚠ RESIDUAL note in `checkGenericConstraints` already records for
+            // this path — the direct instantiation sites (the issue's repro
+            // and every sibling shape) substitute the owner's arguments.
             checkOneConstraint(p.innerSite->span.begin, p.innerParamName, view,
-                               boundAst, bound, &boundScope);
+                               boundAst, bound, &boundScope, nullptr);
         }
     }
 }

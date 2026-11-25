@@ -5918,7 +5918,8 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             GenericParamConstraint item;
                             item.kind = "value";
                             checkOneConstraint(t.span.begin, c.paramName,
-                                               item, argAst, arg, nullptr);
+                                               item, argAst, arg, nullptr,
+                                               nullptr);
                         }
                         break;
                     }

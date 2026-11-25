@@ -21,6 +21,7 @@
 #include "sema/SpanFamily.hpp"    // isSpanFamilyTypeRef — §3.3 / §4.14 / §4.15 span views (fix #8211)
 #include "sema/TypeResolution.hpp"  // typeRefEqual, overrideParamTypeMatches
 #include "sema/SubstArgs.hpp"       // sema::substituteGenericArgs — generic class IComparable check
+#include "sema/TypeSpelling.hpp"    // fix #9052: spellTypeRefWithArgs (§14.2 bound spelling)
 #include "sema/GenericParams.hpp"   // sema::hasVariantGenericParam — §12.9 variance read from BOTH
                                    // sources (#3143; an AST-only read answers invariant for an import)
 #include "sema/GroupingElem.hpp"    // fix #8542: sema::iGroupingElemTypeRef — the ONE IGrouping
@@ -10722,6 +10723,65 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // `ctx_.resolvedType(*item.typeArg)` the
                             // pre-fix code computed inline.
                             TypeRef* bound = item.bound;
+                            // fix #9052 (§14.1 *Instantiation and its site* /
+                            // §14.2 *Interface conformance*, v0.359): a bound
+                            // that names one of the METHOD's OWN type
+                            // parameters — a SIBLING of the parameter the
+                            // constraint is checked against (`where T:
+                            // IEntity<K>` on `method M<K, T>(...)`) — is read
+                            // AT THE CALL SITE, under the type arguments the
+                            // call supplies (§14.1: "An instantiation of a
+                            // generic declaration is the constructed ... member
+                            // obtained by substituting type arguments for its
+                            // type parameters").
+                            //
+                            // WITHOUT the substitution the bound stayed the
+                            // OPEN `IEntity<K>` and the conformance walk
+                            // compared it against the candidate's own
+                            // instantiation `IEntity<int>` — `K` against
+                            // `int` — so `M<int, User>(u)` was REFUSED
+                            // although `User` lists `IEntity<int>` in its
+                            // inheritance clause (§14.2 rule 1). The walk's own
+                            // fallback for a bare-parameter marker ("treat it
+                            // as the candidate itself") covers only the
+                            // `where T: IFoo<T>` shape, where the marker names
+                            // the CONSTRAINT'S OWN parameter.
+                            //
+                            // The constrained parameter itself is NOT in the
+                            // map: it substitutes to the CANDIDATE, which the
+                            // conformance walk already applies (the
+                            // `isBoundParamMarker` arm of
+                            // `argSatisfiesTypeBound`).
+                            //
+                            // The METHOD's own parameters are substituted
+                            // FIRST: §14.1's *Type-parameter names* rule
+                            // forbids a generic method's type parameter from
+                            // reusing the name of a type parameter in scope at
+                            // the method's declaration, "including its
+                            // enclosing type's" — so the method's map and the
+                            // class's map cannot name the same parameter, and
+                            // the order carries no meaning.
+                            bool boundSubstituted = false;
+                            TypeRef* boundSubst = bound;
+                            if (bound && !subst.empty()) {
+                                std::unordered_map<std::string_view,
+                                                   TypeRef*> methodArgs;
+                                for (const auto& kv : subst) {
+                                    if (kv.first == gc.typeParam) continue;
+                                    if (!kv.second) continue;
+                                    methodArgs[kv.first] = kv.second;
+                                }
+                                if (!methodArgs.empty()) {
+                                    SubstArgs sa{ctx_, methodArgs};
+                                    if (TypeRef* substituted =
+                                            sema::substituteGenericArgs(
+                                                bound, sa))
+                                        if (substituted != bound) {
+                                            boundSubst = substituted;
+                                            boundSubstituted = true;
+                                        }
+                                }
+                            }
                             // fix #8663 (§14.1 / §14.2, v0.357): read the
                             // bound under the RECEIVER's class
                             // instantiation, so a bound naming the
@@ -10732,11 +10792,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // what says whether the bound is a bare type
                             // PARAMETER (the type-parameter-bound arm
                             // below) at all.
-                            TypeRef* boundSubst = bound;
                             if (bound && classParent &&
                                 !classParent->genericParams.empty())
                                 boundSubst = substituteMemberType(
-                                    bound, classRecv, classParent);
+                                    boundSubst, classRecv, classParent);
                             // fix #8741 (§14.2 *A type parameter as the type
                             // argument*, v0.359): a class argument that is a
                             // TYPE PARAMETER IN SCOPE at the call
@@ -11064,8 +11123,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // against the class's ARGUMENT.
                             if (!argSatisfiesTypeBound(argRef, boundSubst,
                                                       &ctx_))
-                                report(std::string(
-                                    bound->declaration->name));
+                                // fix #9052 (§14.2, v0.359): name the bound
+                                // AS IT STANDS AT THIS SITE — the FULL
+                                // spelling, with its type argument, when the
+                                // bound was substituted with the call's own
+                                // type arguments (`IEntity<int>`); the head
+                                // name otherwise (the spelling every other
+                                // §14.2 bound diagnostic uses).
+                                report(boundSubstituted
+                                           ? spellTypeRefWithArgs(boundSubst)
+                                           : std::string(
+                                                 bound->declaration->name));
                         } else if (item.kind == "class") {
                             // §14.2: non-nullable reference type only.
                             //
