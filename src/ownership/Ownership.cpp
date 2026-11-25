@@ -451,6 +451,56 @@ bool armDivertsToEnclosingLoop(
     return false;
 }
 
+// fix #9098 (§28.2, §28.3.10, v0.359): does control PROVABLY never come back to
+// this loop's head from the end of `stmts`? The lambda-body pre-pass models the
+// back edge of a loop only where one exists: the method body's CFG has no edge
+// from a body that ends in an unconditional `break` (or `return` / `throw`, or
+// a labeled `continue` of an OUTER loop) to the loop head, so a kill made
+// just before that exit reaches no later pass. A SYNTACTIC under-approximation
+// of "the last statement leaves": `return` / `throw` (`stmtNeverFallsThrough`),
+// `break`, a labeled `continue`, a `do` block ending in one, an `if` whose every
+// branch (an `else` is required) ends in one, a `try` whose `finally` leaves or
+// whose body and every `catch` arm leave, a `case` whose every arm leaves and
+// whose no-match edge is dead. Under-approximating means the back edge is
+// modelled for a shape this misses, never skipped for one that returns to the
+// head. `continue` of THIS loop reaches the head. // per §28.2, §21.5
+static bool stmtLeavesLoopHead(const ast::Stmt& s);
+static bool bodyLeavesLoopHead(
+    const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    for (auto it = stmts.rbegin(); it != stmts.rend(); ++it)
+        if (*it) return stmtLeavesLoopHead(**it);
+    return false;
+}
+static bool stmtLeavesLoopHead(const ast::Stmt& s) {
+    if (stmtNeverFallsThrough(s)) return true;
+    if (dynamic_cast<const ast::BreakStmt*>(&s)) return true;
+    if (auto* cnt = dynamic_cast<const ast::ContinueStmt*>(&s))
+        return cnt->targetLoopOffset != 0;
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s))
+        return bodyLeavesLoopHead(dob->body);
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (!ifs->hasElse) return false;
+        if (!bodyLeavesLoopHead(ifs->ifBranch.body)) return false;
+        for (const auto& el : ifs->elifBranches)
+            if (!bodyLeavesLoopHead(el.body)) return false;
+        return bodyLeavesLoopHead(ifs->elseBody);
+    }
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        if (ts->hasFinally && bodyLeavesLoopHead(ts->finallyBody)) return true;
+        if (!bodyLeavesLoopHead(ts->body)) return false;
+        for (const auto& arm : ts->catches)
+            if (!arm.body || !stmtLeavesLoopHead(*arm.body)) return false;
+        return true;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (!cs->noMatchEdgeStaticallyDead) return false;
+        for (const auto& arm : cs->arms)
+            if (!bodyLeavesLoopHead(arm.stmts)) return false;
+        return !cs->arms.empty();
+    }
+    return false;
+}
+
 // fix #3037 / §28.3 (v0.240): the source location of a §28.3 owned-binding
 // diagnostic. Most owned-binding kinds carry `obligationOrigin` populated by the
 // analysis (a back-pointer to the AST node where the obligation was created,
@@ -17225,7 +17275,7 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         // over `x` invoked in the pass after one that discarded `x`. The
         // method body's CFG carries this edge; the first walk above cannot.
         // The second visit reports only what the first could not. // per §28.2
-        if (!armNeverFallsThrough(ws->body)) rewalkLambdaBlock(ws->body);
+        if (!bodyLeavesLoopHead(ws->body)) rewalkLambdaBlock(ws->body);
         // fix #4141: join every break/continue-arm end-state pushed
         // during this body's walk into the post-loop join. Each one is
         // a path through the body that EXITED the loop early; together
@@ -17279,7 +17329,7 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         }
         // fix #9098: the back edge, as in the WhileStmt arm above.
         // per §28.2
-        if (!armNeverFallsThrough(fs->body)) rewalkLambdaBlock(fs->body);
+        if (!bodyLeavesLoopHead(fs->body)) rewalkLambdaBlock(fs->body);
         for (std::size_t i = pendingStart; i < pendingEnd; ++i) {
             joinInto(states_, pendingDivertedStates_[i], fs->span.begin,
                      /*emitClash=*/false, /*unionKeys=*/false);

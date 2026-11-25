@@ -183,3 +183,92 @@ BEZEL_TEST(ownership_lambda_body_flow_holder_check_9098,
         "      return s;\n"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ---- fix-forward: no back edge from a body that cannot reach its end ------
+// §28.2 (v0.359) rejects a use reached by a disposal on some path. After an
+// unconditional trailing `break` (also one inside a `do` block, or a `try`
+// whose `finally` ends in one) no path returns to the loop head, so a kill
+// before it reaches no later pass: the METHOD twin admits every program
+// below, and the first #9098 commit falsely rejected them ("may have already
+// been disposed on another branch"). Each row is RED on that commit.
+
+// ADMIT: `for` body kills the source, then breaks unconditionally.
+BEZEL_TEST(ownership_lambda_body_flow_holder_check_9098,
+           for_kill_then_trailing_break_admitted_spec_28_2) {
+    OwnershipResult r = parseAndCheckOwnership(lambdaProg(
+        "      var x := new Res(1);\n"
+        "      var y := x;\n"
+        "      var s := 0;\n"
+        "      for var i in [0, 1] do s := s + y.tag; x.Dispose(); break; end;\n"
+        "      return s;\n"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ADMIT: the same shape in a `while` loop.
+BEZEL_TEST(ownership_lambda_body_flow_holder_check_9098,
+           while_kill_then_trailing_break_admitted_spec_28_2) {
+    OwnershipResult r = parseAndCheckOwnership(lambdaProg(
+        "      var x := new Res(1);\n"
+        "      var y := x;\n"
+        "      var i := 0;\n"
+        "      var s := 0;\n"
+        "      while i < 2 do s := s + y.tag; x.Dispose(); break; end;\n"
+        "      return s;\n"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ADMIT: the kill is a `try ... finally x.Dispose(); end`, then `break`.
+BEZEL_TEST(ownership_lambda_body_flow_holder_check_9098,
+           loop_try_finally_kill_then_trailing_break_admitted_spec_28_2) {
+    OwnershipResult r = parseAndCheckOwnership(lambdaProg(
+        "      var x := new Res(1);\n"
+        "      var y := x;\n"
+        "      var s := 0;\n"
+        "      while true do\n"
+        "        s := s + y.tag;\n"
+        "        try s := s + 1; finally x.Dispose(); end;\n"
+        "        break;\n"
+        "      end;\n"
+        "      return s;\n"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ADMIT: the trailing `break` sits inside a `do` block.
+BEZEL_TEST(ownership_lambda_body_flow_holder_check_9098,
+           loop_kill_then_break_in_do_block_admitted_spec_28_2) {
+    OwnershipResult r = parseAndCheckOwnership(lambdaProg(
+        "      var x := new Res(1);\n"
+        "      var y := x;\n"
+        "      var s := 0;\n"
+        "      while true do s := s + y.tag; do x.Dispose(); break; end; end;\n"
+        "      return s;\n"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ADMIT: an inner loop's kill+break inside an outer loop that itself breaks.
+BEZEL_TEST(ownership_lambda_body_flow_holder_check_9098,
+           nested_loops_inner_kill_break_outer_break_admitted_spec_28_2) {
+    OwnershipResult r = parseAndCheckOwnership(lambdaProg(
+        "      var x := new Res(1);\n"
+        "      var y := x;\n"
+        "      var s := 0;\n"
+        "      for var i in [0, 1] do\n"
+        "        s := s + y.tag;\n"
+        "        for var j in [0, 1] do x.Dispose(); break; end;\n"
+        "        break;\n"
+        "      end;\n"
+        "      return s;\n"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ADMIT: a loop inside a `finally`, ending in kill+break.
+BEZEL_TEST(ownership_lambda_body_flow_holder_check_9098,
+           finally_loop_kill_then_trailing_break_admitted_spec_28_2) {
+    OwnershipResult r = parseAndCheckOwnership(lambdaProg(
+        "      var x := new Res(1);\n"
+        "      var y := x;\n"
+        "      var r := 0;\n"
+        "      try r := 1; finally while true do r := r + y.tag; x.Dispose(); break; end; end;\n"
+        "      return r;\n"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
