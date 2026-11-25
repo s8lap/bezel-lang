@@ -8009,17 +8009,55 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
     llvm::Type* retTy = lowerType(pd->type.get());
     if (!retTy) retTy = i32();
 
-    auto* fnTy = llvm::FunctionType::get(retTy, {ptrTy()}, false);
+    // fix #9224 (§22.12 / §23.3, v0.359): a STATIC property's accessor runs
+    // with NO receiver — §22.12's static members ("Static methods, properties,
+    // fields, and constructors are declared with `static`") and the
+    // static-context restriction it rests on (spec §2.7's *Enclosing-type
+    // members*: "a static body has no `this`"). So a STATIC block-form
+    // property's getter is a `T get()` — no `this` parameter — exactly the
+    // signature `ensurePropertyAccessorFn` already builds for a static
+    // property (fix #2885's static branch, the `$spropget` ABI).
+    //
+    // MEASURED on r30-c1 (issue #9224): the block-form getter read site
+    // (LlvmBackend_Exprs.cpp's CG33b block-form arm) LOWERS THE RECEIVER
+    // first, and for a static property the receiver is the TYPE NAME
+    // (`Hx.U`), which is not a value — `lowerExpr` yields null and the whole
+    // read fails to lower. The consequences, all measured on the base:
+    // `t := t + Hx.U(1);` printed `0` behind #2961's "assignment RHS
+    // expression failed to lower" warning; `var g := Hx.U; g(1);` degraded to
+    // a zero-initialized `g` behind #2434 and then SEGFAULTED on the null
+    // closure; the BARE spelling `U` inside the declaring class emitted
+    // `call ptr @"bz$prop$U$get"(<null operand!>)` and failed IR
+    // verification; and `Apply(Hx.U)` failed behind #1386. The INSTANCE
+    // spelling of the same shape (`o.P(1)`) works — its receiver is a value.
+    //
+    // The getter BODY is emitted exactly as the instance twin's is (the same
+    // #8763 reader-reference protocol, the same #6766/#8831 closure and
+    // borrowing-collection analyses) — only the ABI differs: no `this`
+    // parameter, and no `this` bound in the body (a static body has no
+    // `this`, and sema rejects one).
+    const bool isStaticProp = isStaticProperty(ps ? ps : psKey);
+    auto* fnTy = isStaticProp
+        ? llvm::FunctionType::get(retTy, {}, false)
+        : llvm::FunctionType::get(retTy, {ptrTy()}, false);
     // fix #8763 (fix-forward 2, §28.9 / §7.5, v0.359): the BORROW variant
     // gets its own name, so an IR dump shows WHICH contract the getter was
     // emitted under (`bz$prop$P$get` mints the reader's reference;
     // `bz$prop$P$get$lend` does not). Without the suffix the two functions
     // would collide on one symbol name and LLVM would rename the second
     // implicitly (`…$get.1`), which reads like an accident.
+    //
+    // fix #9224 (§22.12, v0.359): the STATIC getter gets its own suffix too
+    // (`$s`), for the same reason and one more: a static and an instance
+    // property may share a name (two classes, or one class's static and
+    // instance members), and their getters have DIFFERENT ABIs — the name
+    // says which one an IR dump is talking about.
+    const std::string propName = "bz$prop$" + std::string(pd->name);
     auto* fn = llvm::Function::Create(
         fnTy, llvm::GlobalValue::InternalLinkage,
-        mintReaderRef ? ("bz$prop$" + std::string(pd->name) + "$get")
-                      : ("bz$prop$" + std::string(pd->name) + "$get$lend"),
+        isStaticProp
+            ? (mintReaderRef ? (propName + "$get$s") : (propName + "$get$lend$s"))
+            : (mintReaderRef ? (propName + "$get") : (propName + "$get$lend")),
         *module_);
     propBlockGetterInstFns_[bgKey] = fn;
     // no capture attribute added (Captures API varies by LLVM version)
@@ -8109,7 +8147,15 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
     // --- Switch into the getter function ---
     currentFn_          = fn;
     builder_.SetInsertPoint(entryBB);
-    currentThis_        = &*fn->args().begin();
+    // fix #9224 (§22.12, v0.359): a STATIC property's getter has NO `this`
+    // argument to bind — a static body has no `this` (spec §2.7's
+    // *Enclosing-type members*), and the getter's function type carries no
+    // receiver parameter at all (the `fnTy` above). Binding argument 0 would
+    // be binding nothing (the static getter has no arguments), so `this`
+    // stays null — the same discipline `ensurePropertyAccessorFn`'s static
+    // branch takes (fix #2885: "leaving it null keeps any future reader from
+    // silently binding argument 0 … as a receiver").
+    currentThis_        = isStaticProp ? nullptr : &*fn->args().begin();
     // fix-forward #8127 (§8.5 / §18.5, v0.355): this getter is emitted LAZILY
     // from inside its first caller's body, so the caller's receiver state is
     // still live; record the property's OWNER as `this`'s type for the body.

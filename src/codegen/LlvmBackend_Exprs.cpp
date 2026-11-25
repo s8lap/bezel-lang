@@ -11083,6 +11083,54 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // CG33b: block-form getter (`get => do … end;`) — emit as a
         // standalone function so that `return` inside the body terminates
         // only the getter, not the enclosing method (§21.7).
+        //
+        // fix #9224 (§22.12 / §23.3 / §27.6 / §28.9, v0.359): a STATIC
+        // property's block-form getter has NO receiver — the accessor runs
+        // with no `this` (spec §2.7's *Enclosing-type members*: "a static
+        // body has no `this`"; §22.12 declares the member `static`). The
+        // arm below lowers the RECEIVER first, and for a static property the
+        // receiver is the TYPE NAME (`Hx.U`), which is not a value:
+        // `lowerExpr` yields null and the read fails to lower.
+        //
+        // MEASURED on r30-c1 (issue #9224): `t := t + Hx.U(1);` printed `0`
+        // behind #2961's "assignment RHS expression failed to lower"
+        // warning; `var g := Hx.U; g(1);` degraded to a zero-initialized `g`
+        // behind #2434 and then SEGFAULTED on the null closure; a plain
+        // `Console.WriteLine(Hx.N)` (a static block-form `int` property)
+        // printed NOTHING behind #3079; and `Apply(Hx.U)` failed behind
+        // #1386. The INSTANCE spelling of the same shape (`o.P(1)`) works —
+        // its receiver is a value — and the EXPRESSION-bodied static twin
+        // (`Hx.T(1)`) works too: the expression-getter arm above has had a
+        // static branch (CG33b's `isStaticProp`) since #5319, and this
+        // block-form arm never got one.
+        //
+        // So the static spelling reads its getter with NO argument, and the
+        // getter itself is emitted receiver-less (the `$get$s` variant of
+        // `ensurePropertyBlockGetter`, fix #9224) — the same ABI
+        // `ensurePropertyAccessorFn` already builds for a static property
+        // (fix #2885's `$spropget`).
+        if (auto* statPs = dynamic_cast<sema::PropertySymbol*>(
+                ctx_.exprSymbol(*ma));
+            statPs && isStaticProperty(statPs)) {
+            if (const ast::PropertyAccessor* acc = blockGetterOf(statPs)) {
+                auto* statPd =
+                    dynamic_cast<const ast::PropertyDecl*>(statPs->decl);
+                if (!statPd) return nullptr;
+                llvm::Function* getterFn = ensurePropertyBlockGetter(
+                    statPd, acc, /*ps=*/statPs, /*psKey=*/statPs,
+                    /*mintReaderRef=*/true);
+                if (!getterFn) return nullptr;
+                llvm::Value* res = builder_.CreateCall(
+                    getterFn->getFunctionType(), getterFn, {});
+                // §31.1/§31.2 (FINDING [4]): a block-form getter is a
+                // standalone function; a `throw` inside it (§23.3's idiom)
+                // leaves the pending-exception global set and returns. The
+                // caller must test that flag and route to the enclosing
+                // unwind target — exactly as an ordinary method call does.
+                emitPendingCheck();
+                return res;
+            }
+        }
         if (const ast::PropertyAccessor* acc =
                 blockGetterOf(ctx_.exprSymbol(*ma))) {
             if (!ma->target) return nullptr;
@@ -11867,8 +11915,20 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // whenever the two return types happen to agree.
             llvm::Function* fn = ensurePropertyBlockGetter(pd, acc, ps, ps,
                                                           /*mintReaderRef=*/true);
+            // fix #9224 (§22.12, v0.359): a STATIC property's getter has NO
+            // receiver — the accessor runs with no `this` (spec §2.7's
+            // *Enclosing-type members*), so the call passes no argument. The
+            // BARE spelling of a static property (inside its declaring
+            // type) would otherwise pass the ENCLOSING method's `this` to a
+            // receiver-less getter — and, before fix #9224, it passed a NULL
+            // `this` (the enclosing body is a static method's), which emitted
+            // `call ptr @"bz$prop$U$get"(<null operand!>)` and failed IR
+            // verification outright (MEASURED on r30-c1).
             llvm::Value* res =
-                builder_.CreateCall(fn->getFunctionType(), fn, {currentThis_});
+                isStaticProperty(ps)
+                    ? builder_.CreateCall(fn->getFunctionType(), fn, {})
+                    : builder_.CreateCall(fn->getFunctionType(), fn,
+                                          {currentThis_});
             // §31.1/§31.2 (FINDING [4]): see the qualified block-getter read
             // above — a throw inside the standalone getter must propagate.
             emitPendingCheck();
