@@ -42847,9 +42847,33 @@ inline const ast::Expr* closureIdentityCallForwardedArg(
 //
 // `safeRead`: true when a bare identifier in the current expression position is
 // a non-consuming read; false when it would escape.
+//
+// fix #9333 (§28.11 / §28.9, v0.359): the two facts the closure walker's
+// COLLECTION-LITERAL arm needs, which the walker (a namespace-scope struct
+// holding only a `const sema::SemaContext&`, no `Emitter`) cannot reach for
+// itself:
+//
+//   * `slotTakesRef` — the Emitter's own answer to "does this collection's
+//     element slot TAKE a reference of its own?". It is the Emitter's
+//     `isFunctionElementSlotPaired`, the SAME predicate the literal
+//     materializer uses to emit the per-element retain
+//     (`materializeHeapCollectionLiteral`), so the retain and the local's
+//     scope-end release can never disagree: a retain without the release
+//     leaks the closure, a release without the retain frees a value the
+//     collection still holds.
+//   * `returnTy` — the enclosing method's RETURN type: the slot a
+//     `return [f, g];` stores its literal into.
+struct ClosureSlotPolicy {
+    std::function<bool(const sema::TypeRef*)> slotTakesRef;
+    const sema::TypeRef* returnTy = nullptr;
+};
+
 struct ClosureEscapeWalker {
     const sema::SemaContext& ctx;
     const void* target;   // the LocalDecl node we are testing
+    // fix #9333 (§28.11 / §28.9, v0.359): the slot facts above. Null on the
+    // walks that do not consult them (their verdicts are unchanged).
+    const ClosureSlotPolicy* slotPolicy = nullptr;
     // fix #8764 (§28.9, v0.359): when set, the tracked binding is this
     // PARAMETER symbol (a ParameterSymbol has no LocalDecl to key on), and
     // `isTargetIdent` matches an identifier resolving to it — the closure
@@ -43851,6 +43875,66 @@ struct ClosureEscapeWalker {
         expr(callee, /*safeRead=*/true);
     }
 
+    // fix #9333 (§28.11 / §28.9, v0.359): walk a COLLECTION LITERAL whose
+    // TARGET type is `targetTy` — the type of the SLOT the literal is stored
+    // into (the local's declared type, the assignment target's type, the
+    // method's return type).
+    //
+    // §28.11's *runtime-managed reference* row puts a function type in the
+    // shared-reference row: a built-in collection's store TAKES a reference of
+    // its own ("the store: stores the reference") and gives that reference
+    // back when the slot goes away. So the element local keeps its OWN
+    // reference and releases it at its scope end — exactly as the
+    // `arr.Add(f)` store does (the CallExpr arm's
+    // `isBuiltinArrayFunctionElementStore` relief sets the same two flags).
+    //
+    // Read as a plain ESCAPE — which is what this arm did before #9333 — the
+    // local's scope-end release was never armed, so the collection's
+    // reference to the closure was never given back and the closure leaked
+    // (issue #9333: 28000 B in 800 allocations over 200 iterations of
+    // `using var st: Array<() -> int> := [f, g];`).
+    //
+    // The verdict is the Emitter's own `isFunctionElementSlotPaired` — the
+    // SAME predicate the literal materializer's per-element retain uses — so
+    // the retain and the scope-end release always agree (see
+    // `ClosureSlotPolicy`).
+    void exprCollectionLiteral(const ast::CollectionLiteralExpr* cl,
+                               const sema::TypeRef* targetTy) {
+        if (!cl) return;
+        const sema::TypeRef* elemTy =
+            (targetTy && !targetTy->genericArgs.empty())
+                ? targetTy->genericArgs[0]
+                : nullptr;
+        const bool takesRef =
+            slotPolicy && slotPolicy->slotTakesRef && targetTy &&
+            slotPolicy->slotTakesRef(targetTy);
+        for (auto& el : cl->elements) {
+            if (!el) continue;
+            // A NESTED literal's target is THIS literal's element type
+            // (`Array<Array<() -> int>> := [[f, g]]` — the inner literal's
+            // slots are the ones that take the references).
+            if (auto* nested =
+                    dynamic_cast<const ast::CollectionLiteralExpr*>(el.get())) {
+                exprCollectionLiteral(nested, elemTy);
+                continue;
+            }
+            // The relief applies to the TARGET's own read: a value that is
+            // not the target says nothing about the target's reference
+            // (the `arr.Add(f)` relief is keyed on the argument being the
+            // target, the same way).
+            if (takesRef && isTargetIdent(el.get())) {
+                const bool savedSite = inReferenceTakingSite_;
+                inReferenceTakingSite_ = true;
+                storedIntoSharedRefSlot_ = true;
+                expr(el.get(), /*safeRead=*/false);
+                inReferenceTakingSite_ = savedSite;
+                continue;
+            }
+            expr(el.get(), /*safeRead=*/false);
+        }
+        for (auto& k : cl->keys) expr(k.get(), /*safeRead=*/false);
+    }
+
     void expr(const ast::Expr* e, bool safeRead) {
         if (!e) return;
         // fix #2107-follow-up / lane-35 narrow (#4422, §27.5 / §28.9, v0.298):
@@ -44529,6 +44613,17 @@ struct ClosureEscapeWalker {
                 recordBindForwardsTarget(ld->type.get(),
                                          ld->initializer.get()))
                 return;
+            // fix #9333 (§28.11 / §28.9, v0.359): a COLLECTION LITERAL bound
+            // to this local — the literal's TARGET is the local's DECLARED
+            // type (the very type the literal materializer is handed,
+            // `lowerLocalDecl`), so the element store's reference-taking
+            // verdict is read from it. See `exprCollectionLiteral`.
+            if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                    ld->initializer.get())) {
+                exprCollectionLiteral(
+                    cl, ld->type ? ctx.resolvedType(*ld->type) : nullptr);
+                return;
+            }
             // Binding the target into ANOTHER local escapes it (the new local
             // may itself be returned/stored).
             expr(ld->initializer.get(), /*safeRead=*/false);
@@ -44556,6 +44651,16 @@ struct ClosureEscapeWalker {
             if (!inLambda &&
                 recordBindForwardsTarget(lc->type.get(), lc->value.get()))
                 return;  // fix #8743
+
+            // fix #9333 (§28.11 / §28.9, v0.359): the `const` twin of the
+            // `var` declaration arm above — a COLLECTION LITERAL bound to
+            // this local, whose TARGET is the local's declared type.
+            if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                    lc->value.get())) {
+                exprCollectionLiteral(
+                    cl, lc->type ? ctx.resolvedType(*lc->type) : nullptr);
+                return;
+            }
 
             expr(lc->value.get(), /*safeRead=*/false); return;
         }
@@ -44631,6 +44736,20 @@ struct ClosureEscapeWalker {
                 const bool savedSite = inReferenceTakingSite_;
                 if (r->value && isTargetIdent(r->value.get()))
                     inReferenceTakingSite_ = true;
+                // fix #9333 (§28.11 / §28.9, v0.359): a COLLECTION LITERAL
+                // returned — the literal's TARGET is the enclosing method's
+                // RETURN type, so the element store's reference-taking verdict
+                // is read from it. See `exprCollectionLiteral`.
+                if (r->value) {
+                    if (auto* cl = dynamic_cast<
+                                const ast::CollectionLiteralExpr*>(
+                            r->value.get())) {
+                        exprCollectionLiteral(
+                            cl, slotPolicy ? slotPolicy->returnTy : nullptr);
+                        inReferenceTakingSite_ = savedSite;
+                        return;
+                    }
+                }
                 expr(r->value.get(), /*safeRead=*/false);
                 inReferenceTakingSite_ = savedSite;
             }
@@ -44870,6 +44989,22 @@ struct ClosureEscapeWalker {
                     isClosureTypedLocalAssign(*as->target) &&
                     forwardsTarget(as->value.get(), /*sawWrap=*/true))
                     inReferenceTakingSite_ = true;
+                // fix #9333 (§28.11 / §28.9, v0.359): `st := [f, g];` — a
+                // COLLECTION LITERAL assigned to a slot: the literal's
+                // TARGET is the assignment target's type (the type the
+                // literal materializer is handed, `LlvmBackend_Assign.cpp`'s
+                // `materializeHeapCollectionLiteral` arm), so the element
+                // store's reference-taking verdict is read from it. See
+                // `exprCollectionLiteral`.
+                if (as->op == ":=" && as->target && as->value) {
+                    if (auto* cl = dynamic_cast<
+                                const ast::CollectionLiteralExpr*>(
+                            as->value.get())) {
+                        exprCollectionLiteral(cl, ctx.exprType(*as->target));
+                        inReferenceTakingSite_ = savedSite;
+                        return;
+                    }
+                }
                 expr(as->value.get(), /*safeRead=*/false);
                 inReferenceTakingSite_ = savedSite;
             }
@@ -46138,6 +46273,31 @@ void Emitter::collectClosureReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     closureReleaseEligible_.clear();
     closureLocalCandidates_.clear();  // fix #3757 follow-up
+    // fix #9333 (§28.11 / §28.9, v0.359): the slot facts the closure
+    // walker's COLLECTION-LITERAL arm needs (see `ClosureSlotPolicy`):
+    //   * `slotTakesRef` — the Emitter's OWN `isFunctionElementSlotPaired`,
+    //     the SAME predicate the literal materializer's per-element retain
+    //     uses (`materializeHeapCollectionLiteral`), so the retain and the
+    //     local's scope-end release always agree;
+    //   * `returnTy` — the enclosing method's RETURN type, the slot a
+    //     `return [f, g];` stores its literal into.
+    // The walker's element store of a collection literal used to read as a
+    // plain ESCAPE, so the element local's scope-end release was never
+    // armed and the collection's reference to the closure leaked (issue
+    // #9333: 28000 B in 800 allocations over 200 iterations of
+    // `using var st: Array<() -> int> := [f, g];`).
+    ClosureSlotPolicy slotPolicy{
+        [this](const sema::TypeRef* collTy) {
+            if (!collTy) return false;
+            const sema::TypeRef* el =
+                (!collTy->genericArgs.empty()) ? collTy->genericArgs[0] : nullptr;
+            return isFunctionElementSlotPaired(collTy, el);
+        },
+        nullptr};
+    {
+        const ast::Type* rtn = returnReprTypeNode();
+        slotPolicy.returnTy = rtn ? ctx_.resolvedType(*rtn) : nullptr;
+    }
     // fix #4434 (§27.5 / §28.9, v0.298): `closureLocalCapturedCell_` and
     // `closureLocalCapturedCellReassigned_` are NOT cleared here — those
     // sets are populated by `collectCapturedCellClosureLocals` (called from
@@ -46725,7 +46885,7 @@ void Emitter::collectClosureReleaseEligible(
                 if (assignedLocals.count(x)) continue;
                 auto xl = declList.find(x);
                 if (xl == declList.end() || xl->second != bl->second) continue;
-                ClosureEscapeWalker xw{ctx_, x};
+                ClosureEscapeWalker xw{ctx_, x, &slotPolicy};
                 if (!xw.forwardsTarget(as->value.get(), /*sawWrap=*/false))
                     continue;
                 assignBinds.insert({x, static_cast<const void*>(as)});
@@ -46746,7 +46906,7 @@ void Emitter::collectClosureReleaseEligible(
             const void* key = static_cast<const void*>(ld);
             if (!closureAliasOwned_.count(key)) continue;
             sourceSafeAliases.insert(key);
-            ClosureEscapeWalker aw{ctx_, key};
+            ClosureEscapeWalker aw{ctx_, key, &slotPolicy};
             aw.coalesceReturnTransfers = coalesceReturnTransfers;  // #6176
             aw.ownedAliasDecls = &closureAliasOwned_;
             aw.scrutineeBorrowMode = true;
@@ -46768,7 +46928,7 @@ void Emitter::collectClosureReleaseEligible(
                 if (!kv.init) continue;
                 for (const void* other : sourceSafeAliases) {
                     if (other == key || keptAliases.count(other)) continue;
-                    ClosureEscapeWalker cw{ctx_, other};
+                    ClosureEscapeWalker cw{ctx_, other, &slotPolicy};
                     if (!cw.containsTargetAnywhere(kv.init)) continue;
                     keptAliases.insert(other);
                     changed = true;
@@ -46782,7 +46942,7 @@ void Emitter::collectClosureReleaseEligible(
     // pass after this loop).
     std::unordered_set<const void*> returnedByName;
     for (const ast::Node* ld : candidates) {
-        ClosureEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        ClosureEscapeWalker w{ctx_, static_cast<const void*>(ld), &slotPolicy};
         w.coalesceReturnTransfers = coalesceReturnTransfers;  // #6176
         // fix #8440: a bind into an alias that takes its own reference does
         // not spend this candidate's reference (see ownedAliasDecls).
@@ -47056,7 +47216,7 @@ void Emitter::collectClosureReleaseEligible(
                 const void* srcKey = static_cast<const void*>(src);
                 if (src == alias || !closureReleaseEligible_.count(srcKey))
                     continue;
-                ClosureEscapeWalker sw{ctx_, srcKey};
+                ClosureEscapeWalker sw{ctx_, srcKey, &slotPolicy};
                 if (!sw.containsTargetAnywhere(av.init)) continue;
                 closureReleaseEligible_.erase(srcKey);
                 closureEscapingScopeEndRelease_.insert(srcKey);
@@ -47078,7 +47238,7 @@ void Emitter::collectClosureReleaseEligible(
     // loop above, so the producer and borrow release sets are constructed
     // under the same escape discipline.
     for (const ast::Node* ld : borrowCandidates) {
-        ClosureEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        ClosureEscapeWalker w{ctx_, static_cast<const void*>(ld), &slotPolicy};
         w.coalesceReturnTransfers = coalesceReturnTransfers;  // #6176
         // Mirrors the producer loop above — same scrutineeBorrowMode opt-in,
         // same soundness argument (independent of whether the slot's +1 came
@@ -47148,7 +47308,7 @@ void Emitter::collectClosureReleaseEligible(
                 fb.boundDecl = s;
                 for (const void* x : fwdSources) {
                     if (x == static_cast<const void*>(s)) continue;
-                    ClosureEscapeWalker xw{ctx_, x};
+                    ClosureEscapeWalker xw{ctx_, x, &slotPolicy};
                     xw.identityCallForwards_ = true;  // fix #8743: a bind
                     // fix-forward #8863: a source the body REASSIGNS is not
                     // forwarded through a bare `Object` bind — the
@@ -47177,7 +47337,7 @@ void Emitter::collectClosureReleaseEligible(
                         if (x == static_cast<const void*>(s) ||
                             assignedLocals.count(x))
                             continue;
-                        ClosureEscapeWalker xw{ctx_, x};
+                        ClosureEscapeWalker xw{ctx_, x, &slotPolicy};
                         if (xw.recordBindMatches(v.type, v.init))
                             fb.sources.push_back(x);
                     }
@@ -47230,7 +47390,7 @@ void Emitter::collectClosureReleaseEligible(
             binds.push_back(std::move(fb));
         }
         for (ForwardedBind& fb : binds) {
-            ClosureEscapeWalker bw{ctx_, fb.bound};
+            ClosureEscapeWalker bw{ctx_, fb.bound, &slotPolicy};
             bw.coalesceReturnTransfers = coalesceReturnTransfers;  // #6176
             bw.scrutineeBorrowMode = true;
             bw.walkWholeBody = true;
@@ -47312,7 +47472,7 @@ void Emitter::collectClosureReleaseEligible(
                 if (bv.isUsing || !isPlainObjectRef(bTy) || bTy->nullable)
                     continue;
                 auto* asE = dynamic_cast<const ast::TypeTestExpr*>(bv.init);
-                ClosureEscapeWalker xw{ctx_, x};
+                ClosureEscapeWalker xw{ctx_, x, &slotPolicy};
                 if (!asE || asE->op != "as" || !asE->operand ||
                     !xw.isTargetIdent(asE->operand.get()) ||
                     !isPlainObjectRef(ctx_.exprType(*asE)))
@@ -47331,7 +47491,7 @@ void Emitter::collectClosureReleaseEligible(
                         sole = false;
                 }
                 if (!sole) continue;
-                ClosureEscapeWalker tw{ctx_, fb.bound};
+                ClosureEscapeWalker tw{ctx_, fb.bound, &slotPolicy};
                 tw.coalesceReturnTransfers = coalesceReturnTransfers;
                 tw.scrutineeBorrowMode = true;
                 tw.walkWholeBody = true;
@@ -47423,7 +47583,7 @@ void Emitter::collectClosureReleaseEligible(
             for (const ast::Node* c : candidates) {
                 const void* x = static_cast<const void*>(c);
                 if (x == dst) continue;
-                ClosureEscapeWalker xw{ctx_, x};
+                ClosureEscapeWalker xw{ctx_, x, &slotPolicy};
                 const bool flows =
                     viaAssign ? xw.forwardsTarget(value, /*sawWrap=*/true)
                               : xw.containsTargetAnywhere(value);
@@ -47501,7 +47661,7 @@ void Emitter::collectClosureReleaseEligible(
             closureKeptCaptureLocals_.erase(key);
             closureReassignedKeptAtExit_.erase(key);
             closureReassignedKeptAtUnwind_.erase(key);
-            ClosureEscapeWalker kw{ctx_, key};
+            ClosureEscapeWalker kw{ctx_, key, &slotPolicy};
             kw.coalesceReturnTransfers = coalesceReturnTransfers;
             kw.ownedAliasDecls = &closureAliasOwned_;
             kw.scrutineeBorrowMode = true;
@@ -47633,7 +47793,7 @@ void Emitter::collectClosureReleaseEligible(
             };
             std::vector<LoopFrame*> loops;
             std::vector<FlowState*> tryAccs;
-            ClosureEscapeWalker bw{ctx_, b};
+            ClosureEscapeWalker bw{ctx_, b, &slotPolicy};
             auto hasOwn = [&](const DefSet& d) {
                 for (const void* x : d)
                     if (ownDefs.count(x)) return true;
