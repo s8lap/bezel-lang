@@ -11813,7 +11813,34 @@ bool Emitter::lowerAccessorNullCoalescingAssign(const ast::AssignmentStmt& as) {
     // assignment actually occurs." Both live inside this branch, and nothing
     // above this point lowered `e`.
     bool stored = false;
-    llvm::Value* rhs = lowerExpr(*as.value);
+    // fix #9177 (§28.3.11 *Unbound owned temporaries*, §28.8 *Ownership
+    // transfer*, §6.6/§7.7, v0.359): the RHS of a `??=` is TRANSFERRED into
+    // the target, so an OWNED chain-call result is handed off to the target's
+    // owner and the CG60 chain-call arm registers no §28.3.11 scope-end
+    // disposal of its own (§28.3.11: a handed-off value "is not disposed
+    // under this rule (it would otherwise be disposed twice)").
+    //
+    // This path's target is always an ACCESSOR-MEDIATED one — a PROPERTY or
+    // an INDEXER (the gate above declines every other target) — and the
+    // `:=` fallback arm treats exactly those targets as owning: the setter
+    // stores the value into the object's own storage, so the object owns it
+    // and disposes it exactly once. That is the same rule the `??=` arm's
+    // `coalesceTargetOwns` reads (LlvmBackend_Stmts.cpp).
+    //
+    // THE DEFECT (issue #9177). This path lowers the RHS inside the null
+    // branch (`coaleq.acc.do`), so the chain-call arm's `ccres.slot` alloca
+    // was created inside that block while the scope-end disposal it registers
+    // is emitted at the SCOPE end — outside the block, which the alloca does
+    // not dominate:
+    //
+    //   Instruction does not dominate all uses!
+    //     %ccres.slot = alloca ptr, align 8
+    //   bezelc: codegen error: IR verification failed
+    //
+    // MEASURED on r30-c1 @ c0ef7b6df with the issue's shape on a property
+    // target (`c.P ??= C.Make()();`). The hand-off removes the `ccres.slot`
+    // from this position, which fixes the ICE and the double dispose it hid.
+    llvm::Value* rhs = lowerChainCallHandedOff(as.value.get());
     if (rhs) {
         // §5.1 to the target's slot, then §7.2's present-wrap of a bare payload
         // (and the `null` literal's normalization to the all-zero form) — the

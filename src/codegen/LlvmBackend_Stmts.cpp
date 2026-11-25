@@ -85,6 +85,59 @@ static bool asyncReturnedLazyFrameMayStayDeferred(
     return deferrable;
 }
 
+// fix #9177 (§28.3.11 *Unbound owned temporaries*, §28.8 *Ownership transfer*,
+// §28.3's producers row, §6.6/§7.7, v0.359): does a `??=` TARGET own the
+// value its right-hand side produces?
+//
+// WHY THE QUESTION EXISTS. A `??=` RHS is TRANSFERRED into the target — §6.6:
+// "`??=` is not a read-modify-write: `x ??= e` assigns `e` only when `x`'s
+// current value is null, with the typing and ownership rules of §7.7", and
+// §7.7: "The compound form `??=` evaluates its right-hand side, and invokes
+// the setter, only when the assignment occurs"; and §28.3's
+// producers row: "The compound form `a ??= b` assigns into `a` and follows
+// the same meet rule for the assigned-into location". The ownership pass
+// models that transfer already: its `??=` arm adopts the RHS's producer state
+// into the target, and marks a null-initialised plain local
+// `becomesOwnedViaReassign` — the flag that registers the target's §28.3
+// scope-end disposal and §28.7's drop-on-overwrite. §28.3.11 then says of a
+// handed-off value that it "is governed by the corresponding transfer or
+// discharge rule and is not disposed under this rule (it would otherwise be
+// disposed twice)": the target's OWNER disposes it, exactly once.
+//
+// So the answer decides whether the chain-call arm registers a §28.3.11
+// scope-end disposal of its own for an owned chain-call result in the `??=`
+// position (issue #9177).
+//
+// THE RULE IS THE `:=` ARM'S OWN, read on the `??=` target. A plain local
+// owns what it holds (`:=`'s `assignTargetOwns`: a `LocalDecl` target, or a
+// local the ownership pass marked `autoDropAtScopeEnd`, or the owned
+// iteration variable of a `for`); an `owned` / `out owned` PARAMETER owns
+// what is stored into it (`out owned` hands the value to the caller); and
+// EVERY OTHER target shape — a FIELD, a PROPERTY, an INDEXER, an IMPORTED
+// slot — is owned by the OBJECT that holds it, which is the `:=` fallback's
+// default (`fallbackTargetOwns = true`).
+//
+// `tsym` is the target's symbol when the target is an IDENTIFIER (null
+// otherwise), and the caller resolves it because `ctx_` is the emitter's.
+//
+// A target that does NOT own keeps the chain-call arm's own registration, so
+// the value is still disposed exactly once — by the callee.
+static bool coalesceTargetOwns(sema::Symbol* tsym) {
+    if (!tsym) return true;  // a field / property / indexer / imported slot
+    if (auto* tls = dynamic_cast<sema::LocalSymbol*>(tsym)) {
+        // `:=`'s `assignTargetOwns`, verbatim: a `var`/`const` declaration, a
+        // local the ownership pass marked `autoDropAtScopeEnd`, or the owned
+        // iteration variable of a `for` (`ownedIterVarAutoDropAtBodyEnd`).
+        auto* tfs = dynamic_cast<const ast::ForStmt*>(tls->decl);
+        return dynamic_cast<const ast::LocalDecl*>(tls->decl) ||
+               tls->autoDropAtScopeEnd ||
+               (tfs && tfs->ownedIterVarAutoDropAtBodyEnd);
+    }
+    if (auto* tps = dynamic_cast<sema::ParameterSymbol*>(tsym))
+        return tps->modifier == "owned" || tps->modifier == "out owned";
+    return true;
+}
+
 // fix #2858 (§17.6 / §12.1 / §12.3 / §11.2, v0.240): `P++` / `P--` on a
 // VIRTUAL, OVERRIDE, ABSTRACT or INTERFACE property.
 //
@@ -1787,7 +1840,71 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         rhs = lowerReturnCollectionLiteral(cl, &tgtTyNN);
                     }
                 }
-                if (!rhs) rhs = lowerExpr(*as->value);
+                // fix #9177 (§28.3.11 *Unbound owned temporaries*, §28.8
+                // *Ownership transfer*, §6.6/§7.7, v0.359): the RHS of a `??=`
+                // is TRANSFERRED into the target, so a chain-call result that
+                // produces an OWNED value is HANDED OFF to the target's owner
+                // and the CG60 chain-call arm must register no §28.3.11
+                // scope-end disposal of its own.
+                //
+                // §6.6: "`??=` is not a read-modify-write: `x ??= e` assigns
+                // `e` only when `x`'s current value is null, with the typing
+                // and ownership rules of §7.7"; §7.7: "The compound form
+                // `??=` evaluates its right-hand side, and invokes the setter,
+                // only when the assignment occurs"; and §28.3's producers row:
+                // "The compound form `a ??= b` assigns into `a` and follows
+                // the same meet rule for the assigned-into location". The
+                // ownership pass already
+                // models this transfer: its `??=` arm adopts the RHS's
+                // producer state into the target and marks a null-initialised
+                // plain local `becomesOwnedViaReassign`, which is what
+                // registers the target's §28.3 scope-end disposal (and §28.7's
+                // drop-on-overwrite). §28.3.11 then says of a handed-off
+                // value that it "is governed by the corresponding transfer or
+                // discharge rule and is not disposed under this rule (it would
+                // otherwise be disposed twice)" — the target's owner disposes
+                // it exactly once.
+                //
+                // THE DEFECT (issue #9177). This arm lowers the RHS INSIDE
+                // the null branch (`coaleq.do`), so the CG60 chain-call arm's
+                // `ccres.slot` alloca was created inside that block while the
+                // scope-end disposal it registers is emitted at the SCOPE end
+                // — OUTSIDE the block, which the alloca does not dominate.
+                // MEASURED on r30-c1 @ c0ef7b6df with the issue's own repro
+                // (`w ??= C.Make()();`, `Make(): () -> owned W`):
+                //
+                //   Instruction does not dominate all uses!
+                //     %ccres.slot = alloca ptr, align 8
+                //     %43 = load ptr, ptr %ccres.slot, align 8
+                //   bezelc: codegen error: IR verification failed
+                //
+                // A compile-time ICE — and, had the IR verified, a DOUBLE
+                // DISPOSE as well: the value would have been stored into the
+                // target AND disposed by the CG60 registration, while the
+                // target's own scope-end disposal disposed it a third time.
+                // The hand-off below removes the `ccres.slot` from this
+                // position entirely (the CG60 arm registers nothing for a
+                // handed-off result), which fixes the ICE and the double
+                // dispose at their common root: the value is produced ONCE and
+                // disposed ONCE, by the target's owner.
+                //
+                // The OWNERSHIP question is the `:=` arm's own, read on the
+                // `??=` target: `coalesceTargetOwns` (above) — a plain local
+                // that owns what it holds, an `owned`/`out owned` PARAMETER,
+                // and every other target shape (a FIELD, a PROPERTY, an
+                // INDEXER, an IMPORTED slot), whose owner is the object's.
+                // A target that does NOT own keeps the CG60 registration, so
+                // the value is still disposed exactly once — by the callee.
+                if (!rhs) {
+                    sema::Symbol* tsym = nullptr;
+                    if (auto* tid =
+                            dynamic_cast<const ast::IdentifierExpr*>(
+                                as->target.get()))
+                        tsym = ctx_.exprSymbol(*tid);
+                    rhs = coalesceTargetOwns(tsym)
+                              ? lowerChainCallHandedOff(as->value.get())
+                              : lowerExpr(*as->value);
+                }
                 if (!rhs) {
                     // fix #3025 (§28.9/§28.3, v0.240): the RHS is lowered only
                     // in §6.6's null branch, but a null lowering result used to
