@@ -13190,6 +13190,82 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
         if ((ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(target))))
             propName = std::string(ma->member);
+        // fix #9214 (stdlib §4.19, §23.3, v0.359): `FrozenArray<T>.Length`
+        // is a GET-ONLY property — stdlib §4.19 declares
+        // `public readonly property Length: int;` on a compiler-intrinsic
+        // type whose prose says it "has no mutating member" — so it is not
+        // an assignable location (§23.3: "A read-only property in block
+        // form omits `set`"; §23.1: a `readonly` auto-property's
+        // assignment "is a store to the backing field (no setter exists
+        // to invoke, §22.7 rule 1)" and is admitted only in a field
+        // initializer or a constructor of the declaring type — which a
+        // compiler-intrinsic `FrozenArray<T>` never has).
+        //
+        // WHY THIS BRANCH IS NEEDED. The builtin collection members carry
+        // NO `PropertySymbol` (they are typed by
+        // `common::isBuiltinIntLengthPropertyHead`, not by a property
+        // symbol), so `ps` stayed null here and EVERY rule below — all of
+        // them keyed on the `PropertySymbol` — was skipped. The write then
+        // reached codegen, where a builtin member has no lvalue address to
+        // store into: the store was DROPPED and the program compiled with
+        // only the `internal:` #4045 backstop warning. MEASURED on r30-c1
+        // (`9ff2f909f`): `f.Length := 3;` on a `FrozenArray<int>` local
+        // compiled with exit 0 and the single diagnostic "internal:
+        // assignment target lvalue address failed to resolve (store dropped
+        // — target retains its previous value) — #4045"; the increment
+        // spelling `f.Length++` produced NO diagnostic at all.
+        //
+        // THE DIAGNOSTIC is the compiler's ORDINARY read-only-property one,
+        // byte-identical in shape to the one a user get-only property gets
+        // ("cannot assign to read-only property `P` — it has no setter
+        // (§23.3)") — the same text, with this property's name.
+        //
+        // THE RECEIVER PREDICATE names the BUILT-IN `FrozenArray<T>` and
+        // nothing else. The always-available names ARE shadowable (§2.3:
+        // "every other always-available name may be shadowed by local
+        // declarations under the normal name-resolution rules"; §2.7 rule 1
+        // resolves the bare name first), so a user `class FrozenArray<T>`
+        // wins the name and its OWN members answer — a user type's WRITABLE
+        // `Length` must keep compiling. `isUserDeclaredTypeSym` is the
+        // house's discriminator for that (§2.3 / #5272: a `builtinClassSym`
+        // is shaped `decl == nullptr && moduleName.empty()`, so a user's
+        // TypeSymbol is its exact complement — a real `ast::TypeDecl`
+        // in-module, or a populated `moduleName` when imported).
+        //
+        // THE TWO SHAPES of a built-in receiver are the ones the #9185 read
+        // fix names: the STUB shape (a factory result — `declaration` = the
+        // synthetic `builtinClassSym("FrozenArray")`) and the
+        // declaration-less ANNOTATION shape (a synthetic ast node, as
+        // `var f: FrozenArray<int> := ...` resolves). MEASURED: both reach
+        // this branch — the local, the field and the bare-annotation
+        // spellings are all rejected.
+        //
+        // (The FrozenArray INDEXER rule, fix #1723, sits in the same
+        // function and uses the LOOSER head-name-only predicate, so it
+        // wrongly rejects a user `class FrozenArray<T>`'s writable indexer
+        // — MEASURED on the base, and left alone here: a different rule,
+        // filed separately.)
+        else if (ma->member == "Length" && ma->target) {
+            const sema::TypeRef* rt = ctx_.exprType(*ma->target);
+            bool isFrozenTy =
+                rt && rt->kind == sema::TypeRef::Kind::Named &&
+                !rt->nullable &&
+                ((rt->declaration
+                      ? (!isUserDeclaredTypeSym(rt->declaration) &&
+                         rt->declaration->name == "FrozenArray")
+                      : (rt->astNode && rt->headName() == "FrozenArray")));
+            if (isFrozenTy) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("cannot ") +
+                        (incOp ? "increment/decrement "
+                               : "assign to ") +
+                        "read-only property `Length` — it has no setter (" +
+                        (incOp ? "§17.6 / " : "") +
+                        "§23.3)");
+                return;
+            }
+        }
     } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&target)) {
         if ((ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(target))))
             propName = std::string(id->name);
