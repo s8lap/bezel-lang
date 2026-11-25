@@ -23822,8 +23822,12 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             else if (const sema::TypeRef* llTy = linkedListTypeOfLocal(ld)) {
                 Disposal d{it->second, nullptr};
                 d.linkedList = true;
-                const sema::TypeRef* llEl =
-                    (!llTy->genericArgs.empty()) ? llTy->genericArgs[0] : nullptr;
+                // fix-forward #9100 / §3.6 rule 2 / §28.11 (v0.359): the
+                // SUBSTITUTED element type, as the list's inserts read it
+                // (`slotStringTestElementType`; a no-op outside a
+                // monomorphized generic body).
+                const sema::TypeRef* llEl = slotStringTestElementType(llTy,
+                    (!llTy->genericArgs.empty()) ? llTy->genericArgs[0] : nullptr);
                 // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
                 // (astNode-less, head in `importedName`) must match the same arm.
                 bool llIsOwning =
@@ -24849,8 +24853,12 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         // #602 / §28.11 v0.135: derive element disposer directly from
         // elementPolicyFor (covering class/interface elements).
         {
-            const sema::TypeRef* llEl =
-                (!llTy->genericArgs.empty()) ? llTy->genericArgs[0] : nullptr;
+            // fix-forward #9100 / §3.6 rule 2 / §28.11 (v0.359): the
+            // SUBSTITUTED element type, as the list's inserts read it
+            // (`slotStringTestElementType`; a no-op outside a monomorphized
+            // generic body).
+            const sema::TypeRef* llEl = slotStringTestElementType(llTy,
+                (!llTy->genericArgs.empty()) ? llTy->genericArgs[0] : nullptr);
             // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
             // (astNode-less, head in `importedName`) must match the same arm.
             bool llIsOwning =
@@ -40447,12 +40455,23 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     // #2603 / issue #401: IList<T>/IReadOnlyList<T> are array-backed + borrowing
     // (same bz_array_t* + per-element string +1 as Array<T>), so a string-element
     // field of those interface types releases its elements through the SAME thunk.
+    //
+    // fix-forward #9100 / §3.6 / §3.6 rule 2 / §28.11 (v0.359): the
+    // drop-on-overwrite release of the DISPLACED collection is the same slot
+    // release `emitOwnedFieldDisposals` (LlvmBackend_Disposal.cpp) performs at
+    // the holder's disposal, so it reads the element type exactly as that site
+    // does: `isStringElementSlotPaired` on the DECLARED element (the
+    // substituted type for a paired kind inside a monomorphized generic body,
+    // the declaration-site one for the Stack / Queue), and WITHOUT the
+    // `!nullable` gate #9064 / #9107 removed there — a `string?` element is
+    // the same §28.11 *runtime-managed reference* row as a `string` one, its
+    // insert takes the +1, so the displaced value must give it back.
+    // MEASURED: overwriting an `owned items: Array<string?>` field (and the
+    // generic `Box<T>`'s `owned items: Array<T>` at T = `string`) leaked one
+    // reference per element of every displaced array.
     if (!elemDisp && !isDict &&
             pol.cat == ElementPolicy::Category::RuntimeManaged &&
-            collElem &&
-            collElem->kind == sema::TypeRef::Kind::Primitive &&
-            collElem->primitive == sema::PrimitiveType::String &&
-            !collElem->nullable &&
+            collTy && isStringElementSlotPaired(collTy, collElem) &&
             // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
             // (astNode-less, head in `importedName`) must match the same arm.
             collTy && [](std::string_view n){
@@ -51056,11 +51075,24 @@ void Emitter::freeUnboundOwnedBorrowingArrayTemp(
     // `elemDisp` NULL, which is what the two pre-existing dict arms in this
     // function already pass for exactly this reason.
     llvm::Value* elemDisp = llvm::ConstantPointerNull::get(ptrTy());
+    // fix-forward #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the reclaim
+    // is the RELEASE half of the temp's slot pair, so it reads the element
+    // type the take half read — the SUBSTITUTED one for a paired kind
+    // (`Array<T>` / `LinkedList<T>`) inside a monomorphized generic body (the
+    // LINQ `ToArray`, `Sorted` / `Reversed` / slicing copies and the linked
+    // list's inserts all take at the substituted type). The escape declines
+    // (`recvElemIsString` in LlvmBackend_Calls.cpp, `valIsString` in the LINQ
+    // `ToDictionary`) read it through the same helper.
+    //
+    // The `!nullable` conjunct holds only for the non-paired kinds
+    // (`isUnboundTempStringElement`): an `Array<string?>` / `LinkedList<
+    // string?>` temporary's slots co-own their elements like a `string` one's
+    // (§3.6 *Nullable forms*), so its reclaim releases them. MEASURED: the
+    // concrete `a.ToArray().Count` / `a.Reversed().Count` over an
+    // `Array<string?>` leaked one reference per element.
     const sema::TypeRef* el = (recvTy && !recvTy->genericArgs.empty())
         ? recvTy->genericArgs[0] : nullptr;
-    const bool elemIsString = el && !el->nullable &&
-        el->kind == sema::TypeRef::Kind::Primitive &&
-        el->primitive == sema::PrimitiveType::String;
+    const bool elemIsString = isUnboundTempStringElement(recvTy, el);
     if (elemIsString && freeIsDict) {
         // fix #6352: a dict-backed collection's string ELEMENT (a set-family
         // head stores each element as a `bz_string*` in the generic-key table's
@@ -60342,10 +60374,15 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
         // `V?` as `V` (nullability stripped), so a `string?` element is the
         // same §28.11 *runtime-managed reference* row as a `string` one and
         // the list co-owns it exactly like `LinkedList<string>` does.
+        //
+        // fix-forward #9100 / §3.6 rule 2 / §28.11 (v0.359): the test reads
+        // the SUBSTITUTED element type (`slotStringTestElementType` — the
+        // linked list is a paired kind), as the list's free does.
+        const sema::TypeRef* erStr = slotStringTestElementType(collTy, er);
         bool llitIsStrElem =
-            er &&
-            er->kind == sema::TypeRef::Kind::Primitive &&
-            er->primitive == sema::PrimitiveType::String &&
+            erStr &&
+            erStr->kind == sema::TypeRef::Kind::Primitive &&
+            erStr->primitive == sema::PrimitiveType::String &&
             !common::isOwningPrefixedName(collTy->headName()) &&
             elementPolicyFor(er, /*owning=*/false).cat ==
                 ElementPolicy::Category::RuntimeManaged;
@@ -61446,9 +61483,9 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
         // stripped), so the linked list co-owns a +1 per element — taken at
         // insert by `llIsStrElem` / `llitIsStrElem` / the source constructor's
         // `ctorRetainStr` — and gives it back here.
-        // (fix #9100: `isStrElemResolved` reads the declaration-site element
-        // type for a linked list — `isStringElementSlotPaired` resolves only
-        // for the ARRAY family — i.e. exactly #9107's test.)
+        // (fix-forward #9100, v0.359: the linked list is now a PAIRED kind, so
+        // `isStrElemResolved` reads the SUBSTITUTED element type here, as
+        // every linked-list insert does — `isSlotReferencePairedCollectionName`.)
         if (!d.collectionElemDisposer && isStrElemResolved(el, /*owning=*/false))
             d.collectionElemDisposer = stringElementReleaseThunk();
         return d;

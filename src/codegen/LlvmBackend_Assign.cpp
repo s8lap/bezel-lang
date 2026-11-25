@@ -13052,10 +13052,15 @@ void Emitter::freeLinkedListSourceNow(llvm::Value* v,
         // list co-owns a +1 per element (taken at insert by `llIsStrElem` /
         // `llitIsStrElem` / `ctorRetainStr`) and the source's free gives it
         // back.
+        //
+        // fix-forward #9100 / §3.6 rule 2 / §28.11 (v0.359): the string test
+        // reads the SUBSTITUTED element type (`slotStringTestElementType` —
+        // the linked list is a paired kind), as the list's inserts do.
+        const sema::TypeRef* elStr = slotStringTestElementType(srcTy, elTy);
         bool llIsStringElem =
             elPol.cat == ElementPolicy::Category::RuntimeManaged &&
-            elTy && elTy->kind == sema::TypeRef::Kind::Primitive &&
-            elTy->primitive == sema::PrimitiveType::String;
+            elStr && elStr->kind == sema::TypeRef::Kind::Primitive &&
+            elStr->primitive == sema::PrimitiveType::String;
         if (!elemDisp && llIsStringElem)
             elemDisp = stringElementReleaseThunk();
     }

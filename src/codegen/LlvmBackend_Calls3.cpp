@@ -2613,9 +2613,14 @@ llvm::Value* Emitter::materializeVtableIEnumerableToArray(
     // reference* row as a `string` one, so this materialize drain takes the
     // +1 the outer ToArray's skip defers to it, and the result array's free
     // gives it back. The gate was issue #9064.
-    if (elemRef &&
-        elemRef->kind == sema::TypeRef::Kind::Primitive &&
-        elemRef->primitive == sema::PrimitiveType::String &&
+    // fix-forward #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): read the
+    // SUBSTITUTED element type — this retain is the take half the outer
+    // ToArray's `skipOuterRetain` defers to, the result is an `Array<T>` whose
+    // free reads the substituted type, and the skip below reads it too.
+    const sema::TypeRef* matStrRef = resolveTypeParamRef(elemRef);
+    if (matStrRef &&
+        matStrRef->kind == sema::TypeRef::Kind::Primitive &&
+        matStrRef->primitive == sema::PrimitiveType::String &&
         elemTy->isPointerTy()) {
         emitStringRetain(curVal);
     }
@@ -4066,9 +4071,21 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
             // `V`, nullability stripped), so the result array co-owns a +1
             // per element exactly as `Array<string>`'s does — and its free
             // gives one back per slot. The gate was issue #9064.
-            if (elemRef &&
-                elemRef->kind == sema::TypeRef::Kind::Primitive &&
-                elemRef->primitive == sema::PrimitiveType::String) {
+            //
+            // fix-forward #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): both
+            // string tests read the SUBSTITUTED element type. This retain is
+            // the TAKE half of the result `Array<T>`'s slot pair, and #9100
+            // made every RELEASE half of an `Array<T>` (the `using var` free,
+            // the scope-end free, the owned-field free, …) read the
+            // substituted type; reading the placeholder `T` here took nothing
+            // inside a monomorphized generic body while the free gave one
+            // back per slot — MEASURED: `using var r := src.ToArray();` (and
+            // `src.Where(…).ToArray()`) in a generic body at T = `string` /
+            // `string?` was a heap-use-after-free of the caller's elements.
+            const sema::TypeRef* elemStrRef = resolveTypeParamRef(elemRef);
+            if (elemStrRef &&
+                elemStrRef->kind == sema::TypeRef::Kind::Primitive &&
+                elemStrRef->primitive == sema::PrimitiveType::String) {
                 if (auto* recvTy = ctx_.exprType(*ma->target)) {
                     if (isVtableBackedIEnumerableType(recvTy))
                         skipOuterRetain = true;
@@ -4078,9 +4095,9 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                 elementPolicyFor(elemRef, /*owningFamily=*/false);
             if (!skipOuterRetain &&
                 toArrPol.cat == ElementPolicy::Category::RuntimeManaged &&
-                elemRef &&
-                elemRef->kind == sema::TypeRef::Kind::Primitive &&
-                elemRef->primitive == sema::PrimitiveType::String) {
+                elemStrRef &&
+                elemStrRef->kind == sema::TypeRef::Kind::Primitive &&
+                elemStrRef->primitive == sema::PrimitiveType::String) {
                 auto* rf = declareC("bz_array_retain_strings",
                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(rf, {arr});
@@ -4332,10 +4349,14 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // int / float / struct-Value / record-Value cases are unaffected
         // (struct values are malloc-copied in the runtime; scalars are
         // refcount-free; only a `string` value aliases the source array).
-        bool valIsString = !hasValueSel && elemRef &&
-            elemRef->kind == sema::TypeRef::Kind::Primitive &&
-            elemRef->primitive == sema::PrimitiveType::String &&
-            !elemRef->nullable;
+        // fix-forward #9100 / §3.6 rule 2 / §28.11 (v0.359): the decline reads
+        // the element type the source's reclaim
+        // (`freeUnboundOwnedBorrowingArrayTemp`) reads — the substituted one
+        // for an `Array<T>` source inside a monomorphized generic body.
+        // `isUnboundTempStringElement` — a `string?` element of a paired kind
+        // counts, as the reclaim releases it.
+        bool valIsString = !hasValueSel &&
+            isUnboundTempStringElement(ctx_.exprType(*ma->target), elemRef);
         // #2151 / §28.3: reclaim an unbound fresh-materializer receiver array
         // here (the lazy is already consumed/disposed by bz_lazy_to_dict). See
         // the matching comment at the ToDictionary entry above for rationale
@@ -5399,10 +5420,21 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     // BORROWED `string?` element was stored WITHOUT a reference, died with its
     // source, and every later read of the slot was an ASan heap-use-after-free
     // (and a +1 producer's +1 was orphaned — a leak).
+    //
+    // fix-forward #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the test
+    // reads the SUBSTITUTED element type (`slotStringTestElementType` — the
+    // linked list is a paired kind). Inside a monomorphized generic body
+    // `llElemRef` is still the placeholder `T`, so a generic
+    // `Fill<T>(l: LinkedList<T>, x: T)` stored the element WITHOUT the list's
+    // +1 while the caller's concrete `LinkedList<string>` free — and every
+    // linked-list release half, which now reads the substituted type too —
+    // gave one back per element: "refcount over-release (string)".
+    const sema::TypeRef* llStrRef =
+        slotStringTestElementType(recvTy, llElemRef);
     bool llIsStrElem =
-        !isOwning && llElemRef &&
-        llElemRef->kind == sema::TypeRef::Kind::Primitive &&
-        llElemRef->primitive == sema::PrimitiveType::String &&
+        !isOwning && llStrRef &&
+        llStrRef->kind == sema::TypeRef::Kind::Primitive &&
+        llStrRef->primitive == sema::PrimitiveType::String &&
         llElemPol.cat == ElementPolicy::Category::RuntimeManaged;
     // Take the list's +1 on the element about to be stored into a new node.
     // `argExpr` is the element argument (arg 0 for AddFirst/AddLast, arg 1 for
@@ -9863,9 +9895,13 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
             // is GONE — a `string?` element is the same §28.11 *runtime-managed
             // reference* row as a `string` one, so the result array co-owns a
             // +1 per element and its free gives one back per slot.
-            if (elemRef &&
-                elemRef->kind == sema::TypeRef::Kind::Primitive &&
-                elemRef->primitive == sema::PrimitiveType::String) {
+            // fix-forward #9100 / §3.6 rule 2 / §28.11 (v0.359): the TAKE
+            // half of the result `Array<T>`'s pair reads the SUBSTITUTED
+            // element type, as its free does.
+            const sema::TypeRef* iaStrRef = resolveTypeParamRef(elemRef);
+            if (iaStrRef &&
+                iaStrRef->kind == sema::TypeRef::Kind::Primitive &&
+                iaStrRef->primitive == sema::PrimitiveType::String) {
                 auto* rf = declareC("bz_array_retain_strings",
                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(rf, {result});

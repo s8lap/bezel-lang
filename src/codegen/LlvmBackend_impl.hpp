@@ -18272,16 +18272,95 @@ private:
     // is PAIRED with it (§28.11's element slot policy is a PAIR: the store
     // takes a reference of its own, and the slot's release gives it back).
     //
+    // fix-forward #9100 (v0.359): the borrowing LINKED LIST is such a kind
+    // too. Since #9107 every one of its insert paths takes the +1 for a
+    // `string` AND a `string?` element (`llIsStrElem` in
+    // LlvmBackend_Calls3.cpp, `llitIsStrElem` in
+    // materializeHeapCollectionLiteral, the source constructor's
+    // `ctorRetainStr` in lowerNew), and every removal (`RemoveFirst` /
+    // `RemoveLast` / `RemoveNode` / `Remove` / `Clear`, through
+    // `llElemDisposer`) and every free gives it back — it has no Pop-style
+    // member that hands the reference out. Leaving it on the declaration-site
+    // reading made a generic body's insert take NOTHING while the caller's
+    // CONCRETE `LinkedList<string>` / `LinkedList<string?>` free released one
+    // per element (the "refcount over-release" abort of a generic
+    // `Fill<T>(l: LinkedList<T>, …)` at T = `string` / `string?`).
+    //
+    // fix-forward #9100 (v0.359): the FROZEN ARRAY is such a kind as well. Its
+    // one string-element take — the copying `FrozenArray<T>.From(items:
+    // Array<T>)` (stdlib §4.19; `tryLowerFrozenArrayCall` in
+    // LlvmBackend_Calls2.cpp) — already reads the SUBSTITUTED element type,
+    // it is immutable (no member removes or hands out a slot's reference), and
+    // its free releases every slot; so its release halves must resolve too.
+    // Leaving it on the declaration-site reading made a generic `Holder<T>`'s
+    // `owned items: FrozenArray<T>` field leak one reference per element at
+    // T = `string`. (Its `string?` take is still `!nullable`-gated — issue
+    // #9121 — so `isUnboundTempStringElement` does not extend the nullable
+    // allowance to it.)
+    //
     // The other array-backed kinds are deliberately NOT here: the STACK and
     // the QUEUE give their slot's reference back at Pop()/Dequeue(), which
     // does NOT release it (issue #8453, OPEN) — a generic body that took that
     // reference would strand it, so their insert keeps the declaration-site
-    // reading (and their free keeps the matching one). The interface-headed
-    // aliases (IList / IReadOnlyList) are not here either: they have their own
-    // free path (the `using var` interface branch in
-    // LlvmBackend_Setup.cpp), which does not resolve the element type.
+    // reading (and their free keeps the matching one; issue #9136 tracks the
+    // generic Push / Enqueue). The interface-headed aliases (IList /
+    // IReadOnlyList) are not here either: they have their own free path (the
+    // `using var` interface branch in LlvmBackend_Setup.cpp), which does not
+    // resolve the element type.
     static bool isSlotReferencePairedCollectionName(std::string_view n) {
-        return n == "Array";
+        return n == "Array" || n == "LinkedList" || n == "FrozenArray";
+    }
+
+    // fix-forward #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the element
+    // type a slot's string test must read, for a collection of head `collTy`:
+    // the SUBSTITUTED type for a paired kind (above), the declaration-site
+    // spelling for every other kind. For the sites that spell the string test
+    // inline (with their own `!nullable` or owning-family conjuncts), so that
+    // a take half, its release half and an escape decline of the same slot
+    // cannot read two different element types. `resolveTypeParamRef` returns
+    // its argument unchanged outside a monomorphized generic body.
+    const sema::TypeRef* slotStringTestElementType(
+            const sema::TypeRef* collTy, const sema::TypeRef* el) const {
+        if (isSlotReferencePairedCollectionName(slotCollectionHead(collTy)))
+            return resolveTypeParamRef(el);
+        return el;
+    }
+
+    // fix-forward #9100 (v0.359): the collection head the slot tests key on.
+    // `TypeRef::headName` is EMPTY for the astNode-less static-factory-result
+    // shape (`FrozenArray<T>.From(...)`'s result: a builtin declaration, no
+    // astNode, no importedName — the shape #3907 records), so it falls back to
+    // `builtinTypeName`, the authority `isCollectionTypeName` reads — the
+    // predicate that routed the slot's collection to its disposal arm in the
+    // first place. MEASURED: a generic body's `using var f :=
+    // FrozenArray<T>.From(src)` took the +1 at the substituted type and its
+    // scope-end free, keyed on the empty head, read `T` raw and leaked.
+    static std::string_view slotCollectionHead(const sema::TypeRef* collTy) {
+        if (!collTy) return {};
+        std::string_view h = collTy->headName();
+        return h.empty() ? builtinTypeName(collTy) : h;
+    }
+
+    // fix-forward #9100 / §3.6 / §3.6 rule 2 / §28.11 (v0.359): whether an
+    // unbound owned borrowing-collection TEMPORARY's slots co-own a string
+    // element — the one test `freeUnboundOwnedBorrowingArrayTemp`'s reclaim and
+    // its escape declines (`recvElemIsString` in LlvmBackend_Calls.cpp, the
+    // LINQ `ToDictionary`'s `valIsString`) read, so the decline and the release
+    // it declines cannot drift. A `string?` element counts for a PAIRED kind:
+    // its every insert takes the +1 for a `string?` as for a `string` (#9064's
+    // array family, #9107's linked list — §3.6's *Nullable forms* read the
+    // element category of `V?` as `V`), so its reclaim must give it back.
+    // The other kinds keep the `!nullable` reading their inserts have.
+    bool isUnboundTempStringElement(const sema::TypeRef* collTy,
+                                    const sema::TypeRef* declEl) const {
+        const sema::TypeRef* el = slotStringTestElementType(collTy, declEl);
+        if (!el || el->kind != sema::TypeRef::Kind::Primitive ||
+            el->primitive != sema::PrimitiveType::String)
+            return false;
+        const std::string_view head = slotCollectionHead(collTy);
+        return !el->nullable ||
+               (head != "FrozenArray" &&
+                isSlotReferencePairedCollectionName(head));
     }
 
     // fix #9100 / §3.6 rule 2 / §14.1 / §28.11 (v0.359): the string-element
@@ -18299,9 +18378,9 @@ private:
     // the placeholder type parameter `T`; §14.4 fixes the element category at
     // the instantiation). The other kinds keep the DECLARATION-SITE reading:
     // the STACK and the QUEUE strand the slot's reference at Pop()/Dequeue()
-    // (issue #8453, OPEN) and the LINKED LIST's insert is `!nullable`-gated
-    // (issue #9107's lane), so neither may take a reference the paired half
-    // does not give back.
+    // (issue #8453, OPEN), so neither may take a reference the paired half
+    // does not give back. (The LINKED LIST joined the paired kinds in the
+    // #9100 fix-forward, once #9107 lifted its insert's `!nullable` gate.)
     bool isStringElementSlotPaired(std::string_view collName,
                                    const sema::TypeRef* el) const {
         if (isSlotReferencePairedCollectionName(collName))
@@ -18313,8 +18392,9 @@ private:
     // head — `TypeRef::headName`).
     bool isStringElementSlotPaired(const sema::TypeRef* collTy,
                                    const sema::TypeRef* el) const {
-        return isStringElementSlotPaired(
-            collTy ? collTy->headName() : std::string_view{}, el);
+        // fix-forward #9100 (v0.359): `slotCollectionHead`, not `headName` —
+        // the astNode-less factory-result shape has an empty `headName`.
+        return isStringElementSlotPaired(slotCollectionHead(collTy), el);
     }
 
     // fix #4127 (§27.5 / §28.9, stdlib §4.8, v0.295): is `rt` the synthetic

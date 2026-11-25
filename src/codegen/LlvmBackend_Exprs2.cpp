@@ -9338,9 +9338,16 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // does, and the snapshot's own retain/release pair below (both
                 // gated on this same predicate) stays balanced. `null` is the
                 // null-safe no-op on both sides.
-                const bool ctorRetainStr =
-                    rt->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
-                    rt->genericArgs[0]->primitive == sema::PrimitiveType::String &&
+                //
+                // fix-forward #9100 / §3.6 rule 2 / §28.11 (v0.359): the test
+                // reads the SUBSTITUTED element type
+                // (`slotStringTestElementType` — the linked list is a paired
+                // kind), as the list's free does.
+                const sema::TypeRef* ctorElStr =
+                    slotStringTestElementType(rt, rt->genericArgs[0]);
+                const bool ctorRetainStr = ctorElStr &&
+                    ctorElStr->kind == sema::TypeRef::Kind::Primitive &&
+                    ctorElStr->primitive == sema::PrimitiveType::String &&
                     ctorPol.cat == ElementPolicy::Category::RuntimeManaged;
                 if (ctorRetainStr) {
                     auto* retainFn = declareC("bz_array_retain_strings",

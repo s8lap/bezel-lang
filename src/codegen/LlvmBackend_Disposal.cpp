@@ -1747,6 +1747,9 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // (and builds the element disposer thunk) — otherwise a bare `T`
             // element has a null declaration → Value policy → elements leak. A
             // no-op outside a substitution (the shared disposer keeps the bare T).
+            // fix-forward #9100 (v0.359): the DECLARED element is kept for the
+            // string-slot test below, which resolves it per collection kind.
+            const sema::TypeRef* collElemDecl = collElem;
             collElem = resolveTypeParamRef(collElem);
             // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
             // (astNode-less, head in `importedName`) must match the same arm.
@@ -1776,7 +1779,18 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                     // `ctorRetainStr`). fix #9100 (v0.359): the collection
                     // KIND gate #9100 kept here (for the linked list, whose
                     // `string?` retain was missing before #9107) goes with it.
-                    isStringElementTypeRef(collElem) &&
+                    //
+                    // fix-forward #9100 / §3.6 rule 2 / §28.11 (v0.359): the
+                    // release reads the element type its TAKE read —
+                    // `isStringElementSlotPaired` on the DECLARED element: the
+                    // substituted type for a paired kind (Array / LinkedList),
+                    // the declaration-site one for the Stack / Queue, whose
+                    // generic Push / Enqueue reads `T` raw (#8453 / #9136).
+                    // Reading the resolved `collElem` released a +1 per
+                    // element that a generic `Box<T>`'s `owned items:
+                    // Stack<T>` / `Queue<T>` never took at T = `string` /
+                    // `string?` ("refcount over-release (string)").
+                    isStringElementSlotPaired(it->collTy, collElemDecl) &&
                     [](std::string_view n){
                         // #2603 / issue #401: IList<T>/IReadOnlyList<T> are
                         // array-backed + borrowing (same bz_array_t* + per-

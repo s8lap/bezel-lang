@@ -4645,12 +4645,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // the RECEIVER, not of a method name — §28.3's "there is no special-cased
     // list of method names" is about the reclaim's trigger, and this narrows
     // where a borrow escapes rather than naming a second trigger.
-    const sema::TypeRef* recvEl =
+    // fix-forward #9100 / §3.6 rule 2 / §28.11 (v0.359): the derivation is now
+    // the shared `isUnboundTempStringElement` `freeUnboundOwnedBorrowingArrayTemp`
+    // reads — the substituted element type for an `Array<T>` / `LinkedList<T>`
+    // receiver inside a monomorphized generic body, and a `string?` element of
+    // those paired kinds — so the decline and the release it declines read
+    // the same test.
+    const bool recvElemIsString = isUnboundTempStringElement(recvTy,
         (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
-                                                : nullptr;
-    const bool recvElemIsString = recvEl && !recvEl->nullable &&
-        recvEl->kind == sema::TypeRef::Kind::Primitive &&
-        recvEl->primitive == sema::PrimitiveType::String;
+                                                : nullptr);
 
     // The element-returning sibling of `freeFreshInputTemp`. Every terminal
     // return site in the `isArr` block whose RESULT may be one of `recv`'s own
