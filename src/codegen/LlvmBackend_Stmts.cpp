@@ -1895,15 +1895,31 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // INDEXER, an IMPORTED slot), whose owner is the object's.
                 // A target that does NOT own keeps the CG60 registration, so
                 // the value is still disposed exactly once — by the callee.
+                //
+                // fix #9337 (§28.3.11, §7.7, §6.6, v0.359): a target that does
+                // NOT own what it holds (a plain `ref` PARAMETER, a non-owned
+                // `for` element binding) keeps the CG60 registration above, and
+                // THAT registration is what the dominance ICE was: the RHS runs
+                // inside `coaleq.do`, so the chain call's `ccres.slot` alloca
+                // sat in a block that does not dominate the scope-end disposal.
+                // The RHS is an operand that runs on only SOME paths, so it is
+                // lowered under `conditionalOperandDepth_` (#9270's mechanism):
+                // the slot is an entry-block, null-initialised alloca, and a
+                // path that never entered `coaleq.do` reaches the null-guarded
+                // disposal with null. For a non-nullable target (a `for`
+                // element: §7.7 says the right operand is never evaluated) the
+                // branch is dead and the disposal is a no-op.
                 if (!rhs) {
                     sema::Symbol* tsym = nullptr;
                     if (auto* tid =
                             dynamic_cast<const ast::IdentifierExpr*>(
                                 as->target.get()))
                         tsym = ctx_.exprSymbol(*tid);
+                    ++conditionalOperandDepth_;
                     rhs = coalesceTargetOwns(tsym)
                               ? lowerChainCallHandedOff(as->value.get())
                               : lowerExpr(*as->value);
+                    --conditionalOperandDepth_;
                 }
                 if (!rhs) {
                     // fix #3025 (§28.9/§28.3, v0.240): the RHS is lowered only

@@ -19283,8 +19283,17 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // temporary disposal — that call's result is not bound to a local at all.
     //
     // fix #9270 (§28.3.11, §28.8, v0.359): the arms of a CONDITIONAL
-    // initializer are handed off too (`lowerChainCallHandedOff` arms them), for
-    // the same reason: the conditional's value is the selected arm's value.
+    // initializer are deliberately NOT handed off here (`handArmsOff=false`).
+    // The ownership pass classifies a local bound to a conditional whose arm is
+    // a chain call as a BORROW (it never drops that local and rejects a
+    // transfer out of it: #9331), so the arm's own CG60 registration is the
+    // value's ONLY disposal; handing the arm off leaks every value (measured).
+    // THIS FLAG IS COUPLED to #9331's classification: the day the ownership pass
+    // treats such a local as OWNED (§20 *Ownership*: owned arms meet to owned),
+    // the local's own drop fires on top of the arm's registration and this flag
+    // MUST flip to `true` in the same change, or the value is disposed TWICE.
+    // (The `??` right operand and the expression-`case` arms of #9340 follow
+    // the same flag.)
     llvm::Value* v = lowerChainCallHandedOff(init, /*handArmsOff=*/false);
     expectedFunctionType_ = savedExpectedForLambdaDecl;
     // fix #4342: restore the flags (saved above) so a subsequent LocalDecl

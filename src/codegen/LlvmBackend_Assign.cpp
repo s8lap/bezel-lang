@@ -11891,7 +11891,14 @@ bool Emitter::lowerAccessorNullCoalescingAssign(const ast::AssignmentStmt& as) {
     // MEASURED on r30-c1 @ c0ef7b6df with the issue's shape on a property
     // target (`c.P ??= C.Make()();`). The hand-off removes the `ccres.slot`
     // from this position, which fixes the ICE and the double dispose it hid.
+    //
+    // fix #9337 (§28.3.11, v0.359): the hand-off covers the chain call that IS
+    // the RHS; a chain call NESTED in it (an argument position) still registers
+    // its own disposal, and this branch runs on only SOME paths, so the RHS is
+    // lowered under `conditionalOperandDepth_` like every other such operand.
+    ++conditionalOperandDepth_;
     llvm::Value* rhs = lowerChainCallHandedOff(as.value.get());
+    --conditionalOperandDepth_;
     if (rhs) {
         // §5.1 to the target's slot, then §7.2's present-wrap of a bare payload
         // (and the `null` literal's normalization to the all-zero form) — the
