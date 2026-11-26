@@ -4,25 +4,19 @@
 
 **A compiled language for services and tools, with ownership-based memory management and no garbage collector.**
 
-When programmers read well-written code, they usually find it easy to tell the lifetimes of every object without any formal annotations for them. Then why can't the compiler see what we see? Why can't we always write obvious code and exploit this in the compiler? Bezel attempts to answer this. Bezel uses common coding conventions and a small number of additional keywords to communicate to the compiler what people usually only infer from code: for example, whether a function keeps what it is given or returns something new, whether a particular assignment copies a reference or transfers the object to a new home. The compiler works out the rest and inserts every memory release itself at points that you can find in the code. Bezel's approach is similar to Rust, except it allows for more natural code at the cost of admitting some code shapes on trust rather than proof. A lot of recent work has gone into reducing the trust surface to near zero without pervasive code annotations.
+Bezel reads object lifetimes off ordinary code. A few keywords (`owned`, `move`, `using var`) say who owns what, and the compiler inserts every release itself, at a point you can find in the source. There is no collector and no silent memory corruption: where the compiler cannot prove a reference is still valid, the default checked build raises an exception instead of reading freed memory. In feel it is close to C#.
 
-The result combines what garbage-collected languages and RAII each get right. As in a language with GC, there is no silent memory corruption, and if a stale reference does survive, the default build raises an exception rather than reads freed memory. As with RAII in C++, everything is released at a known point with no collector, no pauses and no hidden reference counting on user classes. Unlike RAII, the compiler enforces the rules, and the guarantees hold across threads. Of course, logical leaks are still possible: a collection that only ever grows will still grow.
-
-Bezel is open-source. The repo contains the language spec, the changelog, language-change proposals, research notes, the rationale with more context for the language changes, the compiler, tests, spec conformance tests, development infrastructure scripts, language guides for people and LLMs and LLM-agent briefs. 
+Bezel is written by AI models, mostly Anthropic's Claude, under the direction of its human owner. Agent commits name the model that wrote them ([Acknowledgements](#acknowledgements)).
 
 ## Status: experimental
 
-Bezel is new. Its development started in April 2026 with a sketch of OOP code. The changelog records how it grew into a full language specification.
-
-The language and the compiler are developed specification-first. The design is now close to settled and written down in full, but the compiler has not caught up with it yet. Until it does, **expect arbitrary things to break while you write Bezel code**. Known bugs are tracked in the [issue tracker](https://github.com/s8lap/bezel-lang/issues). The compiler runs on Linux x86-64 only for now. If something breaks and it's not a known bug, please [report it](#reporting-a-bug) here.
+Bezel started in April 2026 and is developed specification-first. The design is close to settled, but the compiler has not caught up, so **expect things to break**. It runs on Linux x86-64 only. Known bugs are in the [issue tracker](https://github.com/s8lap/bezel-lang/issues); if you hit another, please [report it](#reporting-a-bug).
 
 ## A first look
 
-Bezel's closest relative is probably C#: their type systems are similar, and the standard library borrows many .NET names. The resemblance is on the surface though: it is a different language and the library is its own design. Bezel's syntax is also close to Pascal and Ada.
-
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-example-dark.svg">
-  <img alt="A Bezel program: a shop with Product and Order records, an Outcome choice with Charged, UnknownSku and OutOfStock cases, an Inventory class that owns a dictionary of products, and a Main method that places orders and prints each outcome." src="docs/images/readme-example-light.svg">
+  <img alt="A short Bezel program: a Conn class whose destructor prints a line, a Reply choice with Page and Failed cases, and a Main method that moves a connection into an owning array, matches each reply with a case expression and parses a port with a ?? default." src="docs/images/readme-example-light.svg">
 </picture>
 
 <details>
@@ -30,74 +24,46 @@ Bezel's closest relative is probably C#: their type systems are similar, and the
 
 <!-- readme-example: editors/vscode/tools/readme-example.js renders this block as docs/images/readme-example-{light,dark}.svg -->
 ```bezel
-module Shop;
+module Demo;
 
-public record Product(Sku: string, Price: decimal, Stock: int);
+public class Conn(name: string)
+  public method Send(text: string) => Console.WriteLine($"{name} <- {text}");
+  destructor
+    Console.WriteLine($"{name} closed");
+  end destructor;
+end Conn;
 
-public record Order(Sku: string, Qty: int);
-
-public choice Outcome
-    Charged(amount: decimal),
-    UnknownSku(sku: string),
-    OutOfStock(left: int);
-end Outcome;
-
-public class Inventory(products: Array<Product>)
-    private owned _bySku: Dictionary<string, Product> :=
-        products.ToDictionary(lambda(p) => p.Sku);
-
-    public method Place(order: Order): Outcome
-        var p := _bySku.GetOrNull(order.Sku);
-
-        if p = null then
-            return UnknownSku(order.Sku);
-        elif p.Stock < order.Qty then
-            return OutOfStock(p.Stock);
-        end;
-
-        _bySku[p.Sku] := p with(Stock := p.Stock - order.Qty);  // an updated copy
-        return Charged(p.Price * order.Qty);
-    end Place;
-
-    // A fresh array, so the return type says `owned`: the caller now holds it.
-    public method LowStock(below: int): owned Array<string> =>
-        _bySku.Where(lambda(e) => e.Value.Stock < below).Select(lambda(e) => e.Key)
-            .ToArray();
-end Inventory;
+public choice Reply
+  Page(body: string), Failed(code: int);
+end Reply;
 
 public class Program
-    public static method Main()
-        using var shop := new Inventory([
-            new Product("pen", 1.25m, 40),
-            new Product("pad", 3.50m, 6),
-            new Product("mug", 8.00m, 3)
-        ]);
+  public static method Main()
+    using var db := new Conn("db");            // closed as Main exits, on every path
+    using var pool := new OwningArray<Conn>();
+    var cache := new Conn("cache");
+    pool.Add(move cache);                      // the pool owns it now
 
-        var orders: Array<Order> :=
-            [new Order("pen", 10), new Order("ink", 1), new Order("pad", 7)];
-
-        for var order in orders do
-            var verdict := (case shop.Place(order) of
-                Charged(var amount) => $"charged {amount:F2}",
-                UnknownSku(var sku) => $"refused, no product '{sku}'",
-                OutOfStock(var left) => $"refused, only {left} left");
-            Console.WriteLine($"{order.Qty} x {order.Sku}: {verdict}");
-        end;
-
-        Console.WriteLine($"running low: {String.Join(", ", shop.LowStock(10))}");
-    end Main;
+    var replies: Array<Reply> := [Reply.Page("home"), Reply.Failed(503)];
+    for var r in replies do
+      db.Send((case r of                       // a new Reply case is flagged here
+          Page(var body) => body,
+          Failed(var code) => $"error {code}"));
+    end;
+    Console.WriteLine($"port {int.ParseOrNull("80x") ?? 8080}");
+  end Main;                                    // pool closes cache, then db closes
 end Program;
 ```
 
 </details>
 
-It prints `10 x pen: charged 12.50`, `1 x ink: refused, no product 'ink'`, `7 x pad: refused, only 6 left` and `running low: pad, mug`. Adding a case to `Outcome` makes the `case` expression in `Main` fail to compile until it handles the new case. [A Tour of Bezel](https://s8lap.github.io/bezel-lang/tour/) walks through the rest of the language.
+It prints `db <- home`, `db <- error 503` and `port 8080`, then `cache closed` and `db closed`: owned objects are released in reverse order as `Main` exits, with no `Dispose` call written. Using `cache` after the `move` is a compile error, and a case added to `Reply` draws a warning at the `case` until it is handled. [A Tour of Bezel](https://s8lap.github.io/bezel-lang/tour/) walks through the rest of the language.
 
 **Try it:** a prebuilt compiler for Linux x86-64 is on the [releases page](https://github.com/s8lap/bezel-lang/releases). It is a single static download with its own linker, so nothing else needs to be installed ([Getting started](#getting-started)).
 
 ## Why Bezel
 
-- **Memory safety without a collector.** Every object has one owner and is disposed exactly once. Using a moved-out value or keeping a borrow past its owner is a compile-time error; where a stale reference can still arise at run time, the default build throws instead of corrupting memory.
+- **Memory safety without a collector.** Every object has one owner and is disposed exactly once. Using a moved-out value or keeping a borrow past its owner is a compile-time error.
 - **Safe across threads.** Execution domains share no mutable state, so the guarantees hold in multi-threaded code and data races are ruled out by construction.
 - **Non-null by default.** A `Connection` always holds an object; only a `Connection?` may be `null`, and calling a member on it is a compile error until narrowed to non-`null` ([§7](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-nullability-2)).
 - **Predictable costs and behavior.** Objects are released at points you can find in the source. Integer overflow throws instead of wrapping ([§6.1](https://s8lap.github.io/bezel-lang/spec/07-6-arithmetic-and-overflow.html#sec-integer-arithmetic)), arithmetic on a nullable value is a compile error ([§7.11](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-lifted-operators)), and user types cannot declare conversion operators ([§25.4](https://s8lap.github.io/bezel-lang/spec/26-25-operator-overloading.html#sec-no-user-defined-conversion-operators)).
@@ -208,7 +174,13 @@ scripts/check_docs.sh                       # the documentation checks
 
 ## Acknowledgements
 
-The Bezel compiler is AI-written. Claude writes most of the specification, compiler and tests. Significant compiler work has come from MiniMax models. Z.AI models and Grok worked on the repo in the past to improve the compiler and the specification.
+Bezel is AI-written: the specification, the compiler, the tests and the research notes are the work of AI models. About three quarters of the attributed commits are by Anthropic's Claude models, which also wrote nearly all of the specification; about a quarter are by MiniMax models, mostly compiler and test work; and a small share in mid-2026 came from Z.AI's GLM. The human owner, [s8lap](https://github.com/s8lap), directs the work, makes the design decisions and reviews the results.
+
+Agent commits end with a `Co-Authored-By` trailer naming the model that wrote them, and the trailers are never stripped. Since September 2026 the gate checks every commit for exactly one (`scripts/check_commit_trailers.py`); some earlier commits and merges have none. To tally them in a full clone:
+
+```sh
+git log --format='%(trailers:key=Co-Authored-By,valueonly)' | grep . | sed 's/ <.*//; s/ (.*//' | sort | uniq -c | sort -rn
+```
 
 ## License
 
