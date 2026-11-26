@@ -34386,6 +34386,7 @@ static bool isGenericFunctionElementStore(const ast::CallExpr& call,
     // it: this declines (the conservative direction — a leak, never an early
     // release), the same refusal `isCallBoundedClosureArgPosition` makes.
     if (ctx.isImported(ms)) return false;
+    // SEAM-DEBT: #9320 AST-gated read of the callee's decl: null for an imported callee, so the arm answers the conservative way; drain onto a sema accessor (declines past the isImported guard above)
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md) return false;
     // POSITIONAL, exact arity — the only shape in which the syntactic index
@@ -42439,6 +42440,7 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
     if (ctx.isImported(ms) &&
         importedCalleeFormalIsCallBounded(ctx, *ms, call, ai, viaDeferredFrame))
         return true;
+    // SEAM-DEBT: #9056 AST-gated read of the callee's decl, behind the isImported guard: the imported arm declines through importedCalleeFormalIsCallBounded; drain onto a sema accessor
     if (ctx.isImported(ms) && !dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
         // fix #9056 (§28.14 / §28.9 / §2.5, v0.359): arm (d) below, for an
         // IMPORTED non-generic callee — the bound-LOCAL spelling of
@@ -42739,6 +42741,7 @@ inline bool closureArgBindsCtorTypeParamTakingField(
         }
     }
     if (!cs || cs->parent != cls) return false;
+    // SEAM-DEBT: #9112 AST-gated read of the constructor's decl: null for an imported constructor, so the arm declines; drain onto a sema accessor
     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
     if (!cd || ai >= cd->params.size() || cd->params.size() != ne.args.size())
         return false;
@@ -60921,6 +60924,7 @@ void Emitter::mintDynFnvalReturnRef(llvm::Value* v, const ast::Expr* value) {
 // unpinned: a bounded leak, never a release under a live reader.
 bool Emitter::dynFnvalMintPinSafe(const ast::LocalDecl* ld) {
     if (!ld || !currentMethod_) return false;
+    // SEAM-DEBT: #9061 AST-gated read of the current method's decl: null if the method symbol carries no AST decl, so the arm declines; drain onto a sema accessor
     auto* md = dynamic_cast<const ast::MethodDecl*>(currentMethod_->decl);
     if (!md) return false;
     bool found = false;

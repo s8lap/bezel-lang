@@ -21438,6 +21438,7 @@ bool Emitter::scopedFormalCallerReleasesProducer(const sema::SemaContext& ctx,
                 if (gp && gp->name == n) return true;
         return false;
     };
+    // SEAM-DEBT: #9056 AST-gated read of the callee's decl: null for an imported callee, so the arm answers the conservative way; drain onto a sema accessor
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md) {
         // An IMPORTED non-generic method (§2.5: the loader re-parses a body
@@ -21600,6 +21601,7 @@ bool Emitter::forwardedScopedFormalRead(const ast::Expr* e) {
 // release is the `rel.syncIter` arm, so arming both would double-release.
 bool Emitter::isPlainAsyncCalleeMethod(sema::MethodSymbol* ms) const {
     if (!ms || !isAsyncMethod(ms)) return false;
+    // SEAM-DEBT: #8950 AST-gated read of the callee's decl: null for an imported callee, so the arm answers the conservative way; drain onto a sema accessor
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md) return false;
     return !(md->bodyKind == ast::MethodBodyKind::Block &&

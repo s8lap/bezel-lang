@@ -11129,6 +11129,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             statPs && isStaticProperty(statPs)) {
             if (const ast::PropertyAccessor* acc = blockGetterOf(statPs)) {
                 auto* statPd =
+                    // SEAM-DEBT: #9224 AST-gated read of the static property's decl: null for an imported property, so the arm declines; drain onto a sema accessor
                     dynamic_cast<const ast::PropertyDecl*>(statPs->decl);
                 if (!statPd) return nullptr;
                 llvm::Function* getterFn = ensurePropertyBlockGetter(

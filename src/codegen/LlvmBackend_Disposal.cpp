@@ -8529,6 +8529,7 @@ bool Emitter::boxValueNeedsStringRetain(const ast::Expr* valueExpr,
             // `isProvablyFreshRecordFactoryMethod` makes; a method with no
             // attached body is not provably fresh, so it retains.
             const auto* md =
+                // SEAM-DEBT: #9254 AST-gated read of the callee's decl: null for an imported callee, so the arm answers the conservative way; drain onto a sema accessor
                 ms ? dynamic_cast<const ast::MethodDecl*>(ms->decl) : nullptr;
             if (md && md->bodyKind == ast::MethodBodyKind::Expression &&
                 freshConstruction(md->exprBody.get()))

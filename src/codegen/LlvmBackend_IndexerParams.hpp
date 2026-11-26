@@ -46,6 +46,7 @@ namespace bezel::codegen {
 inline const sema::TypeRef* indexerParamType(const sema::SemaContext& ctx,
                                              const sema::PropertySymbol* ps,
                                              std::size_t k) {
+    // SEAM-DEBT: #9102 AST-gated read of the indexer's declared parameters: null for an imported indexer; drain onto a sema accessor
     if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
         return (k < pd->indexerParams.size() && pd->indexerParams[k].type)
                    ? ctx.resolvedType(*pd->indexerParams[k].type)
@@ -60,6 +61,7 @@ inline const sema::TypeRef* indexerParamType(const sema::SemaContext& ctx,
 }
 
 inline std::size_t indexerParamCount(const sema::PropertySymbol* ps) {
+    // SEAM-DEBT: #9102 AST-gated read of the indexer's declared parameter count: null for an imported indexer; drain onto a sema accessor
     if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
         return pd->indexerParams.size();
     return ps->indexerParams.size();
@@ -79,6 +81,7 @@ inline std::size_t indexerParamCount(const sema::PropertySymbol* ps) {
 // is not knowable — the caller then declines.
 inline std::string_view indexerParamModifier(const sema::PropertySymbol* ps,
                                              std::size_t k) {
+    // SEAM-DEBT: #9102 AST-gated read of the indexer's declared parameter modifier: null for an imported indexer; drain onto a sema accessor
     if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
         return (k < pd->indexerParams.size()) ? pd->indexerParams[k].modifier
                                               : std::string_view();
