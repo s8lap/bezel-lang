@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Status** | under-review — draft (2026-11-26); recommends option B (§4); four owner questions (§10) |
+| **Status** | under-review — draft (2026-11-26), critiqued (pc-0217, SOUND-WITH-FIXES), revised; recommends option B (§4); three owner questions (§10); the form of `ExceptionInfo.TypeName` split out as a separate clarification (§10) |
 | **Tracking issue** | [#8401](https://github.com/s8lap/bezel-lang/issues/8401) (spec-question: `DomainFaultedException` drops the original exception's type name). Related: [#8669](https://github.com/s8lap/bezel-lang/issues/8669) (a cancelled child joining as cancellation; independent, §4.4), [#8402](https://github.com/s8lap/bezel-lang/issues/8402) (obsolete, §1.3) |
-| **Target documents** | **spec** — §30.14 *Faults* (two sentences), §30.14 *Data-parallel combinators* (one clause of the *Results and faults* bullet), §31.4 (one sentence added to *Cause chaining is by snapshot*, one clause of the supersession paragraph). **stdlib** — §6.8 (one comment line in the listing, one sentence of prose), §6.12 (one clause). **rationale** — §12.6 (one clause, one declined item). **Guide 4** §5 (one sentence), **Guide 2** §4 (one clause). **code-generation reference** — §5.6 (one comment line in the `Domain` listing). **proposals** — `README.md` (this row), `DECLINED.md` (the rows of §5, at graduation), proposal 0110's status note (Q2). No grammar change, no new member, no new type, no new diagnostic. |
-| **Written against** | spec, stdlib and rationale **v0.360** (`origin/main` `bd12fe038`). v0.361 (branch `spec/v0361-2026-11`, `c85ce271c`, landing in parallel) does not touch the sections this proposal edits: every `Old` text of §6 occurs exactly once in both trees (checked by script, §11). Probes on compiler release **r42** (`bezelc 0.0.0-8ccf7ff0`). |
+| **Target documents** | **spec** — §30.14 *Faults* (two sentences), §30.14 *Data-parallel combinators* (one clause of the *Results and faults* bullet), §31.4 (one sentence added to *Cause chaining is by snapshot*, one clause of the supersession paragraph). **stdlib** — §6.8 (one comment line in the listing, one sentence of prose), §6.12 (one clause). **rationale** — §12.6 (one clause, one declined item). **Guide 4** §5 (one sentence), **Guide 2** §4 (one clause). **code-generation reference** — §5.6 (one comment line in the `Domain` listing). **proposals** — `README.md` (this row), `DECLINED.md` (the rows of §5, at acceptance), proposal 0110's status note (Q2). No grammar change, no new member, no new type, no new diagnostic. |
+| **Written against** | spec, stdlib and rationale **v0.360** (`origin/main` `bd12fe038`). v0.361 (branch `spec/v0361-2026-11`, `c85ce271c`, landing in parallel) does not touch the sections this proposal edits: every `Old` text of §6 occurs exactly once in both trees (checked by script, §11). v0.361's new §31.2 sentence on per-raise `SupersededChain` clearing does bear on Q3, and is cited there. Probes on compiler release **r42** (`bezelc 0.0.0-8ccf7ff0`). |
 | **Origin** | Issue #8401, filed from the error-model research note ([`docs/research/error-model/README.md`](../research/error-model/README.md) §10 item 1, probe `p04_domain_fault.bzl`) for proposal 0211 to answer. Proposal 0211 (v0.356) answered the band half and left the type half open ([its §6.3](0211-failure-marker-and-boundary-arm.md)); the triage of the v0.361 run classified the rest as a design change. |
 | **Change class** | Design change ([`spec-change-process.md`](spec-change-process.md) §2): it adds to what crosses a domain boundary, which proposal 0211 §6.3 recorded as one fact and nothing else, and it changes observable runtime content (a join exception's `CauseChain`, its `ToString()` rendering and the §33.3 report). It reopens no `DECLINED.md` row (§2.4). After acceptance it lands as a ruling-class revision. |
 
@@ -19,13 +19,13 @@ The options are: leave it (A); put a snapshot of the original into the join exce
 
 **Recommendation: B.**
 
-- It adds no member, no type and no rule a handler can select on. The class the join raises stays the one fact a catch arm reads (rationale §12.6), and the type name is diagnostic text, which is how proposal 0211 §6.6 already treats `ExceptionInfo.TypeName` ("the entry's `TypeName` identifies it in a log").
+- It adds no member, no type and no arm pattern that names it. The class the join raises stays the one fact a catch arm's type pattern reads (rationale §12.6), and the type name is diagnostic text, which is how proposal 0211 §6.6 already treats `ExceptionInfo.TypeName` ("the entry's `TypeName` identifies it in a log").
 - The rules that print exceptions already render `CauseChain`: `ToString()` (§31.4) and the uncaught report (§33.3). So the issue's repro, and every log line and crash report of a child domain's fault, name the original with no further text.
 - It composes across nested spawns and through `Parallel.*`, and it carries the original's own causes.
-- It is a runtime change of about 20–40 lines in one function, reusing the existing snapshot helper; sema and codegen already lower `CauseChain` on every exception (§3.2).
+- For synchronous entries it is a runtime change of about 20–40 lines in one function, reusing the existing snapshot helper; sema and codegen already lower `CauseChain` on every exception (§3.2). The runtime work is sequenced after #8634 (§9).
 - Nothing in the tests or the rule corpus pins an empty chain or the old rendering on a join exception (§7).
 
-Declined: a dedicated name property (proposal 0110's `FaultTypeName` rider, which B subsumes), a `Type`-valued property, the name in `Message`, and carrying the original's `SupersededChain` (§5).
+Declined: a dedicated name property (proposal 0110's `FaultTypeName` rider, which B subsumes), a `Type`-valued property, the name in `Message`, and (subject to Q3) carrying the original's `SupersededChain` (§5).
 
 ## 1. The question and its history
 
@@ -36,7 +36,7 @@ Declined: a dedicated name property (proposal 0110's `FaultTypeName` rider, whic
 ### 1.2 What v0.356–v0.359 answered
 
 - **The band.** Proposal 0211 (v0.356) carried one bit across the seam: the join raises `DomainFailedException`, a subclass of `DomainFaultedException` that implements `IFailure`, when the original's class implements the marker (its §6.3). Proposal 0214 (v0.358) narrowed the marker's meaning to origin ("the outside world disagreed", spec §31.4) and kept `DomainFailedException` (its §3.5). So the first half of the issue, telling an `IFailure`-marked exception from one whose class makes no statement, is answered.
-- **The type.** 0211 §6.3 says one fact crosses "with the two strings", and nothing else. 0211 §6.6 declined a kind field on `ExceptionInfo`, saying the entry's `TypeName` "identifies it in a log". The maintainer's comment on #8401 (2026-11-10) records that the type half "remains this issue's open question, for its own ruling".
+- **The type.** 0211 §6.3 says one fact about the original crosses "with the two strings"; the maintainer's comment on #8401 (2026-11-10) reads it as "one bit across the seam … and nothing else". 0211 §6.6 declined a kind field on `ExceptionInfo`, saying the entry's `TypeName` "identifies it in a log". The same comment records that the type half "remains this issue's open question, for its own ruling".
 - **The story.** v0.359 ("one story, one voice") restated the domain case without changing it: "A domain join raises `DomainFaultedException`, or `DomainFailedException` for an `IFailure`-marked class" (QUOTED, v0.359 changelog). Its R3 made explicit that a cancelled child joins as plain `DomainFaultedException`, and filed #8669 for crossing as cancellation instead.
 
 ### 1.3 #8402 is obsolete and does not bear on this
@@ -53,6 +53,8 @@ Declined: a dedicated name property (proposal 0110's `FaultTypeName` rider, whic
 - `ToString()` renders "the receiver's qualified type name", its non-empty `Message`, and "every entry of the receiver's `CauseChain`" and `SupersededChain`, each entry by "its `ExceptionInfo`'s `TypeName` and its `Message` when that is non-empty" (QUOTED, §31.4).
 - The uncaught report prints "the exception's type, message, stack trace, `CauseChain`, and `SupersededChain`" (QUOTED, §33.3).
 - Rationale §12.6 (QUOTED): "Copying the message and stack-trace text (strings — sendable) preserves the diagnostic value, and the class the join raises carries the one fact a handler selects on — whether the fault was `IFailure`-marked".
+
+A `CauseChain` filled by the implementation, not by a constructor the program calls, already exists: §9.8's synthesized `Deserialize` records the `ContractViolationException` in its `SerializationException`'s `CauseChain` "in §31.4's snapshot form" (QUOTED, §9.8).
 
 The runtime builds the join's exception itself; no constructor is named. Read with §30.14's enumeration of what crosses and 0211 §6.3's "nothing else", the join exception has no cause, so its `CauseChain` is empty.
 
@@ -79,7 +81,7 @@ public class Program
 end Program;
 ```
 
-1. **Handled at the join.** `xs[5]` raises `IndexOutOfRangeException` with an empty message (§31.4's tree; the indexer is its producer). It propagates out of the entry. Its class does not implement `IFailure`, so the join raises plain `DomainFaultedException` with `Message = ""` and `FaultStackTrace` the original's trace text (`""` where traces are unavailable, §31.4). The arm takes it. `ToString()` renders the qualified type name `System.Threading.DomainFaultedException`, no message (empty), and no chain entries (both chains empty). Nothing printed names the original.
+1. **Handled at the join.** `xs[5]` raises `IndexOutOfRangeException` (§31.4's tree; the indexer is its producer). The spec does not fix the indexer's message; on r42 it is empty (MEASURED, `q1`). It propagates out of the entry. Its class does not implement `IFailure`, so the join raises plain `DomainFaultedException` with `Message = ""` and `FaultStackTrace` the original's trace text (`""` where traces are unavailable, §31.4). The arm takes it. `ToString()` renders the qualified type name `System.Threading.DomainFaultedException`, no message (empty), and no chain entries (both chains empty). Nothing printed names the original.
 2. **Uncaught.** Without the `try`, the join's exception escapes `Main`. §33.3 prints its type, an empty message, the trace text and two empty chains, and exits 70. The report says `DomainFaultedException` and nothing else.
 3. **An `IFailure`-marked original.** With `throw new FileNotFoundException("app.toml")` in the entry, the join raises `DomainFailedException`; an `IFailure` arm or a `DomainFaultedException` arm takes it, and `Message` is `"app.toml"`. The handler learns the origin (the marker) and the message, not that it was a missing file rather than a permission error or a dropped channel.
 4. **Cancellation.** An entry ending in `OperationCanceledException` joins as plain `DomainFaultedException` (§30.14, v0.359 R3; rule case `s30_14_0021`). Its message is whatever the raiser wrote, often empty. A log of the join cannot show that the child was cancelled rather than broken; Guide 4 §9 tells a supervisor to check its own source's `IsCancellationRequested` for the decision, which still works, but the log line has nothing.
@@ -93,10 +95,10 @@ MEASURED (r42; probe files under `/var/tmp/bezel-scratch/v361/p-0217/`):
 | `q1_repro` | the repro, plus `ex.CauseChain.Count` | `'' / System.Threading.DomainFaultedException`, then `causes=0` |
 | `q2_uncaught` | the repro without the `try` | `Unhandled exception: System.Threading.DomainFaultedException`, exit 70 |
 | `q3_cause_local` | the same fault wrapped in one domain by `new InvalidOperationException("wrapped", e)` | `causes=1 first=System.IndexOutOfRangeException` |
-| `q4_uncaught_cause` | that wrap, uncaught | `Unhandled exception: System.InvalidOperationException: wrapped` / `Caused by: System.IndexOutOfRangeException` |
+| `q4_uncaught_cause` | that wrap, uncaught | `Unhandled exception: System.InvalidOperationException: wrapped` / `Caused by: System.IndexOutOfRangeException` / `Superseded: System.IndexOutOfRangeException` (the `Superseded:` line is an r42 deviation; §31.2 does not make an arm-body throw a supersession) |
 | `p04` (research) | `FileNotFoundException("app.toml")` in the entry | `matched DomainFaultedException: Message='app.toml'` |
 
-The contrast between `q2` and `q4` is the issue in one line: the same fault, wrapped by a constructor in one domain, is reported with its type; crossing a domain, it is not. (r42's `ToString()` renders the type name only, a known lag behind §31.4's rendering rule; the report path already renders `CauseChain`.)
+The contrast between `q2` and `q4` is the issue in one line: the same fault, wrapped by a constructor in one domain, is reported with its type; crossing a domain, it is not. (r42's `ToString()` renders the type name only, not even `Message` — MEASURED by the critic's `t1_tostring.bzl` — a known lag behind §31.4's rendering rule, tracked by #3302; the report path already renders `CauseChain`.)
 
 ### 2.3 What a program can do today
 
@@ -118,7 +120,7 @@ The wrap works, at a cost. Every entry needs it. The program must declare a mark
 
 ### 2.4 Why this is design-level
 
-The text is not unclear. §30.14 lists what crosses, `CauseChain` is "empty when no cause", and 0211 §6.3 recorded the one-bit decision. Carrying more is a decision about the domain boundary, with a choice of surface (§3) that changes observable output and that proposal 0110 (under review) also touches with a different surface (its §2.6). So it is not a clarification. It reopens no `DECLINED.md` row: the sendability declines (rationale §12.6; `DECLINED.md`, *Sendability requirement on throwable types* and *Stating `Exception`'s inherited state transfer-compatible*) concern the exception object, which still does not cross; the *kind field on `ExceptionInfo`* row concerns the record's shape, which does not change.
+The text is not unclear. §30.14 lists what crosses, `CauseChain` is "empty when no cause", and 0211 §6.3 recorded the one-bit decision. Carrying more is a decision about the domain boundary, with a choice of surface (§3) that changes observable output and that proposal 0110 (under review) also touches with a different surface (its §2.6). So it is not a clarification. It reopens no `DECLINED.md` row: the sendability decline and deferral (rationale §12.6; `DECLINED.md`, *Sendability requirement on throwable types* and *Stating `Exception`'s inherited state transfer-compatible*) concern the exception object, which still does not cross; the *kind field on `ExceptionInfo`* row concerns the record's shape, which does not change.
 
 ## 3. The options
 
@@ -144,9 +146,9 @@ The join exception's `CauseChain` holds the entries the `(message, cause)` const
 - Path 5: the returned task's exception carries the snapshot of the first body fault. The entry's message is the original's even where the implementation decorates `Message` with the element index.
 - Path 6: unchanged, apart from path 1's content.
 - Nested spawns: an outer entry that awaits an inner join and lets its exception propagate ends with the inner join's exception. The outer join's chain is then `[snapshot(inner join exception)] ++ inner chain`: the inner join class first, then the original. The marker composes as today (0211 §6.3).
-- Soundness: no object crosses. `ExceptionInfo` is a record of three `string`s, and `string` is sendable (§30.14). The array is built by the runtime for the exception it raises at the join, the same way that exception's `Message` string is today. No catch rule, ownership rule or sendability verdict changes. The original's disposal in the child is unchanged (the runtime's `bz_exc_end_handling` path).
-- Ergonomics: no new name to learn. The data sits where a reader of any wrapped exception already looks, and the printing rules show it with no code. A reader iterating `CauseChain` for the root cause finds it.
-- Cost (HYPOTHESIS, from `src/`): runtime only. `bz_domain_spawn`'s fault branch (`src/runtime/bezel_runtime_concurrency.cpp`) already reads the original's message at the header's offset 8 before disposing it. It would also read the type name through the original's virtual `ToString` slot, the channel the supersession snapshot uses (`src/runtime/bezel_runtime_itable.cpp`, the #3261 append), and the original's `CauseChain` at offset 24, which every exception subclass carries (the header the #2950 layout test pins). It would then call `bz_exc_causechain_link` and store the result in the join exception's `CauseChain` slot. Sema and codegen need nothing: `CauseChain` is lowered on every exception (`LlvmBackend_Exprs.cpp`, the `CauseChain` member arm). The same deviation the two existing snapshots share (a user `ToString` override becomes the `TypeName`, #8634) would apply until #8634 is fixed. `Parallel` is unimplemented (#3557) and would take the rule when it is built. Estimate: 20–40 lines and three or four tests, one of them a leak loop over a faulting spawn (the CLAUDE.md vacuous-oracle rule).
+- Soundness: no object crosses. A `CauseChain` the implementation fills is not new: §9.8's synthesized `Deserialize` already records one in §31.4's snapshot form. `ExceptionInfo` is a record of three `string`s, and `string` is sendable (§30.14). The array is built by the runtime for the exception it raises at the join, the same way that exception's `Message` string is today. No catch rule, ownership rule or sendability verdict changes. The original's disposal in the child is unchanged (the runtime's `bz_exc_end_handling` path).
+- Ergonomics: no new name to learn. The data sits where a reader of any wrapped exception already looks, and the printing rules show it with no code. A reader iterating `CauseChain` for the root cause finds it. A non-empty message is rendered twice, once as the join's `Message` and once in the first entry: the same duplication §3.5 counts against E, for the message instead of the name; it is accepted because `Message` keeps its stdlib §6.8 meaning.
+- Cost (HYPOTHESIS, from `src/`): runtime only. `bz_domain_spawn`'s fault branch (`src/runtime/bezel_runtime_concurrency.cpp`) already reads the original's message at the header's offset 8 before disposing it. It would also read the original's type name, and its `CauseChain` at offset 24, which every exception subclass carries (the header the #2950 layout test pins). It would then call `bz_exc_causechain_link` and store the result in the join exception's `CauseChain` slot. Sema and codegen need nothing: `CauseChain` is lowered on every exception (`LlvmBackend_Exprs.cpp`, the `CauseChain` member arm). The type name must not come from the virtual `ToString` slot, the channel the two existing snapshots use (`src/runtime/bezel_runtime_itable.cpp`, the #3261 append): that channel is #8634, which records a wrong value under a user override, user code running mid-snapshot, and a leak of the `ToString` result. Here a user override would run inside the runtime continuation, between the `bz_exc` save and restore, with no exception edge. So the work is sequenced after #8634 (§9). `Parallel` (#3557) and async entries (#1523) are unimplemented and take the rule when built. Estimate, for synchronous entries: 20–40 lines and three or four tests, one of them a leak loop over a faulting spawn (the CLAUDE.md vacuous-oracle rule).
 - Migration: a join exception's `CauseChain.Count` goes from 0 to at least 1; its `ToString()` and the §33.3 report gain lines. §7.1 lists the tests and corpus cases checked: none flips.
 
 ### 3.3 C — a dedicated property
@@ -185,7 +187,7 @@ The join's `Message` becomes, for example, `"IndexOutOfRangeException: "` follow
 | Crash report names it | no | yes | no (without a §33.3 clause) | no | yes |
 | Original's own causes cross | no | yes | C2 only by widening `ExceptionInfo` | no | no |
 | New member or type | — | none | one member | one member | none |
-| New dispatch surface | — | none | none (by documentation) | yes | none |
+| New dispatch surface | — | none (by documentation; a `when` guard can read it, as C1's property) | none (by documentation) | yes | none |
 | Runtime / sema / codegen work | — | runtime only | all three | all three, plus `Type` | runtime only |
 | Existing tests or cases flipping | — | none found | none found | none found | three rule cases |
 
@@ -195,16 +197,16 @@ The join's `Message` becomes, for example, `"IndexOutOfRangeException: "` follow
 
 1. It answers the issue as filed, with the mechanism the issue names, and the answer reaches every place a fault is read by a person: the handler's `ToString()`, the uncaught report, and logs that render the exception.
 2. It keeps rationale §12.6's design whole. The exception object does not cross, and the class the join raises remains "the one fact a handler selects on". The name crosses as text, in the record the language already uses for text about other exceptions.
-3. It is the smallest change: no member, no type, no rule a program can dispatch on. A program that never reads `CauseChain` sees only longer output.
+3. It is the smallest change: no member, no type, and no arm pattern that names it; like any string a `when` guard could test it, which G1 tells readers not to do. A program that never reads `CauseChain` sees only longer output.
 4. It composes: nested spawns, `Parallel.*`, the original's own causes, both join classes.
 5. It is cheap and local to the runtime, and the snapshot helper it needs is already tested by two snapshot paths.
 
 ### 4.2 The rule, precisely
 
-- **Content.** The join exception's `CauseChain` is the chain the `(message, cause)` constructor would build with the original as `cause`: first the original's type name, message and stack-trace text, then each entry of the original's own `CauseChain`, in that chain's order. The type name is the one the cause snapshot copies (§31.4 "its type name"; Q3 asks whether to pin its form).
+- **Content.** The join exception's `CauseChain` is the chain the `(message, cause)` constructor would build with the original as `cause`: first the original's type name, message and stack-trace text, then each entry of the original's own `CauseChain`, in that chain's order. The type name is the one the cause snapshot copies (§31.4 "its type name"); whether to pin its form is split out as a separate clarification (§10).
 - **Which joins.** Every exception that ends an entry and is raised at the join: `DomainFaultedException` and `DomainFailedException` alike, cancellation included, and the exception `Parallel.*` raises for its first body fault.
 - **When.** In the spawned domain, while the original is still alive, before its handling ends and it is disposed. Only the snapshot's strings cross, as the `Message` copy does.
-- **What it does not carry.** The original's `SupersededChain` stays behind, as it does for the `(message, cause)` constructor's snapshot (§31.4 copies a cause's "own `CauseChain`" and nothing else). Q4 asks the owner to confirm the loss.
+- **What it does not carry.** The original's `SupersededChain` stays behind; the `(message, cause)` constructor's snapshot also copies a cause's "own `CauseChain`" and nothing more (§31.4). This loss is in tension with rationale §11.8, and Q3 puts it to the owner.
 - **`Message` and `FaultStackTrace`** are unchanged. For a `Domain.Spawn` join, the first entry's `Message` and `StackTrace` are the same text as the join's `Message` and `FaultStackTrace`. For `Parallel.*`, `Message` may carry the element index (stdlib §6.12), and the first entry keeps the original's message.
 - **Allocation.** The array is allocated like the join exception and its message string: under §17.7's ordinary rule, not the best-effort rule §31.2 gives the supersession append. The join must raise an exception in any case, and an allocation the join cannot make terminates the process as the exception's own allocation would.
 
@@ -226,18 +228,18 @@ The story says to name the types you handle and let everything else propagate, a
 
 ## 5. Declined, and why
 
-Row text for `DECLINED.md` (`declined-at-proposal`), to add at graduation if B is accepted:
+Row text for `DECLINED.md` (`declined-at-proposal`), to add at acceptance if B is accepted (`DECLINED.md` scope rule 1; 0212's rows landed the same way):
 
-| Direction | Class | Home | Reopening bar |
+| Topic | Verdict class | Authoritative record | Reopening bar |
 |---|---|---|---|
 | A `Type`-valued property carrying the original exception's runtime type across a domain join (`FaultType: Type`), and re-raising the original's class at the join | `declined-at-proposal` | [proposal 0217 §3.4](0217-domain-join-cause-snapshot.md); rationale §12.6 | Programs that must act on a child's exception type and cannot return it as a sendable result, counted; and an implemented `Type` (#3819). The class the join raises is the one fact a handler selects on; the re-raise half is rationale §12.6's sendability decline, not reopened. |
 | A dedicated type-name property on `DomainFaultedException` (`FaultTypeName: string`, proposal 0110 §2.6's rider) in place of the cause snapshot | `declined-at-proposal` | [proposal 0217 §3.3](0217-domain-join-cause-snapshot.md) | Evidence that readers do not find the original's name in `CauseChain`. The snapshot carries the name, is rendered by `ToString()` and by the uncaught report, and carries the original's causes; a property does none of the last three without further clauses. |
 | Writing the original's type name into the join exception's `Message` | `declined-at-proposal` | [proposal 0217 §3.5](0217-domain-join-cause-snapshot.md) | —(none stated). `Message` is the original's message text (stdlib §6.8); a prefix changes every handler's printed output and makes the message a string to parse. |
-| Carrying the original's `SupersededChain` across a domain join | `declined-at-proposal` | [proposal 0217 §4.2](0217-domain-join-cause-snapshot.md); spec §31.4 | Field evidence of a child's cleanup failure hiding the fault that mattered, at a join. The join exception superseded nothing, so its `SupersededChain` cannot hold the entries; the cause snapshot drops a cause's supersessions for the same reason (§31.4). |
+| Carrying the original's `SupersededChain` across a domain join (if Q3 confirms the loss) | `declined-at-proposal` | [proposal 0217 §4.2, §10 Q3](0217-domain-join-cause-snapshot.md); spec §31.2, §31.4; rationale §11.8 | Field evidence of a child's cleanup failure hiding the fault that mattered, at a join. `SupersededChain` records what this exception superseded (§31.2), and v0.361's per-raise clearing would drop carried entries at a second awaiter's re-raise. The loss is the one place rationale §11.8's "the buried failure survives" does not hold, recorded as such. |
 
 If the owner chooses A instead, the row is:
 
-| Direction | Class | Home | Reopening bar |
+| Topic | Verdict class | Authoritative record | Reopening bar |
 |---|---|---|---|
 | Carrying the original exception's type name across a domain join, by a cause snapshot in the join exception's `CauseChain` or by a property (#8401) | `declined-at-proposal` | [proposal 0217](0217-domain-join-cause-snapshot.md); spec §30.14 *Faults* | Crash reports or logs from programs written against a compiler that implements the join, where an unidentified child fault cost a diagnosis. The documented remedy is a sendable result or a channel (§30.14). |
 
@@ -270,7 +272,7 @@ Programs that need richer fault data return it as a sendable result or send it o
 New:
 
 ````text
-The snapshot is diagnostic text, which `ToString()` and [§33.3](#sec-exit-code)'s report render; the class the join raises remains the one fact a catch arm selects on. Programs that need richer fault data, or need to act on the original's type, return it as a sendable result or send it over a channel.
+The snapshot is diagnostic text, which `ToString()` and [§33.3](#sec-exit-code)'s report render; the class the join raises remains the one fact a catch arm's type pattern selects on. Programs that need richer fault data, or need to act on the original's type, return it as a sendable result or send it over a channel.
 ````
 
 ### 6.3 Spec §30.14 *Data-parallel combinators*, *Results and faults* (S3)
@@ -284,7 +286,7 @@ Old:
 New:
 
 ````text
-  the returned task faults with `DomainFaultedException` (`DomainFailedException` where that first fault's class is `IFailure`-marked; its `CauseChain` the snapshot of that fault, as *Faults* above states) — this section's fault vocabulary, with the no-aggregation
+  the returned task faults with `DomainFaultedException` (`DomainFailedException` where that first fault's class is `IFailure`-marked), whose `CauseChain` holds the snapshot of that fault as *Faults* above states — this section's fault vocabulary, with the no-aggregation
 ````
 
 ### 6.4 Spec §31.4, *Cause chaining is by snapshot* (S4)
@@ -312,7 +314,7 @@ Old:
 New:
 
 ````text
-`CauseChain` records causation — what a *constructor* was told, or, for a domain join's exception, the exception that ended the entry ([§30.14](#sec-multiple-domains)) — and `SupersededChain` what the *runtime* observed at supersession.
+`CauseChain` records causation — what a *constructor* was told, or what the implementation records in the same snapshot form where this specification says so (a domain join's exception, [§30.14](#sec-multiple-domains); a synthesized `Deserialize`'s contract failure, [§9.8](#sec-serialization-synthesis)) — and `SupersededChain` what the *runtime* observed at supersession.
 ````
 
 ### 6.6 Stdlib §6.8 (L1, L2)
@@ -349,13 +351,13 @@ New:
 Old:
 
 ````text
-or as `DomainFailedException` where that fault's class is `IFailure`-marked ([§6.8](#sec-domain)) (implementations
+surfaced at the `await` as `DomainFaultedException`, or as `DomainFailedException` where that fault's class is `IFailure`-marked ([§6.8](#sec-domain)) (implementations
 ````
 
 New:
 
 ````text
-or as `DomainFailedException` where that fault's class is `IFailure`-marked, with that fault's snapshot in `CauseChain` ([§6.8](#sec-domain)) (implementations
+surfaced at the `await` as `DomainFaultedException`, or as `DomainFailedException` where that fault's class is `IFailure`-marked, either one carrying that fault's snapshot in `CauseChain` ([§6.8](#sec-domain)) (implementations
 ````
 
 ### 6.8 Rationale §12.6 (R1, R2)
@@ -405,13 +407,13 @@ The guide's pin moves to the landing revision.
 Old:
 
 ````text
-A domain join raises `DomainFaultedException` with the original's message and stack-trace text, or `DomainFailedException`
+A domain join raises `DomainFaultedException` with the original's message and stack-trace text, or `DomainFailedException`, which implements `IFailure`, when the original's class did;
 ````
 
 New:
 
 ````text
-A domain join raises `DomainFaultedException` with the original's message and stack-trace text and, in its `CauseChain`, the original's type name, or `DomainFailedException`
+A domain join raises `DomainFaultedException` — or `DomainFailedException`, which implements `IFailure`, when the original's class did — with the original's message and stack-trace text and, in its `CauseChain`, the original's type name;
 ````
 
 The guide's pin moves to the landing revision.
@@ -427,8 +429,8 @@ Old:
 New:
 
 ````text
-                                      //   class implements IFailure; its CauseChain[0] is the original's
-                                      //   (TypeName, Message, StackTrace), for logs, not for dispatch
+                                      //   class implements IFailure; either way the joined exception's CauseChain[0]
+                                      //   is the original's (TypeName, Message, StackTrace), for logs, not for dispatch
 ````
 
 The reference's pin moves to the landing revision.
@@ -440,21 +442,21 @@ The reference's pin moves to the landing revision.
 MEASURED (`git grep` at `bd12fe038`):
 
 - No gtest asserts on a join exception's `CauseChain`, `ToString()` or uncaught report. The one exact-text pin on the class, `builtin_exception_module_path_5177`'s `domain_faulted_exception_is_system_threading`, renders a user-constructed `new DomainFaultedException()` with no cause, which this rule does not reach. `shared_sync_689_contention`'s `async_main_uncaught_reports_type_and_message_33_3_1609` uses `find` on an exception thrown in `Main`, not at a join.
-- No rule-corpus case reads `CauseChain`, `SupersededChain` or `ToString()` on a join exception: none of `s30_14_0017`–`0021`, `l6_8_0003`, `l6_8_4301`–`4303`, `l6_12_0001` or `l6_12_0006` flips.
+- Of the files under `tests/` that contain `Domain.Spawn` or `Parallel.`, only three read `CauseChain`, `SupersededChain` or a `Caused by` text: `exception_unresolved_member_2423_test.cpp` (it reads `FaultStackTrace` on a join, and `CauseChain` only on a non-join exception), `builtin_registry_snapshot_test.cpp` (the registry) and the rule corpus's `manifest.tsv` (row text only). `async_fault_causechain_reclaim_2330_test.cpp` names the `bz_domain_spawn` site in a comment; its cells are not joins. So no gtest and no rule-corpus case flips.
 - The doc-example corpus case `tests/conformance/cases/stdlib_0125.bzl` is stdlib §6.8's listing; L1 adds a comment line to it. It is listed for the #1380 merge-by-content regeneration, not regenerated by the landing.
 
 ### 7.2 Changelog sketch
 
 > **The original's type name crosses a domain join (#8401; proposal 0217).**
 > - *Decided.* The exception a domain join raises, `DomainFaultedException` or `DomainFailedException`, carries in its inherited `CauseChain` the snapshot the `(message, cause)` constructor would take of the original: its type name, message and stack-trace text, then its own `CauseChain` (spec §30.14 *Faults*, §31.4; stdlib §6.8). The same holds for the first body fault `Parallel.*` raises (spec §30.14; stdlib §6.12). The snapshot is taken in the spawned domain before the original is disposed, and only strings cross.
-> - *Declined.* A dedicated property (`FaultTypeName`, proposal 0110's rider) or a `Type`-valued one; the name in `Message`; carrying the original's `SupersededChain` (`DECLINED.md`, four rows).
+> - *Declined.* A dedicated property (`FaultTypeName`, proposal 0110's rider) or a `Type`-valued one; the name in `Message`; carrying the original's `SupersededChain` (`DECLINED.md`, four rows, indexed at acceptance).
 > - *Why.* A child's fault reached its handler and the crash report with no type, and a fault with an empty message with nothing at all. The rules that print exceptions already render `CauseChain`.
 >
 > **Migration.**
 >
 > *Newly defined:* a join exception's `CauseChain` is non-empty (it was empty), so its `ToString()` rendering and the §33.3 uncaught report name the original. No compile-time verdict changes, and no catch arm takes a different exception.
 >
-> *Spec-ahead-of-impl:* the runtime builds the join exception with an empty chain; tracker to file (`spec-tracking`), naming `bz_domain_spawn`. `Parallel` is unimplemented (#3557) and takes the rule when built. The type name follows #8634's known deviation for a user `ToString` override.
+> *Spec-ahead-of-impl:* the runtime builds the join exception with an empty chain; tracker to file (`spec-tracking`), naming `bz_domain_spawn`, sequenced after #8634 (whose type-name source it uses). Spec-rule tier, with no stdlib `⚠` marker: `CauseChain` is implemented on `DomainFaultedException`, and the content rule is spec §30.14's; it is recorded by the tracker and by the banked `fail` rows of the new cases. `Parallel` (#3557) and async entries (#1523) are unimplemented; their fault paths take the rule when built.
 >
 > *Rule corpus:* seven new cases (§7.3); no verdict changes; `baseline.tsv` untouched.
 >
@@ -462,13 +464,13 @@ MEASURED (`git grep` at `bd12fe038`):
 
 ### 7.3 Proposed rule-corpus cases
 
-All `run`, all expected to fail on r42 until the tracker lands (MEASURED for the first four: r42 prints the empty-chain results shown). The type-name checks use `EndsWith`, because §31.4 does not pin the name's form (Q3).
+All `run`, all expected to fail on r42 until the tracker lands (MEASURED for the first four: r42 prints the empty-chain results shown). The type-name checks use `EndsWith`, because §31.4 does not pin the name's form (the split-out clarification, §10). Cases 1–3 guard each `CauseChain[0]` read with a `Count` test, so that on a compiler without the rule the banked failure is a stdout mismatch, not a crash; the expected outputs are unchanged.
 
-1. **`s30_14_0022`** — the issue's repro. Rule: S1's new sentence. Program: §2.2's `BadIndex` entry; the `DomainFaultedException` arm prints `ex.CauseChain.Count` and `ex.CauseChain[0].TypeName.EndsWith("IndexOutOfRangeException")`. `stdout: 1` / `True`. r42: prints `0`, then faults on `CauseChain[0]`.
-2. **`s30_14_0023`** — the original's own causes follow. Entry: `int.Parse("x")` inside a `try` whose `FormatException` arm throws `new InvalidOperationException("bad config", e)`. Arm prints `Count`, `CauseChain[0].Message`, `CauseChain[1].TypeName.EndsWith("FormatException")`. `stdout: 2` / `bad config` / `True`. r42: `0`, then a fault.
-3. **`s30_14_0024`** — cancellation is snapshotted too. Entry throws `new OperationCanceledException("stop")`; the `DomainFaultedException` arm prints `ex.CauseChain[0].TypeName.EndsWith("OperationCanceledException")`. `stdout: True`. r42: a fault on `CauseChain[0]`.
+1. **`s30_14_0022`** — the issue's repro. Rule: S1's new sentence. Program: §2.2's `BadIndex` entry; the `DomainFaultedException` arm prints `ex.CauseChain.Count` and `ex.CauseChain[0].TypeName.EndsWith("IndexOutOfRangeException")`. `stdout: 1` / `True`. r42: `0` / `no snapshot` (MEASURED, guarded form).
+2. **`s30_14_0023`** — the original's own causes follow. Entry: `int.Parse("x")` inside a `try` whose `FormatException` arm throws `new InvalidOperationException("bad config", e)`. Arm prints `Count`, `CauseChain[0].Message`, `CauseChain[1].TypeName.EndsWith("FormatException")`. `stdout: 2` / `bad config` / `True`. r42: `0`, then the guard's `no snapshot`.
+3. **`s30_14_0024`** — cancellation is snapshotted too. Entry throws `new OperationCanceledException("stop")`; the `DomainFaultedException` arm prints `ex.CauseChain[0].TypeName.EndsWith("OperationCanceledException")`. `stdout: True`. r42: the guard's `no snapshot`.
 4. **`s30_14_0025`** — an `IFailure`-marked original. Entry throws `new FileNotFoundException("app.toml")` (with `import System.IO;`); a `var f: IFailure` arm prints `f.CauseChain[0].TypeName.EndsWith("FileNotFoundException")` and `f.CauseChain[0].Message`. `stdout: True` / `app.toml`. r42: rejected (`IFailure` unresolved, #8414).
-5. **`s30_14_0026`** — nested spawns. An `async` entry `Outer(): Task<int>` spawns `Inner` (which throws `FileNotFoundException("app.toml")`) and returns `await` of that join. The outer join's arm prints `Count` and whether entries 0 and 1 end with `DomainFailedException` and `FileNotFoundException`. `stdout: 2` / `True` / `True`. r42: rejected at the outer spawn (the `Task<int>` entry's result is reported not sendable, though §30.14's own `TickAsync` example has that shape; not investigated here).
+5. **`s30_14_0026`** — nested spawns. An `async` entry `Outer(): Task<int>` spawns `Inner` (which throws `FileNotFoundException("app.toml")`) and returns `await` of that join. The outer join's arm prints `Count` and whether entries 0 and 1 end with `DomainFailedException` and `FileNotFoundException`. `stdout: 2` / `True` / `True`. r42: rejected at the outer spawn — async entries are unimplemented (#1523; banked `s30_14_0016 fail #1523`); §30.14's own `TickAsync` example is rejected the same way (MEASURED by the critic, `a1_tick.bzl`). Once #1523 lands, the case also needs `DomainFailedException` and `IFailure` (#8442, #8414).
 6. **`l6_8_0006`** — the first entry agrees with the copied strings. Entry throws `new InvalidOperationException("boom")`; the arm prints `ex.CauseChain.Count = 1 and ex.CauseChain[0].StackTrace = ex.FaultStackTrace and ex.CauseChain[0].Message = ex.Message`. `stdout: True`. Rule: L2. r42: prints `False`.
 7. **`l6_12_0007`** — `Parallel.Map`. `Parallel.Map(new Array<int>(4, 3), Program.Fail)` where `Fail` throws `new InvalidOperationException("bad item")`; the arm prints `ex.CauseChain[0].TypeName.EndsWith("InvalidOperationException")` and `ex.CauseChain[0].Message`. `stdout: True` / `bad item`. Rule: L3. r42: rejected (`Parallel` unresolved, #3557).
 
@@ -505,7 +507,11 @@ public class Program
     catch
       var ex: DomainFaultedException => do
         Console.WriteLine(ex.CauseChain.Count);
-        Console.WriteLine(ex.CauseChain[0].TypeName.EndsWith("IndexOutOfRangeException"));
+        if ex.CauseChain.Count > 0 then
+          Console.WriteLine(ex.CauseChain[0].TypeName.EndsWith("IndexOutOfRangeException"));
+        else
+          Console.WriteLine("no snapshot");
+        end if;
       end,
     end try;
   end Main;
@@ -548,34 +554,37 @@ The uncaught report (§33.3) writes to standard error, which the rule corpus doe
 
 ## 8. Probes
 
-The probe programs are those of §2.2 (`q1`–`q4`) and §7.3 (`c1`–`c7`), compiled with r42 under `/var/tmp/bezel-scratch/v361/p-0217/`. They are not committed: every program is reproduced in this document in full or in the one-line form §7.3 gives. Results, MEASURED:
+The probe programs are those of §2.2 (`q1`–`q4`) and §7.3 (`c1`–`c7`, and `c1g`, case 1 as guarded), compiled with r42 under `/var/tmp/bezel-scratch/v361/p-0217/`. They are not committed: every program is reproduced in this document in full or in the one-line form §7.3 gives. The `Superseded:` lines after an arm's fault are the r42 deviation noted in §2.2 (§31.2 does not make an arm-body throw a supersession; no tracker found, a candidate for triage). Results, MEASURED:
 
 | Probe | §7.3 case | r42 result |
 |---|---|---|
-| `c1` | 1 | `0`, then `Unhandled exception: System.IndexOutOfRangeException` (the `CauseChain[0]` read) |
-| `c2` | 2 | `0`, then the same fault |
-| `c3` | 3 | the same fault |
+| `c1` | 1 (unguarded) | `0`, then `Unhandled exception: System.IndexOutOfRangeException` (the `CauseChain[0]` read) / `Superseded: System.Threading.DomainFaultedException`, exit 70 |
+| `c1g` | 1 (guarded, as in §7.3) | `0` / `no snapshot`, exit 0 |
+| `c2` | 2 (unguarded) | `0`, then the same fault / `Superseded: System.Threading.DomainFaultedException: bad config`, exit 70 |
+| `c3` | 3 (unguarded) | the same fault / `Superseded: System.Threading.DomainFaultedException: stop`, exit 70 |
 | `c4` | 6 | `False` |
-| `c5` | 5 | compile error at the outer spawn (async `Task<int>` entry) |
+| `c5` | 5 | compile error at the outer spawn (#1523) |
 | `c6` | 7 | compile error: `Parallel` unresolved |
 | `c7` | 4 | compile error: `IFailure` unresolved |
 
 ## 9. Implementation sketch and trackers (non-normative)
 
-- Runtime, `bz_domain_spawn`'s fault branch (`src/runtime/bezel_runtime_concurrency.cpp`): before `bz_exc_end_handling`/`bz_dispose_class_obj` on the original, read its type name through the virtual `ToString` slot (as the #3261 supersession append does) and its `CauseChain` at the header's offset 24, call `bz_exc_causechain_link(typeName, message, chain)`, and store the result at the join exception's `CauseChain` slot. The stack-trace field uses the same `""` stub as the existing snapshot until traces are formatted.
-- Reclaim: the join exception's chain is reclaimed by the same path as any exception's `CauseChain` (#2330's reclaim). A loop of 100 faulting spawns under ASan confirms it.
+- Runtime, `bz_domain_spawn`'s fault branch (`src/runtime/bezel_runtime_concurrency.cpp`): before `bz_exc_end_handling`/`bz_dispose_class_obj` on the original, read its type name from a type-name source that runs no user code — the `bz_exc_type_name(obj)` entry #8634 proposes (or #3302's), not the virtual `ToString` slot; the tracker is sequenced after #8634, or fixes all three snapshot sites together — and its `CauseChain` at the header's offset 24, call `bz_exc_causechain_link(typeName, message, chain)`, and store the result at the join exception's `CauseChain` slot. The stack-trace field uses the same `""` stub as the existing snapshot until traces are formatted.
+- Reclaim: the join exception's chain is reclaimed by the same path as any exception's `CauseChain` (#2330's reclaim). A loop of 100 faulting spawns under ASan is the gate, including for #8634's leak at this site.
+- #8727 (open: a borrow of a catch binding's `CauseChain` stored in a field outlives the exception, an ASan heap-use-after-free) is not this proposal's defect, but every join exception would now carry a non-empty chain, so its exposure grows; the implementing lane should know.
+- Async entries (#1523): when built, their fault path uses the same helper. The 20–40-line estimate covers synchronous entries only.
 - `Parallel` (#3557): when built, its first-fault path uses the same helper.
 - Trackers to file at landing (`spec-tracking`): one for the runtime change, citing this proposal and the rule cases of §7.3. #8401 closes with the landing.
 
 ## 10. Owner questions
 
-**Q1 — Which option?** B (recommended), C1/C2 (a property), or A (decline, with §5's alternative row). B is recommended for §4.1's reasons: it prints where exceptions are printed, it carries the causes, and it adds nothing to dispatch on.
+**Q1 — Which option?** B (recommended), C1/C2 (a property), or A (decline, with §5's alternative row). B is recommended for §4.1's reasons: it prints where exceptions are printed, it carries the causes, and it adds no arm pattern; as a dispatch surface it is on a par with C1 (text a `when` guard could test, barred by documentation only).
 
-**Q2 — Proposal 0110's `FaultTypeName`.** If B is accepted, should 0110's stage-1 rider drop `FaultTypeName` and keep `ExitKind` alone (recorded as a status note on 0110 at this proposal's graduation)? Recommendation: yes. `ExitKind` is a separate question that #8669 now also bears on.
+**Q2 — Proposal 0110's `FaultTypeName`.** If B is accepted, should 0110's stage-1 rider drop `FaultTypeName` and keep `ExitKind` alone (recorded as a status note on 0110 at this proposal's graduation)? Recommendation: yes. B and that property are equally text a `when` guard could test, and B also prints and carries the causes. `ExitKind` is a separate question that #8669 now also bears on.
 
-**Q3 — The form of `TypeName`.** §31.4 says a snapshot copies "its type name" without fixing the form, while `ToString()` renders "the qualified type name" (the `Type.FullName` rendering, stdlib §2.13). r42 produces the qualified name in both existing snapshots. Should §31.4 say that every `ExceptionInfo.TypeName` the runtime or the cause constructor writes is the qualified name? Recommendation: yes, as a separate one-sentence clarification in the same landing, applying to all three snapshot sites. The rule cases of §7.3 do not depend on it, since they use `EndsWith`.
+**Q3 — The original's `SupersededChain`.** B drops it. Rationale §11.8 rests later-wins on the buried failure surviving into `SupersededChain` and the §33.3 report, and v0.361 delivers that chain whole through task seams (§31.2 on the v0.361 branch: "The chain is per raise, not per instance"; an async body's own raise "is the raise being reported, and its chain is delivered whole"). The join is now the one seam that loses it: a child whose body fault is superseded by a failing cleanup reports only the cleanup's exception. This holds under A as under B. Options: (a) confirm the loss (recommended for now; the reopening bar is field evidence, §5's fourth row); (b) carry the original's `SupersededChain` into the join exception's `SupersededChain`, which needs a clause in §31.2/§31.4 beside S5 and an exemption from v0.361's new-raise clearing, so that later awaiters of a `Task<R>` join still see it; (c) append the entries to `CauseChain`, which is declined because §31.4 requires the two chains to stay distinguishable.
 
-**Q4 — The original's `SupersededChain`.** B drops it at the join, as the cause snapshot does for any cause. Confirm the loss (§5's fourth row), or ask for a design that carries it, which would need a place in the join exception other than either chain as §31.4 defines them. Recommendation: confirm.
+**Split out, not asked here: the form of `ExceptionInfo.TypeName`.** §31.4 says a snapshot copies "its type name" without fixing the form, while `ToString()` renders "the qualified type name" (the `Type.FullName` rendering, stdlib §2.13), and r42 produces the qualified name in both existing snapshots. Pinning the qualified name for every `TypeName` the runtime or the cause constructor writes is a one-sentence clarification covering all three snapshot sites (cause constructor, supersession, and the join this proposal adds). It goes as its own small clarification issue, not as part of this design change; it would also make #8634 plainly a bug. This proposal's rule cases use `EndsWith`, so they do not depend on it.
 
 ## 11. Classifications and checks
 
@@ -584,4 +593,5 @@ The probe programs are those of §2.2 (`q1`–`q4`) and §7.3 (`c1`–`c7`), com
 - **Sendability (§30.14):** untouched. Only strings cross, and no type's verdict changes.
 - **Anchor check (MEASURED):** a script checked that each of the thirteen `Old` texts of §6 (S1–S5, L1–L3, R1–R2, G1–G2, C1) occurs exactly once in its document at `bd12fe038` (v0.360) and at `c85ce271c` (the v0.361 branch).
 - **Absence check:** `git grep` for `FaultTypeName`, `FaultType` and `ExitKind` in `src/` and `tests/` finds nothing (MEASURED), so no implementation-ahead-of-spec delta arises from the declined surfaces.
-- **Composition:** one train. It shares §30.14 *Faults* with #8669 (independent, §4.4) and `DomainFaultedException`'s listing with proposal 0110 (Q2).
+- **Composition:** one train. It shares §30.14 *Faults* with #8669 (independent, §4.4) and `DomainFaultedException`'s listing with proposal 0110 (Q2). Its Q3 bears on v0.361's §31.2 per-raise rule, which lands in parallel.
+- **Critique:** non-author critique pc-0217 (SOUND-WITH-FIXES) at `b58f441be`; findings F1–F14 applied in this revision, with F3 and F4 changing what the owner is asked (Q1's wording, Q3), and the qualified-`TypeName` question split out.
