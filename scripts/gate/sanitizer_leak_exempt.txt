@@ -307,3 +307,16 @@ codegen_lambda_captured_param_cell_9025.frame_owned_param_lambda_write_releases_
 codegen_lambda_captured_param_cell_9025.compound_writes_release_each_displaced_value_spec_4_6  # status:residue issue:9380 spec §4.6/§28.9: displaced values released; the shared cell's final value leaks (<= 400 allocations)
 codegen_lambda_captured_fn_param_cell_9039.loop_of_fresh_writes_releases_each_displaced_closure_spec_28_9  # status:residue issue:9380 spec §28.9: displaced closures released; the shared cell's final closure leaks (<= 200 allocations)
 codegen_lambda_captured_type_param_cell_9060.loop_of_writes_releases_each_displaced_value_spec_28_9  # status:residue issue:9380 spec §28.9: displaced values released; the shared cell's final value leaks (<= 600 allocations)
+
+# ── R43 captured `ref p: T` alias + ref-argument residues (#4980, #9381) — 6 rows ──
+# These ownership rows also PASS with a deliberate, bounded leak, and they too were never declared (a second part of the same R43
+# gate-1 ASan failure). 9077/9119: the displaced value of a write through a captured `ref p: T` alias at T=string leaks under the
+# retain-only `T`-local policy of #4965, which is #4980 (OPEN). Each row asserts `<= 800` allocations; measured 800/800/400 and
+# 800/800 on 2026-11-26. 9222: the retaining-callee control leaks the caller's +1, one 64 B closure cell per call; its bound is
+# 200 allocations / 12800 B, measured equal. #9222 closes with its fix, so the residue's owner is #9381.
+ownership_captured_ref_type_param_alias_9077.caller_reads_its_own_ref_local_after_the_write_spec_22_3  # status:residue issue:4980 spec §22.3/§28.9: the displaced value of a captured ref-T alias write leaks (retain-only T-local policy, <= 800 allocations)
+ownership_captured_ref_type_param_alias_9077.generic_caller_alias_type_param_local_keeps_its_value_spec_28_9  # status:residue issue:4980 spec §28.9: the displaced value of a captured ref-T alias write leaks (retain-only T-local policy, <= 800 allocations)
+ownership_captured_ref_type_param_alias_9077.second_env_reads_the_written_alias_spec_27_5  # status:residue issue:4980 spec §27.5/§28.9: the displaced value of a captured ref-T alias write leaks (retain-only T-local policy, <= 800 allocations)
+ownership_captured_ref_type_param_alias_nullable_9119.a_null_write_through_the_alias_then_a_value_spec_28_9  # status:residue issue:4980 spec §28.9: the displaced value of a captured ref-T? alias write leaks (retain-only T-local policy, <= 800 allocations)
+ownership_captured_ref_type_param_alias_nullable_9119.caller_reads_its_own_ref_local_after_the_write_spec_22_3  # status:residue issue:4980 spec §22.3/§28.9: the displaced value of a captured ref-T? alias write leaks (retain-only T-local policy, <= 800 allocations)
+ownership_ref_arg_caller_owned_closure_local_9222.ref_arg_retaining_callee_keeps_the_value_alive_spec_28_9  # status:residue issue:9381 spec §28.9: a callee that retains a ref-argument closure leaves the caller's +1 unreleased (64 B per call, bound 200 / 12800 B)
