@@ -4427,6 +4427,8 @@ public class Task
 end Task;
 ```
 
+**`Delay` observes its token at the cancellation.** A `Delay` given a token completes with `OperationCanceledException` when the token is cancelled — at the cancellation, not at the deadline (language spec [§30.8](Bezel_Language_Spec.md#sec-cancellation): the inner call observes the request) — and a cancellation that comes from the source's **disposal** counts, disposal being a full `Cancel()` ([§6.1](#sec-cancellationtoken-and-cancellationtokensource)): a `using var` source leaving scope while a delay on its token is pending cancels the delay. A token already cancelled at the call completes the delay with `OperationCanceledException` at once; a delay whose deadline passes before any cancellation completes normally.
+
 **Raises.** `WhenAny` raises `ArgumentException` synchronously when `tasks` is empty (language spec [§30.10](Bezel_Language_Spec.md#sec-standard-library-task-helpers)); non-throwing form: none — a precondition (`Count` is the test). `WhenAll` raises nothing of its own: awaiting it re-raises the exception of the first non-successful input in input order, a cancelled input counting as `OperationCanceledException` (language spec §30.10), and `WhenEach` yields faulted and cancelled tasks for the caller to await.
 
 `FireAndForget` registers a continuation that logs any exception the task produces through the implementation-defined diagnostic channel (the closing note below is the single statement of mechanism), then disposes the task. The calling code relinquishes ownership (the parameter is `owned`); the runtime supervises the task's lifecycle.
