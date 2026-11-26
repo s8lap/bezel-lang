@@ -4020,7 +4020,7 @@ end;
 
 `null` is itself the failure signal (Try shape (b), §1), producing simple call sites with no out-parameter contortion.
 
-**Blocking discipline (spec §30.12).** `Acquire()` and `TryAcquire(timeout)` block the calling thread. They are rejected at compile time inside `async` methods and `async` lambdas (use `AcquireAsync`/`TryAcquireAsync`); where a non-`async` helper reached from a domain continuation would actually park in them, the runtime raises `InvalidOperationException` instead (non-throwing form: none — a precondition; the `Async` forms are the remedy). They remain fully legal on the startup thread and on FFI foreign threads (outside any domain), and when the mutex is immediately available.
+**Blocking discipline (spec §30.12).** `Acquire()` and `TryAcquire(timeout)` block the calling thread. They are rejected at compile time where the innermost enclosing method or lambda body is `async` (use `AcquireAsync`/`TryAcquireAsync`; a non-`async` lambda nested in an `async` body is not such a body, spec §30.3); where a non-`async` helper or lambda reached from a domain continuation would actually park in them, the runtime raises `InvalidOperationException` instead (non-throwing form: none — a precondition; the `Async` forms are the remedy). They remain fully legal on the startup thread and on FFI foreign threads (outside any domain), and when the mutex is immediately available.
 
 **Non-reentrant (language spec [§30.12](Bezel_Language_Spec.md#sec-thread-synchronization)).** A `Mutex` does not track its holder: a holder that acquires it again **waits on itself**, in every acquisition form — the blocking forms park (or hit the runtime guard above where a domain continuation would park), the `Async` forms never complete, and `TryAcquire`/`TryAcquireAsync` return `null` at the timeout. A nested critical section acquires once and passes the guard; it never re-acquires. `Locked<T>` and `RwLocked<T>` ([§6.11](#sec-locked-and-rwlocked)) carry the same posture.
 
@@ -4869,8 +4869,8 @@ end Sessions;
 
 Semantics and obligations (normative statement: language spec §30.12):
 
-- **Acquisition mirrors `Mutex` ([§6.2](#sec-mutex-and-lock))**: blocking forms are rejected lexically inside `async`
-  bodies and hit the runtime `InvalidOperationException` guard where a domain continuation would actually park; the
+- **Acquisition mirrors `Mutex` ([§6.2](#sec-mutex-and-lock))**: blocking forms are rejected where the innermost enclosing method or lambda body is
+  `async` and hit the runtime `InvalidOperationException` guard where a domain continuation would actually park; the
   `Async` forms are Pattern B (`using var g := await x.LockAsync();`). `TryLock(timeout)`/`TryRead`/`TryWrite` return
   `null` on timeout (Try shape (b), [§1](#sec-conventions)); cancellation follows §6.2's contract: a
   cancelled pending acquisition faults with `OperationCanceledException` and never holds the lock. **Non-reentrant**: a holder re-acquiring waits on itself

@@ -16405,7 +16405,7 @@ Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change pro
 
 ### v0.361 changelog (v0.360 → v0.361)
 
-**Quick rulings: twenty-five open questions decided from the text (2026-11-26).** A triage lane sorted the open `spec-question` backlog and found 26 RULE-NOW items; 25 are ruled here, and #9275 is not (*Not ruled*, below). Five ruling lanes then wrote the RULE-NOW items, each lane owning disjoint sections, and two adversarial critics attacked the union before composition (spec-change process §4). Every item below is **clarification** or **ruling** class: each makes the existing design say one thing, and none reverses a recorded decision. Where a lane found that an answer needed new semantics, it wrote nothing, and the item is under *Not ruled*. Three queued owner rulings (#8617, #9377, #9379) are written in the same pass, and the owner's decisions of 2026-11-26 on #9287, #8062, #9324 and #9377 are applied. Three DECIDED items gained a restating sentence (#8748, #8116, #8577).
+**Quick rulings: twenty-five open questions decided from the text (2026-11-26).** A triage lane sorted the open `spec-question` backlog and found 26 RULE-NOW items; 25 are ruled here, and #9275 is not (*Not ruled*, below). Five ruling lanes then wrote the RULE-NOW items, each lane owning disjoint sections, and two adversarial critics attacked the union before composition (spec-change process §4). Every item below is **clarification** or **ruling** class: each makes the existing design say one thing, and none reverses a recorded decision. Where a lane found that an answer needed new semantics, it wrote nothing, and the item is under *Not ruled*. Three queued owner rulings (#8617, #9377, #9379) are written in the same pass, the owner's decisions of 2026-11-26 on #9287, #9324 and #9377 are applied, and #8062's transition point is ruled by the coordinator under the owner's delegation. Three DECIDED items gained a restating sentence (#8748, #8116, #8577).
 
 **Ownership: holders, bindings and `ref` locations (spec §15.3, §20, §28.2, §28.3, §28.9, §29.2).**
 - **#8708, a local bound from a member read is a holder** (ruling; §28.2 holder list, Appendix C.3, the reference's §4.4).
@@ -16443,6 +16443,7 @@ Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change pro
 - **#8115, a binding named `String`** (ruling; §3.4), **with #8116** (DECIDED restatement).
   - *Decided.* A local of any declaration form, a parameter (method, constructor or lambda), a pattern or `catch` binding, or a type parameter named one of §3.4's reserved PascalCase names is a compile error at the declaration. These are exactly the declarations §2.7 rule 1 finds ahead of the always-available names. A **member** may still take the name, since §2.7 ranks members below the type at a chain head. Wherever a type can stand, the bare name and its qualified spelling (`System.String`, #8116) name the type.
   - *Declined.* Reading B (ban type declarations only), because §2.3 row 1 says "**No**". A member ban was also declined: it protects nothing and would flip working programs.
+  - *Consequence in §26.4* (clarification at composition). A generic extension head's bare identifier declares a type parameter, so `extension IEnumerable<String>` is now §3.4's declaration error, where §26.4 said only that the compiler warns on shadowing. §26.4's sentence now says so and names the remedy, the keyword (`extension IEnumerable<string>`). Before this revision the head was already against §2.3 row 1.
 - **#8113, `extension string` storing `this`** (ruling; §26.7).
   - *Decided: reading B, keyed on the extension head's declared type.* Over a runtime-managed extended type (`string`, `Type`), `this` is read as a plain parameter of that type, so storing it is the store of a runtime-managed value. An `Object`- or interface-headed extension stays under the ban.
   - *Declined.* Reading A. It would reject `"abc".Wrap()` while the static twin is legal, which protects nothing (§9.7: "runtime-managed values have unbounded lifetime by construction"). The issue's use-after-free is a codegen obligation, and #9219 is untouched.
@@ -16450,7 +16451,7 @@ Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change pro
   - *Decided: interpretation 1.* §26.5 rule 2 (v0.355, #7699) governs: there is no unbound instance-method reference. §27.6's static-wins paragraph is replaced by *No unbound instance-method reference*, and "static wins" becomes a consequence. The *No method reference to `Dispose`* paragraph now routes `D.Dispose` and `IDisposable.Dispose` through that paragraph (critic A).
   - *Declined.* Interpretation 2, a call-through rule, which would reverse #7699.
 - **#9246, arrow bodies on procedures and no-value `Task` methods** (clarification; §22.2).
-  - *Decided.* On a method with no declared return type, `=> e;` is the block `e;` under §21.9's regime, as §27.3 already says for a procedure lambda. A `()` result is quiet. Another result draws the discard warning. A non-trivial-dispose class, interface or `Task`-family result is the hard error.
+  - *Decided.* On a method with no declared return type, `=> e;` is the block `e;` under §21.9's regime, as §27.3 already says for a procedure lambda. A `()` result is quiet. Another result draws the discard warning. A non-trivial-dispose class, interface or `Task`-family result is the hard error. Its remedies are §21.9's: the two discard forms, which take a block body, are not available for a `Task`-family result (§17.13), so that result takes `Task.FireAndForget(…)` (composition clarification; the lane's text listed only the discard forms).
   - **Departs from the triage draft on the async half.** An `async` method declared `Task` completes with no value (§30.1). §30.6 already says, by reference to async methods, that a valued body does not conform to a plain `Task`. So a valued expression body there is a compile error at the body, not a warning.
   - *Declined.* Silent discard (today's behaviour), and a type error for the procedure half, which would make the arrow stricter than the block it abbreviates.
 - **#7431, tier per clause against the floor's substituted instance** (editorial; §22.16 *The current prover floor*). The tier stays per clause. A `requires` clause's floor inhabitant is read at each discharge instance. A `static requires` is proven because every call it admits folds `true`. A plain `requires` stays checked, and an instance that folds `true` discharges only its call. No verdict changes.
@@ -16463,13 +16464,14 @@ Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change pro
   - *Declined.* Reading A, which makes every async-body supersession invisible, §33.3's report included.
 - **#8425, an interface arm after a bare `Exception` arm** (clarification; §31.2.3). The earlier unguarded bare arm covers every later arm, interface arms included. Interpretation 3 (general interface coverage) is not adopted, because it needs conformance facts the spec states only for `IFailure`.
 - **#8403, the `<exception>` tag** (clarification; §31.3). The tag is the convention for user code. The stdlib states its fault contracts in prose under its §1 failure-signal rule, and the compiler checks neither form. Adopting the tag across the stdlib was declined (no reader gain). Retiring it would be a design change.
-- **#8076, the blocking-form ban and nested non-async lambdas** (clarification; §30.3, §30.12 twice, Guide 04, the reference). The ban applies where the **innermost enclosing method or lambda body** is `async`. A non-`async` lambda nested in one falls to the runtime guard: `await` is not available there, which is the ban's own ground. Textual containment was declined. Guide 04 and the reference said "lexically inside `async` bodies"; that is now wrong for this case, and both are corrected.
+- **#8076, the blocking-form ban and nested non-async lambdas** (clarification; §30.3, §30.12 twice, stdlib §6.2 and §6.11, Guide 04, the reference). The ban applies where the **innermost enclosing method or lambda body** is `async`. A non-`async` lambda nested in one falls to the runtime guard: `await` is not available there, which is the ban's own ground. Textual containment was declined. Guide 04 and the reference said "lexically inside `async` bodies", and stdlib §6.2 and §6.11 said the same; that is now wrong for this case, and all four are corrected (the stdlib two at composition).
 - **#8710, a `Receive` pending at a close** (clarification; §30.15, stdlib §6.9 *Closing*). A `Receive` pending on the empty channel faults with `ChannelClosedException` when the channel closes, by `Close()`, by the last sender's disposal or by its own disposal. The issue's (c) asked whether disposing the channel under a live `Receive` task is itself §30.1's source-outlives-settlement violation. It is not: the text makes no stdlib `Receive` task a borrower of its channel, and the abandonment paragraph treats the waiter as runtime-managed. Leaving the waiter pending forever was declined.
 - **#8486, `Task.Delay(ms, token)` and cancellation** (ruling; stdlib §6.7). A `Delay` given a token completes with `OperationCanceledException` at the cancellation, not at the deadline (§30.8). A source's disposal counts, because disposal is a full `Cancel()` (stdlib §6.1). Observing the token only at the deadline was declined.
 - **#8617 (owner-ruled A, 2026-11-11; §14.5).** A collection-literal argument, like `null`, contributes no binding. An argument that bound nothing is still checked against the substituted signature at §22.6, a collection literal being typed against its substituted parameter type. Where a type parameter is still free, the literal's "cannot infer target type" error stands beside phase 3's unbound-parameter error.
 - **#9377 (owner-ruled B, 2026-11-25; owner decision 2026-11-26; §30.13, §30.3).** The startup thread holds the main domain's **claim** (the exclusive right to run the domain's code, which serial execution gives one running continuation at a time) while it runs program code. It releases the claim only while blocked at a process-edge wait: `Wait()`/`Result`, a blocking acquisition, or a runtime scope-end wait. It releases it for good when `Main` returns.
   - The list is exhaustive (owner decision). Any other blocking call on the startup thread, such as a synchronous console or file read or an FFI call, keeps the claim, so main-domain work does not advance during it. The remedy is the call's async form where the library has one.
   - The ruling's "blocked or gone" is written "blocked", to compose with #9379's N3. The term *claim* is now defined (critic B).
+  - *Composition correction.* §30.3's blocked-startup-thread sentence and §30.13's suspension-point sentence still said that any blocking wait releases the claim. Both now name the process-edge waits, §30.13's list, so they agree with the exhaustive list.
 - **#9379 (owner-ruled (a)+(c), (b) declined, N3, 2026-11-26; §30.13, §30.3, §33.3).** Polling `IsCompleted` from the startup thread on a task whose completion waits on a main-domain continuation never completes; wait with `Wait()`/`Result` instead. The §30.3 runtime message names the remedy. Its text has no backticks, matching the runtime's plain string, which the owner accepted. At `Main`'s return the main domain is abandoned, as §33.3 states, and is not drained.
 
 **Standard library: data, text and IO.**
@@ -16478,7 +16480,7 @@ Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change pro
   - *Declined.* "Null unless exactly one", which no revision ever stated and which falsifies two sentences of §5.
 - **#8062, `ToUtc`/`ToLocal`** (ruling; stdlib §2.5).
   - *Decided: reading 2.* Both members move `Ticks` by the machine zone's offset, and `Unspecified` is read as UTC. `ToUtc` of a `Local` value subtracts the offset in force at that local time, and of a `Utc`/`Unspecified` value only relabels. `ToLocal` of a `Utc`/`Unspecified` value adds the offset at that instant, and leaves a `Local` value unchanged. The shift is `Add` of the offset and keeps `Add`'s `OverflowException` outside `MinValue..MaxValue`.
-  - *A ruling on a point the text did not settle* (the coordinator, under the owner's delegation, 2026-11-26). A local time that a transition makes ambiguous or skips takes the offset in force **before** the transition, so neither member raises for a transition. This is java.time's default (an overlap takes the earlier offset; a gap is shifted forward by its length). .NET differs at an overlap, where it reads standard time, the post-transition offset.
+  - *A ruling on a point the text did not settle* (ruled by the coordinator under the owner's delegation, 2026-11-26). A local time that a transition makes ambiguous or skips takes the offset in force **before** the transition, so neither member raises for a transition. This is java.time's default (an overlap takes the earlier offset; a gap is shifted forward by its length). .NET differs at an overlap, where it reads standard time, the post-transition offset.
   - *Declined.* Reading 1 (relabel only), which makes "`ToUnixTimeSeconds` converts a `Kind = Local` value via `ToUtc()`" vacuous. Reading 3, which contradicts "treats `Unspecified` as already UTC". Clamping at the range edges, a silent substitution the tick domain uses nowhere.
   - The `ToUnixTimeSeconds` parenthetical now reads "`ToUnixTimeSeconds` never reads an `Unspecified` value against the machine zone". Read globally, the lane's wording was false for `ToLocal` (critic B).
 - **#8090 + #8091, the count `BeginObject` receives** (ruling; spec §9.8 *Synthesized `Serialize`* step 1, choice *Wire shape*).
@@ -16515,6 +16517,7 @@ Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change pro
   - §20 (#7612);
   - §22.2 (#9246);
   - §22.16 (#7431);
+  - §26.4 (#8115);
   - §26.7 (#8113);
   - §27.6 ×2 (#8065);
   - §28.2 (#8708, #8748);
@@ -16536,6 +16539,7 @@ Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change pro
   - §2.1 (#9324);
   - §2.5 ×2 (#8062);
   - §5 ×2 (#9287);
+  - §6.2, §6.11 (#8076);
   - §6.7 (#8486);
   - §6.9 (#8710);
   - §7.4 (#9305);
@@ -16548,7 +16552,7 @@ Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change pro
 
   *Newly rejected:*
   - a use, after a dominating disposal of the variable, of a local bound from a member read or call through it (§28.2);
-  - a binding of any form, or a type parameter, named a reserved PascalCase type name (§3.4);
+  - a binding of any form, or a type parameter, named a reserved PascalCase type name (§3.4), a generic extension head's bare identifier included (§26.4);
   - a store, set-erasing pass or return of a function-typed `ref` parameter's entry value in the callee (§28.3);
   - a closure over a frame local or a borrowed source at `yield return` (§29.2; already the sink rule's verdict);
   - a nested-closure use of a `scoped` parameter, `+=` and `.Add` alike (§28.14; already bound 6's verdict);
@@ -16557,7 +16561,7 @@ Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change pro
 
   *Newly warned:* a valued non-`()` arrow body on a procedure (§22.2); an interface arm after a bare `Exception` arm (§31.2.3); a `move` initializer whose source's produced type has a destructor, at a trivial-dispose destination (§28.9).
 
-  *Newly defined:* the members and counts in the stdlib bullets above (`SingleOrNull`, `ToUtc`/`ToLocal`, `ReadLine`, standard-input decoding, `Delay`'s token, a pending `Receive` at a close, `BeginObject`'s count, unsigned negative parses); the first awaiter's `SupersededChain` (§31.2); the startup thread's claim (§30.13); `_child := new Child(scoped this)` admitted (§28.14).
+  *Newly defined:* the members and counts in the stdlib bullets above (`SingleOrNull`, `ToUtc`/`ToLocal`, `ReadLine`, standard-input decoding, `Delay`'s token, a pending `Receive` at a close, `BeginObject`'s count, unsigned negative parses); the first awaiter's `SupersededChain` (§31.2); the startup thread's claim (§30.13); `_child := new Child(scoped this)` admitted (§28.14); `extension string` storing `this`, admitted as the store of a runtime-managed value (§26.7, #8113).
 
   *Doc-only:* #8748, #8116, #8403, #7431, #8617 (already implemented), and the restatements in Appendix C.3, Guide 04 and the reference.
 
@@ -16565,11 +16569,11 @@ Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change pro
   - #8708: `bindHeldBorrows` does not reach member-read, borrow-returning-call or borrowing-match bindings.
   - #8748: the use-after-disposal diagnostic's "reads freed memory" wording.
   - #7612: a storage-read binding of a move-only value is not classified as a borrow, in ownership or in codegen's move-only registrations.
-  - #8789: a lambda's `owned` parameters are not seeded into the state map.
+  - #8789: a lambda's `owned` parameters are not seeded into the state map, and the displaced value of such a parameter is not disposed (`s28_3_3_3602`).
   - #9093: the callee-side unannounced read; the #9075 caller-side union should be removed.
   - #9088: no closure-escape check at the `yield return` operand.
   - #8397: no registration-lifetime report line is emitted.
-  - #9311: the nested-closure carrier admission (`scopedCarrierEscape`).
+  - #9311: the nested-closure carrier admission (`scopedCarrierEscape`) and invocation through a locally-invoked lambda; the own-body `+=` forward is rejected (`s28_14_3607`), so the in-lambda `+=` rejection names the wrong rule.
   - #8115: no declaration-site ban.
   - #8116 and #8360: the issues themselves track the compiler bugs.
   - #8113: the stored `string` receiver is not retained (a use-after-free with a +1 receiver).
@@ -16583,7 +16587,7 @@ Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change pro
   - #8577: `ulong.Parse("-1")` raises `FormatException`.
   - #8090: the record and choice paths may count a null optional component. HYPOTHESIS: to be probed against binary `HasMoreElements()`.
   - #9379: the issue tracks the runtime message and the exit drain. Separately, and from before this revision, the runtime aborts at a blocking wait in a continuation instead of raising `InvalidOperationException`.
-  - No delta for #8710, #8486, #8617, #9377 or #8076, which the compiler already implements.
+  - No delta for #8710, #8486, #8617, #9377, #8076 or #8716, which the compiler already implements.
 
   *Tests that flip* (for the fix lanes; this revision edits no gtest):
   - `pin_use_after_dominating_dispose_7893_test.cpp` `pin_over_a_member_read_left_to_the_runtime_backstop_spec_28_10` (#8708);
@@ -16634,6 +16638,7 @@ Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change pro
     - stdlib §5 (`l5_3601`–`3604`; #9287), §2.5 (`l2_5_3601`–`3603`, zone-independent only; #8062), §6.7 (`l6_7_3601`; #8486) and §9.1 (`l9_1_3601`; #8577);
     - §9.8 (`s9_8_3601`; #8090).
     - The new cases are unclassified.
+    - Corrected at composition: `s29_2_3602`'s `rule:` quote, a lane draft, is now §29.2's text; `s3_4_3605`'s arm no longer uses the name, so only the declaration can reject it; `s27_6_3601` drops its annotation, so no type mismatch stands in for the name error; `s28_14_3604`'s diagnostic is the bound's word, `closure`, since a compiler that rejects the own-body `+=` (`s28_14_3607`) rejects it for the wrong reason.
   - **Not written:**
     - #9305 and #9324 need standard input, which the runner does not supply; they are gtest rows for the fix lane.
     - #8062's gap and overlap cases are zone-dependent; they are gtest rows under `TZ=`.
@@ -16644,7 +16649,7 @@ Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change pro
 
   *Doc-example corpus:* not regenerated (#1380).
 
-**Corrections at the meaning gate** (critic A on L1–L3, critic B on L4–L5; the coordinator's dispositions, then the owner's decisions of 2026-11-26, applied before publication).
+**Corrections at the meaning gate** (critic A on L1–L3, critic B on L4–L5; the coordinator's dispositions, then the owner's decisions of 2026-11-26 and the #8062 point ruled by the coordinator under the owner's delegation, applied before publication).
 - *Critic A (FIX):*
   - #8708's restatements in Appendix C.3 and the reference;
   - #7612's *Local lifetime* and §20 scoping;
@@ -16661,7 +16666,7 @@ Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change pro
   - #8062's parenthetical;
   - the #8076 restatements in Guide 04 and the reference;
   - #8710's stdlib mirror.
-  - Critic B called #8062's transition sentence and #9324's three points DESIGN. The owner decided both (above). Its narrower #9324 text was therefore not landed.
+  - Critic B called #8062's transition sentence and #9324's three points DESIGN. The owner decided #9324, and #8062 was ruled by the coordinator under the owner's delegation (above). Its narrower #9324 text was therefore not landed.
 - *Not applied (optional, non-blocking):*
   - loosening #8748's "certain to fault";
   - qualifying §28.3 *Reach*'s "fully static bound" for #8397;

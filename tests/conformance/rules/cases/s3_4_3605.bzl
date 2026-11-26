@@ -16,7 +16,7 @@ public class Program
     try
       throw new InvalidOperationException("x");
     catch
-      var String: InvalidOperationException => Console.WriteLine(String.Message),
+      var String: InvalidOperationException => Console.WriteLine("caught"),
     end try;
   end Main;
 end Program;

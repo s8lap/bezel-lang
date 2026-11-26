@@ -8,9 +8,12 @@
 //!   `scoped` parameter — whether or not the closure escapes the callee
 //! cites: 28.14, 17.2
 //! expect: reject
-//! diagnostic: scoped
+//! diagnostic: closure
 //! issue: 9311
-//! notes: Accepting twin s28_14_3607 makes the same forward in the method body itself.
+//! notes: Accepting twin s28_14_3607 makes the same forward in the method body itself. A compiler that
+//!   rejects the `+=` forward even there passes this case for the wrong reason, so the diagnostic is the
+//!   bound's own word (`nested closure`): a rejection that does not name the closure is a mismatch, and
+//!   the verdict is read together with s28_14_3607's.
 module Conf;
 
 public class Hub

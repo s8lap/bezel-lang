@@ -8,7 +8,8 @@
 //! expect: reject
 //! diagnostic: Foo
 //! issue: 8065
-//! notes: The receiver-taking function is written `lambda(k: K) => k.Foo()`.
+//! notes: The receiver-taking function is written `lambda(k: K) => k.Foo()`. The binding carries no
+//!   annotation, so no target-type mismatch can stand in for the error at the name.
 module Conf;
 
 public class K
@@ -18,7 +19,7 @@ end K;
 
 public class Program
   public static method Main()
-    var f: (K) -> int := K.Foo;
+    var f := K.Foo;
     using var k := new K();
     Console.WriteLine(f(k));
   end Main;

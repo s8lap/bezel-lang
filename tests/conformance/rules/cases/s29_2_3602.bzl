@@ -2,7 +2,8 @@
 //! doc: spec
 //! section: 29.2
 //! title: a closure over an owned frame local yielded from an iterator is rejected even with no later move
-//! rule: a function value is judged at the `yield return` itself by the closure bullet's sink rule,
+//! rule: a closure carrying a borrow of a frame-resident binding — a captured owned local contributing
+//!   its enclosing scope … — is rejected at the `yield return` itself by the closure bullet's sink rule,
 //!   exactly as `return f;` is at a return (`var f := lambda(): int => a.N; yield return f;`)
 //! cites: 29.2, 28.3.8
 //! expect: reject
