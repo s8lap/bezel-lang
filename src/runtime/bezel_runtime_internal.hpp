@@ -584,6 +584,16 @@ struct bz_domain_t {
     // sequence, also in bezel_runtime_refcounting.cpp.
     std::atomic<uint64_t> identity_hash_seq{0};
 
+    // fix #9377 (§30.13, v0.359, ruling B): the startup thread is one more
+    // serial participant of the MAIN domain. It holds the claim (`active`)
+    // while it runs program code and gives it up only while it is blocked at
+    // a process-edge wait. When it wants the claim back while a drain holds
+    // it, it sets `startup_waiting` (under `mtx`) and sleeps on `startup_cv`;
+    // the drain hands the claim over at its next continuation boundary by
+    // clearing the flag WITHOUT clearing `active` (see domain_drain).
+    bool                    startup_waiting = false;
+    std::condition_variable startup_cv;
+
     ~bz_domain_t() = default;
 
     // Enqueue a continuation.  If the domain is idle, mark it active and
@@ -844,5 +854,12 @@ std::mutex& bz_sub_live_mutex();                             // events
 std::unordered_set<void*>& bz_sub_live_set();                // events
 void* bz_task_make_oce(void* oce_vtable);                    // concurrency
 void  bz_timer_schedule_after(int64_t ms, std::function<void()> cb); // concurrency (#9055)
+// fix #9377 (§30.13, v0.359, ruling B): the startup thread's process-edge waits give
+// the main domain's claim up while they block. `bz_startup_claim_suspend`
+// returns true when THIS thread held the claim and released it; the caller
+// then calls `bz_startup_claim_resume` after the wait, holding no runtime
+// lock a continuation could need. Both are no-ops on every other thread.
+bool  bz_startup_claim_suspend();                            // concurrency
+void  bz_startup_claim_resume();                             // concurrency
 
 #endif // BEZEL_RUNTIME_INTERNAL_HPP

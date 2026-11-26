@@ -141,7 +141,14 @@ void* bz_mutex_new(void) {
 // stays alive even if the Mutex object is disposed before the Lock is released.
 void* bz_mutex_acquire(void* mp) {
     auto* m = ((bz_mutex_t*)mp)->core;
-    pthread_mutex_lock(&m->mtx);  // blocking; non-recursive → always enters if not held
+    // fix #9377 (§30.13 / §30.12, v0.359, ruling B): an acquisition that would park the
+    // startup thread gives the main domain's claim up while it blocks (a
+    // main-domain continuation may hold the lock across an await).
+    if (pthread_mutex_trylock(&m->mtx) != 0) {
+        bool yielded = bz_startup_claim_suspend();
+        pthread_mutex_lock(&m->mtx);  // blocking; non-recursive → always enters if not held
+        if (yielded) bz_startup_claim_resume();
+    }
     mutex_core_ref(m);             // Lock holds a ref on the core
     auto* lk = bz_lock_make(m);
     return lk;
@@ -170,7 +177,13 @@ void* bz_mutex_try_acquire(void* mp, int64_t timeout_ms) {
             deadline.tv_sec  += 1;
             deadline.tv_nsec -= 1000000000LL;
         }
-        rc = pthread_mutex_timedlock(&m->mtx, &deadline);
+        // fix #9377 (§30.13, v0.359, ruling B): see bz_mutex_acquire.
+        rc = pthread_mutex_trylock(&m->mtx);
+        if (rc != 0 && rc != EDEADLK) {
+            bool yielded = bz_startup_claim_suspend();
+            rc = pthread_mutex_timedlock(&m->mtx, &deadline);
+            if (yielded) bz_startup_claim_resume();
+        }
         if (rc == EDEADLK) rc = ETIMEDOUT;
     }
     if (rc != 0) return nullptr;   // timeout or contention → null (owned Lock?)
@@ -769,18 +782,28 @@ static bool semaphore_take_blocking(bz_semaphore_core_t* s, int64_t timeout_ms) 
     bz_sem_waiter_t w;              // blocking kind (is_async = false)
     s->waiters.push_back(&w);
     auto granted = [&w] { return w.state == 1; };
+    // fix #9377 (§30.13 / §30.12, v0.359, ruling B): the startup thread gives the main
+    // domain's claim up while it is parked here, and takes it back only after
+    // s->mtx is released (a continuation the drain runs may release a permit).
+    // The waiter is already queued, so a release in that window hands it the
+    // permit and the predicate below sees it.
+    lk.unlock();
+    bool yielded = bz_startup_claim_suspend();
+    lk.lock();
+    bool took = true;
     if (timeout_ms < 0) {
         s->cv.wait(lk, granted);
-        return true;
+    } else if (!s->cv.wait_until(lk, std::chrono::steady_clock::now() +
+                                         std::chrono::milliseconds(timeout_ms),
+                                 granted)) {
+        // Timed out still waiting: leave the FIFO (no permit was handed to us).
+        auto it = std::find(s->waiters.begin(), s->waiters.end(), &w);
+        if (it != s->waiters.end()) s->waiters.erase(it);
+        took = false;
     }
-    if (s->cv.wait_until(lk, std::chrono::steady_clock::now() +
-                                 std::chrono::milliseconds(timeout_ms),
-                         granted))
-        return true;
-    // Timed out still waiting: leave the FIFO (no permit was handed to us).
-    auto it = std::find(s->waiters.begin(), s->waiters.end(), &w);
-    if (it != s->waiters.end()) s->waiters.erase(it);
-    return false;
+    lk.unlock();
+    if (yielded) bz_startup_claim_resume();
+    return took;
 }
 
 extern "C" {

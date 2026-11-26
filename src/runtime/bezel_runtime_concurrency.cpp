@@ -131,6 +131,12 @@ thread_local bz_domain_t* g_current_domain = nullptr;
 // bz_task_then, so they always take the inline path regardless of this depth.
 thread_local int g_task_then_depth = 0;
 
+// fix #9377 (§30.13, v0.359, ruling B): true while THIS thread is the startup
+// thread and holds the main domain's claim (bz_startup_claim_enter ... exit).
+// Cleared across a process-edge wait (bz_startup_claim_suspend) and set again
+// when the claim is reacquired (bz_startup_claim_resume).
+static thread_local bool g_startup_holds_claim = false;
+
 // #1553 / §22.13 (v0.181): a stable, non-zero per-OS-thread identifier used by
 // the static-initialization re-entrancy backstop (emitEnsureInitFns) to
 // distinguish a SAME-thread re-entrant touch of an in-progress initializer —
@@ -576,7 +582,18 @@ static void domain_drain(bz_domain_t* dom) {
         bool done = false;
         {
             std::lock_guard<std::mutex> lk(dom->mtx);
-            if (dom->queue.empty()) {
+            if (dom->startup_waiting) {
+                // fix #9377 (§30.13, v0.359, ruling B): the startup thread is back from
+                // a process-edge wait and wants the main domain's claim. Hand
+                // it over at this continuation boundary: `active` STAYS true
+                // (the claim passes to the startup thread, so no enqueue can
+                // start a second drain meanwhile) and the startup thread wakes.
+                // Items still queued run when it next blocks or Main returns
+                // (bz_startup_claim_suspend submits a fresh drain then).
+                dom->startup_waiting = false;
+                dom->startup_cv.notify_one();
+                done = true;
+            } else if (dom->queue.empty()) {
                 // Atomically clear active under the lock.  Any concurrent
                 // enqueue that arrives now must acquire the lock first, will
                 // see active=false, will set active=true, and will submit a
@@ -679,6 +696,77 @@ void bz_scheduler_init(int num_threads) {
     g_scheduler = new BzScheduler();
     for (int i = 0; i < num_threads; i++)
         g_scheduler->threads.emplace_back([](){ g_scheduler->run_worker(); });
+}
+
+// ---------------------------------------------------------------------------
+// The startup thread's claim on the main domain — fix #9377 (§30.13, v0.359, ruling B)
+// ---------------------------------------------------------------------------
+//
+// Ruling (B) on #9377: while the startup thread runs program code (a
+// non-`async` Main and what it calls directly, and an `async` Main's
+// synchronous prefix — #9195), it HOLDS the main domain's claim, so no
+// main-domain continuation runs at the same time. It releases the claim only
+// while it is blocked at a process-edge wait (§30.3's Wait()/Result, §30.12's
+// blocking acquisitions, and the implicit scope-end borrow wait of #4540's
+// bz_wait_for_borrows), reacquires it before returning to program code, and
+// releases it for good when Main returns. Its synchronous code is thereby one
+// more serial participant of the main domain whose suspension points are
+// exactly its blocking waits.
+//
+// The claim is the domain's own `active` flag, so the single-drain argument
+// above (domain_enqueue) is unchanged: while the startup thread holds it, an
+// enqueue only appends; when it releases with work queued it submits the
+// drain itself; and a drain that finds `startup_waiting` hands the claim back
+// without clearing `active` (domain_drain).
+
+// Take the main domain's claim on the calling (startup) thread, waiting for
+// the drain that holds it to reach a continuation boundary if need be.
+static void startup_claim_take(bz_domain_t* dom) {
+    std::unique_lock<std::mutex> lk(dom->mtx);
+    if (!dom->active) {
+        dom->active = true;
+    } else {
+        dom->startup_waiting = true;
+        dom->startup_cv.wait(lk, [dom] { return !dom->startup_waiting; });
+        // The drain cleared startup_waiting and left active=true for us.
+    }
+    g_startup_holds_claim = true;
+}
+
+bool bz_startup_claim_suspend() {
+    if (!g_startup_holds_claim) return false;
+    g_startup_holds_claim = false;
+    bz_domain_t* dom = g_main_domain;
+    bool need_drain;
+    {
+        std::lock_guard<std::mutex> lk(dom->mtx);
+        // Work queued while the startup thread held the claim gets a drain
+        // now (the claim passes to it); otherwise the domain goes idle and the
+        // next enqueue claims it the ordinary way.
+        need_drain = !dom->queue.empty();
+        if (!need_drain) dom->active = false;
+    }
+    if (need_drain) {
+        if (!g_scheduler) bz_scheduler_init(4);
+        g_scheduler->submit([dom]() { domain_drain(dom); });
+    }
+    return true;
+}
+
+void bz_startup_claim_resume() {
+    startup_claim_take(g_main_domain);
+}
+
+// Emitted at the start of the entry point's prologue (sync and async Main).
+void bz_startup_claim_enter(void) {
+    if (g_startup_holds_claim) return;
+    startup_claim_take(bz_main_domain_get());
+}
+
+// Emitted before every return of a sync Main, and after an async Main's task
+// settled (before bz_scheduler_shutdown). Idempotent.
+void bz_startup_claim_exit(void) {
+    (void)bz_startup_claim_suspend();
 }
 
 void bz_scheduler_shutdown(void) {
@@ -1353,11 +1441,26 @@ static void* bz_task_await_sync_impl(void* tp, bool observesResult) {
         fflush(stderr);
         abort();
     }
+    // fix #9377 (§30.13, v0.359, ruling B): a startup-thread Wait()/Result gives the
+    // main domain's claim up while it blocks, so the continuations it waits
+    // for can run; it takes the claim back after the task->mtx is released (a
+    // continuation the drain is running may still need that lock).
+    bool yielded = false;
+    if (g_startup_holds_claim) {
+        lk.unlock();
+        yielded = bz_startup_claim_suspend();
+        lk.lock();
+    }
     task->cv.wait(lk, [task]{ return task->done; });
     // The disposer is attached before the task completes, so a blocking read
     // that started earlier disowns again now that the result exists.
     if (observesResult) bz_task_disown_fnval_result(task);
-    return task->is_error ? nullptr : task->result;
+    void* r = task->is_error ? nullptr : task->result;
+    if (yielded) {
+        lk.unlock();
+        bz_startup_claim_resume();
+    }
+    return r;
 }
 
 void* bz_task_await_sync(void* tp) {

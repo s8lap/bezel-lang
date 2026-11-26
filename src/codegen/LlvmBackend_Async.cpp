@@ -1783,6 +1783,14 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             // each worker, so no continuation is still in flight when we free the
             // task below. bz_scheduler_shutdown is a no-op if the pool was never
             // started (a purely synchronous body that lazily-init'd nothing).
+            // fix #9377 (§30.13, v0.359, ruling B): Main returns here, so the startup
+            // thread releases the main domain's claim for good (it took the
+            // claim back when bz_task_await_sync returned). This must precede
+            // the shutdown: work still queued on the main domain gets its
+            // drain now, and the pool joins only after running it.
+            builder_.CreateCall(declareC("bz_startup_claim_exit",
+                                         llvm::Type::getVoidTy(llvm_), {}),
+                                {});
             auto* schedShutdownFn = declareC("bz_scheduler_shutdown",
                                              llvm::Type::getVoidTy(llvm_), {});
             builder_.CreateCall(schedShutdownFn, {});

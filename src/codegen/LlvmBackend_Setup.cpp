@@ -11317,6 +11317,15 @@ bool Emitter::isFreshOwnedClassProducer(const ast::Expr* e) const {
 // prologue site, so without this call the static event sources (and every other
 // static root) were never allocated (#1502).
 void Emitter::emitMainStaticInitPrologue() {
+    // fix #9377 (§30.13, v0.359, ruling B): the startup thread holds the main domain's
+    // claim while it runs program code — static constructors and Main's body
+    // included, and an async Main's synchronous prefix (#9195). The runtime
+    // gives it up around each process-edge wait; the matching
+    // bz_startup_claim_exit runs when Main returns (the end of emitFunctionBody for
+    // a sync Main; before bz_scheduler_shutdown for an async one).
+    builder_.CreateCall(declareC("bz_startup_claim_enter",
+                                 llvm::Type::getVoidTy(llvm_), {}),
+                        {});
     // §2.15 / §9.8: register the SerializationException vtable with the runtime
     // so bz_ser_throw (called by JSON runtime helpers) produces a well-formed
     // exception that emitIsA's catch dispatch can identify. Must run before any
@@ -12472,6 +12481,23 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // scope-end work (the §28.3 dispose registrations) was already collected
     // during lowering.
     finalizeEnsuresEpilogue();
+    // fix #9377 (§30.13, v0.359, ruling B): a sync Main releases the main domain's claim
+    // for good when it returns — after its scope-end disposals, which already
+    // ran before each `ret`. Placed on the finished body so every return path
+    // (explicit return, fall-through, the ensures epilogue) is covered.
+    if (isMain(ms)) {
+        auto* exitFn = declareC("bz_startup_claim_exit",
+                                llvm::Type::getVoidTy(llvm_), {});
+        std::vector<llvm::ReturnInst*> rets;
+        for (llvm::BasicBlock& bb : *fn)
+            if (auto* ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(
+                    terminatorOrNull(&bb)))
+                rets.push_back(ret);
+        for (llvm::ReturnInst* ret : rets) {
+            llvm::IRBuilder<> b(ret);
+            b.CreateCall(exitFn, {});
+        }
+    }
     currentEnumMethod_ = savedEnumMethod;
 }
 

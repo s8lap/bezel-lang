@@ -1114,13 +1114,30 @@ extern "C" void bz_wait_for_borrows(void* obj) {
     auto it = g_borrow_table.find(obj);
     if (it == g_borrow_table.end()) return;
     BzBorrowEntry* e = it->second.get();
-    e->cv.wait(lk, [&] {
+    auto drained = [&] {
         // Re-check under the lock: a register/release may have raced with us
         // between the find and the wait. The predicate reads the atomic with
         // acquire so it synchronizes-with the release that drove the count
         // to zero.
         return e->borrow_count.load(std::memory_order_acquire) == 0;
-    });
+    };
+    if (drained()) return;
+    // fix #9377 (§30.13, v0.359, ruling B): this scope-end wait is one of the startup
+    // thread's process-edge waits. The borrower is typically a main-domain
+    // continuation that can run only while the startup thread does NOT hold
+    // the main domain's claim, so the claim is given up while it blocks
+    // (holding it here would deadlock), and taken back after g_borrow_mu is
+    // released (the continuation's bz_release_borrow needs that lock). The
+    // entry outlives the unlocked window: entries are never erased before the
+    // process-exit drain.
+    lk.unlock();
+    bool yielded = bz_startup_claim_suspend();
+    lk.lock();
+    e->cv.wait(lk, drained);
+    if (yielded) {
+        lk.unlock();
+        bz_startup_claim_resume();
+    }
 }
 // fix #3460 follow-up: process-exit drain for the borrow-tracker side table.
 //

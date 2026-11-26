@@ -1028,6 +1028,14 @@ void*   bz_filestream_path(void* h);
 void  bz_scheduler_init(int num_threads);
 void  bz_scheduler_shutdown(void);
 
+// fix #9377 (§30.13, v0.359, ruling B): the entry point's startup thread holds the main
+// domain's claim while it runs program code. `enter` is emitted at the start
+// of Main's prologue (sync and async); `exit` before every return of a sync
+// Main and after an async Main's task settled. Process-edge waits release the
+// claim while they block (bezel_runtime_internal.hpp).
+void  bz_startup_claim_enter(void);
+void  bz_startup_claim_exit(void);
+
 // Allocate a task object (opaque bz_task_t*).
 void* bz_task_alloc(void);
 
