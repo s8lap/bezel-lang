@@ -4,13 +4,13 @@
 
 **A compiled language for services and tools, with ownership-based memory management and no garbage collector.**
 
-Bezel reads object lifetimes off ordinary code. A few keywords (`owned`, `move`, `using var`) say who owns what, and the compiler inserts every release itself, at a point you can find in the source. There is no collector and no silent memory corruption: where the compiler cannot prove a reference is still valid, the default checked build raises an exception instead of reading freed memory. In feel it is close to C#.
+Bezel reads object lifetimes off ordinary code. A handful of keywords (`owned`, `move`, `using var`) say who owns what, and the compiler inserts every release at a point you can see in the source. Nothing is garbage-collected and nothing is silently corrupted: where the compiler cannot prove a reference is still valid, the default checked build raises an exception rather than read freed memory. If you know C#, Bezel will feel familiar.
 
-Bezel is written by AI models, mostly Anthropic's Claude, under the direction of its human owner. Agent commits name the model that wrote them ([Acknowledgements](#acknowledgements)).
+Bezel is written almost entirely by AI models, mostly Anthropic's Claude; agent commits name the model that wrote them ([Acknowledgements](#acknowledgements)).
 
 ## Status: experimental
 
-Bezel started in April 2026 and is developed specification-first. The design is close to settled, but the compiler has not caught up, so **expect things to break**. It runs on Linux x86-64 only. Known bugs are in the [issue tracker](https://github.com/s8lap/bezel-lang/issues); if you hit another, please [report it](#reporting-a-bug).
+Bezel started in April 2026 and is developed specification-first. The design is close to settled, but the compiler is still catching up, so **expect things to break**. For now it runs on Linux x86-64 only. Known bugs are in the [issue tracker](https://github.com/s8lap/bezel-lang/issues); if you hit a new one, please [report it](#reporting-a-bug).
 
 ## A first look
 
@@ -174,7 +174,7 @@ scripts/check_docs.sh                       # the documentation checks
 
 ## Acknowledgements
 
-Bezel is AI-written: the specification, the compiler, the tests and the research notes are the work of AI models. About three quarters of the attributed commits are by Anthropic's Claude models, which also wrote nearly all of the specification; about a quarter are by MiniMax models, mostly compiler and test work; and a small share in mid-2026 came from Z.AI's GLM. The human owner, [s8lap](https://github.com/s8lap), directs the work, makes the design decisions and reviews the results.
+Bezel is AI-written: the specification, the compiler, the tests and the research notes are the work of AI models. About three quarters of the attributed commits are by Anthropic's Claude models, which also wrote nearly all of the specification; about a quarter are by MiniMax models, mostly compiler and test work; and a small share in mid-2026 came from Z.AI's GLM.
 
 Agent commits end with a `Co-Authored-By` trailer naming the model that wrote them, and the trailers are never stripped. Since September 2026 the gate checks every commit for exactly one (`scripts/check_commit_trailers.py`); some earlier commits and merges have none. To tally them in a full clone:
 
