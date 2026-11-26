@@ -18087,6 +18087,7 @@ void MethodOwnership::checkLambdaBodyOwnedLocalsAtExit(
         if (lambdaCapturedSyms_.count(sym)) continue;
         auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
         if (!ls) continue;
+        // LOCALDECL-ONLY: an Owned, maybe-consumed local carries a disposal obligation, and a runtime `const` may not hold an owned production (§21.1 Ownership), so no `const` reaches this
         const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
         if (!ld || ld->isUsing) continue;
         // The disagreement must be BETWEEN exits: at least one exit leaves
@@ -18195,6 +18196,7 @@ void MethodOwnership::recordLambdaBodyExitOwnedLocals(
         // disposal (§28.3 / #3575).
         auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
         if (!ls) continue;
+        // LOCALDECL-ONLY: a local with an end-of-scope disposal obligation is a plain `var`; a runtime `const` may not hold an owned production (§21.1 Ownership)
         auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
         if (!ld || ld->isUsing) continue;
         lambdaBodyExitOwnedLocals_.insert(sym);

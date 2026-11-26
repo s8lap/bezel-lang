@@ -129,6 +129,7 @@ static bool coalesceTargetOwns(sema::Symbol* tsym) {
         // local the ownership pass marked `autoDropAtScopeEnd`, or the owned
         // iteration variable of a `for` (`ownedIterVarAutoDropAtBodyEnd`).
         auto* tfs = dynamic_cast<const ast::ForStmt*>(tls->decl);
+        // LOCALDECL-ONLY: an assignment target is never a `const` local (§21.1), so only a plain `var` can reach this return
         return dynamic_cast<const ast::LocalDecl*>(tls->decl) ||
                tls->autoDropAtScopeEnd ||
                (tfs && tfs->ownedIterVarAutoDropAtBodyEnd);

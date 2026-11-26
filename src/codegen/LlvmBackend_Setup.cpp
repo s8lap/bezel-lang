@@ -20970,6 +20970,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     armBoxBorrowPin(declNode, declType, init, v);
     // fix-forward #9061 (§28.9, v0.359): the reference a minting call's
     // value carries (`var g := h.Get();`).
+    // LOCALDECL-DEBT: #9061 the mint-pin arm reads a LocalDecl only; a `const` local over a minting call is not handled here (§21.1)
     armDynFnvalMintPin(dynamic_cast<const ast::LocalDecl*>(declNode), init, v);
     // #1003 / stdlib §5 / §28: if this `var` borrowing-`Array<T>` local was bound
     // to a fresh materializer (ToArray/Sorted/Reversed) and the escape walk proved

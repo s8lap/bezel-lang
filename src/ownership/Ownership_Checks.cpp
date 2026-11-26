@@ -1243,6 +1243,7 @@ void MethodOwnership::flagPerPathDisposal(const BlockState& before) {
         auto pre = before.find(sym);
         if (pre == before.end() || pre->second.maybeConsumed) continue;
         auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+        // LOCALDECL-ONLY: an Owned, maybe-consumed local carries a disposal obligation, and a runtime `const` may not hold an owned production (§21.1 Ownership), so no `const` reaches this
         auto* ld = ls ? dynamic_cast<const ast::LocalDecl*>(ls->decl) : nullptr;
         if (!ld || st.implicitDischarge) continue;
         // A move-only value local (an owning inline array or choice) already
@@ -15595,6 +15596,7 @@ sema::LocalSymbol* MethodOwnership::freshBuiltinClassLocalStoreSource(
         // `const` over an owned production, so that spelling is §21.1's
         // business, not this rule's (the same exclusion #8165 records for the
         // fresh-materializer local).
+        // LOCALDECL-ONLY: a `const` over an owned production is rejected by §21.1 (Ownership), so this rule never sees one
         const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
         if (!ld || !ld->initializer) return nullptr;
         // The production: a fresh `new` of a declaration-less builtin CLASS.
