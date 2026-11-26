@@ -373,7 +373,9 @@ def generic_call_names(code):
         while i < len(code) and depth:
             if code[i] == '<':
                 depth += 1
-            elif code[i] == '>':
+            elif code[i] == '>' and code[i - 1] != '-':
+                # `->` is a function type's arrow (`F<() -> int>(x)`), not a
+                # closing angle bracket.
                 depth -= 1
             i += 1
         if depth:

@@ -771,6 +771,22 @@ class TestNamesIndexGaps(unittest.TestCase):
                 "end Program;\n")
         self.assertEqual(self.types(body), ([], []))
 
+    def test_a_generic_method_call_over_a_function_type_is_not_an_invented_type(self):
+        # `Swap2<() -> int>(b, f)` is a generic METHOD call whose type argument
+        # is a function type. The `>` of `->` is the arrow, not the closing
+        # bracket: counting it ended the span early, hid the `(`, and reported
+        # the method's OWN name as an invented type — case s28_9_9906.
+        body = ("module Conf;\n\n"
+                "public class Program\n"
+                "  public static method Main()\n"
+                "    var o := Swap2<() -> int>(1, lambda() => 9);\n"
+                "  end Main;\n\n"
+                "  public static method Swap2<T>(b: int, x: T): T\n"
+                "    return x;\n"
+                "  end Swap2;\n"
+                "end Program;\n")
+        self.assertEqual(self.types(body), ([], []))
+
     def test_the_nested_call_spelling_does_not_silence_a_real_finding(self):
         # The anchor for the fix above: an invented type in a plain type
         # position is still reported, and a generic type CONSTRUCTED with
