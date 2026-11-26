@@ -15596,7 +15596,7 @@ sema::LocalSymbol* MethodOwnership::freshBuiltinClassLocalStoreSource(
         // `const` over an owned production, so that spelling is §21.1's
         // business, not this rule's (the same exclusion #8165 records for the
         // fresh-materializer local).
-        // LOCALDECL-ONLY: a `const` over an owned production is rejected by §21.1 (Ownership), so this rule never sees one
+        // LOCALDECL-DEBT: #9378 the alias hop also reads only `ast::LocalDecl`, but §21.1 admits `const alias := inner;` as a borrow, so a `const` alias escapes this rule
         const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
         if (!ld || !ld->initializer) return nullptr;
         // The production: a fresh `new` of a declaration-less builtin CLASS.
