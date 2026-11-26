@@ -313,6 +313,48 @@ const sema::TypeRef* interfaceIndexerElementType(
     }
     return elem;
 }
+
+// fix #9264 (§5.1 / §23.4 / §27.3, v0.359): the EXPECTED function type of
+// the index argument at position `k` — the indexer's k-th index-parameter type
+// (§23.4), when that type is FUNCTION-typed and the argument is a lambda
+// literal.
+//
+// THE DEFECT. §27.3 types a lambda literal AT the slot it is written at: "at
+// a call argument the same check applies to the slot after §14.5's
+// substitution — the body is typed, and its inferred return type must equal
+// the target's return slot or implicitly convert to it (§5.1)". The METHOD
+// path supplies that target twice. To SEMA, for the §27.3 CHECK: the matched
+// formal's return slot is threaded into the lambda's own visit and the lambda
+// arm checks the body's value type against it (fix #9230 added the same check
+// at an INDEX position — the admission was already correct). And to CODEGEN,
+// for the ADAPTER: `buildOrderedArgs` threads the matched formal's FUNCTION
+// TYPE into `lowerLambda` as `expectedFunctionType_`, and `lowerLambda` then
+// types the closure's RETURN at that slot — for a nullable value type `int?`
+// the tagged `{i8, T}` carrier (fix #543) — and wraps the body value into it.
+//
+// The INDEX path supplied the target to SEMA only, and never to CODEGEN, so
+// the lambda kept its own inferred return type and the accessor called it
+// through the SLOT's ABI: a `() -> int?` index parameter called with
+// `lambda() => 7` emitted a closure returning a bare `int` where the slot
+// reads an `int?` carrier — garbage (MEASURED on r30-c1 @ ec6d77840 with
+// `scripts/agent_check.sh --probe --asan`: the indexer printed -1234714617
+// instead of 7, and the value differed run to run; the METHOD twin
+// `M(f: () -> int?)` called with the same lambda printed 7). This helper is
+// the index path's use of the method path's ONE adapter — the same
+// `expectedFunctionType_` mechanism, not a second one.
+//
+// A lambda LITERAL only, exactly as the method path's arm gates: a named
+// closure written at an index position is already typed (its own function type
+// IS its type), so there is nothing to bridge.
+const sema::TypeRef* indexerArgExpectedFuncTy(
+        const sema::SemaContext& ctx, const sema::PropertySymbol* ps,
+        std::size_t k, const ast::Expr* arg) {
+    if (!arg) return nullptr;
+    if (!dynamic_cast<const ast::LambdaExpr*>(arg)) return nullptr;
+    const sema::TypeRef* pt = indexerParamType(ctx, ps, k);
+    if (!pt || pt->kind != sema::TypeRef::Kind::Function) return nullptr;
+    return pt;
+}
 }  // namespace
 
 // fix #2437/#2442 (§11.2/§23.4, v0.235): find the class `ts`'s (or an
@@ -3241,6 +3283,22 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     if (!recvDecl) return nullptr;
     auto* ps = selectIndexer(recvDecl, ix);  // per §23.4 (#1172)
     if (!ps) return nullptr;
+    // fix #9264 (§5.1 / §23.4 / §27.3, v0.359): lower ONE index argument with
+    // the indexer's k-th index-parameter type threaded into `lowerLambda` as
+    // the EXPECTED function type — the METHOD path's own adapter
+    // (`buildOrderedArgs`: "When the argument is a lambda and the formal
+    // parameter has a function type, inform lowerLambda of the expected param
+    // types"), applied to the INDEX path, where it was missing. See
+    // `indexerArgExpectedFuncTy` for the defect and the measurement.
+    auto lowerIndexArg = [&](std::size_t k) -> llvm::Value* {
+        const sema::TypeRef* savedExpected = expectedFunctionType_;
+        if (const sema::TypeRef* exp = indexerArgExpectedFuncTy(
+                ctx_, ps, k, ix.indices[k].value.get()))
+            expectedFunctionType_ = exp;
+        llvm::Value* v = lowerExpr(*ix.indices[k].value);
+        expectedFunctionType_ = savedExpected;
+        return v;
+    };
     // fix #3231 (§12.3 / §23.4 / §2.8.2, v0.252): `base[i]` on an IMPORTED
     // VIRTUAL base indexer now ROUTES through the OWNER's direct entry —
     // `importedIndexerGetterDirectFns_[ps]`, populated by
@@ -3267,7 +3325,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
              k < ix.indices.size() &&
              k + 1 < fnTy->getNumParams(); ++k) {
             if (!ix.indices[k].value) return nullptr;
-            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            llvm::Value* argVal = lowerIndexArg(k);
             if (!argVal) return nullptr;
             callArgs.push_back(
                 coerceNumericToType(argVal, fnTy->getParamType(k + 1), false));
@@ -3388,7 +3446,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
              k < ix.indices.size() &&
              k + 1 < fnTy->getNumParams(); ++k) {
             if (!ix.indices[k].value) return nullptr;
-            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            llvm::Value* argVal = lowerIndexArg(k);
             if (!argVal) return nullptr;
             callArgs.push_back(
                 coerceNumericToType(argVal, fnTy->getParamType(k + 1), false));
@@ -3518,7 +3576,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         for (std::size_t k = 0; k < nparams &&
              k < ix.indices.size(); ++k) {
             if (!ix.indices[k].value) return nullptr;
-            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            llvm::Value* argVal = lowerIndexArg(k);
             if (!argVal) return nullptr;
             callArgs.push_back(coerceNumericToType(argVal, paramTys[k + 1],
                                                    false));
@@ -3647,7 +3705,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
                 for (std::size_t k = 0; k < pd->indexerParams.size() &&
                      k < ix.indices.size(); ++k) {
                     if (!ix.indices[k].value) return nullptr;
-                    llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+                    llvm::Value* argVal = lowerIndexArg(k);
                     if (!argVal) return nullptr;
                     callArgs.push_back(
                         coerceNumericToType(argVal, paramTys[k + 1], false));
@@ -3764,7 +3822,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         for (std::size_t k = 0; k < ps->indexerParams.size() &&
              k < ix.indices.size(); ++k) {
             if (!ix.indices[k].value) return nullptr;
-            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            llvm::Value* argVal = lowerIndexArg(k);
             if (!argVal) return nullptr;
             callArgs.push_back(argVal);
             idxArgVals.push_back(argVal);
@@ -3893,7 +3951,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     for (std::size_t k = 0; k < ps->indexerParams.size() &&
          k < ix.indices.size(); ++k) {
         if (!ix.indices[k].value) { argVals.push_back(nullptr); continue; }
-        llvm::Value* av = lowerExpr(*ix.indices[k].value);
+        llvm::Value* av = lowerIndexArg(k);
         if (!av) return nullptr;
         argVals.push_back(av);
     }
@@ -4285,6 +4343,19 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
     if (!recvDecl) return false;
     auto* ps = selectIndexer(recvDecl, ix);  // per §23.4 (#1172)
     if (!ps) return false;
+    // fix #9264 (§5.1 / §23.4 / §27.3, v0.359): the SETTER twin of
+    // lowerIndexerGet's `lowerIndexArg` — the METHOD path's own adapter
+    // (`buildOrderedArgs`) applied to the INDEX path. See
+    // `indexerArgExpectedFuncTy` for the defect and the measurement.
+    auto lowerIndexArg = [&](std::size_t k) -> llvm::Value* {
+        const sema::TypeRef* savedExpected = expectedFunctionType_;
+        if (const sema::TypeRef* exp = indexerArgExpectedFuncTy(
+                ctx_, ps, k, ix.indices[k].value.get()))
+            expectedFunctionType_ = exp;
+        llvm::Value* v = lowerExpr(*ix.indices[k].value);
+        expectedFunctionType_ = savedExpected;
+        return v;
+    };
     // fix #3231 (§12.3 / §23.4 / §2.8.2, v0.252): the `base[i] := v`
     // half of the widening. §12.3 bypasses virtual dispatch and writes
     // the OWNER-class slot — the direct entry in
@@ -4311,7 +4382,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
              k < ix.indices.size() &&
              k + 1 < fnTy->getNumParams(); ++k) {
             if (!ix.indices[k].value) return false;
-            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            llvm::Value* argVal = lowerIndexArg(k);
             if (!argVal) return false;
             callArgs.push_back(
                 coerceNumericToType(argVal, fnTy->getParamType(k + 1), false));
@@ -4423,7 +4494,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
              k < ix.indices.size() &&
              k + 1 < fnTy->getNumParams(); ++k) {
             if (!ix.indices[k].value) return false;
-            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            llvm::Value* argVal = lowerIndexArg(k);
             if (!argVal) return false;
             callArgs.push_back(
                 coerceNumericToType(argVal, fnTy->getParamType(k + 1), false));
@@ -4569,7 +4640,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
         for (std::size_t k = 0; k < nparams &&
              k < ix.indices.size(); ++k) {
             if (!ix.indices[k].value) return false;
-            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            llvm::Value* argVal = lowerIndexArg(k);
             if (!argVal) return false;
             callArgs.push_back(coerceNumericToType(argVal, paramTys[k + 1],
                                                    false));
@@ -4770,7 +4841,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
                 for (std::size_t k = 0; k < pd->indexerParams.size() &&
                      k < ix.indices.size(); ++k) {
                     if (!ix.indices[k].value) return false;
-                    llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+                    llvm::Value* argVal = lowerIndexArg(k);
                     if (!argVal) return false;
                     callArgs.push_back(
                         coerceNumericToType(argVal, paramTys[k + 1], false));
@@ -4875,7 +4946,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
     for (std::size_t k = 0; k < ps->indexerParams.size() &&
          k < ix.indices.size(); ++k) {
         if (!ix.indices[k].value) { argVals.push_back(nullptr); continue; }
-        llvm::Value* av = lowerExpr(*ix.indices[k].value);
+        llvm::Value* av = lowerIndexArg(k);
         if (!av) return false;
         argVals.push_back(av);
     }
@@ -5116,6 +5187,19 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
     if (!recvDecl) return false;
     auto* ps = selectIndexer(recvDecl, *ix);  // per §23.4 (#1172)
     if (!ps) return false;
+    // fix #9264 (§5.1 / §23.4 / §27.3, v0.359): the COMPOUND twin of
+    // lowerIndexerGet's `lowerIndexArg` — the METHOD path's own adapter
+    // (`buildOrderedArgs`) applied to the INDEX path. See
+    // `indexerArgExpectedFuncTy` for the defect and the measurement.
+    auto lowerIndexArg = [&](std::size_t k) -> llvm::Value* {
+        const sema::TypeRef* savedExpected = expectedFunctionType_;
+        if (const sema::TypeRef* exp = indexerArgExpectedFuncTy(
+                ctx_, ps, k, ix->indices[k].value.get()))
+            expectedFunctionType_ = exp;
+        llvm::Value* v = lowerExpr(*ix->indices[k].value);
+        expectedFunctionType_ = savedExpected;
+        return v;
+    };
     // fix #3231 (§12.3 / §23.4 / §2.8.2, v0.252): the COMPOUND half of
     // the indexer widening. `base[i] OP= v` (§12.3 bypasses virtual
     // dispatch) reads AND writes through the OWNER's body directly, so
@@ -5147,7 +5231,7 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
              k < ix->indices.size() &&
              k + 1 < getFnTy->getNumParams(); ++k) {
             if (!ix->indices[k].value) return false;
-            llvm::Value* argVal = lowerExpr(*ix->indices[k].value);
+            llvm::Value* argVal = lowerIndexArg(k);
             if (!argVal) return false;
             llvm::AllocaInst* slot = entryAlloca(argVal->getType());
             builder_.CreateStore(argVal, slot);
@@ -5293,7 +5377,7 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
              k < ix->indices.size() &&
              k + 1 < getFnTy->getNumParams(); ++k) {
             if (!ix->indices[k].value) return false;
-            llvm::Value* argVal = lowerExpr(*ix->indices[k].value);
+            llvm::Value* argVal = lowerIndexArg(k);
             if (!argVal) return false;
             llvm::AllocaInst* slot = entryAlloca(argVal->getType());
             builder_.CreateStore(argVal, slot);
@@ -5540,7 +5624,7 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
         std::vector<llvm::AllocaInst*> idxSlots;
         for (std::size_t k = 0; k < nparams && k < ix->indices.size(); ++k) {
             if (!ix->indices[k].value) return false;
-            llvm::Value* argVal = lowerExpr(*ix->indices[k].value);
+            llvm::Value* argVal = lowerIndexArg(k);
             if (!argVal) return false;
             llvm::AllocaInst* slot = entryAlloca(argVal->getType());
             builder_.CreateStore(argVal, slot);
@@ -5764,7 +5848,7 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
                 for (std::size_t k = 0; k < pd->indexerParams.size() &&
                      k < ix->indices.size(); ++k) {
                     if (!ix->indices[k].value) return false;
-                    llvm::Value* argVal = lowerExpr(*ix->indices[k].value);
+                    llvm::Value* argVal = lowerIndexArg(k);
                     if (!argVal) return false;
                     llvm::AllocaInst* slot = entryAlloca(argVal->getType());
                     builder_.CreateStore(argVal, slot);
@@ -5929,7 +6013,7 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
             idxArgVals.push_back(nullptr);
             continue;
         }
-        llvm::Value* argVal = lowerExpr(*ix->indices[k].value);
+        llvm::Value* argVal = lowerIndexArg(k);
         if (!argVal) {
             idxSlots.push_back(nullptr);
             idxArgVals.push_back(nullptr);
