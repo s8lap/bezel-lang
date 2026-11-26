@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review — draft (2026-11-26); critiqued (pc-0218, SOUND-WITH-FIXES), revised: the five blocking findings (F1–F5) and the seven notes (F6–F12) are applied, each recorded in §13. Owner questions in §10, Q1–Q7. |
+| **Status** | accepted — accepted (2026-11-26, owner: all recommended answers); critiqued (pc-0218, SOUND-WITH-FIXES), revised |
 | **Tracking issue** | [#7429](https://github.com/s8lap/bezel-lang/issues/7429) (the missing owning forms) and [#7440](https://github.com/s8lap/bezel-lang/issues/7440) (the call-bounded fan-out with no spelling), answered together |
 | **Target documents** | **spec** — §30.10 (the owning overload's bullet, one new bullet, two sentences of *Aggregation contracts*, the closing parenthetical of *Structured fan-out*), §28.14 rule 2 (one sentence replaced by three), §15.4 (one parenthetical). **stdlib** — §6.7 (the declaration block, *Raises*, the subsection *`WhenAll` for class T* renamed and its sketch replaced, the *Building the borrowed input* bullet), §6.9 (the `Pool` example's join loop). **rationale** — §12.12 (one paragraph). **Guide 04** — §2 (one sentence), §4 (one sentence and one example). **code-generation reference** — §5.6 (two index lines). **proposals** — `README.md` (this row); `DECLINED.md` rows at acceptance (§5). No grammar change, no new keyword, no new type. |
 | **Written against** | spec, stdlib, rationale, Guide 04 and the code-generation reference at **v0.361**, `origin/main` `cdd2022c7` (v0.361 landed). The first draft was written against v0.360 (`bd12fe038`) and the v0.361 branch text (`c85ce271c`). v0.361 touches one section this proposal edits (stdlib §6.7 gains the `Delay` paragraph, which no edit here overlaps) and rules #8640 in spec §31.2 (*The chain is per raise* and the paragraph after it), which §2.4, §3.1 and §6.2 read. Every anchor quoted in §6 occurs exactly once at `cdd2022c7` (§12). Section numbers are v0.361's. |
@@ -193,7 +193,7 @@ public static method WhenAll<T>(owned tasks: OwningArray<Task<T>>): Task<Array<T
 
 ### 5.1 Rows for `DECLINED.md` (`declined-at-proposal`, added at acceptance)
 
-Per the index's scope rule (status gates the record), these rows are not added while the proposal is a draft.
+Per the index's scope rule (status gates the record), these rows were not added while the proposal was a draft; they were added at its acceptance (2026-11-26).
 
 | Topic | Class | Authoritative record | Reasons and reopening bar |
 |---|---|---|---|
@@ -510,7 +510,19 @@ Read from `src/` at `bd12fe038` (no `src/` change in v0.361's landing touches th
 - **Ownership.** The rule-2 recognizer (`whenAllCollection` in `checkCallBoundedTaskSettlement`, `src/ownership/Ownership_Checks.cpp`) matches `Task.WhenAll(<ident>)`. It gains `await Task.WhenAll(move <ident>)` for an `OwningArray` local, and a bound aggregate (`using var all := Task.WhenAll(move <ident>);`) awaited on every normal-exit path. The aggregate inherits the minted frames' call bound, so it is itself checked against rule 2's sinks: stored, returned, dropped unawaited or passed to `Task.FireAndForget`. About 20–40 lines (HYPOTHESIS).
 - **Compiler divergences found along the way**, separable and not fixed here: (1) the merged-name gap above (banked); (2) p09, an owned local of an `async` `OwningTask<…>` body that is returned on the normal path is not disposed on the fault edge (a leak, three of three runs); (3) p11, r42 passes an `Array<Task<int>>` to `WhenAny(tasks: Array<Task>)`, although class generics are invariant (§12.9); (4) p03, the rule-2 check does not credit a borrowing snapshot of a purely local owning collection (`whenAllCollection` matches one identifier), though the text admits it; low priority once B lands; (5) critique probe q01, two owning inputs that re-raise one shared operand's fault clear its `SupersededChain` at the second (prints `0`; §31.2 gives `1`), the per-task flag of #8640's implementation; this is #8640's residue, not this proposal's; (6) critique probes q03/q04, r42 resolves a collection-literal argument between an `Array<T>` and an `owned OwningArray<T>` overload by declaration order and reports no ambiguity. Items 2–6 are not filed. The coordinator files them, since this lane does not comment on GitHub.
 
-## 10. Owner questions
+## 10. Owner decisions (2026-11-26)
+
+On 2026-11-26 the owner accepted this proposal with every recommended answer ("I accept all"). The decisions are recorded below; the questions follow as they were put, with their reasoning.
+
+- **Q1 — R1.** An owning aggregate settles every input first.
+- **Q2 — B.** The two owning overloads are added. An owning `WhenAny` (every task family) and an owning `WhenEach` (`Task` and value tasks) are declined by name (§5.1, now indexed).
+- **Q3 — dispose silently.** The non-first faults of a failed owning aggregate are disposed without a report.
+- **Q4 — `Task<Array<T>>`.** The value-result owning form returns the borrowing form's result type.
+- **Q5 — yes.** The value-result owning form at a class `T` is a compile error.
+- **Q6 — filed separately** as [#9426](https://github.com/s8lap/bezel-lang/issues/9426).
+- **Q7 — (a).** The literal ambiguity is accepted, and the typed local is taught as its remedy.
+
+**The questions, as asked.**
 
 **Q1 — The owning aggregate's fault path: settle all (R1) or stop at the first failure (R2)?** §30.10 states both. Recommendation: R1. Rule 2, rationale §12.12 and the runtime already assume it. R2 abandons running tasks inside a library call and leaves #7440 open.
 

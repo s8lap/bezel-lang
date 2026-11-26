@@ -1052,6 +1052,11 @@ The edits of §8.3–§8.12 cover the defining occurrences. The remaining ones a
 - **Ramp:** §7.3's paragraph.
 - **Spec-ahead-of-impl:** §10's trackers.
 
+### 8.15 Edits recorded by later accepted proposals [S3]
+
+- **[Proposal 0216](0216-runtime-managed-values-held-where-stored.md)** (accepted 2026-11-26, its Q5): the stage-3 train (a) states that a box contributes no source because its storing location keeps it (0216 §5); (b) flips `s28_9_2161` and `s28_11_2163` to `reject`; (c) restates 0216 §6.5's runtime-managed sentence and §6.7(b)'s clause in the replacement field-store bullet (§8.5, clause 3, "No residual") and the replacement *Storing a borrow* (§8.6), or cites §28.9 *Held while referenced* there, since stage 3 deletes the clauses that carry them.
+- **[Proposal 0219](0219-fresh-store-at-the-many-element-forms.md)** (accepted 2026-11-26, option (b); 0219 §13): 0219 edits K8.4's exception sentence, the one after the plain-parameter sentence §8.3 rewrites, and the two edits apply in either order. The stage-3 train re-reads two points against 0219's landed text: §8.6's item 4 names only "a single-element store position", which 0219 widens to the many-element forms; and 0219 anchors its residual (enumerator-owned yields) to §28.11's borrowing-collection store residual, a sentence inside the span §8.6 replaces with "No residual is recorded".
+
 ---
 
 ## 9. Records this proposal answers

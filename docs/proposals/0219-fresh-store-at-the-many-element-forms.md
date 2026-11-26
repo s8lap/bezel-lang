@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review — critiqued (pc-0219, SOUND-WITH-FIXES), revised 2026-11-26: the critique's fourteen findings applied, and the coordinator's ruling on the draft's question 4 folded in as §2.4; recommends option (b), with option (a), keeping proposal 0207's scope, argued in §4.1; owner decision pending on §12's four questions |
+| **Status** | accepted — accepted (2026-11-26, owner: all recommended answers); critiqued (pc-0219, SOUND-WITH-FIXES), revised |
 | **Tracking issue** | [#7426](https://github.com/s8lap/bezel-lang/issues/7426) (`spec-question`, `campaign:collection-elements`; filed at the v0.346 landing of [proposal 0207](0207-fresh-store-into-a-borrowing-collection-is-an-error.md)). The compiler half of #7426 (its question 1) is a bug under every option (§3, §9.1). [#3047](https://github.com/s8lap/bezel-lang/issues/3047) (0207's tracker, open for lint B) is where the compiler arms would go if (b) is accepted. |
 | **Target module(s)** | **spec**: §15.4 (the store paragraph: the position sentence, one sentence on bulk copies, one remedy sentence), §28.11 (*Borrowing collections* clause 4; *Value-copy members*, one sentence), K8.4 (the exception sentence), Appendix C.3 (one bullet). **stdlib**: §4 (*Value-copy members are stores*, one sentence), §4.4, §4.10 and §4.15 (one sentence or comment each). **rationale**: §5.28.6 (one paragraph). **code-generation reference**: §4.5 (one paragraph), §7.2 (two callouts). **proposals**: `README.md` (this row), `DECLINED.md` (three rows). **guides**: none. **compiler**: spec-ahead-of-impl, one tracker (§11). **conformance**: no banked case changes expectation; ten proposed cases (§10). **tests**: one comment to correct at landing (§6). |
 | **Written against** | spec/stdlib **v0.361** at `cdd2022c7` (`origin/main`). The first draft was written against v0.360 (`bd12fe038`). Every edit anchor in §8 was re-verified verbatim against `cdd2022c7`: each occurs exactly once, and v0.361 changed none of them. This proposal composes with accepted [proposal 0212](0212-borrow-bearing-classes.md) §8.3 (stage 3), which rewrites K8.4's plain-parameter sentence. The new K8.4 text here anchors to §28.11's borrowing-collection residual, not to that sentence, so the two can land in either order. §13 gives the interaction, and §2.3's two readings must be re-read against 0212's text at graduation. |
@@ -361,7 +361,7 @@ One test comment must be corrected at landing. `fresh_store_warning_3364`'s `bul
 
 ## 7. Declined alternatives (`DECLINED.md`, `declined-at-proposal`)
 
-If (b) is accepted, three rows are added:
+(b) was accepted (2026-11-26), so these three rows are added:
 
 | decline | ground | reopening bar |
 |---|---|---|
@@ -548,7 +548,16 @@ The §9.1 bugs are filed separately and do not wait on this tracker. Two leak me
 
 ---
 
-## 12. Owner questions
+## 12. Owner decisions (2026-11-26)
+
+On 2026-11-26 the owner accepted this proposal with every recommended answer ("I accept all"). The decisions are recorded below; the questions follow as they were put, with their reasoning.
+
+- **1 — (b).** The fresh-store rule extends to the store positions and to temporary-sourced bulk copies (§4.2, §8.1–§8.6).
+- **2 — the residual is confirmed.** Iterator calls with enumerator-owned yields stay at the backstop as a stated residual; (c) is declined.
+- **3 — yes.** A span view's indexer-set is covered.
+- **4 — yes.** A fresh fill into a fresh result is rejected uniformly, whatever the result's landing.
+
+**The questions, as asked.**
 
 1. **(b) or (a)?** Extend the fresh-store rule to `Fill`, `fill`, the span-view indexer-set and the temporary-sourced bulk copies (recommended, §5)? Or keep 0207's scope, with the admission written in terms (§4.1, §8.7)? Under (a), `LoadAll().ToArray()` and `new LinkedList<T>(LoadAll())` are rejected while `ws.AddRange(LoadAll())` is admitted: one copy, two verdicts. Either way the §9.1 bugs are fixed.
 2. **Iterator calls with enumerator-owned yields.** Under (b), `ws.AddRange(Gen())` (`p21`: it faults when checked and segfaults when unchecked) stays at the backstop, a stated residual. Confirm the residual (recommended, §4.3), or take (c) and accept the cross-module question row 634 defers? This no longer concerns a lazy frame over a temporary: §28.3 already sources that, and (b) rejects it (arm 2b).

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review — critiqued (pc-0215, SOUND-WITH-FIXES), revised: drafted 2026-11-26 from the v0.361 L2 lane's design finding on #9275; critique pass run (pc-0215, 2026-11-26), both blocking findings and the ten others applied (§12); owner decision pending |
+| **Status** | accepted — accepted (2026-11-26, owner: all recommended answers); critiqued (pc-0215, SOUND-WITH-FIXES), revised |
 | **Tracking issue** | [#9275](https://github.com/s8lap/bezel-lang/issues/9275); related: [#8397](https://github.com/s8lap/bezel-lang/issues/8397) (ruled v0.361, the registration-lifetime residual and form 1 composing with form 3), [#9311](https://github.com/s8lap/bezel-lang/issues/9311) (ruled v0.361, bound 6 stays deferred) |
 | **Target documents** | spec §28.14 (*The `scoped` modifier*, the callee bullet's first sentence; *The registration-lifetime residual*, one sentence; a new paragraph *The callee's bound* before *Quiescence*; *Class- and interface-typed `scoped` parameters*, the callee-side bullet, one sentence), §28.3 axiom register (row A11), Appendix C.3 (one bullet). stdlib §6.1 (`Register`, one sentence), §6.5 (*Subscribing*, one sentence). rationale §5.26 (the A11 entry of *The axioms' reasons*, one paragraph). Guide 1 §9 (one sentence). Code-generation reference §4 (*`scoped`*, one sentence) and §7.2 (one entry). No grammar change, no new keyword, no interface-artifact (§2.8.2) change. |
 | **Written against** | spec, stdlib and rationale **v0.361**, `origin/main` at `cdd2022c7` (v0.361 landed). Every `old` anchor in §7 was re-verified there: each occurs exactly once. The first draft was written against the v0.361 branch at `c85ce271c`; the documents differ from `cdd2022c7` in none of the anchored passages. Section numbers are v0.361's. |
@@ -342,7 +342,7 @@ Side observations and spin-off issues, not this proposal's question:
 
 ## 6. Declined, and the `DECLINED.md` row text
 
-Per `DECLINED.md`'s scope rule (2), the rows are indexed only once this proposal is accepted. The proposed text, class `declined-at-proposal`, record "proposal 0215 §3":
+Per `DECLINED.md`'s scope rule (2), the rows are indexed only once this proposal is accepted; they were indexed at its acceptance (2026-11-26). The proposed text, class `declined-at-proposal`, record "proposal 0215 §3":
 
 1. *A caller-side co-bound at bounding forms 2/3 on a call of a user-authored instance method whose return is `owned` (captures tested against the receiver as well as the returned object; #9275 interpretation (a)).* It rejects the stdlib §6.5 observer pattern wherever the publisher is a parameter, a getter-faced property or an interface face, rejects the hub idiom's short-lived-capture form at form 2, and cannot reach interface dispatch. Reopening bar: a caller-visible retention announcement, which does not exist today.
 2. *Reading the bound of an owned-return instance method as the returned object alone (#9275 interpretation (b)).* Unsound at forms 4/5: a returned forward over a non-`this` receiver (`=> tok.Register(cb)`) or a returned constructed holder (`=> new Button(on)`) dangles when the caller bounds by the receiver. Reopening bar: none while forms 4/5 resolve the receiver at an owned-return call.
@@ -528,7 +528,7 @@ The header pin moves to the landing revision, which `check_docs.sh`'s PIN check 
 
 ### 7.12 Proposals folder
 
-`README.md` carries the *Pending decision* row. On acceptance, the rows of §6 go into `DECLINED.md`.
+`README.md` carries the proposal's row. On acceptance, the rows of §6 go into `DECLINED.md` (done 2026-11-26).
 
 ## 8. Changelog sketch
 
@@ -582,7 +582,20 @@ IDs are assigned in the landing revision's band. Each fixture declares `Counter2
 | R | `reject` | "the bound is read … at the declaration a member implements" | `m1`: an interface `Watch(scoped h): owned IEnumerable<int>;` and an implementation spelling the return unmarked that stores `_h := h` (once the compiler implements §11.2's carve; until then the case rejects on the §11.2 mismatch, so its `diagnostic:` must name the §28.14 text) |
 | S | `run` | "form 1 composed with its placement" (Q8) | a constructor `_child := new Child(h)` with `Child(scoped h)` storing it, the owner disposing `_child` in its cascade |
 
-## 10. Owner questions
+## 10. Owner decisions (2026-11-26)
+
+On 2026-11-26 the owner accepted this proposal with every recommended answer ("I accept all"). The decisions are recorded below; the questions follow as they were put, with their reasoning.
+
+- **Q1 — yes.** D is adopted as the answer to #9275: the callee's bound, with "both" at an owned-return instance method, read at the implemented or overridden declaration, and with no returned-object severance at an `async` or iterator callee.
+- **Q2 — yes.** The static half (D2) lands with Q1: the returned-forward severance at static methods, with the returned constructor forward it needs.
+- **Q3 — (ii).** `s28_14_0017` is narrowed to a *liftable* v1 bound, after its §7.9 initialization error is repaired (§5.2): it is re-headed `reject` with a `diagnostic:`, and its remedy twin `=> new Registry(cb)` is `run`.
+- **Q4 — yes.** The class-typed half (§7.4) lands in the same revision.
+- **Q5 — yes.** The rule is an error from the start, with no warning stage.
+- **Q6 — yes.** §7.7's sentence is confirmed as a standard-library register obligation on `Register`, not a new caller rule.
+- **Q7 — no.** Form 2's "a call whose return is `owned`" keeps the marker reading for this revision. Aligning form 2 with the announcement table is [#9435](https://github.com/s8lap/bezel-lang/issues/9435).
+- **Q8 — yes.** `_child := new Child(h)` (form 1 composed with form 3's placement) is admitted as a forward severed by `this` at a constructor or an item-2 method.
+
+**The questions, as asked.**
 
 1. **Q1, the rule.** Adopt D, the callee's bound with "both" at owned-return instance methods, read at the implemented or overridden declaration, with no returned-object severance at an `async` or iterator callee, as the answer to #9275? Recommended. It is the only option that closes `p1` (with its `+=` and `.Add` spellings), `p3`, `p5`, `m2`, `p2`, `p9` and the `async` shape without changing a caller's verdict or adding an interface fact. The cost: a user type can no longer implement `IEvent<T>` with its own subscriber storage, even behind a handle that severs it. It must wrap an owned `EventSource<T>`. The measured tree has no such implementation.
 2. **Q2, the static half (D2).** Land the returned-forward severance at static methods, and the returned constructor forward it needs, together with Q1? Recommended.

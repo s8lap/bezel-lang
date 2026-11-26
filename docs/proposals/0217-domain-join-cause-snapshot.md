@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review — draft (2026-11-26), critiqued (pc-0217, SOUND-WITH-FIXES), revised; recommends option B (§4); three owner questions (§10); the form of `ExceptionInfo.TypeName` split out as a separate clarification (§10) |
+| **Status** | accepted — accepted (2026-11-26, owner: all recommended answers); critiqued (pc-0217, SOUND-WITH-FIXES), revised |
 | **Tracking issue** | [#8401](https://github.com/s8lap/bezel-lang/issues/8401) (spec-question: `DomainFaultedException` drops the original exception's type name). Related: [#8669](https://github.com/s8lap/bezel-lang/issues/8669) (a cancelled child joining as cancellation; independent, §4.4), [#8402](https://github.com/s8lap/bezel-lang/issues/8402) (obsolete, §1.3) |
 | **Target documents** | **spec** — §30.14 *Faults* (two sentences), §30.14 *Data-parallel combinators* (one clause of the *Results and faults* bullet), §31.4 (one sentence added to *Cause chaining is by snapshot*, one clause of the supersession paragraph). **stdlib** — §6.8 (one comment line in the listing, one sentence of prose), §6.12 (one clause). **rationale** — §12.6 (one clause, one declined item). **Guide 4** §5 (one sentence), **Guide 2** §4 (one clause). **code-generation reference** — §5.6 (one comment line in the `Domain` listing). **proposals** — `README.md` (this row), `DECLINED.md` (the rows of §5, at acceptance), proposal 0110's status note (Q2). No grammar change, no new member, no new type, no new diagnostic. |
 | **Written against** | spec, stdlib and rationale **v0.360** (`origin/main` `bd12fe038`). v0.361 (branch `spec/v0361-2026-11`, `c85ce271c`, landing in parallel) does not touch the sections this proposal edits: every `Old` text of §6 occurs exactly once in both trees (checked by script, §11). v0.361's new §31.2 sentence on per-raise `SupersededChain` clearing does bear on Q3, and is cited there. Probes on compiler release **r42** (`bezelc 0.0.0-8ccf7ff0`). |
@@ -228,7 +228,7 @@ The story says to name the types you handle and let everything else propagate, a
 
 ## 5. Declined, and why
 
-Row text for `DECLINED.md` (`declined-at-proposal`), to add at acceptance if B is accepted (`DECLINED.md` scope rule 1; 0212's rows landed the same way):
+Row text for `DECLINED.md` (`declined-at-proposal`), added at acceptance (2026-11-26, B accepted) (`DECLINED.md` scope rule 1; 0212's rows landed the same way):
 
 | Topic | Verdict class | Authoritative record | Reopening bar |
 |---|---|---|---|
@@ -576,7 +576,16 @@ The probe programs are those of §2.2 (`q1`–`q4`) and §7.3 (`c1`–`c7`, and 
 - `Parallel` (#3557): when built, its first-fault path uses the same helper.
 - Trackers to file at landing (`spec-tracking`): one for the runtime change, citing this proposal and the rule cases of §7.3. #8401 closes with the landing.
 
-## 10. Owner questions
+## 10. Owner decisions (2026-11-26)
+
+On 2026-11-26 the owner accepted this proposal with every recommended answer ("I accept all"). The decisions are recorded below; the questions follow as they were put, with their reasoning.
+
+- **Q1 — B.** The original's snapshot goes into the join exception's `CauseChain` (§4).
+- **Q2 — yes.** Proposal 0110's stage-1 rider drops `FaultTypeName` and keeps `ExitKind`; a note recording that is added to [0110 §2.6](0110-partial-failure-toolkit.md).
+- **Q3 — (a).** The loss of the original's `SupersededChain` at a join is confirmed for now; the reopening bar is field evidence (§5's fourth row, now indexed).
+- **Split out:** the form of `ExceptionInfo.TypeName` (the qualified-name clarification) is [#9427](https://github.com/s8lap/bezel-lang/issues/9427).
+
+**The questions, as asked.**
 
 **Q1 — Which option?** B (recommended), C1/C2 (a property), or A (decline, with §5's alternative row). B is recommended for §4.1's reasons: it prints where exceptions are printed, it carries the causes, and it adds no arm pattern; as a dispatch surface it is on a par with C1 (text a `when` guard could test, barred by documentation only).
 

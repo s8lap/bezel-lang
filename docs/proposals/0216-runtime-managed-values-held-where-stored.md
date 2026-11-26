@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review — critique round 1 (2026-11-26): critiqued (pc-0216, SOUND-WITH-FIXES), revised; findings F1–F12 folded in (§11). The v0.361 changelog lists #9219 under *Not ruled*, an owner decision needing a proposal |
+| **Status** | accepted — accepted (2026-11-26, owner: all recommended answers); critiqued (pc-0216, SOUND-WITH-FIXES), revised |
 | **Tracking issue** | [#9219](https://github.com/s8lap/bezel-lang/issues/9219) (found while fixing [#9206](https://github.com/s8lap/bezel-lang/issues/9206)) |
 | **Target documents** | **spec** — §28.3.1 K1.6 (one sentence) and K4.1 (one sentence), §28.2 (one clause), §28.3.4 (the runtime-managed producers row, one clause), §28.3.8 field-store bullet clause 3 (one sentence), §28.9 (the boxes bullet, one clause; a new paragraph *Held while referenced*), §28.11 (one paragraph after the operations table; one clause in *Storing a borrow*), §30.14 (two words in an implementation note). **rationale** — §4 (one paragraph). **Guide 01** — §3 (one sentence). **stdlib, code-generation reference, Appendix C** — no edit (§6.9). No grammar change, no new name. |
 | **Written against** | spec, stdlib, rationale and guides **v0.361** (`origin/main` `cdd2022c7`). Every *old* string in §6 was re-verified there (MEASURED, `grep -c -F`: each occurs exactly once). `src/` and test anchors were read at `bd12fe038` and re-checked at `cdd2022c7`. |
@@ -429,7 +429,18 @@ The steps are ordered. Step 4 is safe only after steps 1–3, and that ordering 
 4. **Release at scope end.** Once steps 1–3 hold, a boxing local releases at its scope end unconditionally. Retire `BoxEscapeWalker`'s escape-keeps-it-alive path, or keep it only as an optimization. #9206's leaks go with it.
 5. **Tests.** Strengthen the 9206 rows (§2.1), rewrite the four `src/` comments, and add an ASan leg over the §8 shapes looped 200×, per CLAUDE.md's allocation rule.
 
-## 10. Owner questions
+## 10. Owner decisions (2026-11-26)
+
+On 2026-11-26 the owner accepted this proposal with every recommended answer ("I accept all"). The decisions are recorded below; the questions follow as they were put, with their reasoning.
+
+- **Q1 — A.** A live location keeps the runtime-managed value it refers to (§2.1, §3). B, C and D are declined (the `DECLINED.md` rows below, now indexed).
+- **Q2 — every runtime-managed value** at an `Object` or interface location: a box, and a `string`, `Type` or function value converted to `Object` or to an interface type it implements.
+- **Q3 — safety only.** *Held while referenced* states no reclamation obligation; the leaks stay quality defects.
+- **Q4 — yes.** The cost is accepted in every build, unchecked included, with the representation (a header bit, a tagged pointer, the flag) left to the implementation. This is the owner's answer against rationale §5.28.1.
+- **Q5 — yes.** (a)–(c) are recorded in proposal 0212's stage-3 edits ([0212 §8.15](0212-borrow-bearing-classes.md)).
+- **Q6 — the cycle leak is accepted** as outside the guarantee; no cycle rule is required.
+
+**The questions, as asked.**
 
 - **Q1. Which option?** Recommended: A (§3). B and C are recorded as declined (§6.10's rationale text; the `DECLINED.md` rows below, indexed only on acceptance under the 2026-08-20 scope rule).
 - **Q2. Scope.** Boxes only, or every runtime-managed value at an `Object` or interface location: boxes, and `string`, `Type` and function values converted to `Object` or to an interface type they implement (`string` at `IEnumerable<char>`, `IComparable<string>`, `IEquatable<string>`)? Recommended: every one. It is the same discriminator (#8118, #9061), and boxes alone would leave a string at an `Object` or interface field under the same false sentence.
@@ -446,7 +457,7 @@ The steps are ordered. Step 4 is safe only after steps 1–3, and that ordering 
   - (c) The replacement field-store bullet (clause 3, "No residual") and the replacement *Storing a borrow* restate §6.5's runtime-managed sentence and §6.7(b)'s clause, or cite §28.9 *Held while referenced*, since stage 3 deletes the clauses that carry them.
 - **Q6. Cycles.** A box can reach itself through a function value's capture cell (MEASURED, §2.1: `cyc.bzl`, `cyc2.bzl`). Under counting the cycle leaks, as a recursive closure's does today (§27.5). Should that leak be accepted as outside the guarantee (recommended), or should the spec require a cycle rule? A cycle rule would need the "small collector" that rationale §4 permits and rationale §1's "nothing runs in the background" resists.
 
-**`DECLINED.md` rows (proposed; indexed only if the proposal is accepted):**
+**`DECLINED.md` rows (indexed at acceptance, 2026-11-26):**
 
 | Item | Class | Where recorded | Reason / reopening bar |
 |---|---|---|---|
