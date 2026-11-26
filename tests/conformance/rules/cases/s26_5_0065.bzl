@@ -12,7 +12,7 @@
 //! expect: reject
 //! diagnostic: Sort
 //! issue: 7699
-//! notes: #8065 asks whether §27.6's unbound instance-method references `T.M` conflict with this sentence. The verdict follows §26.5 as written.
+//! notes: §27.6 *No unbound instance-method reference* (v0.361, #8065) agrees: over an instance method `T.M` names no member.
 module Conf;
 
 public class Program

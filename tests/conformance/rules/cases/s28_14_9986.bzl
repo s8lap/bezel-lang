@@ -1,14 +1,16 @@
 //! case: s28_14_9986
 //! doc: spec
 //! section: 28.14
-//! title: a lambda over a `scoped` formal may be invoked in place or passed to a call-bounded parameter
-//! rule: it may be immediately invoked
+//! title: a lambda over a `scoped` formal invoked through nested closures in the callee is rejected
+//! rule: Callee-side uses inside a nested closure are escaping uses (*liftable*): invoking a scoped
+//!   parameter through a locally-invoked closure is rejected in v1. The bound covers every callee-side use
+//!   the closure body makes of the parameter … whether or not the closure escapes the callee
 //! cites: 28.14, 28.3
-//! expect: run
-//! output: 600
-//! notes: The admitting twin of the #9310 rejections: every spelling invokes the callback within the call (6
-//!   hits per On: immediate invoke, `??`, `if`, `case`, a call-bounded argument, a call-bounded local).
-//!   100 calls: total = 600.
+//! expect: reject
+//! diagnostic: scoped
+//! notes: Was `run` (600), quoting §28.3's general "it may be immediately invoked"; §28.14's bound 6
+//!   narrows that admission for a closure over a `scoped` parameter of the enclosing callee, which v0.361
+//!   (#9311) states. Every spelling here invokes `handler` through a nested closure.
 module Conf;
 public class Counter2
   private _n: int := 0;

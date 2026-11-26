@@ -2,12 +2,10 @@
 //! doc: spec
 //! section: 9.8
 //! title: a positional record's synthesized Serialize writes a counted object in declaration order
-//! rule: For an eligible record, the synthesized `Serialize(s: ISerializer)`
-//!   body is: 1. `s.BeginObject(n)` where `n` is the number of serialized
-//!   components. 2. For each component in declaration order:
-//!   `s.WriteFieldName("<name>")` followed by the component's encoding —
-//!   `s.WriteInt`/`WriteString`/etc. for a primitive or `string`; … 3.
-//!   `s.EndObject()`.
+//! rule: For an eligible record, the synthesized `Serialize(s: ISerializer)` body is: 1.
+//!   `s.BeginObject(n)` where `n` is the number of fields the call writes into this object — one for each
+//!   `WriteFieldName` it makes there. … 2. For each serialized component in declaration order:
+//!   `s.WriteFieldName("<name>")` followed by the component's encoding … 3. `s.EndObject()`.
 //! cites: 9.8, 9.1
 //! expect: run
 //! stdout: obj2;@B;int7;@A;str:x;end;

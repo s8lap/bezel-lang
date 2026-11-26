@@ -1,17 +1,17 @@
 //! case: s28_3_8_8902
 //! doc: spec
 //! section: 28.3.8
-//! title: a closure swapped into a function-typed field via `ref` arguments stays live at an `Object` param
-//! rule: carries the empty set: those holders, every position declared `Object`, and every position a
-//!   generic body declares at a type parameter
+//! title: a non-generic Swap of two function-typed ref parameters is rejected in its own body
+//! rule: A read carrying the unannounced source may be invoked, bound to a local or passed at a plain
+//!   function-typed parameter, but not stored into a holder (the `ref` or `out` location itself and a
+//!   sibling one included), passed at a set-erasing position or returned from the enclosing method.
 //! cites: 28.3.8, 22.3, 28.9
-//! expect: run
-//! output: 1800
-//! notes: Pins #9092 (the `Swap(ref h.F, ref g)` variant). `Swap` exchanges the field with the local `g`
-//!   (`lambda() => 9`), so `h.F` now holds the capture-free `lambda() => 9`; it is passed at `Keep`'s
-//!   `Object` parameter and the holder dies. 9 per iteration, 200 iterations: 1800. The holder `Hold`
-//!   itself leaks under the ASan leak leg (#9173, `ref` argument over a function-typed field); that
-//!   leak is a separate open tracker and is not asserted here.
+//! expect: reject
+//! diagnostic: unannounced
+//! notes: Pins #9092's `Swap(ref h.F, ref g)` shape; v0.361 (#9093) flips it from run to reject.
+//!   `Swap`'s `a := b` stores `b`'s entry value, an unannounced source, into the sibling `ref` location,
+//!   so the callee is rejected whatever its callers pass. The field route stays expressible with the
+//!   generic `Swap<T>(ref a: T, ref b: T)` (s28_3_8_8601).
 module Conf;
 public class Reg2
   private _o: Object? := null;
