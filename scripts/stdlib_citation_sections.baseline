@@ -16,7 +16,7 @@
 # -- and NO line number, because a line-numbered key would fail the
 # gate on every unrelated commit that moved a comment.
 #
-count: 469
+count: 481
 site:	src/codegen/LlvmBackend_Assign.cpp	wrong-section	IOwningEnumerable	4.5
 site:	src/codegen/LlvmBackend_Assign.cpp	wrong-section	Range	4.4
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	2.6
@@ -27,6 +27,7 @@ site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	5.1
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	7.1
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	CompareTo	5.1
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Dictionary	2.4
+site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Dictionary	5
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Guid	2.2
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	IComparable	2.2
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	IComparable	2.5
@@ -73,6 +74,7 @@ site:	src/codegen/LlvmBackend_String.cpp	wrong-section	Mutex	2.13
 site:	src/codegen/LlvmBackend_String.cpp	wrong-section	ToString	2.18
 site:	src/codegen/LlvmBackend_impl.hpp	wrong-section	Array	10
 site:	src/codegen/LlvmBackend_impl.hpp	wrong-section	Array	4.1
+site:	src/codegen/LlvmBackend_impl.hpp	wrong-section	Array	4.19
 site:	src/codegen/LlvmBackend_impl.hpp	wrong-section	CompareTo	2.8
 site:	src/codegen/LlvmBackend_impl.hpp	wrong-section	CompareTo	4.4
 site:	src/codegen/LlvmBackend_impl.hpp	wrong-section	IComparable	4.18
@@ -84,6 +86,7 @@ site:	src/common/BuiltinRegistry.cpp	wrong-section	Array	3.1
 site:	src/common/BuiltinRegistry.cpp	wrong-section	IComparable	2.2
 site:	src/common/BuiltinRegistry.cpp	wrong-section	IReadOnlyCollection	4.11
 site:	src/common/BuiltinRegistry.cpp	wrong-section	Random	3
+site:	src/common/BuiltinRegistry.hpp	wrong-section	OwningDictionary	4.14
 site:	src/common/BuiltinRegistry.hpp	wrong-section	Span	3.2
 site:	src/driver/Driver.cpp	wrong-section	Result	7.1
 site:	src/ownership/Ownership.cpp	wrong-section	IDisposable	4.12
@@ -107,6 +110,7 @@ site:	src/runtime/bezel_runtime_strings.cpp	wrong-section	ToString	2.18
 site:	src/runtime/bezel_runtime_time.cpp	wrong-section	Guid	2.18
 site:	src/runtime/bezel_runtime_time.cpp	wrong-section	TimeSpan	2.18
 site:	src/sema/ExprTypecheck.cpp	wrong-section	Array	5
+site:	src/sema/ExprTypecheck.cpp	wrong-section	Encoding	1
 site:	src/sema/ExprTypecheck.cpp	wrong-section	IDisposable	4.12
 site:	src/sema/ExprTypecheck.cpp	wrong-section	JsonOptions	3.3
 site:	src/sema/ExprTypecheck.cpp	wrong-section	MaxValue	1
@@ -255,6 +259,7 @@ site:	tests/codegen/linq_iface_chain_icomparable_8186_test.cpp	wrong-section	Com
 site:	tests/codegen/linq_iface_chain_icomparable_8186_test.cpp	wrong-section	IComparable	5.1
 site:	tests/codegen/linq_last_single_predicate_789_test.cpp	wrong-section	Range	5
 site:	tests/codegen/linq_minmax_selector_wide_value_8048_test.cpp	wrong-section	Guid	9.6
+site:	tests/codegen/linq_selector_record_sum_8691_test.cpp	wrong-section	Zero	5.1
 site:	tests/codegen/linq_test.cpp	wrong-section	IEnumerable	9.6
 site:	tests/codegen/linq_throw_469_test.cpp	wrong-section	IComparable	5
 site:	tests/codegen/math_convert_test.cpp	wrong-section	IComparable	2.2
@@ -349,11 +354,15 @@ site:	tests/ownership/fresh_store_indexer_key_3395_test.cpp	wrong-section	Dictio
 site:	tests/ownership/iterable_interface_head_stored_view_exclusion_3295_test.cpp	wrong-section	IAsyncDisposable	4.12
 site:	tests/ownership/lambda_owned_return_direct_borrow_4005_test.cpp	wrong-section	IDisposable	4.12
 site:	tests/ownership/lazy_select_slice_minting_selector_7156_test.cpp	wrong-section	Select	9.6
+site:	tests/ownership/nullcond_builtin_collection_surface_8783_test.cpp	wrong-section	ToString	5
 site:	tests/ownership/shared_non_owning_iter_format_enumerable_head_predicate_4032_test.cpp	wrong-section	IAsyncDisposable	4.13
 site:	tests/ownership/span_field_store_1251_test.cpp	wrong-section	Array	4.15
 site:	tests/ownership/static_interface_constraint_disposal_1425_test.cpp	wrong-section	Zero	2.19
+site:	tests/ownership/textreader_readtoend_producer_leak_9199_test.cpp	wrong-section	ReadToEnd	1
+site:	tests/ownership/textreader_readtoend_producer_leak_9199_test.cpp	wrong-section	ReadToEnd	2.1
 site:	tests/ownership/vacuous_lint_cstring_to_bytes_2826_test.cpp	wrong-section	Array	10.1
 site:	tests/ownership/vacuous_lint_materializer_remedy_2709_test.cpp	wrong-section	Array	5
+site:	tests/sema/bound_primitive_vs_iteration_iface_8796_test.cpp	wrong-section	Type	9.6
 site:	tests/sema/builtin_call_admission_7372_test.cpp	wrong-section	ReadOnlyStringSpan	9.1
 site:	tests/sema/builtin_collection_to_primitive_4760_test.cpp	wrong-section	IOwningEnumerable	4.5
 site:	tests/sema/builtin_ctor_named_arg_binding_3425_test.cpp	wrong-section	Array	4.2
@@ -394,6 +403,8 @@ site:	tests/sema/math_minmax_nullable_7660_test.cpp	wrong-section	IComparable	2.
 site:	tests/sema/math_minmax_nullable_7660_test.cpp	wrong-section	IComparable	9.6
 site:	tests/sema/math_sign_constraint_7227_test.cpp	wrong-section	INumber	2.2
 site:	tests/sema/names_compared_with_arity_5172_test.cpp	wrong-section	Set	3
+site:	tests/sema/owning_dictionary_lazy_linq_tier_9285_test.cpp	wrong-section	OwningDictionary	5
+site:	tests/sema/owning_dictionary_or_null_tier_9262_test.cpp	wrong-section	OwningDictionary	5
 site:	tests/sema/parameter_typing_test.cpp	wrong-section	StringBuilder	2.9
 site:	tests/sema/primitive_boxes_into_builtin_iface_2765_test.cpp	wrong-section	IComparable	9.6
 site:	tests/sema/primitive_boxes_into_builtin_iface_2765_test.cpp	wrong-section	IEquatable	9.4
