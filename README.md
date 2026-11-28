@@ -4,7 +4,7 @@
 
 **A compiled language for services and tools, with ownership-based memory management and no garbage collector.**
 
-Bezel reads object lifetimes off ordinary code. A handful of keywords (`owned`, `move`, `using var`) say who owns what, and the compiler inserts every release at a point you can see in the source. Nothing is garbage-collected and nothing is silently corrupted: where the compiler cannot prove a reference is still valid, the default checked build raises an exception rather than read freed memory. If you know C#, Bezel will feel familiar.
+Bezel reads object lifetimes from ordinary code. A handful of keywords (`owned`, `move`, `using var`) say who owns what, and the compiler inserts every release at a point you can see in the source. Nothing is garbage-collected. Ownership mistakes the compiler can prove, such as using a value after it was moved, are compile errors. Where it cannot prove that a borrowed reference is still valid, it accepts the program and the default checked build tests it at run time: using an object that has already been disposed raises a `DisposedAccessException` instead of reading freed memory. If you know C#, Bezel will feel familiar.
 
 Bezel is written almost entirely by AI models, mostly Anthropic's Claude; agent commits name the model that wrote them ([Acknowledgements](#acknowledgements)).
 
@@ -68,18 +68,18 @@ It prints `db <- home`, `db <- error 503` and `port 8080`, then `cache closed` a
 - **Non-null by default.** A `Connection` always holds an object; only a `Connection?` may be `null`, and calling a member on it is a compile error until narrowed to non-`null` ([§7](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-nullability-2)).
 - **Predictable costs and behavior.** Objects are released at points you can find in the source. Integer overflow throws instead of wrapping ([§6.1](https://s8lap.github.io/bezel-lang/spec/07-6-arithmetic-and-overflow.html#sec-integer-arithmetic)), arithmetic on a nullable value is a compile error ([§7.11](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-lifted-operators)), and user types cannot declare conversion operators ([§25.4](https://s8lap.github.io/bezel-lang/spec/26-25-operator-overloading.html#sec-no-user-defined-conversion-operators)).
 - **Compared with Rust.** The ownership model is close to Rust, but there are no lifetime annotations and no single-writer rule: freedom from data races comes from domains, not from restricting aliases. The price is that a small class of mistakes Rust rejects at compile time shows up here as a deterministic run-time exception ([rationale §1](https://s8lap.github.io/bezel-lang/rationale/02-1-the-big-picture.html#sec-the-big-picture)).
-- **Feature-full.** Classes, interfaces, generics, records, enums, sum types with exhaustive matching, `async`/`await` with structured concurrency, LINQ-style queries, exceptions and contracts.
+- **Full-featured.** Classes, interfaces, generics, records, enums, sum types with exhaustive matching, `async`/`await` with structured concurrency, LINQ-style queries, exceptions and contracts.
 - **A specification first.** Every rule is pinned by a test that states the specification's verdict, not the compiler's.
 
 ## How memory management works
 
-The rules are in [chapter 28 of the specification](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-resource-management). They are complicated, yet most of their weight falls on the compiler; the programmer meets three keywords, plus `using var` for a local disposed at the end of its block:
+The rules are in [chapter 28 of the specification](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-resource-management). They are detailed, but most of the weight falls on the compiler: a programmer mostly meets three keywords, plus `using var` for a local disposed at the end of its block:
 
 - `owned` marks a slot that holds ownership: a parameter that takes it, a return type that hands it to the caller, or a field.
 - `move` transfers ownership out of a named variable. Where the destination itself announces the transfer, such as a `return` or a store into an `owned` field, no marker is needed, so every transfer is visible in the source.
 - `scoped` lets a method keep a callback (or a borrowed object) beyond the call, for as long as the object that stores it lives. A plain parameter may only be used during the call; with `scoped`, the compiler checks at the call site that everything the callback captures outlives the object keeping it ([§28.14](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-scoped-callback-parameters); [Guide 1](https://s8lap.github.io/bezel-lang/guide-01/) has a worked example).
 
-A local initialized with a new object owns it. Every other reference is a borrow, and the compiler checks that no borrow outlives what it borrows. Only the owner may dispose an object ([§28.6](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-who-may-dispose)): `Dispose()` runs its cleanup and marks it disposed, and the memory is released by code the compiler inserts at the owner's release point, such as the end of a scope. Trying to use an object after it has been disposed is either a compile error or a `DisposedAccessException` in the default build.
+A local initialized with a new object owns it. Every other reference is a borrow, and the compiler checks that no borrow outlives what it borrows. Only the owner may dispose an object ([§28.6](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-who-may-dispose)): `Dispose()` runs its cleanup and marks it disposed, and the memory is released by code the compiler inserts at the owner's release point, such as the end of a scope. Using an object after it has been disposed is a compile error where the compiler can see it, and a `DisposedAccessException` at run time in the default build where it cannot.
 
 **Threads.** Code runs in execution domains ([§30.13](https://s8lap.github.io/bezel-lang/spec/31-30-asynchronous-programming.html#sec-runtime-model)). A domain runs one piece of code at a time; domains run in parallel but share no mutable state, and a value passes between them only by being moved or as an immutable copy ([§30.14](https://s8lap.github.io/bezel-lang/spec/31-30-asynchronous-programming.html#sec-multiple-domains)). That keeps the memory guarantees in multi-threaded programs and rules out data races, with one documented limit: an alias the compiler cannot see, made before the move, is the programmer's responsibility.
 
@@ -94,10 +94,10 @@ tar xzf bezelc-<version>-linux-x86_64.tar.gz
 export PATH="$PWD/bezelc-<version>-linux-x86_64/bin:$PATH"
 ```
 
-**From source.** Bezel builds on Linux with clang and LLVM 21. It is developed and tested on Fedora; other platforms are untested ([#446](https://github.com/s8lap/bezel-lang/issues/446)).
+**From source.** Bezel builds on Linux with clang and LLVM 23. It is developed and tested on Fedora; other platforms are untested ([#446](https://github.com/s8lap/bezel-lang/issues/446)).
 
 ```sh
-sudo dnf install cmake clang llvm llvm-devel      # LLVM 21
+sudo dnf install cmake clang llvm llvm-devel      # LLVM 23
 cmake -B build -DCMAKE_CXX_COMPILER=clang++
 cmake --build build -j$(nproc)                    # the compiler is build/bezelc
 ```
@@ -142,11 +142,11 @@ A few proposals are good reading on their own:
 - [0077, silent tracking](docs/proposals/0077-silent-tracking.md): classes that hold no resources need no `using var` and draw no warnings, yet each instance still has a known owner and is freed at a known point, with no runtime lifetime mechanism on any class you write.
 - [0131, the trust-admission report](docs/proposals/0131-report-trust-admissions.md): where the guarantees stop. A build mode warns at every place the compiler accepts a borrow on trust rather than proof, naming the source and the static spelling that would replace the trust.
 
-Apart from the proposals, these are published together as a searchable site, one page per chapter, at **[s8lap.github.io/bezel-lang](https://s8lap.github.io/bezel-lang/)**. The site is rebuilt from `docs/` by `scripts/build_book.py` whenever the documents change on main.
+Everything in the table except the proposals is published as one searchable site, a page per chapter, at **[s8lap.github.io/bezel-lang](https://s8lap.github.io/bezel-lang/)**. `scripts/build_book.py` rebuilds it from `docs/` whenever the documents change on main.
 
 **Editor support:** [`editors/vscode/`](editors/vscode/) is a VS Code extension with syntax highlighting, editing rules and snippets. Its grammar is generated from the specification.
 
-## How far along is it
+## How far along it is
 
 - **The compiler**, `bezelc`, is an ahead-of-time front end and LLVM back end. It compiles the language's core end to end — ownership and borrow checking, classes and generics, records, enums and choices, exceptions, collections and queries, `async`/`await`, multi-module builds — and much of the standard library.
 - **The tests.** About 45,000 behavior tests compile and run real programs, with an AddressSanitizer pass before anything lands on main, and 2,500 diagnostic tests pin the compiler's error messages.
@@ -167,7 +167,7 @@ Questions about what the specification means are welcome too. A crash, a leak or
 The project works specification first: if the compiler and the specification disagree, the compiler is wrong, and every fix ships a regression test that cites the section it enforces. [`CONTRIBUTING.md`](CONTRIBUTING.md) explains how to build, test and send a change, [`tests/README.md`](tests/README.md) how to write a test, and [`docs/proposals/spec-change-process.md`](docs/proposals/spec-change-process.md) how the language itself changes. [`CLAUDE.md`](CLAUDE.md) holds the stricter working rules the project's AI agents follow.
 
 ```sh
-tests/run_parallel.sh 16                    # the behaviour suite, sharded
+tests/run_parallel.sh 16                    # the behavior suite, sharded
 cmake --build build --target check-lit      # the diagnostic suite (needs lit and FileCheck)
 scripts/check_docs.sh                       # the documentation checks
 ```
@@ -175,6 +175,8 @@ scripts/check_docs.sh                       # the documentation checks
 ## Acknowledgements
 
 Bezel is AI-written: the specification, the compiler, the tests and the research notes are the work of AI models. About three quarters of the attributed commits are by Anthropic's Claude models, which also wrote nearly all of the specification; about a quarter are by MiniMax models, mostly compiler and test work; and a small share in mid-2026 came from Z.AI's GLM.
+
+None of it would exist without [s8lap](https://github.com/s8lap), who started Bezel, sets its direction, makes the design decisions and reviews the results.
 
 Agent commits end with a `Co-Authored-By` trailer naming the model that wrote them, and the trailers are never stripped. Since September 2026 the gate checks every commit for exactly one (`scripts/check_commit_trailers.py`); some earlier commits and merges have none. To tally them in a full clone:
 
