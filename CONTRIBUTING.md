@@ -10,7 +10,7 @@ For anything larger than a small fix, open or comment on an issue first so the w
 
 ## Building
 
-Bezel builds on Linux with clang and LLVM 21 (C++20). It is developed on Fedora; other distributions may need small changes to the package names.
+Bezel builds on Linux with clang and LLVM 23 (C++20). It is developed on Fedora 45; other distributions may need small changes to the package names.
 
 ```sh
 sudo dnf install cmake clang llvm llvm-devel

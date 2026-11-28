@@ -11,7 +11,7 @@
 # this project already links against (Fedora: /usr/bin/FileCheck, from
 # llvm package; a versioned /usr/bin/FileCheck-21 symlink also exists).
 #
-# Pinned to the version validated on this box (LLVM 21 system, Fedora).  lit's
+# Pinned to the version validated on this box (LLVM 21 system, Fedora; the system LLVM is now 23).  lit's
 # RUN/CHECK surface is stable across versions, so a newer lit will also work;
 # the pin exists for reproducibility, not because a floor is required.
 lit==18.1.8

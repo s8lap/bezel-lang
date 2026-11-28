@@ -133,7 +133,7 @@ bezelc hello.bzl -o hello && ./hello
 | [Standard library](https://s8lap.github.io/bezel-lang/stdlib/) | every type and member; if a name is not there, it does not exist |
 | [Language specification](https://s8lap.github.io/bezel-lang/spec/) | the normative reference, with the full grammar and the compiler-enforced invariants |
 | [Design rationale](https://s8lap.github.io/bezel-lang/rationale/) | why each decision was made, and what was declined |
-| [Design proposals](docs/proposals/README.md) | how the language was argued into shape: about 190 proposals, accepted, declined and pending, each with the alternatives it weighed |
+| [Design proposals](docs/proposals/README.md) | how the language was argued into shape: over 210 proposals, accepted, declined and pending, each with the alternatives it weighed |
 
 A few proposals are good reading on their own:
 
@@ -149,8 +149,8 @@ Everything in the table except the proposals is published as one searchable site
 ## How far along it is
 
 - **The compiler**, `bezelc`, is an ahead-of-time front end and LLVM back end. It compiles the language's core end to end — ownership and borrow checking, classes and generics, records, enums and choices, exceptions, collections and queries, `async`/`await`, multi-module builds — and much of the standard library.
-- **The tests.** About 45,000 behavior tests compile and run real programs, with an AddressSanitizer pass before anything lands on main, and 2,500 diagnostic tests pin the compiler's error messages.
-- **The gap** is measured. A rule corpus of one hand-written case per specification rule ([`tests/conformance/rules/`](tests/conformance/rules/)) records where the compiler still differs: of the 3,085 cases with a recorded result, 2,873 match the specification. Every difference has a tracking issue.
+- **The tests.** About 46,000 behavior tests compile and run real programs, with an AddressSanitizer pass before anything lands on main, and about 2,600 diagnostic tests pin the compiler's error messages.
+- **The gap** is measured. A rule corpus of one hand-written case per specification rule ([`tests/conformance/rules/`](tests/conformance/rules/)) records where the compiler still differs: it holds 8,239 cases, and of the 4,816 with a recorded result, 4,621 match the specification. Every difference has a tracking issue.
 
 ## Reporting a bug
 

@@ -14,15 +14,16 @@ The design is mostly settled: a normative spec (with rationale, stdlib and guide
 
 ## The documents (read these before doing anything)
 
-Twelve documents in `docs/`. Their roles are distinct; consult the right one for the question at hand.
+Thirteen documents in `docs/`. Their roles are distinct; consult the right one for the question at hand.
 
-**If you are about to *write* Bezel code, read [`Bezel_For_Code_Generation.md`](docs/Bezel_For_Code_Generation.md) first.** It is a dense writing reference (syntax surface, ownership rules as obligations, a stdlib name index with exact signatures, idioms, and a *looks-right-is-rejected* section) at roughly a fifteenth the size of the spec plus stdlib. It is **not normative**: where it and the spec disagree, the spec wins and the disagreement is a defect to report.
+**If you are about to *write* Bezel code, read [`Bezel_For_Code_Generation.md`](docs/Bezel_For_Code_Generation.md) first.** It is a dense writing reference (syntax surface, ownership rules as obligations, a stdlib name index with exact signatures, idioms, and a *looks-right-is-rejected* section) at roughly a tenth the size of the spec plus stdlib. It is **not normative**: where it and the spec disagree, the spec wins and the disagreement is a defect to report.
 
 - **`Bezel_Language_Spec.md`**: the normative reference. Appendix A is the complete grammar; Appendix C lists compiler-enforced invariants.
 - **`Bezel_Standard_Library.md`**: every type, method and constant the stdlib provides. **Do not invent stdlib APIs.**
 - **`Bezel_Design_Rationale.md`**: *why* each decision was made and what alternatives were declined.
 - **`Bezel_Changelog.md`**: per-revision history, oldest first, normative for migration. Pinned: never edited retroactively, never the place to look up a current rule.
 - **`Bezel_For_Code_Generation.md`**: the writing reference above. `scripts/check_docs.sh`'s PIN check fails if it falls more than three revisions behind.
+- **`Bezel_Tour.md`**: a non-normative half-hour introduction for programmers who know another language; it carries its own validated-against pin.
 - **`Bezel_Guide_01` … `07`** (Memory and Ownership, Errors and Nullability, Modeling Data, Concurrency, Collections and Iteration, Contracts and Purity, Style): short example-first guides to idiomatic Bezel.
 
 Filenames are stable since v0.131 (earlier revisions carried the version in the filename; such citations refer to that archived revision in git history). When citing the spec, cite the section **and** the revision (e.g. "spec §28.2, v0.131").
@@ -77,7 +78,7 @@ These require explicit human direction:
 
 ## Build toolchain
 
-- Built with **clang++** against Fedora's system **LLVM**, C++20. Never introduce CMake, source or CI that assumes g++; detect the compiler with clang feature tests, not `__GNUC__` version checks.
+- Built with **clang++** against Fedora's system **LLVM** (LLVM 23 on Fedora 45; the static release still builds with Alpine's LLVM 21, `scripts/release_musl_bezelc.sh`), C++20. Never introduce CMake, source or CI that assumes g++; detect the compiler with clang feature tests, not `__GNUC__` version checks.
 - Configure auto-detects ccache, mold (else lld), `-gsplit-dwarf`, the shared `libLLVM`, and a PCH. ccache needs `sloppiness = pch_defines,time_macros` and `file_clone = true` in `~/.config/ccache/ccache.conf`, with `max_size = 180G`. Cloned entries are stored uncompressed and btrfs reports uncompressed sizes, so 180G is about 80G on disk; don't lower it.
 - **The suite is six per-area binaries** (`build/tests/bezel_tests_{codegen,ownership,sema,frontend,module,support}`); `bezel_tests` is still the target name. For a path, read `build/tests/test_binaries.txt`; never hardcode one.
 - `BEZEL_TEST_FILTER=<substr>` selects tests (the binaries **ignore `--gtest_filter`**). `BEZEL_TEST_ENUMERATE=1` lists what would run.
@@ -103,7 +104,7 @@ These require explicit human direction:
 - **Never weaken a test to make it pass.** Forbidden without exception: `EXPECT_EQ`→`EXPECT_NE`, relaxing `exitCode == 0`, flipping `leaksAtLeast`, deleting `didNotCrash` / `assertNoLeak`, adding `DISABLED_`. Such a fix is reverted and re-dispatched. Strengthening is welcome. If you believe an oracle is wrong, say so and stop.
 - **A behavior flip must update the tests that pinned the old behavior.** Before committing, `git grep` every test named in the commit and every test in the touched files. Name each flipped test and its new expectation in the commit body. **A diagnostic-text rename is a behavior flip**: grep every needle in gtest *and* lit. A lit `CHECK-NOT` on vanished text passes vacuously. `scripts/pregate_stale_needles.py` finds candidates mechanically.
 - **Pin THE bug.** The regression test uses the issue's actual repro, fails on pre-fix code and passes with the fix. **Prove fail-without mechanically**, never by assumption.
-- **A gtest row that is green on the base pins nothing: do not add it** (owner, 2026-11-12; the suite is ~45 000 tests). A control that a spec sentence decides (an admitting twin, a must-still-admit shape, a live-source variant) goes to the **conformance corpus** through the harvest lane: the producer leaves it in its probe directory under `corpus-candidates/`. At most **two** gtest boundary controls per suite, only where a corpus case cannot express the check (e.g. `assertNoLeak` over 200 iterations), each red under a plausible wrong fix that the commit body names. Lane contract §7, review contract §2.
+- **A gtest row that is green on the base pins nothing: do not add it** (owner, 2026-11-12; the suite is ~46 000 tests). A control that a spec sentence decides (an admitting twin, a must-still-admit shape, a live-source variant) goes to the **conformance corpus** through the harvest lane: the producer leaves it in its probe directory under `corpus-candidates/`. At most **two** gtest boundary controls per suite, only where a corpus case cannot express the check (e.g. `assertNoLeak` over 200 iterations), each red under a plausible wrong fix that the commit body names. Lane contract §7, review contract §2.
 - **Vacuous-oracle traps**:
   - one-shot leak repros (loop 50–500×);
   - `failedAtCompileTimeWithRealLocation` on a crash (assert the specific diagnostic);

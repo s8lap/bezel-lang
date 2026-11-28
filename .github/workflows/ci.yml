@@ -1,6 +1,6 @@
 # CI is currently disabled.
 #
-# The project's reference toolchain is clang++ + LLVM 21 (Fedora, per
+# The project's reference toolchain is clang++ + LLVM 23 (Fedora 45, per
 # CLAUDE.md). GitHub-hosted Ubuntu runners ship LLVM 18 by default; the
 # codegen has come to depend on post-LLVM-18 APIs
 # (`Intrinsic::getOrInsertDeclaration`, the `Triple`-typed
@@ -9,11 +9,11 @@
 # a toolchain the project does not support anyway.
 #
 # Local validation uses `scripts/run-tests.sh` (relink-guarded test
-# runner) against the reference Fedora LLVM 21.
+# runner) against the reference Fedora LLVM 23.
 #
-# To re-enable: install LLVM 21 on the runner (e.g. via apt.llvm.org or a
-# docker image with LLVM 21 preinstalled), then restore the previous job.
-# Tracked at https://github.com/s8lap/bezel-lang/pull/260 (the LLVM 21
+# To re-enable: install LLVM 23 on the runner (e.g. via apt.llvm.org or a
+# docker image with LLVM 23 preinstalled), then restore the previous job.
+# Tracked at https://github.com/s8lap/bezel-lang/pull/260 (an LLVM 21
 # install approach was prototyped there and closed in favor of disabling
 # CI for now).
 

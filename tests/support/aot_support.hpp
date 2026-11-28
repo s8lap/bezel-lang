@@ -45,8 +45,9 @@
 // A use-after-free / out-of-bounds READ performed by an emitted Bezel load is
 // then caught at the access — not merely the allocator-level leaks/double-frees
 // an instrumented runtime alone nets. This is the in-process equivalent of
-// `bezelc --sanitize=address`, closing the WS2 gap. (LLVM 21 pass + system
-// clang 21 ASan runtime => matching ABI; verified E6.)
+// `bezelc --sanitize=address`, closing the WS2 gap. (the LLVM pass and the
+// system clang's ASan runtime must come from the same LLVM release for a
+// matching ABI: LLVM 21 when verified in E6, LLVM 23 on the Fedora 45 dev build.)
 //
 // QUALITY ROUND 2 (qr2) — three hardening items layered on round 1:
 //   * RUN-TIMEOUT TUNING (S4). The compiled-PROGRAM deadline defaults to 30s,
