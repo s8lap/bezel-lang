@@ -2,8 +2,8 @@
 //! doc: spec
 //! section: 30.3
 //! title: Result on an OwningTask inside an async method is rejected
-//! rule: The compiler rejects `Wait()` and `Result` lexically inside `async` methods and `async`
-//!   lambdas
+//! rule: The compiler rejects `Wait()` and `Result` where the innermost enclosing method or lambda body
+//!   is `async` (there, `await` is strictly superior and always available).
 //! cites: 30.5
 //! expect: reject
 //! diagnostic: inside async methods

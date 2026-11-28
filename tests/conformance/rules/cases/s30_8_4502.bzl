@@ -9,6 +9,7 @@
 //! expect: run
 //! output: x=42
 //! issue: 7956
+//! notes: Also stated by stdlib §6.7 *`Delay` observes its token at the cancellation* (v0.361, #8486).
 module Conf;
 import System.Threading;
 

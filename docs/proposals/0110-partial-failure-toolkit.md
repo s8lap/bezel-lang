@@ -115,6 +115,8 @@ end RuntimeFaults;
 
 ### 2.6 The `DomainFaultedException` discriminant rider — judged: it rides stage 1
 
+> **Note (2026-11-26).** [Proposal 0217](0217-domain-join-cause-snapshot.md) was accepted with its Q2: this rider drops `FaultTypeName` (the original's type name crosses the join as a cause snapshot in `CauseChain` instead) and keeps `ExitKind` alone.
+
 0106 §7.5.6 lists it among riders "folded into whichever proposal opens first": "▲ a small sendable exit-kind enum as the dispatch surface, the fault's type name carried as diagnostic text only — restart policy is a function of the exit reason, a supervisor dispatching on any string must string-match, and string-matching is exactly the stringly-typed dispatch Bezel rejects elsewhere."
 
 **Judgment: stage 1.** (i) Stage 1 mints `TaskExitKind` anyway — a swallowed `OperationCanceledException` and a swallowed crash are different events to every observer. (ii) Stage 2's completions carry the same discriminant, so deferring would force a second vocabulary. (iii) It is the smallest increment on a landed type and is useful *today*: at v0.262 a program awaiting a join cannot distinguish "the child crashed" from "the child observed the cancellation I asked for", because §30.14 routes **every** exception out of the entry — `OperationCanceledException` included — into `DomainFaultedException`, whose only discriminating surface is text.

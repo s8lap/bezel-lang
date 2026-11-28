@@ -6,7 +6,7 @@ B4	OrderBy ignores non-int keys	input order	string, double, decimal keys sort	FI
 B5	Array<DictionaryEntry> sort no-op; Add segfault	no-op / segfault	both legs correct	FIXED	#8385, #6557	closed / closed	yes	
 B6	string from an element into a record constructor is freed with its source	reused memory	correct, also a 300-row / 3000-allocation stress (bad 0; r40 bad 300). No ASan runtime on this box	FIXED	#8386	OPEN	NO: open, repro passes	do not close yet: close only after an ASan loop (none on this box); remaining residuals live in #8484
 B7	untyped string comparer does not sort	input order	sorts	FIXED	#8387	closed (completed)	yes	
-B8	narrowed local in an if-expression branch is nullable	error at the later use	same; also now seen in an expression-case arm (n19)	STILL	#6698	OPEN (spec question)	yes (contested)	
+B8	narrowed local in an if-expression branch is nullable	error at the later use	same; also now seen in an expression-case arm (n19)	STILL	#6698	OPEN (spec question)	yes (ruled: compiler bug)	
 B9	int.ParseOrNull not found	rejected	works for int, Int32, long	FIXED	#7318	closed (completed)	yes	
 B10	enum NameOf / FromNameOrNull not found	rejected	works	FIXED	#3862	closed (completed)	yes	
 B11	checked mode: false DisposedAccessException on sets	fault	all seven t15 drafts correct, 20/20 runs each of v1, v3, v6, final	FIXED	#6314	OPEN (umbrella, 14 corpus cases)	yes: keep open	the t15 leg passes; the umbrella's other 13 legs were not checked
@@ -15,7 +15,7 @@ B13	decimal Sum wrong	34	7 (spec: scale is not part of a decimal value, stdlib ย
 B14	File.Delete draws the unused-result warning	warning	silent	FIXED	#8389	closed (completed)	yes	
 B15	Stream span overloads not implemented	rejected	t22 v1 (`FileStream` receiver: `Write(ReadOnlySpan)`, `Read(Span)`) compiles and is correct, and FileStream's Count-window guards raise IndexOutOfRangeException; but the issue's own repro (a `Stream`-typed receiver, `s.Read(b.AsSpan())` and the windowed `s.Read(b, 0, 4)`) still fails ("produced no value")	FIXED (FileStream only)	#1394	OPEN	yes: keep open	not a hand-close candidate; comment that b870b63de covers FileStream only
 B16	collection literal at an IEnumerable parameter accepted, writes nothing	silent no-op	rejected at compile time with a ยง15.4 message naming the concrete targets	NOW-REJECTED-CORRECTLY	#8390	closed (completed)	yes	
-B17	Select with an interpolated projection rejected as a launder	rejected	same	STILL	#7170, #7215	OPEN (spec questions)	yes (contested)	
+B17	Select with an interpolated projection rejected as a launder	rejected	same	STILL	#7170, #7215	OPEN (spec questions)	yes (ruled: compiler bug)	
 B18	internal warning on ToString() over T	internal warning	silent, correct (t29 v2/final)	FIXED	none filed	-	-	
 B19	class owning Array<string> not serialization-eligible	rejected	accepted; n06 round-trips a class with an owned Array of records	FIXED	#8391	closed (completed)	yes	
 B20	must-use warning on an owned local returned on every path	warning	silent	FIXED	#8392	closed (completed)	yes	

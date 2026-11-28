@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.360 — November 2026**
+**Companion to the Bezel Language Specification, v0.361 — November 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -16400,5 +16400,282 @@ These adaptations have not had an adversarial critique of their own; the composi
 Guide pins stay at v0.359: a caveat line is not an idiom change (spec-change process §5 item 5).
 
 **Migration.** Doc-only. *Spec-ahead-of-impl:* no new delta. The four trackers above were already open, and this revision only marks them in the documents.
+
+---
+
+### v0.361 changelog (v0.360 → v0.361)
+
+**Quick rulings: twenty-five open questions decided from the text (2026-11-26).** A triage lane sorted the open `spec-question` backlog and found 26 RULE-NOW items; 25 are ruled here, and #9275 is not (*Not ruled*, below). Five ruling lanes then wrote the RULE-NOW items, each lane owning disjoint sections, and two adversarial critics attacked the union before composition (spec-change process §4). Every item below is **clarification** or **ruling** class: each makes the existing design say one thing, and none reverses a recorded decision. Where a lane found that an answer needed new semantics, it wrote nothing, and the item is under *Not ruled*. Three queued owner rulings (#8617, #9377, #9379) are written in the same pass, the owner's decisions of 2026-11-26 on #9287, #9324 and #9377 are applied, and #8062's transition point is ruled by the coordinator under the owner's delegation. Three DECIDED items gained a restating sentence (#8748, #8116, #8577).
+
+**Ownership: holders, bindings and `ref` locations (spec §15.3, §20, §28.2, §28.3, §28.9, §29.2).**
+- **#8708, a local bound from a member read is a holder** (ruling; §28.2 holder list, Appendix C.3, the reference's §4.4).
+  - *Decided.* A local bound from a member read or call through a variable (`var v := h.Inner;`, `var v := h.Get();`, a borrowing-match binding over `h.F`) is a §28.2 holder of the variable's value. A use of it after a dominating `h.Dispose()` is the compile error, whether or not the field is `owned`.
+  - *Declined.* The issue's owned-only narrowing, which would leave a non-`owned` field to the runtime backstop. It needs per-hop field-ownership reading, which proposal 0205 §9 item 3 declined; 0205's own table already expected `s9_4_0008` and `s28_10_0012` to be `reject`.
+  - *Why.* §28.3's receiver-sourced rows source both field kinds at the variable. The non-`owned` rejection is conservative, and the text now states that cost and its remedy (borrow from the referent's own binding). Closures over the variable (#8709) are not decided here.
+- **#8748, span components through a killed borrow** (DECIDED; one parenthetical in §28.2). `Start`, `Length`, `IsEmpty` and `Slice` are uses like every other member access. The checked-mode bullet's "touch no storage" is about run time. The compiler's "reads freed memory" wording is wrong for these members, and changing it is a needle flip for the fix lane.
+- **#7612, `var x := h.F` over a move-only field** (ruling; §15.3 scope note, *Local lifetime*, §20 *Ownership*).
+  - *Decided.* A plain binding initialized from a storage read is a **borrow** of the move-only value (K1.5, "reads of storage lend"), as the `using var` pin and a `case` binding over the same read are. It carries no obligation, its scope end disposes nothing, its validity is bounded by the storage's holder, and a consuming use of it is rejected.
+  - *Declined.* Reading B, an error, which would leave the plain spelling with no meaning. §15.3's "has no borrow reading" is about a named-binding read, where a move is possible; a move-only field is never moved from.
+  - *Meaning-gate corrections.* *Local lifetime* now says a borrow-only binding owns no slots. §20's "a move-only value is never bound by a borrow arm-meet" is scoped to arms naming a binding, and an arm that is a storage read lends. The all-storage arm-meet (`(if c then h.F else h2.F)`) therefore follows from K1.5 and the borrowed-meet rule; no corpus case is written for it in this revision.
+- **#8789, the state match reaches a lambda's `owned` parameter** (clarification; §28.3.3). The match covers every classified binding: `var` locals and the `owned` or plain parameters of methods, constructors and lambdas. `lambda(owned p) => do p := p; … end` is rejected as the method form is. `ref`/`out` parameters stay under their own location rules (critic A's wording fix).
+- **#9093, a function-typed `ref` parameter's entry value** (ruling; §28.3 *A `ref` or plain `out` location outlives the call*, *Function-typed holders*; the reference's §4.4).
+  - *Decided: reading B, the callee side.* The entry value is the caller's, admitted at the call whatever its set and never checked against the sink rule. A read of it is a parameter read under provenance clause 6 and carries an **unannounced** source. It may be invoked, bound to a local or passed at a plain function-typed parameter. It may not be stored into a holder (the location itself or a sibling), passed at a set-erasing position, or returned from the enclosing method. That makes "a `ref` location keeps the set it carried before the call" exact.
+  - *Declined: reading C*, the triage draft and the issue's recommendation, which rejects a non-empty argument at the call. It contradicts §28.14's normative "a plain or `ref` function-typed slot, which the caller side admits whatever its set", and proposal 0140 §1's recorded ground for the sentence ("it cannot copy the location's value anywhere (a read of a `ref` function-typed parameter is unannounced …)").
+  - *Cost (stated).* A non-generic function-value `Swap` is rejected in its body. Write `Swap<T>(ref a: T, ref b: T)`. The *Function-typed holders* read sentence now excepts the entry value, so the two paragraphs no longer appear to conflict.
+- **#9088, a closure over a frame local yielded from an iterator** (clarification; §29.2 closing paragraph).
+  - *Decided.* The repro is rejected at `yield return f;`. The closure bullet's sink rule names `yield return` explicitly, and the iterator's `yield return` slot at a function type is a function-typed holder. The later `move a` raises no question.
+  - *Declined.* Both of the issue's readings, and triage's B (adopt-then-yield invalidation extended to a function value), assumed an admitted yield.
+- **#8716, the §28.9 exemption key for a `move x` initializer** (ruling; §28.9).
+  - *Decided.* A marked transfer is no producer of its own and carries **x's key**: x's produced type where x's value has one statically-known producer, x's declared type otherwise, and an `owned` parameter's declared type. The destination's declared type never decides, so `var d := new Derived(); var b: Base := move d;` is not exempt.
+  - *Declined.* Keying on the destination, which reopens the hole the produced-type arm closes.
+
+**§28.14 bounding objects.**
+- **#8397, `_child := new Child(scoped this)`** (ruling; the admission list's `this` arm, *No quiescence obligation arises*).
+  - *Decided.* Form 1 composes with form 3's placement. A constructor call assigned to an `owned` field of `this` reaches the `this` arm, as form 1 already reaches the `using var` arm, so the repro is admitted and prints `Root`. The bullet's "fully static, with no recorded trust clause" now holds only where the storing object is the bound itself. Where the storing object sits in an `owned` field, moving it out is the existing *registration-lifetime residual*. That is a recorded trust clause, which the trust-admission report names at the admitting site, with K4.1 as the backstop.
+  - *Declined.* Reading 1, which rejects the shape and leaves the spec's own `new Reader(scoped _s)` example unreachable. Freezing the move-out was also declined: rationale §5.26 A11 records that such fields are not frozen.
+  - The destructor-window shape is the existing slot posture. Its order test stays §28.15's, which is staged.
+- **#9311, `+=` against `.Add` in a callee's local lambda** (clarification; bound 6). **Departs from the triage draft**, which admitted both.
+  - *Decided: reading (a), both are rejected.* Bound 6 already makes every callee-side use of a `scoped` parameter inside a nested closure an escaping use, invocation through a locally-invoked closure included. §17.2 makes `+=` the same `Add` call. The text now says this holds whether or not the closure escapes. It also says that bound 6 narrows the closure-capture rule's general admissions ("it may be immediately invoked …") for a closure over a `scoped` parameter of the enclosing callee. That cross-reference is the meaning gate's addition; the banked corpus row read the general admission without it.
+  - *Declined.* (b), because admitting both would lift bound 6, which `DECLINED.md` records as `deferred`; lifting it is a proposal (spec-change process §2). (c) contradicts §17.2's fixed desugaring.
+  - The compiler's admission of the `.Add` spelling, and its v0.359 carrier model (`scopedCarrierEscape`), are spec-ahead deltas.
+
+**Names, extensions, method references, bodies and contracts.**
+- **#8115, a binding named `String`** (ruling; §3.4), **with #8116** (DECIDED restatement).
+  - *Decided.* A local of any declaration form, a parameter (method, constructor or lambda), a pattern or `catch` binding, or a type parameter named one of §3.4's reserved PascalCase names is a compile error at the declaration. These are exactly the declarations §2.7 rule 1 finds ahead of the always-available names. A **member** may still take the name, since §2.7 ranks members below the type at a chain head. Wherever a type can stand, the bare name and its qualified spelling (`System.String`, #8116) name the type.
+  - *Declined.* Reading B (ban type declarations only), because §2.3 row 1 says "**No**". A member ban was also declined: it protects nothing and would flip working programs.
+  - *Consequence in §26.4* (clarification at composition). A generic extension head's bare identifier declares a type parameter, so `extension IEnumerable<String>` is now §3.4's declaration error, where §26.4 said only that the compiler warns on shadowing. §26.4's sentence now says so and names the remedy, the keyword (`extension IEnumerable<string>`). Before this revision the head was already against §2.3 row 1.
+- **#8113, `extension string` storing `this`** (ruling; §26.7).
+  - *Decided: reading B, keyed on the extension head's declared type.* Over a runtime-managed extended type (`string`, `Type`), `this` is read as a plain parameter of that type, so storing it is the store of a runtime-managed value. An `Object`- or interface-headed extension stays under the ban.
+  - *Declined.* Reading A. It would reject `"abc".Wrap()` while the static twin is legal, which protects nothing (§9.7: "runtime-managed values have unbounded lifetime by construction"). The issue's use-after-free is a codegen obligation, and #9219 is untouched.
+- **#8065, `T.M` over an instance method** (clarification; §27.6).
+  - *Decided: interpretation 1.* §26.5 rule 2 (v0.355, #7699) governs: there is no unbound instance-method reference. §27.6's static-wins paragraph is replaced by *No unbound instance-method reference*, and "static wins" becomes a consequence. The *No method reference to `Dispose`* paragraph now routes `D.Dispose` and `IDisposable.Dispose` through that paragraph (critic A).
+  - *Declined.* Interpretation 2, a call-through rule, which would reverse #7699.
+- **#9246, arrow bodies on procedures and no-value `Task` methods** (clarification; §22.2).
+  - *Decided.* On a method with no declared return type, `=> e;` is the block `e;` under §21.9's regime, as §27.3 already says for a procedure lambda. A `()` result is quiet. Another result draws the discard warning. A non-trivial-dispose class, interface or `Task`-family result is the hard error. Its remedies are §21.9's: the two discard forms, which take a block body, are not available for a `Task`-family result (§17.13), so that result takes `Task.FireAndForget(…)` (composition clarification; the lane's text listed only the discard forms).
+  - **Departs from the triage draft on the async half.** An `async` method declared `Task` completes with no value (§30.1). §30.6 already says, by reference to async methods, that a valued body does not conform to a plain `Task`. So a valued expression body there is a compile error at the body, not a warning.
+  - *Declined.* Silent discard (today's behaviour), and a type error for the procedure half, which would make the arrow stricter than the block it abbreviates.
+- **#7431, tier per clause against the floor's substituted instance** (editorial; §22.16 *The current prover floor*). The tier stays per clause. A `requires` clause's floor inhabitant is read at each discharge instance. A `static requires` is proven because every call it admits folds `true`. A plain `requires` stays checked, and an instance that folds `true` discharges only its call. No verdict changes.
+
+**Exceptions, cancellation and async.**
+- **#8640, the first `await` of a faulted task** (ruling; §31.2).
+  - *Decided: reading B.* A task-owned fault's escape from its async body and the first awaiter's re-raise are one raise. That re-raise clears nothing, and the issue's program prints `1`.
+  - **The unit is the raise, not the instance.** This departs from the triage draft, which cleared at every later re-raise of the instance. Under the draft, a `return await t;` wrapper's own re-raise would clear the chain before the wrapper's awaiter saw it.
+  - *Meaning-gate correction (critic B).* A raise ends when a matching arm is left by any edge other than `throw;`, or at a supersession. The capture of a fault into a task does not end it. Only a re-raise of an instance that is propagating nowhere and bound by no arm begins a new raise and clears. The lane's first wording ("a matching arm completes") never ended a raise whose arm left by `throw new …`, and it let a concurrent awaiter clear a chain still being propagated. The heading word *handled* collided with §30.9's "handling completes at the fault", and is now *caught or superseded*.
+  - *Declined.* Reading A, which makes every async-body supersession invisible, §33.3's report included.
+- **#8425, an interface arm after a bare `Exception` arm** (clarification; §31.2.3). The earlier unguarded bare arm covers every later arm, interface arms included. Interpretation 3 (general interface coverage) is not adopted, because it needs conformance facts the spec states only for `IFailure`.
+- **#8403, the `<exception>` tag** (clarification; §31.3). The tag is the convention for user code. The stdlib states its fault contracts in prose under its §1 failure-signal rule, and the compiler checks neither form. Adopting the tag across the stdlib was declined (no reader gain). Retiring it would be a design change.
+- **#8076, the blocking-form ban and nested non-async lambdas** (clarification; §30.3, §30.12 twice, stdlib §6.2 and §6.11, Guide 04, the reference). The ban applies where the **innermost enclosing method or lambda body** is `async`. A non-`async` lambda nested in one falls to the runtime guard: `await` is not available there, which is the ban's own ground. Textual containment was declined. Guide 04 and the reference said "lexically inside `async` bodies", and stdlib §6.2 and §6.11 said the same; that is now wrong for this case, and all four are corrected (the stdlib two at composition).
+- **#8710, a `Receive` pending at a close** (clarification; §30.15, stdlib §6.9 *Closing*). A `Receive` pending on the empty channel faults with `ChannelClosedException` when the channel closes, by `Close()`, by the last sender's disposal or by its own disposal. The issue's (c) asked whether disposing the channel under a live `Receive` task is itself §30.1's source-outlives-settlement violation. It is not: the text makes no stdlib `Receive` task a borrower of its channel, and the abandonment paragraph treats the waiter as runtime-managed. Leaving the waiter pending forever was declined.
+- **#8486, `Task.Delay(ms, token)` and cancellation** (ruling; stdlib §6.7). A `Delay` given a token completes with `OperationCanceledException` at the cancellation, not at the deadline (§30.8). A source's disposal counts, because disposal is a full `Cancel()` (stdlib §6.1). Observing the token only at the deadline was declined.
+- **#8617 (owner-ruled A, 2026-11-11; §14.5).** A collection-literal argument, like `null`, contributes no binding. An argument that bound nothing is still checked against the substituted signature at §22.6, a collection literal being typed against its substituted parameter type. Where a type parameter is still free, the literal's "cannot infer target type" error stands beside phase 3's unbound-parameter error.
+- **#9377 (owner-ruled B, 2026-11-25; owner decision 2026-11-26; §30.13, §30.3).** The startup thread holds the main domain's **claim** (the exclusive right to run the domain's code, which serial execution gives one running continuation at a time) while it runs program code. It releases the claim only while blocked at a process-edge wait: `Wait()`/`Result`, a blocking acquisition, or a runtime scope-end wait. It releases it for good when `Main` returns.
+  - The list is exhaustive (owner decision). Any other blocking call on the startup thread, such as a synchronous console or file read or an FFI call, keeps the claim, so main-domain work does not advance during it. The remedy is the call's async form where the library has one.
+  - The ruling's "blocked or gone" is written "blocked", to compose with #9379's N3. The term *claim* is now defined (critic B).
+  - *Composition correction.* §30.3's blocked-startup-thread sentence and §30.13's suspension-point sentence still said that any blocking wait releases the claim. Both now name the process-edge waits, §30.13's list, so they agree with the exhaustive list.
+- **#9379 (owner-ruled (a)+(c), (b) declined, N3, 2026-11-26; §30.13, §30.3, §33.3).** Polling `IsCompleted` from the startup thread on a task whose completion waits on a main-domain continuation never completes; wait with `Wait()`/`Result` instead. The §30.3 runtime message names the remedy. Its text has no backticks, matching the runtime's plain string, which the owner accepted. At `Main`'s return the main domain is abandoned, as §33.3 states, and is not drained.
+
+**Standard library: data, text and IO.**
+- **#9287, `SingleOrNull` on more than one element** (clarification, **confirmed by the owner**; stdlib §5). Both forms return `null` only when the element is missing, and raise `InvalidOperationException` when more than one is present (or matches), as `Single` does.
+  - The predicate form's comment and parenthetical have said so since v0.145 (#789). The `Where` equivalence then forces the no-argument form. A second element is a band-1 caller bug, not a band-2 absence, so it has no non-throwing form (`Take(2).Count()` is the test).
+  - *Declined.* "Null unless exactly one", which no revision ever stated and which falsifies two sentences of §5.
+- **#8062, `ToUtc`/`ToLocal`** (ruling; stdlib §2.5).
+  - *Decided: reading 2.* Both members move `Ticks` by the machine zone's offset, and `Unspecified` is read as UTC. `ToUtc` of a `Local` value subtracts the offset in force at that local time, and of a `Utc`/`Unspecified` value only relabels. `ToLocal` of a `Utc`/`Unspecified` value adds the offset at that instant, and leaves a `Local` value unchanged. The shift is `Add` of the offset and keeps `Add`'s `OverflowException` outside `MinValue..MaxValue`.
+  - *A ruling on a point the text did not settle* (ruled by the coordinator under the owner's delegation, 2026-11-26). A local time that a transition makes ambiguous or skips takes the offset in force **before** the transition, so neither member raises for a transition. This is java.time's default (an overlap takes the earlier offset; a gap is shifted forward by its length). .NET differs at an overlap, where it reads standard time, the post-transition offset.
+  - *Declined.* Reading 1 (relabel only), which makes "`ToUnixTimeSeconds` converts a `Kind = Local` value via `ToUtc()`" vacuous. Reading 3, which contradicts "treats `Unspecified` as already UTC". Clamping at the range edges, a silent substitution the tick domain uses nowhere.
+  - The `ToUnixTimeSeconds` parenthetical now reads "`ToUnixTimeSeconds` never reads an `Unspecified` value against the machine zone". Read globally, the lane's wording was false for `ToLocal` (critic B).
+- **#8090 + #8091, the count `BeginObject` receives** (ruling; spec §9.8 *Synthesized `Serialize`* step 1, choice *Wire shape*).
+  - *Decided.* `n` is the number of fields the synthesized call writes into the object, one per `WriteFieldName`. A null `serialized optional` component is not counted. A class's `$type` and a choice's `$case` are counted. The identity tokens of the `$id`/`$ref` mechanism are the format's, and the count does not include them.
+  - *Declined.* A per-type constant and a payload-only count, because the binary reader answers `HasMoreElements()` from the count. "Unspecified", because the wire shapes are normative so that implementations agree.
+  - *Meaning-gate correction.* The lane counted "an identity tag the format writes as a field". That made `n` depend on the format behind the format-agnostic `ISerializer`, and decided an open interface question, so the clause is dropped (critic B).
+- **#9305, `ReadLine`'s terminator** (ruling; stdlib §7.4 *Lines*). **Departs from the triage draft**, which chose LF/CR/CRLF.
+  - *Decided: reading (c).* A line ends at LF, an immediately preceding CR being part of the terminator, so a lone CR is an ordinary character. This is §7.3's `ReadAllLines` rule, so a file read whole and the same bytes read line by line agree. A final unterminated line is returned. `Read` and `ReadToEnd` normalize nothing.
+  - *Declined.* (b), whose premise ("the only terminator set the spec states is the source-text one") is false. §1.1's set is the lexer's rule. (a), LF only.
+  - If classic-Mac lone-CR input matters, §7.3 and §7.4 move together.
+- **#9324, ill-formed UTF-8 on standard input** (ruling, **the owner's decision of 2026-11-26**; stdlib §2.1 *Standard input*). Three points are decided:
+  1. Standard input is decoded as UTF-8, by reference to §7.3's file contract. A leading BOM decodes to U+FEFF.
+  2. A read that meets an ill-formed sequence raises `FormatException`. It consumes the sequence's **maximal subpart** (Unicode's definition), and the next read resumes at the following byte. A byte that cannot continue the sequence, CR and LF included, is never consumed by the failure, so a terminator after a bad lead byte still ends a line. A truncated tail raises, and the next read is at end of input.
+  3. The failing read discards what it decoded before the sequence and returns nothing. A partial result would be a silent substitution, which stdlib §1's failure-signal rule rules out.
+  - *Declined.* Byte pass-through, the substitution §3.2 forbids. U+FFFD, declined in v0.136. Leaving it unspecified, when `File`'s text reads already decide it. A line-granular resync, where a bad line raises and the next read returns the next line.
+  - Critic B had recommended landing only the raise and leaving the three points to the owner. The owner decided them.
+- **#8577, a negative spelling for an unsigned width** (DECIDED; one sentence in stdlib §9.1). The sign is in the grammar at every width, so `uint.Parse("-1")` and `ulong.Parse("-1", 10)` raise `OverflowException`, not `FormatException`.
+
+**DECIDED, no text** (the documents already answer; comments only): #8406 (stance alone justifies the tiers; no cost model), #8405 (stdlib §1's shape (b) `owned T?`; Guide 02 §7 gains a row in a later guide-only pass), #8404 (`TryAcquire(timeout)` is the single mechanism for its own condition), #8381 (§25.2's carve is shape-keyed), #8360 (`K.Foo()` over an instance method names no member; compiler bug), #8071 (over a choice scrutinee a bare case name is the case pattern), #8006 (ruled v0.355; compiler citation sweep), #7952 (an imported module's public extension members are visible to the importer).
+
+**Not ruled** (owner decisions, each needing a proposal):
+- [#9275](https://github.com/s8lap/bezel-lang/issues/9275): which object bounds an owned-return instance method's callee-side `scoped` obligations. Every closure of the hole adds a rule. The lane also found an interface variant, a user `IEvent<T>.Subscribe` storing into `this`. Its recommendation is a callee-side rule: a store is admitted only as a forward whose result is the returned value.
+- [#9219](https://github.com/s8lap/bezel-lang/issues/9219): K4.1's backstop is not a safety net for a runtime-managed box.
+- [#8401](https://github.com/s8lap/bezel-lang/issues/8401): `DomainFaultedException` carrying the original type name, which proposal 0211 §6.3 deliberately left out.
+- [#7440](https://github.com/s8lap/bezel-lang/issues/7440) and [#7429](https://github.com/s8lap/bezel-lang/issues/7429): a spelling for dynamic fan-out of a call-bounded task-minting callback, and owning `WhenAll`/`WhenAny` over `OwningArray<Task>`.
+- [#7426](https://github.com/s8lap/bezel-lang/issues/7426): the fresh-store error for many-element forms, which reverses proposal 0207's recorded scope.
+
+**Per document.**
+- **Spec**:
+  - §3.4 (#8115, #8116);
+  - §9.8 ×2 (#8090/#8091);
+  - §14.5 ×2 (#8617);
+  - §15.3 ×2 (#7612);
+  - §20 (#7612);
+  - §22.2 (#9246);
+  - §22.16 (#7431);
+  - §26.4 (#8115);
+  - §26.7 (#8113);
+  - §27.6 ×2 (#8065);
+  - §28.2 (#8708, #8748);
+  - §28.3.3 (#8789);
+  - §28.3 ×2 (#9093);
+  - §28.9 (#8716);
+  - §28.14 ×3 (#8397, #9311);
+  - §29.2 (#9088);
+  - §30.3 ×2 (#8076, #9377, #9379);
+  - §30.12 ×2 (#8076);
+  - §30.13 ×2 (#9377, #9379);
+  - §30.15 (#8710);
+  - §31.2 (#8640);
+  - §31.2.3 (#8425);
+  - §31.3 (#8403);
+  - §33.3 (#9379);
+  - Appendix C.3 (#8708).
+- **Standard library**:
+  - §2.1 (#9324);
+  - §2.5 ×2 (#8062);
+  - §5 ×2 (#9287);
+  - §6.2, §6.11 (#8076);
+  - §6.7 (#8486);
+  - §6.9 (#8710);
+  - §7.4 (#9305);
+  - §9.1 (#8577).
+- **Code-generation reference** (pins to v0.361): §4.4's holder list (#8708) and `ref`/`out` bullet (#9093's `Swap<T>` note), and the §30.3 trap line (#8076).
+- **Guide 04**: the blocking-ban sentence (#8076). Guide pins stay at v0.359: a one-line correction is not an idiom change (spec-change process §5 item 5).
+- **Rationale**: header only.
+
+**Migration.**
+
+  *Newly rejected:*
+  - a use, after a dominating disposal of the variable, of a local bound from a member read or call through it (§28.2);
+  - a binding of any form, or a type parameter, named a reserved PascalCase type name (§3.4), a generic extension head's bare identifier included (§26.4);
+  - a store, set-erasing pass or return of a function-typed `ref` parameter's entry value in the callee (§28.3);
+  - a closure over a frame local or a borrowed source at `yield return` (§29.2; already the sink rule's verdict);
+  - a nested-closure use of a `scoped` parameter, `+=` and `.Add` alike (§28.14; already bound 6's verdict);
+  - a consuming use of a plain storage-read binding of a move-only value (§15.3);
+  - a valued arrow body on an `async` method declared `Task`, and a non-trivial-dispose class, interface or `Task`-family arrow body on a procedure (§22.2).
+
+  *Newly warned:* a valued non-`()` arrow body on a procedure (§22.2); an interface arm after a bare `Exception` arm (§31.2.3); a `move` initializer whose source's produced type has a destructor, at a trivial-dispose destination (§28.9).
+
+  *Newly defined:* the members and counts in the stdlib bullets above (`SingleOrNull`, `ToUtc`/`ToLocal`, `ReadLine`, standard-input decoding, `Delay`'s token, a pending `Receive` at a close, `BeginObject`'s count, unsigned negative parses); the first awaiter's `SupersededChain` (§31.2); the startup thread's claim (§30.13); `_child := new Child(scoped this)` admitted (§28.14); `extension string` storing `this`, admitted as the store of a runtime-managed value (§26.7, #8113).
+
+  *Doc-only:* #8748, #8116, #8403, #7431, #8617 (already implemented), and the restatements in Appendix C.3, Guide 04 and the reference.
+
+  *Spec-ahead-of-impl* (trackers to file at landing, `spec-tracking`):
+  - #8708: `bindHeldBorrows` does not reach member-read, borrow-returning-call or borrowing-match bindings.
+  - #8748: the use-after-disposal diagnostic's "reads freed memory" wording.
+  - #7612: a storage-read binding of a move-only value is not classified as a borrow, in ownership or in codegen's move-only registrations.
+  - #8789: a lambda's `owned` parameters are not seeded into the state map, and the displaced value of such a parameter is not disposed (`s28_3_3_3602`).
+  - #9093: the callee-side unannounced read; the #9075 caller-side union should be removed.
+  - #9088: no closure-escape check at the `yield return` operand.
+  - #8397: no registration-lifetime report line is emitted.
+  - #9311: the nested-closure carrier admission (`scopedCarrierEscape`) and invocation through a locally-invoked lambda; the own-body `+=` forward is rejected (`s28_14_3607`), so the in-lambda `+=` rejection names the wrong rule.
+  - #8115: no declaration-site ban.
+  - #8116 and #8360: the issues themselves track the compiler bugs.
+  - #8113: the stored `string` receiver is not retained (a use-after-free with a +1 receiver).
+  - #9246: procedure arrow bodies are not routed through §21.9, and a valued `async … : Task` arrow body is admitted.
+  - #8640: a `WhenAll` aggregate re-raised after a handled input await does not clear.
+  - #8425: no bare-`Exception` coverage arm.
+  - #9287: the array family and the #9234 dictionary no-argument tier return `null` on more than one element.
+  - #8062: the runtime has no zone offset.
+  - #9305: `ReadLine` keeps a CR.
+  - #9324: standard input passes ill-formed bytes through.
+  - #8577: `ulong.Parse("-1")` raises `FormatException`.
+  - #8090: the record and choice paths may count a null optional component. HYPOTHESIS: to be probed against binary `HasMoreElements()`.
+  - #9379: the issue tracks the runtime message and the exit drain. Separately, and from before this revision, the runtime aborts at a blocking wait in a continuation instead of raising `InvalidOperationException`.
+  - No delta for #8710, #8486, #8617, #9377, #8076 or #8716, which the compiler already implements.
+
+  *Tests that flip* (for the fix lanes; this revision edits no gtest):
+  - `pin_use_after_dominating_dispose_7893_test.cpp` `pin_over_a_member_read_left_to_the_runtime_backstop_spec_28_10` (#8708);
+  - `set_erasing_ref_arg_definition_9075_test.cpp`: its prelude `Swap` is rejected. Three ADMIT rows flip, and six REJECT rows move site and needle (#9093);
+  - `ref_arg_caller_owned_closure_local_9222_test.cpp` `ref_arg_retaining_callee_keeps_the_value_alive_spec_28_9` (#9093);
+  - four `scoped_formal_lambda_capture_9310_test.cpp` rows: CONTROL 1, CONTROL 2, and rows 12 and 13 (#9311);
+  - four `string_alias_static_head_7494_test.cpp` `…_under_a_local_named_string` needles (#8115);
+  - three arrow rows of `owned_chain_call_handed_off_9138_test.cpp`; its two lambda rows were already off-spec (#9246);
+  - #9287:
+    - `stdlib_wave2_test.cpp` `singleornull_two_elements_returns_null` and `singleornull_pred_two_matches_returns_null`;
+    - `linq_gaps_test.cpp` `single_or_null_multiple_spec_5`;
+    - `linq_throw_469_test.cpp` `single_or_null_multi_returns_null_spec_5`;
+    - `firstor_null_lastor_null_singleor_null_string_receiver_3795_test.cpp` `non_empty_first_last_single_or_null`; its two `force_unwrap` rows become vacuous and should be strengthened;
+    - `dict_predicate_terminals_9261_test.cpp` `the_no_argument_ornull_tier_keeps_its_answer_spec_5`;
+  - zone-dependent, needing a `TZ=UTC` pin (#8062): `datetime_kind_7716.to_utc_to_local` and `linq_minmax_value_type_result_7874` `a_datetime_selector_orders_by_ticks_and_not_by_the_raw_word`;
+  - `int_parse_radix_2024.ulong_negative_throws_format` and `parse_range_64bit_8540.ulong_parse_negative_is_a_format_failure` (#8577);
+  - at risk when the exit drain is removed (#9379 N3): `startup_thread_main_domain_claim_9377_test.cpp` `control_startup_wait_and_result_release_the_claim_spec_30_3`.
+
+  *Rule corpus* (8,167 → 8,239 cases):
+  - **Flipped to reject (4).**
+    - `s28_3_8_8902` (#9093). It was unclassified.
+    - `s9_4_0008` and `s28_10_0012` (#8708).
+    - `s28_14_9986` (#9311). Its `run` verdict quoted §28.3's general admission without bound 6.
+    - The three classified rows are re-banked `fail` in `baseline.tsv`: the compiler admits each, and its banked observation already shows it. Each rule header is re-quoted.
+  - **Rule quotes refreshed, verdicts kept (17):**
+    - `s28_14_7521` (now the `this` arm's source test) and `s28_3_0091` (#8397);
+    - `s22_16_0020` (#7431); `s26_5_0065` (notes; #8065); `s9_8_0009` and `s9_8_0013` (notes; #8090);
+    - `s30_12_0001`, `0002`, `0004`, `0005` and `0006`, and `s30_3_0002`, `0003`, `0015` and `0906` (#8076's wording). Each blocking form stands directly in an async body.
+    - `s30_8_4501`–`4503` (notes, stdlib §6.7; #8486).
+  - **New (72), in the `36NN` block of each section:**
+    - §28.2 (`3601`–`3606`; #8708, #8748);
+    - §15.3 (`3601`–`3603`; #7612);
+    - §28.3.3 (`3601`–`3602`; #8789);
+    - §28.3.8 (`3601`–`3605`; #9093);
+    - §29.2 (`3601`–`3603`; #9088);
+    - §28.9 (`3601`–`3603`; #8716);
+    - §28.14 (`3601`–`3607`; #8397, #9311);
+    - §3.4 (`3601`–`3607`; #8115, #8116);
+    - §26.7 (`3601`–`3603`; #8113);
+    - §27.6 (`3601`–`3603`; #8065);
+    - §22.2 (`3601`–`3606`; #9246);
+    - §31.2 (`3601`–`3604`; #8640, including the critic's distinguishing case in a simplified form);
+    - §31.2.3 (`3601`–`3602`; #8425);
+    - §30.3 and §30.12 (`3601` each; #8076);
+    - §30.15 (`3601`–`3602`; #8710);
+    - §14.5 (`3601`–`3603`; #8617);
+    - §30.13 (`3601`; #9379);
+    - stdlib §5 (`l5_3601`–`3604`; #9287), §2.5 (`l2_5_3601`–`3603`, zone-independent only; #8062), §6.7 (`l6_7_3601`; #8486) and §9.1 (`l9_1_3601`; #8577);
+    - §9.8 (`s9_8_3601`; #8090).
+    - The new cases are unclassified.
+    - Corrected at composition: `s29_2_3602`'s `rule:` quote, a lane draft, is now §29.2's text; `s3_4_3605`'s arm no longer uses the name, so only the declaration can reject it; `s27_6_3601` drops its annotation, so no type mismatch stands in for the name error; `s28_14_3604`'s diagnostic is the bound's word, `closure`, since a compiler that rejects the own-body `+=` (`s28_14_3607`) rejects it for the wrong reason.
+  - **Not written:**
+    - #9305 and #9324 need standard input, which the runner does not supply; they are gtest rows for the fix lane.
+    - #8062's gap and overlap cases are zone-dependent; they are gtest rows under `TZ=`.
+    - The choice and polymorphic `BeginObject` counts: a choice's rendering is unpinned.
+    - The all-storage move-only arm-meet (#7612).
+    - The #8397 destructor window, which waits for §28.15.
+    - The #9287 dictionary twin.
+
+  *Doc-example corpus:* not regenerated (#1380).
+
+**Corrections at the meaning gate** (critic A on L1–L3, critic B on L4–L5; the coordinator's dispositions, then the owner's decisions of 2026-11-26 and the #8062 point ruled by the coordinator under the owner's delegation, applied before publication).
+- *Critic A (FIX):*
+  - #8708's restatements in Appendix C.3 and the reference;
+  - #7612's *Local lifetime* and §20 scoping;
+  - #8789's "`owned` or plain parameter";
+  - #9093's read-sentence exception, "returned from the enclosing method" and the reference's swap note;
+  - #9311's cross-reference;
+  - #8113's grammar;
+  - #8065's Dispose paragraph.
+  - Critic A confirmed the lanes' departures for #9093, #9088, #9246 and #9311, and found that #9311 under-reported its flips (`s28_14_9986` and four #9310 rows).
+- *Critic B (FIX):*
+  - #8640's raise-end definition;
+  - #9377's definition of *claim*;
+  - #8090/#8091's identity clause;
+  - #8062's parenthetical;
+  - the #8076 restatements in Guide 04 and the reference;
+  - #8710's stdlib mirror.
+  - Critic B called #8062's transition sentence and #9324's three points DESIGN. The owner decided #9324, and #8062 was ruled by the coordinator under the owner's delegation (above). Its narrower #9324 text was therefore not landed.
+- *Not applied (optional, non-blocking):*
+  - loosening #8748's "certain to fault";
+  - qualifying §28.3 *Reach*'s "fully static bound" for #8397;
+  - #8425's "and so is every implementer" phrasing.
+
+**Recorded, not changed.**
+- Two pre-existing tensions are left for follow-up filing. §3.4's user-type list omits `choice`. Stdlib §2 declares `public sealed class Type`, while spec §28.9 says no runtime-managed type is a class.
+- A cached `TypeInitializationException` touched from two domains would need the "raise ended" state of #8640 to be cross-domain. That question predates this revision and is noted on the #8640 tracker.
+
+**Checks.** `scripts/check_docs.sh` (all phases), `check_proposals.sh`, `build_book.py --check`, `check_src_citations.py`, `gen_editor_grammars.py --check`, `corpus.py lint --strict` (8,239 cases) and `corpus.py check`, the harness unit tests (171), and `check_commit_trailers.py --strict`.
 
 ---

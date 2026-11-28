@@ -1,9 +1,9 @@
 // bug: B8
-// title: A narrowed local used as an `if`-expression branch makes the result nullable (contested: #6698)
-// issue: #6698 (open spec question: contested)
+// title: A narrowed local used as an `if`-expression branch makes the result nullable (ruled 2026-10-21, a compiler bug: #6698)
+// issue: #6698 (ruled 2026-10-21; sema tracker)
 // rests-on: spec §7.4 (v0.355): inside a narrowing region the variable is narrowed; §20 common type of `string` and `string` is `string`
 // source: data/compiler-bugs.md, verbatim below this header
-// note: Contested: the expectation is the study's reading of §7.4; #6698 may rule otherwise.
+// note: The expectation follows the #6698 ruling (§7.11, §12.7, §22.6): a narrowed read has the narrowed type.
 // expect: run
 // stdout: 2
 // stdout: 5

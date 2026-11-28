@@ -2,10 +2,14 @@
 //! doc: spec
 //! section: 28.14
 //! title: a local of the constructor passed as a scoped source into an owned field of this is rejected
-//! rule: A bounding object that is none of the admitted resolutions
+//! rule: **`this`** (per forms 3/4, or through the initializer resolution of form 1 where the
+//!   constructor call is directly assigned to (or initializes) an `owned` field of `this` …), where every
+//!   captured source is `this` itself or a value whose borrow provably originates from `this`
 //! cites: 28.14
 //! expect: reject
 //! diagnostic: bounding object
+//! notes: Re-headed at v0.361 (#8397): the construction reaches the `this` arm by form 1, and is
+//!   rejected because the captured source `x`, a constructor local, does not originate from `this`.
 module Conf;
 import System;
 

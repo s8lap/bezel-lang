@@ -10,8 +10,8 @@
 //! expect: run
 //! output: obj;@A;int1;end;
 //!   obj;@A;int2;@N;str:z;end;
-//! notes: this Tape does not log BeginObject's count — whether `n` counts an
-//!   omitted optional component is not settled (reported as a question).
+//! notes: this Tape does not log BeginObject's count; s9_8_3601 does (v0.361, #8090: an omitted null
+//!   optional component is not counted).
 module Conf;
 
 public record Entry(A: int, N: string? serialized optional): ISerializable, IDeserializable;

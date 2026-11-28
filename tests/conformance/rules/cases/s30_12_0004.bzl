@@ -3,8 +3,8 @@
 //! section: 30.12
 //! title: Semaphore.Acquire() lexically inside an async method is rejected
 //! rule: `Mutex.Acquire()`/`TryAcquire(timeout)`, `Semaphore.Acquire()`/`TryAcquire(timeout)`,
-//!   … **block the calling thread**. … the compiler rejects the blocking forms
-//!   lexically inside `async` methods and `async` lambdas
+//!   … **block the calling thread**. … the compiler rejects the blocking forms where the innermost
+//!   enclosing method or lambda body is `async`
 //! cites: 30.12, 30.3
 //! expect: reject
 //! diagnostic: blocking

@@ -1,16 +1,18 @@
 //! case: s28_10_0012
 //! doc: spec
 //! section: 28.10
-//! title: a read through a borrow-pin after the source's explicit Dispose faults in checked mode
-//! rule: The site-announced kills stay unfrozen under their flag backstop: an
-//!   explicit `Dispose()` of a borrow-pin's source is permitted, and a read
-//!   through the pinned binding afterwards raises `DisposedAccessException` in
-//!   checked disposal mode.
-//! cites: 28.10, 28.2, 28.3
-//! expect: run
-//! stdout: faulted
+//! title: a using-var pin over a borrow-returning call is rejected after the source's dominating Dispose
+//! rule: or a local bound from a member read or call through the variable or through such a holder
+//!   (`var v := a.F;`, `var v := a.Get();`, a borrowing-match binding over `a.F`) … a use of the holder —
+//!   a read or member access through it … — is the same compile error
+//! cites: 28.2, 28.10, 28.3
+//! expect: reject
+//! diagnostic: dominat
 //! flags: --checked-disposal
 //! issue: 4413
+//! notes: v0.361 (#8708) flips this case from run/faulted to reject: `view` is bound from the call
+//!   `h.Borrowed()` and `h.Dispose()` dominates its read. The kill stays permitted; only the use is
+//!   rejected. The checked-mode backstop is now reached only by a kill on some paths.
 module Conf;
 
 public class Widget

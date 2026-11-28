@@ -15,7 +15,7 @@ F013	t03-csv	sort groups by key	COMPILER-BUG		C-silent-query	2	resolved	compiler
 F014	t03-csv	record from array element	COMPILER-BUG		C-string-lifetime	3	resolved	compiler fix	B6
 F015	t03-csv	helper returning Array	COMPILER-BUG		C-ownership-false-positive	1	resolved	compiler fix	B2
 F016	t03-csv	CSV parsing	MISSING	text-stdlib		2	still	-	no CSV reader
-F017	t04-grep	if-expression over narrowed local	COMPILER-BUG		C-misc	2	still	-	B8 (contested #6698)
+F017	t04-grep	if-expression over narrowed local	COMPILER-BUG		C-misc	2	still	-	B8 (ruled #6698)
 F018	t04-grep	diagnostic for B8	DIAGNOSTIC	diagnostics		2	still	-	t04 v1/v2 same diagnostic at the later use
 F019	t05-ini	field holding a fresh collection	LANG-RULE	ownership-outside-resources		1	still	-	t05 v1 same owned-field error
 F020	t05-ini	nested collection	LANG-RULE	ownership-outside-resources		2	still	-	t05 v1 same fresh-store error
@@ -69,7 +69,7 @@ F067	t28-comparer	generic call inside interpolation hole	LANG-RULE	small-rules		
 F068	t28-comparer	MaxBy helper	MISSING	query-surface		1	still	-	no MaxBy
 F069	t28-comparer	explicit type args for a generic method with a lambda	COMPILER-BUG		C-inference	3	resolved	compiler fix	B24
 F070	t29-partition	multiple results	MISSING	tuples		2	still	-	no tuples
-F071	t29-partition	interpolation in a Select projection	COMPILER-BUG		C-string-lifetime	1	still	-	B17 (contested)
+F071	t29-partition	interpolation in a Select projection	COMPILER-BUG		C-string-lifetime	1	still	-	B17 (ruled #7170/#7215)
 F072	t29-partition	generic inference from a Range argument	COMPILER-BUG		C-inference	1	resolved	compiler fix	B22
 F073	t29-partition	ToString on T in a generic body	COMPILER-BUG		C-inference	1	resolved	compiler fix	B18
 F074	t30-workers	fresh tasks into an Array	LANG-RULE	ownership-outside-resources		2	still	-	t30 v1 same error; recurred in n15 (5 holder lines)

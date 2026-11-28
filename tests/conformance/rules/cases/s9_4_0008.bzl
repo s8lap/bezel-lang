@@ -1,19 +1,18 @@
 //! case: s9_4_0008
 //! doc: spec
 //! section: 9.4
-//! title: a binding read of an owning inline array field faults after its holder is destroyed
-//! rule: A move-only value disposed in place **with no replacement** — ... or
-//!   the holder of either kind destroyed (§28.4 step 2, whose per-slot pass
-//!   disposes an owning inline array's slots in place, §15.1.1) — is left in
-//!   a **disposed state** ... In checked disposal mode a read of the value in
-//!   that state — through an in-place `this`, or through a borrowing-match
-//!   binding of it, an owning inline array's slot reads, iteration and
-//!   compiler-provided operations (§15.1.2) included — faults as
-//!   `DisposedAccessException`
-//! cites: 9.4, 15.1.1, 28.4, 28.2
-//! expect: run
-//! stdout: faulted
+//! title: a match binding of an owning inline array field read after its holder's disposal is rejected
+//! rule: or a local bound from a member read or call through the variable or through such a holder
+//!   (`var v := a.F;`, `var v := a.Get();`, a borrowing-match binding over `a.F`), which §28.3's
+//!   receiver-sourced rows source at the variable's value whether or not the field is `owned` … a use of
+//!   the holder — a read or member access through it … — is the same compile error
+//! cites: 28.2, 9.4, 15.1.1, 28.4
+//! expect: reject
+//! diagnostic: dominat
 //! issue: 5642
+//! notes: v0.361 (#8708) flips this case from run/faulted to reject: `h.Dispose()` dominates the read
+//!   of `a[0]`, and `a` is a borrowing-match binding over `h.Slots`. The runtime fault it pinned is now
+//!   reached only by a kill on some paths (proposal 0205's table, which already expected reject).
 module Conf;
 
 public class Conn
